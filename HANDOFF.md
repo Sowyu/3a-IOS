@@ -31,7 +31,7 @@ Updated 2026-11-02, about 22:20 AEDT. Update this file whenever the state change
 4. Wi-Fi, then a modem probe for mobile data. `docs/research-wifi.md`.
 5. Sound and a real battery reading. `docs/plan-power.md`.
 6. Small ones:
-   - Glass flicks white, and stayed white in Calculator
+   - Glass buttons render flat: opaque grey in Notes, opaque white in Calculator, and the Notes clock is white on white. The owner photographed it during a self-test on 2026-11-02. An agent is diagnosing it at the desk (`analysis/glass-flat.md`). The leading guess is a wrong or stale brightness sample behind the glass. Related: flat grey dock in old captures, `docs/glass.md`.
    - Calendar widget stays a skeleton
    - App top spacing: apps still reserve 68 pt. The fix in `tools/statusbar/sweetsb_safearea.h` (50 pt) installs in PosterBoard but showed no sign of running in real apps, whose stderr went nowhere. The new version (`docs/app-safearea2.md`) logs through `sweetnull`, falls back to `/private/var/tmp` for its guard file, and reports every early return. One hands-free run is staged: `plans/statusbar-real/boot/next-loop-sb-null-boot.img`, untested.
    - Only 24 GB of storage is visible
