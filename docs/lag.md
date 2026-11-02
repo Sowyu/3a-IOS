@@ -302,9 +302,11 @@ The difference is within run-to-run noise, and the GPU time shows no cause, so G
 
 Both are dropped. Steering only chooses among idle cores, so moving the render thread would take a change in the scheduler itself (a reservation or preemption for marked threads). I did not try that tonight.
 
-### The GPU time is the fetch sync (ast113 to 116)
+### GPU time tracks the fetch syncs (ast113 to 116), but they are not its cause
 
-**Proven.** With per-command-buffer fetch-sync counts in the trace, a fit of GPU time on both draws and syncs gives:
+**Correction, ast119.** I first marked the fit below as proven cause. Turning the sync off entirely left GPU time unchanged (below), so the fit measured correlation: fetch syncs count the full-screen glass draws, and those draws are the cost.
+
+With per-command-buffer fetch-sync counts in the trace, a fit of GPU time on both draws and syncs gives:
 
 | Run | Constant | Per draw | Per fetch sync |
 |---|---:|---:|---:|
@@ -313,8 +315,40 @@ Both are dropped. Steering only chooses among idle cores, so moving the render t
 | ast114 | 0.83 ms | −0.022 ms | 0.644 ms |
 | ast116 | 0.87 ms | −0.045 ms | 0.738 ms |
 
-Draws cost nothing measurable. Command buffers of 100 to 160 draws record a median of 32 or 33 fetch syncs, so 16 to 20 ms of GPU drain per heavy frame. That is the whole GPU stage of a late frame.
+Draws cost nothing measurable once syncs are in the fit. Command buffers of 100 to 160 draws record a median of 32 or 33 fetch syncs.
 
 The barrier is the tear fix (`analysis/fetch-fix.md`): before every draw whose fragment shader fetches an attachment written since the last sync, it emits a full clean and invalidate of every cache, a wait for memory writes, a wait for idle and a wait for the CP's ME.
 
 **Candidate, `lumafs`.** The same sync with only what this dependency needs, matching Turnip's own barrier for a colour write followed by an input-attachment read: `CCU_CLEAN_COLOR | CACHE_INVALIDATE | CCHE_INVALIDATE | WAIT_FOR_IDLE`. The fetch draw still waits for the earlier draws and reads cleaned memory through freshly invalidated texture caches. Dropped are the depth clean, the UCHE clean, both CCU invalidates, the bindless invalidate, the wait for memory writes and the wait for ME. It passes the host checks, including `tear-check.py`. Whether the label tear stays fixed is **Missing** until the no-hw run's frames (batch 2).
+
+**Light sync, Proven no gain (ast117).** Shown 43.1 fps, 70.4% one vsync, flip rate 0.28, steady 44.1%, 40% of heavy frames late. GPU time is 0.88 ms + 0.001 ms per draw + **0.561 ms per fetch sync**, the same as the full flush. So the cost is the wait for idle itself: every fetch draw waits for all earlier draws to drain, which serialises about 32 full-screen glass draws per heavy frame. The cache flags don't matter.
+
+The second light run (ast118) was already running and finished. The no-hw run of this arm was cancelled, because an arm with no gain needs no tear check. `lumafs` is dropped.
+
+**Next candidate, `lumaov`: ordering in hardware instead of a drain.**
+
+- Chlorophyll already marks every fetch pipeline with rasterization-order attachment access (`chl_render.c.inc`, `cbs` flags).
+- On A810, which has coherent UBWC flag caches, Turnip skips its sysmem prim-mode state and gives raster-order pipelines `GRAS_SC_CNTL.SINGLE_PRIM_MODE=FLUSH_PER_OVERLAP` (`tu_pipeline.cc`, `tu_pipeline_builder_parse_rasterization_order`). The label tear happened with exactly that mode, before the fetch sync existed.
+- `lumaov` gives those pipelines `FLUSH_PER_OVERLAP_AND_OVERWRITE`, the mode Turnip uses for sysmem raster order on chips without coherent flag caches. It turns the full-drain sync off with `sweetfetchsync=0`.
+- The hardware then flushes only where a primitive overlaps earlier fragments, not the whole GPU per draw.
+- Whether that stops the label tear (black bands at the bottom of home-screen icons, `analysis/label-tear.md`) is tested first, in a run without hw scale so the frames are readable.
+
+### Hardware overlap ordering: the tear returns, and GPU time does not drop (ast119)
+
+`lumaov` with `sweetfetchsync=0`, without hw scale. **Proven:**
+
+- 0 fetch syncs were recorded per heavy command buffer, and the boot args confirm `sweetfetchsync=0`.
+- GPU time for 100 to 160 draws was a median of **13.0 ms** (536 command buffers). With the sync on it was 11.3 to 11.6 ms. So removing every full drain does not shorten GPU time.
+- The **label tear is back**: torn bands at the bottom of the Photos, Mail, News, Maps and Settings icons in `frames/04-page-1-right.check.png`, and a garbled battery glyph.
+
+`lumaov` is dropped. Its second run (ast120) was already running and finished. The other one was cancelled.
+
+**Conclusion, Inferred from ast61, ast103, ast105 and ast119.** GPU time on heavy frames is the pixel work of the full-screen glass draws themselves. The evidence:
+
+- A 26% higher clock gave 3% (ast61).
+- Allowing GMEM changed nothing while the sync forced those passes to sysmem (ast103, ast105).
+- Removing the drains changed nothing (ast119).
+
+That points at memory traffic in sysmem rendering.
+
+**Next, `GF`:** force GMEM (`sweettu=gmem,...`) with the fetch sync off, on stock Turnip. In GMEM a fetch reads on-chip tile memory, ordered by `FLUSH_PER_OVERLAP` as Turnip intends, so it could fix the tear and cut memory traffic together. No-hw first, for the tear and for recoveries, since GMEM hung often before the 2100 fix.
