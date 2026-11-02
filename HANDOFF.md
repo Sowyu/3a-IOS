@@ -14,6 +14,10 @@ Updated 2026-11-02, about 22:20 AEDT. Update this file whenever the state change
 - Input latency: four kernel patches prepared, off by default, not yet run (`patches/input/` 2150 to 2153, `docs/input.md`): key poll period, touch on interrupt with sample timestamps, instant screen blank on power, and latching frames closer to the tick. Test after the lag agent, with a Sol audit of 2152 first, since it changes panel power.
 - Running on 2026-11-02 evening: a lag agent drives the phone through `dev.py` (`plans/lag/`, `analysis/lag.md`); a Freeform agent does desk work (`plans/freeform/`, `analysis/freeform.md`).
 
+## Overnight 2026-11-03, 01:00 to 08:00
+
+The owner asked for the lag to be worked on autonomously overnight. The lag agent owns the phone after `plans/night-queue.sh` finishes (about 01:20): it picks a lever, runs it hands-free with `dev.py`, measures the share of 1-vsync gaps at 60 Hz, and keeps or drops it. Rules: RAM boots only, no flashing or boot-path writes, no 30 Hz cap, no visual reductions, keep and astwait together, stop on any run that needs a button. It ends by pushing the best known-good driver to the root. The Freeform and USB agents work at the desk only. The USB patches get a Sol audit before any boot, and their phone tests wait for the owner. The Mac is kept awake with `caffeinate`.
+
 ## What works
 
 - Cold boot, and OrangeFox from the fastboot menu's Recovery mode
