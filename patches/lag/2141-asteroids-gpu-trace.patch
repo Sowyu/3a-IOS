@@ -1,0 +1,106 @@
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -56,6 +56,45 @@
+ bool sweet_gpu_check_fault(void);
+ void sweet_gpu_cache_sync(void *va, size_t len);
+ uint32_t sweet_gpu_submit(const uint64_t *ib_iova, const uint32_t *ib_dwords, unsigned count);
++/* 2141: who uses the GPU when. A ring of submissions (G: time, pid, fence, commands) and fence waits that returned (W: the time
++ * the wait began, the time it returned, pid, fence, result), printed after the display trace in kern.sweet_fb_trace in absolute
++ * microseconds. Relaxed stores, racy reads: a diagnostic. */
++#define SWEET_GPU_TRACE_N 512
++static struct { uint64_t t, t0; uint32_t pid, fence; uint8_t kind, arg; } gGpuTrace[SWEET_GPU_TRACE_N];
++static uint32_t gGpuTraceI;
++static void
++gpuTrace(uint8_t kind, uint64_t t0, uint32_t pid, uint32_t fence, uint8_t arg)
++{
++	uint32_t j = __atomic_fetch_add(&gGpuTraceI, 1, __ATOMIC_RELAXED) & (SWEET_GPU_TRACE_N - 1);
++	gGpuTrace[j].t = 0;
++	gGpuTrace[j].t0 = t0;
++	gGpuTrace[j].pid = pid;
++	gGpuTrace[j].fence = fence;
++	gGpuTrace[j].kind = kind;
++	gGpuTrace[j].arg = arg;
++	__atomic_store_n(&gGpuTrace[j].t, mach_absolute_time(), __ATOMIC_RELEASE);
++}
++extern "C" size_t sweet_gpu_trace_text(char *buf, size_t cap);
++size_t
++sweet_gpu_trace_text(char *buf, size_t cap)
++{
++	size_t n = 0;
++	uint32_t ti = __atomic_load_n(&gGpuTraceI, __ATOMIC_RELAXED);
++	for (uint32_t k = 0; k < SWEET_GPU_TRACE_N && n + 64 < cap; k++) {
++		uint32_t j = (ti + k) & (SWEET_GPU_TRACE_N - 1);
++		uint64_t t = __atomic_load_n(&gGpuTrace[j].t, __ATOMIC_ACQUIRE), a, b = 0;
++		if (t == 0) {
++			continue;
++		}
++		absolutetime_to_nanoseconds(t, &a);
++		if (gGpuTrace[j].t0) {
++			absolutetime_to_nanoseconds(gGpuTrace[j].t0, &b);
++		}
++		n += (size_t)snprintf(buf + n, cap - n, "%c %llu %llu %u %u %u\n", gGpuTrace[j].kind, a / 1000, b / 1000, gGpuTrace[j].pid,
++		    gGpuTrace[j].fence, gGpuTrace[j].arg);
++	}
++	return n;
++}
+ bool sweet_gpu_fence_done(uint32_t fence);
+ uint32_t sweet_gpu_fence_last(void);
+ void sweet_gpu_mark_lost(void);
+@@ -1168,6 +1207,7 @@
+ 			}
+ 		}
+ 		fLastFence = fence;
++		gpuTrace('G', 0, (uint32_t)fPid, fence, (uint8_t)(r->nr_cmds > 255 ? 255 : r->nr_cmds));      /* 2141 */
+ 		r->fence = fence;
+ 		r->fence_fd = -1;
+ 		quarantineDrain(false);
+@@ -1226,6 +1266,8 @@
+ 		uint64_t ns = (r->timeout.tv_sec < 0 || r->timeout.tv_nsec < 0) ? 0 :
+ 		    (uint64_t)r->timeout.tv_sec * NSEC_PER_SEC + (uint64_t)r->timeout.tv_nsec;
+ 		uint32_t epoch = sweet_gpu_epoch();
++		uint64_t wt0 = mach_absolute_time();
++		bool already = sweet_gpu_fence_done(r->fence);
+ 		ret = waitFence(r->fence, ns) && epoch == sweet_gpu_epoch() ? kIOReturnSuccess :
+ 		    ((sweet_gpu_ready() && epoch == sweet_gpu_epoch()) ? kIOReturnTimeout : kIOReturnIOError);
+ 		/* 2015: a recovery made every earlier fence pass (its work void); Turnip takes an error here as a lost device for
+@@ -1233,6 +1275,9 @@
+ 		if (ret == kIOReturnIOError && sweet_gpu_ready() && sweet_gpu_fence_done(r->fence)) {
+ 			ret = kIOReturnSuccess;
+ 		}
++		if (ns != 0 || ret == kIOReturnSuccess) {
++			gpuTrace('W', wt0, (uint32_t)fPid, r->fence, (uint8_t)((ret == kIOReturnSuccess ? 1 : 0) | (already ? 2 : 0)));     /* 2141 */
++		}
+ 	}
+ 	sweet_gpu_unlock();
+ 	return ret;
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -317,6 +317,7 @@
+ 	return r->id == id ? r : NULL;
+ }
+ extern "C" size_t sweet_fb_trace_text(char *buf, size_t cap);
++extern "C" size_t sweet_gpu_trace_text(char *buf, size_t cap);     /* 2141, SweetAdreno.cpp */
+ size_t
+ sweet_fb_trace_text(char *buf, size_t cap)
+ {
+@@ -358,6 +359,9 @@
+ 		}
+ 	}
+ #undef REL
++	if (n < cap) {
++		n += sweet_gpu_trace_text(buf + n, cap - n);
++	}
+ 	return n < cap ? n : cap;
+ }
+ class AppleCLCD;
+--- a/bsd/dev/sweet_fb.c
++++ b/bsd/dev/sweet_fb.c
+@@ -123,7 +123,7 @@
+ static int sweet_fb_trace_sysctl SYSCTL_HANDLER_ARGS
+ {
+ #pragma unused(oidp, arg1, arg2)
+-	const size_t cap = 32768;       /* 2140: 128 swaps and 256 ticks, absolute */
++	const size_t cap = 65536;       /* 2140: 128 swaps and 256 ticks, absolute; 2141: 512 GPU events */
+ 	if (req->oldptr == USER_ADDR_NULL) {
+ 		return SYSCTL_OUT(req, NULL, cap);
+ 	}

@@ -1,0 +1,211 @@
+--- a/Chlorophyll/air/chl_vk.c
++++ b/Chlorophyll/air/chl_vk.c
+@@ -236,6 +236,8 @@
+    size_t size;
+    uint64_t addr;
+    bool ring;            /* an upload-ring slab, owned by the device's slab list */
++   bool staging;         /* an upload or readback staging buffer: back to the device's staging pool when the last reference goes */
++   struct chl_buffer *next_free;
+ };
+ 
+ struct chl_view_cache { unsigned level, slice; VkImageView view; };
+@@ -424,6 +426,14 @@
+    pthread_mutex_t free_lock;
+    struct chl_cmdbuf *free_cbs;
+    struct chl_slab *free_slabs;
++
++   /* lag: staging buffers of texture uploads and readbacks, kept for reuse by power-of-two size class (16 KB .. 16 MB). Each upload
++    * used to allocate, map, free and unmap a BO: four kernel calls, a third of backboardd's encode time (analysis/lag.md). A buffer
++    * comes back here where it used to be freed, after the GPU work holding it retired, so reuse is as safe as that free. */
++   pthread_mutex_t staging_lock;
++   struct chl_buffer *staging_free[11];
++   size_t staging_bytes;
++   unsigned long staging_hits, staging_misses;
+ 
+    /* completion thread */
+    pthread_t thread;
+@@ -437,6 +447,8 @@
+  * Reference counting
+  */
+ static void destroy_obj(struct chl_obj *o);
++static void staging_drain(struct chl_device *d, size_t keep);
++static unsigned long g_staging_hits, g_staging_misses, g_staging_bytes;   /* lag: for bgmtl's perf line; racy reads */
+ 
+ static void
+ obj_init(struct chl_obj *o, struct chl_device *dev, enum chl_kind kind)
+@@ -798,6 +810,7 @@
+    pthread_mutex_init(&d->queue_lock, NULL);
+    pthread_mutex_init(&d->pro_lock, NULL);
+    pthread_mutex_init(&d->free_lock, NULL);
++   pthread_mutex_init(&d->staging_lock, NULL);
+    pthread_mutex_init(&d->share_lock, NULL);
+    pthread_mutex_init(&d->done_lock, NULL);
+    pthread_cond_init(&d->done_cv, NULL);
+@@ -966,6 +979,7 @@
+    if (idle == VK_SUCCESS || idle == VK_ERROR_DEVICE_LOST)
+       pro_teardown(d);
+    pthread_mutex_unlock(&d->pro_lock);
++   staging_drain(d, 0);
+    while (d->layouts) {
+       struct chl_shared_layout *sl = d->layouts;
+       d->layouts = sl->next;
+@@ -1033,9 +1047,103 @@
+    VkBufferDeviceAddressInfo dai = { VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, NULL, b->vk };
+    b->addr = d->vk.vkGetBufferDeviceAddress(d->dev, &dai);
+    bo_count(d, CHL_BO_BUFFERS, 1);
++   return b;
++}
++
++/* Staging pool. ponytail: one budget for all classes, no aging; trim on idle if backboardd's footprint ever matters */
++#define CHL_STAGING_MIN_SHIFT 14
++#define CHL_STAGING_CLASSES 11
++#define CHL_STAGING_BUDGET (24u << 20)
++static int
++staging_class(size_t size)
++{
++   for (int c = 0; c < CHL_STAGING_CLASSES; c++)
++      if (size <= ((size_t)1 << (CHL_STAGING_MIN_SHIFT + c)))
++         return c;
++   return -1;
++}
++
++static void
++buffer_free_vk(struct chl_device *d, struct chl_buffer *b)
++{
++   d->vk.vkDestroyBuffer(d->dev, b->vk, NULL);
++   d->vk.vkFreeMemory(d->dev, b->mem, NULL);
++   bo_count(d, CHL_BO_BUFFERS, -1);
++}
++
++/* free pooled buffers until at most `keep` bytes stay */
++static void
++staging_drain(struct chl_device *d, size_t keep)
++{
++   for (;;) {
++      struct chl_buffer *b = NULL;
++      pthread_mutex_lock(&d->staging_lock);
++      for (int c = CHL_STAGING_CLASSES - 1; c >= 0 && !b && d->staging_bytes > keep; c--)
++         if ((b = d->staging_free[c])) {
++            d->staging_free[c] = b->next_free;
++            d->staging_bytes -= b->size;
++         }
++      pthread_mutex_unlock(&d->staging_lock);
++      if (!b)
++         return;
++      buffer_free_vk(d, b);
++      free(b);
++   }
++}
++
++static struct chl_buffer *
++staging_new(struct chl_device *d, size_t size, char *why, size_t why_size)
++{
++   int c = staging_class(size);
++   if (c < 0)
++      return buffer_new(d, size, why, why_size);
++   struct chl_buffer *b;
++   pthread_mutex_lock(&d->staging_lock);
++   if ((b = d->staging_free[c])) {
++      d->staging_free[c] = b->next_free;
++      d->staging_bytes -= b->size;
++      d->staging_hits++;
++   } else {
++      d->staging_misses++;
++   }
++   g_staging_hits = d->staging_hits; g_staging_misses = d->staging_misses; g_staging_bytes = d->staging_bytes;
++   pthread_mutex_unlock(&d->staging_lock);
++   if (b) {
++      obj_init(&b->o, d, K_BUFFER);
++      b->next_free = NULL;
++      return b;
++   }
++   b = buffer_new(d, (size_t)1 << (CHL_STAGING_MIN_SHIFT + c), why, why_size);
++   if (b)
++      b->staging = true;
+    return b;
+ }
+ 
++/* destroy_obj of a staging buffer: true when the pool took it */
++static bool
++staging_put(struct chl_device *d, struct chl_buffer *b)
++{
++   int c = staging_class(b->size);
++   bool kept = false;
++   pthread_mutex_lock(&d->staging_lock);
++   if (c >= 0 && d->staging_bytes + b->size <= CHL_STAGING_BUDGET) {
++      b->next_free = d->staging_free[c];
++      d->staging_free[c] = b;
++      d->staging_bytes += b->size;
++      kept = true;
++   }
++   pthread_mutex_unlock(&d->staging_lock);
++   return kept;
++}
++
++void
++chl_staging_stats(unsigned long *hits, unsigned long *misses, unsigned long *bytes)
++{
++   *hits = g_staging_hits;
++   *misses = g_staging_misses;
++   *bytes = g_staging_bytes;
++}
++
+ struct chl_buffer *
+ chl_buffer_create(struct chl_device *d, size_t size, char *why, size_t why_size)
+ {
+@@ -1589,7 +1697,7 @@
+       say(why, why_size, "%zu bytes per row for a region whose rows need %zu", row, r.row_bytes);
+       return -1;
+    }
+-   r.staging = buffer_new(d, r.image_bytes * r.size[2], why, why_size);
++   r.staging = staging_new(d, r.image_bytes * r.size[2], why, why_size);
+    if (!r.staging)
+       return -1;
+    unsigned rows = (r.size[1] + t->fmt->bh - 1) / t->fmt->bh;
+@@ -2636,9 +2744,9 @@
+    switch (o->kind) {
+    case K_BUFFER: {
+       struct chl_buffer *b = (struct chl_buffer *)o;
+-      d->vk.vkDestroyBuffer(d->dev, b->vk, NULL);
+-      d->vk.vkFreeMemory(d->dev, b->mem, NULL);
+-      bo_count(d, CHL_BO_BUFFERS, -1);
++      if (b->staging && staging_put(d, b))
++         return;   /* kept for the next upload: the GPU work that held it has retired */
++      buffer_free_vk(d, b);
+       break;
+    }
+    case K_TEXTURE: {
+--- a/Chlorophyll/air/chl.h
++++ b/Chlorophyll/air/chl.h
+@@ -187,6 +187,7 @@
+ /* Submit. `done` runs on the device's completion thread when the GPU has finished (status 0) or failed (-1). */
+ typedef void (*chl_done_fn)(void *ctx, int status, const char *why);
+ int chl_cmdbuf_commit(struct chl_cmdbuf *cb, chl_done_fn done, void *ctx, char *why, size_t why_size);
++void chl_staging_stats(unsigned long *hits, unsigned long *misses, unsigned long *bytes);   /* lag: upload staging pool, totals */
+ void chl_gpu_timing(uint64_t *busy_ns, uint64_t *between_ns, uint64_t *slowest_ns, uint64_t *count);   /* zero unless bgmtl.gputs; slowest is per call */
+ /* What holds Turnip BOs, for the log line that proves the BO list stays flat. Racy reads, fine for a log line. */
+ enum { CHL_BO_BUFFERS, CHL_BO_SLABS, CHL_BO_TEXTURES, CHL_BO_CMDBUFS, CHL_BO_PRO_LIVE, CHL_BO_PRO_SUBMITS, CHL_BO_SOURCES };
+--- a/Chlorophyll/src/bgmtl.m
++++ b/Chlorophyll/src/bgmtl.m
+@@ -2094,6 +2094,10 @@
+       if (bg_texpool_cap()) {
+          snprintf(line, sizeof(line), "texpool: %lu hits, %lu misses, %.1f MB held", g_texpool_hits, g_texpool_misses,
+                   g_texpool_bytes / 1048576.0);
++         bgmtl_note_line(line);
++         unsigned long sh, sm, sb;
++         chl_staging_stats(&sh, &sm, &sb);
++         snprintf(line, sizeof(line), "staging: %lu hits, %lu misses in total, %.1f MB pooled", sh, sm, sb / 1048576.0);
+          bgmtl_note_line(line);
+          g_texpool_hits = g_texpool_misses = 0;
+       }
+--- a/verify.py
++++ b/verify.py
+@@ -21,7 +21,7 @@
+ # Preserve the exported API from the earlier diagnostic payload.
+ syms=lambda f:subprocess.check_output(['nm','-gU',str(f)],text=True).split('\n')
+ names=lambda f:sorted(l.split()[-1] for l in syms(f) if l.strip())
+-assert set(names(root/'out-metal/libchlorophyll.dylib'))-set(names(base/'out-metal/libchlorophyll.dylib'))=={'_chl_tear_probe','_chl_gpu_timing','_chl_bo_counts'}
++assert set(names(root/'out-metal/libchlorophyll.dylib'))-set(names(base/'out-metal/libchlorophyll.dylib'))=={'_chl_tear_probe','_chl_gpu_timing','_chl_bo_counts','_chl_staging_stats'}
+ assert set(names(base/'out-metal/libchlorophyll.dylib')) <= set(names(root/'out-metal/libchlorophyll.dylib'))
+ patch=''
+ for f in ['Chlorophyll/air/chl_vk.c','Chlorophyll/src/bgmtl.m','build.sh','test/render-check.py','test/shatter-check.py','verify.py']:

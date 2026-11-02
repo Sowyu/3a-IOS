@@ -1,56 +1,163 @@
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -6796,6 +6796,25 @@ sweet_ui_exec_path(const char *p)
+@@ -416,6 +416,8 @@ static int execargs_alloc(struct image_params *imgp);
+ static int execargs_free(struct image_params *imgp);
+ static int exec_check_permissions(struct image_params *imgp);
+ static int exec_extract_strings(struct image_params *imgp);
++static char *sweet_appmetal_inserted(struct image_params *imgp);
++static void sweet_appmetal_check(struct image_params *imgp, proc_t p, char *s, int mac_transition);
+ static int exec_add_apple_strings(struct image_params *imgp, const load_result_t *load_result, task_t task);
+ static int exec_handle_sugid(struct image_params *imgp);
+ static int sugid_scripts = 0;
+@@ -2400,7 +2402,18 @@ grade:
+ 	/*
+ 	 * deal with set[ug]id.
+ 	 */
++	char *sweet_am = sweet_appmetal_inserted(imgp);
++#if CONFIG_MACF
++	/* 2130: the query exec_handle_sugid makes first; it does not keep the answer */
++	int sweet_am_mac = sweet_am != NULL && mac_cred_check_label_update_execve(imgp->ip_vfs_context, imgp->ip_vp,
++	    imgp->ip_arch_offset, imgp->ip_scriptvp, imgp->ip_scriptlabelp, imgp->ip_execlabelp, p, &imgp->ip_px_smpx);
++#else
++	int sweet_am_mac = 0;
++#endif
+ 	error = exec_handle_sugid(imgp);
++	if (sweet_am != NULL && !error) {
++		sweet_appmetal_check(imgp, p, sweet_am, sweet_am_mac);
++	}
+ 	if (error) {
+ 		KERNEL_DEBUG_CONSTANT(BSDDBG_CODE(DBG_BSD_PROC, BSD_PROC_EXITREASON_CREATE) | DBG_FUNC_NONE,
+ 		    proc_getpid(p), OS_REASON_EXEC, EXEC_EXIT_REASON_SUGID_FAILURE, 0, 0);
+@@ -6796,6 +6809,102 @@ sweet_ui_exec_path(const char *p)
      return *p && !strchr(p,'/') && strcmp(p,".") && strcmp(p,"..");
  }
  
 +/*
-+ * 2130: sweetappmetal=<executable> gives one top-level app in /Applications the Chlorophyll inject. Off without the boot-arg.
-+ * The name has to match the last path component exactly; nested extensions and XPC services never match (sweet_ui_exec_path).
++ * 2130: sweetappmetal=Freeform inserts the Chlorophyll inject into exactly /Applications/Freeform.app/Freeform, the trial of
++ * plans/freeform. Off without the boot-arg, and every other value is refused. With 2058's sweetsb=1 as well, Freeform gets one
++ * variable listing both, sweetsb first. The match is the exec path string and the vnode's own path, so another bundle, a
++ * helper of the same name or a symlink to another file does not match.
 + */
++#define SWEET_APPMETAL_PATH "/Applications/Freeform.app/Freeform"
++static const char sweet_insert_app[] = "DYLD_INSERT_LIBRARIES=/usr/local/lib/bgmtl/bgmtl-inject.dylib";
++static const char sweet_insert_both[] = "DYLD_INSERT_LIBRARIES=/usr/local/lib/sweetsb.dylib:/usr/local/lib/bgmtl/bgmtl-inject.dylib";
++/* a refused insertion is renamed in place to this, the same length, so no string or pointer moves after extraction */
++#define SWEET_APPMETAL_DENIED "SWEET_APPMETAL_DENIED="
++_Static_assert(sizeof(SWEET_APPMETAL_DENIED) == sizeof("DYLD_INSERT_LIBRARIES="), "2130 renames in place");
++
 +static int
-+sweet_appmetal_match(const char *path)
++sweet_appmetal_enabled(void)
 +{
-+	static char name[32];
 +	static int state = -1;
 +	if (state < 0) {
-+		state = PE_parse_boot_argn("sweetappmetal", name, sizeof(name)) && name[0] != '\0';
++		char name[16] = "";
++		state = PE_parse_boot_argn("sweetappmetal", name, sizeof(name)) && !strcmp(name, "Freeform");
++		if (!state && name[0] != '\0') {
++			printf("SWEET EXEC: appmetal: sweetappmetal=%s refused, only Freeform is supported\n", name);
++		}
 +	}
-+	if (!state || strncmp(path, "/Applications/", 14) || !sweet_ui_exec_path(path)) {
++	return state;
++}
++
++/*
++ * An inherited variable that this patch writes, stripped so children of Freeform do not inherit the inject. Only with the
++ * feature on: on a boot without sweetappmetal=Freeform this patch wrote nothing, so it strips nothing either.
++ */
++static int
++sweet_appmetal_own(const char *s)
++{
++	const size_t d = sizeof(SWEET_APPMETAL_DENIED) - 1;
++	if (!sweet_appmetal_enabled()) {
 +		return 0;
 +	}
-+	const char *base = strrchr(path, '/');
-+	return base != NULL && !strcmp(base + 1, name);
++	if (!strcmp(s, sweet_insert_app) || !strcmp(s, sweet_insert_both)) {
++		return 1;
++	}
++	return !strncmp(s, SWEET_APPMETAL_DENIED, d) && (!strcmp(s + d, sweet_insert_app + d) || !strcmp(s + d, sweet_insert_both + d));
++}
++
++static int
++sweet_appmetal_match(struct image_params *imgp)
++{
++	char real[64];
++	int len = sizeof(real);
++	if (!sweet_appmetal_enabled() || strcmp(imgp->ip_strings + strlen(EXECUTABLE_KEY), SWEET_APPMETAL_PATH)) {
++		return 0;
++	}
++	/* the file actually being executed: ENOSPC for a longer path, which is not ours either */
++	return imgp->ip_vp != NULLVP && vn_getpath(imgp->ip_vp, real, &len) == 0 && !strcmp(real, SWEET_APPMETAL_PATH);
++}
++
++/* Our insertion among the extracted environment strings, or NULL. With the feature on an inherited copy was stripped. */
++static char *
++sweet_appmetal_inserted(struct image_params *imgp)
++{
++	if (!sweet_appmetal_enabled() || imgp->ip_endargv == NULL || imgp->ip_endenvv == NULL) {
++		return NULL;
++	}
++	for (char *s = imgp->ip_endargv; s < imgp->ip_endenvv; s += strlen(s) + 1) {
++		if (!strcmp(s, sweet_insert_app) || !strcmp(s, sweet_insert_both)) {
++			return s;
++		}
++	}
++	return NULL;
++}
++
++/*
++ * After exec_handle_sugid, before the strings are copied out: what extraction could not know yet. A set-id or MAC credential
++ * change, a restricted, hardened or library-validated signature, or a privileged code-signing flag loses the insertion,
++ * sweetsb.dylib included when the variable lists both. This port's AMFI stand-in lets dyld honour DYLD_* for every arm64e
++ * process (sweet_amfi.c), so dyld would not drop it for us.
++ */
++static void
++sweet_appmetal_check(struct image_params *imgp, proc_t p, char *s, int mac_transition)
++{
++	const uint32_t cs = imgp->ip_csflags;
++	const char *why = proc_issetugid(p) ? "set-id credentials" :
++	    mac_transition ? "a MAC label transition" :
++	    (imgp->ip_origvattr->va_mode & (VSUID | VSGID)) ? "a set-id file" :
++	    (cs & CS_RESTRICT) ? "a restricted signature" :
++	    (cs & CS_RUNTIME) ? "the hardened runtime" :
++	    (cs & (CS_REQUIRE_LV | CS_FORCED_LV)) ? "library validation" :
++	    (cs & (CS_INSTALLER | CS_DATAVAULT_CONTROLLER | CS_NVRAM_UNRESTRICTED)) ? "privileged code-signing flags" : NULL;
++	if (why == NULL) {
++		printf("SWEET EXEC: appmetal inject for %s\n", SWEET_APPMETAL_PATH);
++		return;
++	}
++	memcpy(s, SWEET_APPMETAL_DENIED, sizeof(SWEET_APPMETAL_DENIED) - 1);
++	printf("SWEET EXEC: appmetal inject refused for %s: %s\n", SWEET_APPMETAL_PATH, why);
 +}
 +
  __attribute__((noinline))
  static int
  exec_extract_strings(struct image_params *imgp)
-@@ -6809,6 +6828,8 @@ exec_extract_strings(struct image_params *imgp)
- 	int sweet_sb = 0;
- 	(void)PE_parse_boot_argn("sweetsb", &sweet_sb, sizeof(sweet_sb));
- 	const char sweet_insert[] = "DYLD_INSERT_LIBRARIES=/usr/local/lib/sweetsb.dylib";
-+	const char sweet_insert_app[] = "DYLD_INSERT_LIBRARIES=/usr/local/lib/bgmtl/bgmtl-inject.dylib";
-+	const char sweet_insert_both[] = "DYLD_INSERT_LIBRARIES=/usr/local/lib/sweetsb.dylib:/usr/local/lib/bgmtl/bgmtl-inject.dylib";
- 	boolean_t sweet_existing = FALSE;
- 
- 	/*
-@@ -6972,7 +6993,8 @@ exec_extract_strings(struct image_params *imgp)
+@@ -6972,7 +7081,7 @@ exec_extract_strings(struct image_params *imgp)
  			goto bad;
  		}
  		/* Never propagate our own variable to children, including when dyld skipped it. */
 -		if (sweet_sb && !strcmp(sweet_begin, sweet_insert)) {
-+		if ((sweet_sb && !strcmp(sweet_begin, sweet_insert)) || !strcmp(sweet_begin, sweet_insert_app) ||
-+		    !strcmp(sweet_begin, sweet_insert_both)) {
++		if ((sweet_sb && !strcmp(sweet_begin, sweet_insert)) || sweet_appmetal_own(sweet_begin)) {
  			size_t n = (size_t)(imgp->ip_strendp - sweet_begin);
  			imgp->ip_strendp = sweet_begin;
  			imgp->ip_strspace += n;
-@@ -7037,17 +7059,23 @@ exec_extract_strings(struct image_params *imgp)
+@@ -7027,6 +7136,9 @@ exec_extract_strings(struct image_params *imgp)
+ 						}
+ 						imgp->ip_argspace -= new_ptr_size;
+ 						imgp->ip_envc++;
++						if (!strncmp(one, "DYLD_INSERT_LIBRARIES=", 22)) {
++							sweet_existing = TRUE;
++						}
+ 						printf("SWEET EXEC: env %s += %s\n", base, one);
+ 					}
+ 					c = e < end ? e + 1 : e;
+@@ -7036,17 +7148,20 @@ exec_extract_strings(struct image_params *imgp)
+ 		}
  	}
  
- 	/* 2058: fail open on insufficient argument space; no fallible append. */
+-	/* 2058: fail open on insufficient argument space; no fallible append. */
 -	if (sweet_sb && !sweet_existing && sweet_arm64e_enabled() &&
-+	boolean_t sweet_app = sweet_appmetal_match(imgp->ip_strings + strlen(EXECUTABLE_KEY));
++	/* 2058, 2130: fail open on insufficient argument space; no fallible append. */
++	boolean_t sweet_app = sweet_appmetal_match(imgp);
 +	const char *sweet_str = !sweet_app ? sweet_insert : sweet_sb ? sweet_insert_both : sweet_insert_app;
 +	size_t sweet_len = strlen(sweet_str) + 1;
 +	if ((sweet_sb || sweet_app) && !sweet_existing && sweet_arm64e_enabled() &&
@@ -70,9 +177,5 @@
 +		imgp->ip_strspace -= sweet_len;
 +		imgp->ip_argspace -= sweet_len + new_ptr_size;
  		imgp->ip_envc++;
-+		if (sweet_app) {
-+			printf("SWEET EXEC: appmetal inject for %s\n", imgp->ip_strings + strlen(EXECUTABLE_KEY));
-+		}
  	}
  
- 	/* Save space for envv[] NULL terminator */

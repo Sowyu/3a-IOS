@@ -1,0 +1,107 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -97,6 +97,7 @@
+  uint64_t swapFlipNS, swapFlips, swapFlipMaxNS, handlerMaxNS, tickGapMaxNS, lastTick, preserves; /* 2052; maxima per log line */
+  uint64_t logFlipNS, logFlips, dropDone, dropHeld; /* 2080: the window mean, and whether a replaced swap had finished on the GPU */
+  uint64_t keptShown; /* 2082 */
++ uint64_t waitN, waitBusy, waitAbs, waitMaxAbs; /* 2142: honest SwapWait in copy mode */
+  uint32_t testSecs; uint64_t testEnd; bool testRegs; volatile uint32_t *lm; /* 2111 sweetfb_hwtest */
+ } ast;
+ static const uint32_t astPA[3] = {0xe3940000, 0xe431c000, 0xe4cf8000};
+@@ -538,6 +539,8 @@
+ 	SweetSurface *fPrevHold[4];
+ 	uint32_t fPrevEpoch, fPrevFence;
+ 	bool fPrevValid, fKeepPrev;
++	bool fAstWait;                  /* 2142 sweetfb_astwait=1: SwapWait(N) is complete only once no older swap's surface is held */
++	bool astOlderHeld(uint32_t id);
+ 	uintptr_t     fDraw;            /* where present() draws */
+ 	uint32_t      fDrawIdx;
+ 	uint8_t       fBarsMask;        /* frames whose scaling bars are black */
+@@ -1182,6 +1185,12 @@
+ 		int keep = 0;
+ 		PE_parse_boot_argn("sweetfb_keep", &keep, sizeof(keep));
+ 		fKeepPrev = keep != 0 && !fEarly;
++		int aw = 0;
++		PE_parse_boot_argn("sweetfb_astwait", &aw, sizeof(aw));
++		fAstWait = aw != 0 && !fEarly;
++		if (fAstWait) {
++			IOLog("SWEET FB: SwapWait honest in copy mode (sweetfb_astwait): a swap is complete once no older swap's surface is held\n");
++		}
+ 	}
+ 	fTickUS = fVsyncUS;
+ 	fNotifyDiv = 1;
+@@ -1655,9 +1664,11 @@
+             ast.latchMinNS/1000, ast.latched ? ast.latchNS/ast.latched/1000 : 0, ast.latchMaxNS/1000);
+         IOLog("SWEET FB AST: copy_us avg=%llu max=%llu copies=%llu gpu_hold_ticks=%llu\n",
+             ast.copies ? ast.copyNS/ast.copies/1000 : 0, ast.copyMaxNS/1000, ast.copies, c.gpuHolds);
+-        IOLog("SWEET FB AST: timing swap_to_flip_us avg=%llu max=%llu handler_us max=%llu tick_gap_us max=%llu preserves=%llu win_avg=%llu drop_done=%llu drop_held=%llu kept=%llu\n",
++        IOLog("SWEET FB AST: timing swap_to_flip_us avg=%llu max=%llu handler_us max=%llu tick_gap_us max=%llu preserves=%llu win_avg=%llu drop_done=%llu drop_held=%llu kept=%llu swapwait n=%llu busy=%llu us=%llu max_us=%llu\n",
+             ast.swapFlips ? ast.swapFlipNS/ast.swapFlips/1000 : 0, ast.swapFlipMaxNS/1000, ast.handlerMaxNS/1000, ast.tickGapMaxNS/1000, ast.preserves,
+-            ast.swapFlips > ast.logFlips ? (ast.swapFlipNS - ast.logFlipNS)/(ast.swapFlips - ast.logFlips)/1000 : 0, ast.dropDone, ast.dropHeld, ast.keptShown);
++            ast.swapFlips > ast.logFlips ? (ast.swapFlipNS - ast.logFlipNS)/(ast.swapFlips - ast.logFlips)/1000 : 0, ast.dropDone, ast.dropHeld, ast.keptShown,
++            ast.waitN, ast.waitBusy, sweet_abs_us(ast.waitAbs), sweet_abs_us(ast.waitMaxAbs));
++        ast.waitMaxAbs = 0;
+         ast.logFlipNS = ast.swapFlipNS;
+         ast.logFlips = ast.swapFlips;
+         ast.swapFlipMaxNS = ast.handlerMaxNS = ast.tickGapMaxNS = 0;
+@@ -2618,11 +2629,60 @@
+ 		tr->wret = mach_absolute_time();
+ 	}
+ 	return r;
++}
++
++/*
++ * 2142: copy mode (ast, not fEarly). Apple's display answers SwapWait(N) once swap N is on the glass and the surface of N-1
++ * has been handed back, and CoreAnimation renders the next frame into that surface as soon as it gets the answer. Here
++ * the panel scans the kernel's own slots, so a surface is handed back when its copy ends (2120), when a newer swap drops
++ * it, or (sweetfb_keep, 2082) when the frame kept for the next tick is shown or replaced. Answering at once while an older
++ * surface was still held let CoreAnimation draw into it, and the bgmtl hold-wait gave up after 50 ms into a black bar.
++ * Held and older than `id`: the kept frame (fPrev) or the one present() is copying.
++ */
++bool
++AppleCLCD::astOlderHeld(uint32_t id)
++{
++	bool held = false;
++	IOLockLock(fLock);
++	if (fPrevValid && (int32_t)(get32(fPrev, 0x50) - id) < 0) {
++		held = true;
++	}
++	IOLockUnlock(fLock);
++	SweetSurface **copying = __atomic_load_n(&fCopyHold, __ATOMIC_ACQUIRE);  /* its entries go NULL when the copy ends (2120), before the latch wait */
++	if (copying != NULL && (int32_t)(__atomic_load_n(&fCurSwapID, __ATOMIC_ACQUIRE) - id) < 0) {
++		for (uint32_t i = 0; i < 4; i++) {
++			if (__atomic_load_n(&copying[i], __ATOMIC_ACQUIRE) != NULL) {
++				held = true;
++			}
++		}
++	}
++	return held;
+ }
+ 
+ IOReturn
+ AppleCLCD::swapWaitInner(uint32_t id)
+ {
++	if (fAstWait && ast.enabled && !fPowerOff && id != 0) {
++		if ((int32_t)(id - __atomic_load_n(&fSwapNewest, __ATOMIC_ACQUIRE)) > 0 || !astOlderHeld(id)) {
++			return kIOReturnSuccess;
++		}
++		uint64_t t0 = mach_absolute_time(), limit, now;
++		nanoseconds_to_absolutetime((uint64_t)fVsyncUS * 1500, &limit);        /* 1.5 frames, then "pending": CoreAnimation asks again */
++		do {
++			delay_for_interval(250, NSEC_PER_USEC);
++			now = mach_absolute_time();
++		} while (astOlderHeld(id) && now - t0 <= limit);
++		ast.waitN++;
++		ast.waitAbs += now - t0;
++		if (now - t0 > ast.waitMaxAbs) {
++			ast.waitMaxAbs = now - t0;
++		}
++		if (now - t0 > limit) {
++			ast.waitBusy++;
++			return kIOReturnBusy;   /* 0221: kIOReturnBusy is "pending" to CoreAnimation's poll, anything else non-zero "complete" */
++		}
++		return kIOReturnSuccess;
++	}
+ 	if (!fSwapSync || !fEarly || fPowerOff || id == 0 || fSwapTimer == NULL) {
+ 		return kIOReturnSuccess;
+ 	}

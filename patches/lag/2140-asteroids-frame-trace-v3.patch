@@ -1,0 +1,133 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -296,10 +296,20 @@
+ struct sweet_fb_trace_rec {
+ 	uint32_t id;
+ 	uint64_t swap, scan, latch, done, wcall, wret;
++	uint64_t begin, tick, rel;      /* 2140: SwapBegin, the vsync tick that took it, its holds let go */
++	uint32_t sid, fence;            /* 2140: layer 0's surface, newest GPU fence when it arrived */
+ };
+ #define SWEET_FB_TRACE_N 128
+ static uint64_t sweet_abs_us(uint64_t abs);
+ static struct sweet_fb_trace_rec sweet_fb_trace[SWEET_FB_TRACE_N];
++/* 2140: per-frame timeline. SwapBegin times by id (swap() clears the record), and every vsync tick: 1 = a new frame was taken,
++ * 2 = a frame waited for the GPU, 0 = nothing new. kern.sweet_fb_trace prints both in absolute microseconds, the clock
++ * mach_absolute_time() gives user space, so bgmtl's own per-frame lines line up with them. Relaxed stores, racy reads. */
++static uint64_t sweet_fb_begin_t[SWEET_FB_TRACE_N];
++static uint32_t sweet_fb_begin_id[SWEET_FB_TRACE_N];
++#define SWEET_FB_TICK_N 256
++static struct { uint64_t t; uint32_t id; uint32_t flag; } sweet_fb_ticks[SWEET_FB_TICK_N];
++static uint32_t sweet_fb_tick_i;
+ static inline struct sweet_fb_trace_rec *
+ sweet_fb_trace_of(uint32_t id)
+ {
+@@ -316,10 +326,11 @@
+ 			base = sweet_fb_trace[i].swap;
+ 		}
+ 	}
+-	size_t n = (size_t)snprintf(buf, cap, "id swap_us scan_us latch_us done_us wcall_us wret_us (0 = not seen; relative to the oldest swap)\n");
++	size_t n = (size_t)snprintf(buf, cap, "S id begin swap tick scan rel latch wcall wret sid fence (absolute us, 0 = not seen); T tick flag id\n");
+ 	if (base == UINT64_MAX) {
+ 		return n;
+ 	}
++	base = 0;       /* 2140: absolute */
+ 	/* oldest first: walk the ring by swap time */
+ 	uint64_t last = 0;
+ 	for (uint32_t k = 0; k < SWEET_FB_TRACE_N && n < cap; k++) {
+@@ -335,10 +346,18 @@
+ 		}
+ 		last = best->swap;
+ #define REL(t) ((t) ? sweet_abs_us((t) - base) : 0ull)
+-		n += (size_t)snprintf(buf + n, cap - n, "%u %llu %llu %llu %llu %llu %llu\n", best->id, REL(best->swap), REL(best->scan),
+-		    REL(best->latch), REL(best->done), REL(best->wcall), REL(best->wret));
+-#undef REL
++		n += (size_t)snprintf(buf + n, cap - n, "S %u %llu %llu %llu %llu %llu %llu %llu %llu %u %u\n", best->id, REL(best->begin),
++		    REL(best->swap), REL(best->tick), REL(best->scan), REL(best->rel), REL(best->latch), REL(best->wcall), REL(best->wret),
++		    best->sid, best->fence);
+ 	}
++	uint32_t ti = __atomic_load_n(&sweet_fb_tick_i, __ATOMIC_RELAXED);
++	for (uint32_t k = 0; k < SWEET_FB_TICK_N && n < cap; k++) {
++		uint32_t j = (ti + k) & (SWEET_FB_TICK_N - 1);
++		if (sweet_fb_ticks[j].t != 0) {
++			n += (size_t)snprintf(buf + n, cap - n, "T %llu %u %u\n", REL(sweet_fb_ticks[j].t), sweet_fb_ticks[j].flag, sweet_fb_ticks[j].id);
++		}
++	}
++#undef REL
+ 	return n < cap ? n : cap;
+ }
+ class AppleCLCD;
+@@ -1352,6 +1371,9 @@
+ 	if (flush || usePrev) {
+ 		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
+ 		if (rec != NULL && flush) {
++			if (struct sweet_fb_trace_rec *tr = sweet_fb_trace_of(get32(fb->fPending, 0x50))) {
++				tr->tick = now;         /* 2140 */
++			}
+ 			memcpy(rec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
+ 			copyEpoch = fb->fPendEpoch;
+ 			fb->fDirty = false;
+@@ -1372,6 +1394,12 @@
+ 		fb->fPrevValid = false;
+ 	}
+ 	bool dirty = fb->fDirty;        /* still unshown: not yet worth lighting the panel */
++	{
++		uint32_t j = __atomic_fetch_add(&sweet_fb_tick_i, 1, __ATOMIC_RELAXED) & (SWEET_FB_TICK_N - 1);     /* 2140 */
++		sweet_fb_ticks[j].t = now;
++		sweet_fb_ticks[j].flag = rec != NULL ? 1 : dirty ? 2 : 0;
++		sweet_fb_ticks[j].id = rec != NULL ? get32(rec, 0x50) : dirty ? get32(fb->fPending, 0x50) : 0;
++	}
+ 	IOLockUnlock(fb->fLock);
+ 	if (ast.enabled && rec == NULL) ast.repeated++; // Software presentation ticks with no new frame.
+ 	if (rec != NULL) {
+@@ -1742,6 +1770,10 @@
+ 		bzero(tr, sizeof(*tr));
+ 		tr->id = get32(rec, 0x50);
+ 		tr->swap = mach_absolute_time();
++		uint32_t bi = tr->id & (SWEET_FB_TRACE_N - 1);
++		tr->begin = sweet_fb_begin_id[bi] == tr->id ? sweet_fb_begin_t[bi] : 0;     /* 2140 */
++		tr->sid = get32(rec, 0x54);
++		tr->fence = fPendFence;
+ 	}
+ 	if (fDirty) {
+ 		fSt.coalesced++;        /* the previous swap never reached the panel (2082: unless kept= counts it later) */
+@@ -4296,10 +4328,12 @@
+         if (ns > ast.copyMaxNS) ast.copyMaxNS = ns;
+         if (ast.bar && !ast.stopped) astBarCheck(back, barSrc, barBpr, barW, barH, fCurSwapID, ns);
+     }
++    uint64_t astRelAbs = 0;
+     if (ast.enabled && fCopyHold != NULL) {
+         /* 2120: the surface was read in full above; the latch wait below touches only the flip buffers. hold-wait.patch waits on this hold */
+         __asm__ volatile("dsb sy" ::: "memory");
+         sweet_hold_release(fCopyHold);
++        astRelAbs = mach_absolute_time();
+     }
+     uint64_t astLatchStart = mach_absolute_time();
+     if (ast.enabled && !ast.stopped) {
+@@ -4310,6 +4344,7 @@
+     if (struct sweet_fb_trace_rec *tr = ast.enabled ? sweet_fb_trace_of(fCurSwapID) : NULL) {
+         uint64_t end = astLatchStart + astLatchAbs, ns;
+         tr->scan = tcp0;
++        tr->rel = astRelAbs;
+         tr->latch = tr->done = end;
+         absolutetime_to_nanoseconds(end - tr->swap, &ns);
+         ast.swapFlipNS += ns;
+@@ -4423,6 +4458,8 @@
+ 	case kSweetFBSwapBegin:
+ 		IOLockLock(fFB->fLock);
+ 		out[0] = ++fFB->fSwapID;
++		sweet_fb_begin_id[out[0] & (SWEET_FB_TRACE_N - 1)] = (uint32_t)out[0];        /* 2140 */
++		sweet_fb_begin_t[out[0] & (SWEET_FB_TRACE_N - 1)] = mach_absolute_time();
+ 		IOLockUnlock(fFB->fLock);
+ 		outCount = 1;
+ 		break;
+--- a/bsd/dev/sweet_fb.c
++++ b/bsd/dev/sweet_fb.c
+@@ -123,7 +123,7 @@
+ static int sweet_fb_trace_sysctl SYSCTL_HANDLER_ARGS
+ {
+ #pragma unused(oidp, arg1, arg2)
+-	const size_t cap = 16384;
++	const size_t cap = 32768;       /* 2140: 128 swaps and 256 ticks, absolute */
+ 	if (req->oldptr == USER_ADDR_NULL) {
+ 		return SYSCTL_OUT(req, NULL, cap);
+ 	}

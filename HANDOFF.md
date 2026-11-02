@@ -23,20 +23,23 @@ Updated 2026-11-02, about 19:00 AEDT. Update this file whenever the state change
 - Widgets that need no internet
 - The hands-free test loop, `tools/devloop/`
 
-## Open, most wanted first
+## Open, most wanted first (updated 22:05)
 
-1. **Lag.** 25 to 35 frames/s while animating, and jittery. Frames run one at a time for an unknown reason. It is not `waitUntilScheduled`, the GPU clock, half-precision shaders, or the display copy. See `docs/speed2.md`.
-2. Freeform: desk work done (`docs/freeform.md`, `patches/freeform/`, `tools/freeform/`). Compute likely already works now that 2100 fixed the IB split hangs; two translator gaps (function constants, `[[color(n)]]` from a constant) are fixed in `next-ff`. Next is phase 2a: the compute self-test via `dev.py`, pushed over `/usr/local/bin/hcitest`, then 2b with kernel 2130 and `sweetappmetal=Freeform`.
-3. Wi-Fi, then a modem probe for mobile data. `docs/research-wifi.md`.
-4. Freeform and PencilKit need Metal in apps, and compute on the A810 is unproven. `docs/appmetal.md`.
-5. Sound and a real battery reading, which share the ADSP port. `docs/plan-power.md`.
+1. **Lag.** Found and partly fixed (`docs/lag.md`). Frames were serial because our driver made 4 kernel calls per texture upload. `patches/lag/chl-staging-pool.patch` pools those buffers, and `sweetfb_keep=1` (kernel 2082) shows a finished frame instead of dropping it. Together they took shown frames in animation bursts from a median of 39.8 to 47.1 per second over 2 runs each. **But keep brings back black bars**: the kernel holds both CoreAnimation surfaces and hold-wait times out after 50 ms. The owner saw them in ast84. The lag agent is now making CoreAnimation use a third surface the way real iPhones do, by making our display behave like Apple's, with the 2090 bar logger as proof. Do not make keep default until that run shows 0 bars. The root currently has the pool payload (`plans/lag/next-keep/out-metal`) pushed by ast84; `next-fix/out-metal` is the previous known-good.
+2. **Freeform.** Compute works on the A810: ast83 ran a trivial kernel and PencilKit's real `sdfPen_kernel`, all results correct, with no GPU recovery. Patch 2130 (inject into Freeform only) failed two Sol audits, `docs/input-ff-audit.md` and `docs/2130-reaudit.md`. A chroot-relative path match and bookkeeping with the arg off are being fixed. After a GO: build the kernel, then run phase 2b in `docs/freeform.md`.
+3. **Input** (`docs/input.md`, `patches/input/`). Sol: 2150, 2151 and 2153 GO; 2152, the instant power button, NO-GO because the panel could stay dark. Being fixed.
+4. Wi-Fi, then a modem probe for mobile data. `docs/research-wifi.md`.
+5. Sound and a real battery reading. `docs/plan-power.md`.
 6. Small ones:
    - Glass flicks white, and stayed white in Calculator
    - Calendar widget stays a skeleton
    - App top spacing could still be tighter
    - Only 24 GB of storage is visible
-   - Nothing logo, and the fixed 10 s wait at boot
-   - Sol's two should-fixes for the recovery gate, in `docs/recovery-audit.md`
+   - Apple logo early in boot (the bootloader's Nothing logo can't safely change: no logo partition, signed ABL)
+   - The fixed 10 s wait in boot
+   - A `com.apple.mobile...` service crashed 4 times in ast84, not seen before
+
+**Plan once those clear:** one kernel with 2130, 2150 to 2153 and the keep fix. Then reflash `boot_a` with the recovery chain (`tools/ablfix/make_relocated.py`, above 14 MB) and `boot_b`. Then rerun `tools/boot/phone_mark.py` (pin the new live bytes first), and the owner tests by hand.
 
 ## Rules from the owner
 

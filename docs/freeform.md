@@ -65,7 +65,8 @@ No new kernel, no boot-arg change, and backboardd's libraries stay as they are.
 
 | See | Means | Next |
 |---|---|---|
-| No `SWEET EXEC` line | The kernel lacks 2130 or the name did not match | Check `dev.py --print-args` on the image |
+| No `SWEET EXEC` line | The kernel lacks 2130, or the exec path or the file's own path is not exactly `/Applications/Freeform.app/Freeform` | Check `dev.py --print-args` on the image |
+| `SWEET EXEC: appmetal inject refused for ...: REASON` | The binary is set-id, restricted, hardened, library-validated, privileged, or changed credentials | Read the reason. The variable became `SWEET_APPMETAL_DENIED=` and dyld ignores it |
 | `constant setters ... NOT FOUND` | iOS names the constant-values class differently | Read the class from the log line and add it to `bg_specialize_install` |
 | `nothing is bound there` in `bgmtl-app.log` | A pipeline declares a buffer PencilKit never binds | Check that the pipeline got its constants (the `specialize:` line) |
 | `the library handed back a function object it had specialized before` | `_MTLLibrary` caches function objects | Wrap the function instead of attaching the values to it |
@@ -168,9 +169,9 @@ Phase 2a needs no root rebuild: `/usr/local/bin/hcitest` exists on the root, and
 
 - `next-ff/` is `next-fix` without images, built with its `build.sh`, and `verify.py` passes. The unchanged copy reproduced `next-fix/out-metal` apart from the embedded source path of `tu_cmd_buffer.cc`. Sibling symlinks (`gpu-fix4`, `chl-work2`, `render-fix3`, `label-fix`) keep its `../` paths working. `rebuild-chl.py` now resolves the build directory and also builds this tree's `air_to_nir.c` into a copy of `libair.a`.
 - `next-ff.patch` holds all source changes against `next-fix`, and applies there by dry run. It has the specialisation, the colour index, the inject's app mode from `plans/appmetal` plus `BGMTL_SPECIALIZE`, and the app's stderr sent to `bgmtl-app.log`.
-- `2130-asteroids-app-metal-exec.patch` is `plans/appmetal`'s patch regenerated on the current `K/` with one fix: the old one moved `__attribute__((noinline))` off `exec_extract_strings`.
-- `tests/compile_check_2130.py` runs `git apply --check` in `K/` and a `-fsyntax-only` compile of `kern_exec.c` with the build's flags. Both pass. Its four "new" warnings are existing ones whose names carry shifted line numbers.
-- `tests/match_check.sh` is the host test of 2130's name match, with and without the boot-arg. It passes.
+- `2130-asteroids-app-metal-exec.patch` was rewritten after Sol's NO-GO (`input-ff-audit.md` findings 3 to 5). See "2130 after the audit" below. `work/k2130/make_2130.py` regenerates it from `K/`, and `tests/old/2130-audited.patch` is the audited version, byte for byte.
+- `tests/compile_check_2130.py` runs `git apply --check` in `K/` and a `-fsyntax-only` compile of `kern_exec.c` with the build's flags. Both pass, with 0 new diagnostics once line numbers inside identifier names are ignored.
+- `tests/exec_env_check.py` compiles the real `exec_extract_strings`, 2130's helpers and its lines around `exec_handle_sugid` on the host, from both patch versions. Every audit finding is reproduced on the audited code and fixed on the current one.
 - `tests/specialize_check.sh` is described above. It passes.
 - `selftest/chl-selftest.c`, `chl_selftest.ll` and `build.sh` make the compute self-test. It calls libchlorophyll's C API directly, with no Metal.framework. The kernel is hand-written AIR because this Mac has no Metal toolchain. It has to be assembled with `llvm-as` from llvm@22, since llvm 23 writes a record the reader refuses.
 - `selftest/compute.sh` and `selftest/freeform.sh` are the `dev.py` test bodies. Both compose with `dev.py --print-script` and pass `sh -n`.
@@ -182,3 +183,25 @@ Phase 2a needs no root rebuild: `/usr/local/bin/hcitest` exists on the root, and
 2120 is neither applied nor cleanly unapplied in `K/` (`SweetFramebuffer.cpp` differs both ways), and `K/bsd/dev/sweet_fb.c` changed at 19:09 today. 2130 touches only `kern_exec.c`, so neither affects it. Check `git apply --check` again before applying.
 
 skipped: running PencilKit's `paint_kernel` and `particle_kernel` in the self-test (they need real stroke data to check), and the `isMetalAvailable` fallback. Add them if phase 2b's strokes come out wrong, or if compute fails on the phone.
+
+## 2130 after the audit
+
+Sol's NO-GO (`analysis/input-ff-audit.md`) had three 2130 blockers and one composition note. The rewrite:
+
+| Finding | Change |
+|---|---|
+| 3: stripping with the args absent | The inject and combined variables are stripped only while `sweetappmetal=Freeform` is on. 2058's own `sweetsb` stripping is unchanged |
+| 4: basename match, symlinks | Only `sweetappmetal=Freeform` turns it on, and other values are refused with a log line. The exec path must equal `/Applications/Freeform.app/Freeform`, and so must `vn_getpath` of the vnode being executed |
+| 5: restricted, hardened, MAC transitions | After `exec_handle_sugid`, before the strings are copied out, the insertion is refused for P_SUGID, a MAC label transition, set-id mode bits, `CS_RESTRICT`, `CS_RUNTIME`, `CS_REQUIRE_LV`, `CS_FORCED_LV`, or the installer, datavault and NVRAM flags |
+| Composition | With `sweetsb=1` Freeform gets one variable, sweetsb first. An insert appended by `sweetexecenv` now counts as existing, so 2058 and 2130 add no second variable |
+
+How the refusal works: extraction cannot know the signature flags or the credential change, so it inserts as before. If the later check refuses, the variable is renamed in place to `SWEET_APPMETAL_DENIED=`, which has the same length. No string or pointer moves, and dyld ignores the name. The MAC answer comes from the same query `exec_handle_sugid` makes, asked just before it, because that function does not keep the answer. The root's Freeform is ad-hoc signed with flags `0x2` and has no `__RESTRICT` segment, and `sweet_amfi.c` changes no CS flags, so the real binary passes. **Proven** from the root image and the source.
+
+Still open:
+
+- A refused combined variable takes sweetsb with it. 2058 alone would have given a restricted Freeform sweetsb. That only applies to the one exact path, and the refusal is the safer direction.
+- dyld also treats a `__RESTRICT` segment as restricted, and the kernel does not see that at this point. Freeform has none.
+- 2058 still inserts sweetsb into restricted and hardened UI apps. That is out of 2130's scope.
+- A library that dyld accepts and that then fails in a dependency or constructor still kills Freeform at load. The watchdog cannot cover that.
+- The near-capacity E2BIG predates 2058 (audit, capacity section).
+- Nothing here ran on a phone. Sol should re-audit before the kernel is built.
