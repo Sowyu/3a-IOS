@@ -4,8 +4,9 @@ in the background; it waits for the phone's gadget, tests the level, writes OUT 
 
   python3 -I host/usb-check.py LEVEL OUT [--wait SECONDS]      LEVEL 3 or 4, default wait 2400 s
 
-Level 3: the USB device 1209:0001 with bcdDevice 0x0103 appears (ioreg), then leaves again (the phone's timed
-soft-disconnect). Level 4: bcdDevice 0x0104; the CDC-ECM interface with the host MAC 02:00:5e:77:ee:01 gets its own
+Level 3: the USB device 1209:0001 with bcdDevice 0x0103 appears (ioreg), macOS configures it (its interface shows up
+as an IOUSBHostInterface), and only then does it leave again (the phone's timed soft-disconnect). A device that leaves
+without ever being configured fails. This is the host half: host/usb-verdict.py also needs the kernel's lines. Level 4: bcdDevice 0x0104; the CDC-ECM interface with the host MAC 02:00:5e:77:ee:01 gets its own
 IPv6 link-local address from macOS; ping6 and ssh to the phone's fixed fe80::5eff:fe77:ee02 on that interface;
 a 4 MiB checksum over ssh. Every command has a timeout. The last line of OUT is the verdict:
   USBCHECK L<n> PASS ...   or   USBCHECK L<n> FAIL <first failed step>
@@ -39,6 +40,16 @@ def gadget():
             return {'bcdDevice': int(get('bcdDevice') or -1), 'speed': get('USBSpeed') or get('Device Speed'),
                     'product': (get('USB Product Name') or get('kUSBProductString') or '').strip('"')}
     return None
+
+
+def configured():
+    """True once macOS has configured the gadget: an IOUSBHostInterface of 1209:0001 exists (only after
+    SET_CONFIGURATION)."""
+    rc, out = run(['ioreg', '-r', '-c', 'IOUSBHostInterface', '-l', '-w0'], 20)
+    for block in re.split(r'\n(?=[ |]*\+-o )', out):
+        if re.search(r'"idVendor" = %d\b' % VID, block) and re.search(r'"idProduct" = %d\b' % PID, block):
+            return True
+    return False
 
 
 def interface():
@@ -86,11 +97,20 @@ def main():
     seen = time.monotonic()
 
     if a.level == 3:
+        cfg = None
         while time.monotonic() - seen < 300:
+            if cfg is None and configured():
+                cfg = time.monotonic()
+                note('configured', True, 'interface present %.0f s after the device appeared' % (cfg - seen))
             if gadget() is None:
-                note('soft-disconnect', True, 'gone %.0f s after it appeared' % (time.monotonic() - seen))
-                finish(True, 'enumerated (%s), then left by itself after %.0f s' % (dev['speed'], time.monotonic() - seen))
-            time.sleep(2)
+                gone = time.monotonic()
+                if cfg is None:
+                    note('soft-disconnect', False, 'left %.0f s after it appeared, never configured' % (gone - seen))
+                    finish(False, 'configured: the device left without macOS ever configuring it')
+                note('soft-disconnect', True, 'gone %.0f s after configuration' % (gone - cfg))
+                finish(True, 'enumerated (%s), configured, then left by itself %.0f s after configuration'
+                       % (dev['speed'], gone - cfg))
+            time.sleep(1)
         note('soft-disconnect', False, 'still present after 300 s')
         finish(False, 'soft-disconnect: still enumerated 300 s later')
 

@@ -284,6 +284,64 @@ test_events(void)
 	checks++;
 }
 
+/* v2: the CmdIOC proof, one slot per endpoint, and requests checked by direction, recipient and state. */
+static void
+test_v2(void)
+{
+	static uint32_t evt[UD_EVT_SIZE / 4];
+	uint8_t d[UD_DATA_SIZE];
+	struct ug_plan p;
+
+	memset(evt, 0, sizeof(evt));
+	evt[0] = 0x020001c2u;
+	CHECK(ug_cmdioc_proof(evt, 4) == UG_PROOF_OK, "the expected event");
+	evt[0] = 0xa2ff01c2u;
+	CHECK(ug_cmdioc_proof(evt, 4) == UG_PROOF_OK, "bits 23:16 and 31:28 are not checked");
+	CHECK(ug_cmdioc_proof(evt, 0) == UG_PROOF_COUNT && ug_cmdioc_proof(evt, 8) == UG_PROOF_COUNT, "count must be 4");
+	evt[0] = 0x020001c0u;
+	CHECK(ug_cmdioc_proof(evt, 4) == UG_PROOF_FORM, "ep0 instead of ep1");
+	evt[0] = 0x03000042u;
+	CHECK(ug_cmdioc_proof(evt, 4) == UG_PROOF_FORM, "XferComplete instead of EPCMDCMPLT");
+	evt[0] = 0x020011c2u;
+	CHECK(ug_cmdioc_proof(evt, 4) == UG_PROOF_FORM, "non-zero status");
+	evt[0] = 0;
+	evt[2] = 0x020001c2u;
+	CHECK(ug_cmdioc_proof(evt, 4) == UG_PROOF_FORM, "the event at offset 8");
+	evt[0] = 0x020001c2u;
+	CHECK(ug_cmdioc_proof(evt, 4) == UG_PROOF_STRAY, "a second word written");
+	evt[2] = 0;
+	evt[1023] = 1;
+	CHECK(ug_cmdioc_proof(evt, 4) == UG_PROOF_STRAY, "a word written at the end");
+
+	uint32_t seen[6] = { 0 };
+	for (unsigned ep = 0; ep < 6; ep++) {
+		uint32_t t = ug_trb_slot(ep);
+		CHECK(t == 0 || ug_trb_off_ok(t), "slot %u is a TRB slot", ep);
+		for (unsigned j = 0; j < ep; j++) {
+			CHECK(t == 0 || t != seen[j], "slot shared by ep%u and ep%u", j, ep);
+		}
+		seen[ep] = t;
+	}
+	CHECK(ug_trb_slot(4) == 0 && ug_trb_slot(6) == 0, "unused endpoints have no slot");
+
+	p = req(UG_LEVEL_ECM, UG_SPEED_HS, true, 0x00, 5, 3, 0, 0, d);
+	CHECK(p.stage == UG_STALL, "SET_ADDRESS once configured stalls");
+	p = req(UG_LEVEL_ECM, UG_SPEED_HS, false, 0x00, 6, 0x0100, 0, 18, d);
+	CHECK(p.stage == UG_STALL, "GET_DESCRIPTOR in the OUT direction stalls");
+	p = req(UG_LEVEL_ECM, UG_SPEED_HS, false, 0x81, 6, 0x0100, 0, 18, d);
+	CHECK(p.stage == UG_STALL, "GET_DESCRIPTOR to an interface stalls");
+	p = req(UG_LEVEL_ECM, UG_SPEED_HS, false, 0x01, 11, 1, 1, 0, d);
+	CHECK(p.stage == UG_STALL, "SET_INTERFACE before configuration stalls");
+	p = req(UG_LEVEL_ECM, UG_SPEED_HS, true, 0x00, 11, 1, 1, 0, d);
+	CHECK(p.stage == UG_STALL, "SET_INTERFACE to the device recipient stalls");
+	p = req(UG_LEVEL_ECM, UG_SPEED_HS, true, 0x80, 9, 1, 0, 0, d);
+	CHECK(p.stage == UG_STALL, "SET_CONFIGURATION in the IN direction stalls");
+	p = req(UG_LEVEL_ECM, UG_SPEED_HS, true, 0x81, 10, 0, 1, 1, d);
+	CHECK(p.stage == UG_IN && p.len == 1, "GET_INTERFACE");
+	p = req(UG_LEVEL_ECM, UG_SPEED_HS, true, 0x83, 0, 0, 0, 2, d);
+	CHECK(p.stage == UG_STALL, "GET_STATUS to recipient 3 stalls");
+}
+
 static void
 test_canary(void)
 {
@@ -315,6 +373,7 @@ main(void)
 	test_frames();
 	test_events();
 	test_canary();
+	test_v2();
 	printf("%s: %d checks, %d failed\n", fails ? "FAIL" : "PASS", checks, fails);
 	return fails ? 1 : 0;
 }
