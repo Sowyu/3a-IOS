@@ -221,3 +221,11 @@ Sol's second NO-GO (`analysis/2130-reaudit.md`) had two blockers. Both are fixed
 The check builds four versions from the tree: base (2058 alone), the first audited version, the re-audited version and the current one. Each finding reproduces on the version where it was found and passes on current. With the trial off or refused, current equals base in all 23,040 executions of the matrix, compared on string bytes, counters, the pointer vector and console lines. `tests/old/2130-reaudited.patch` is the re-audited version, byte for byte.
 
 Still open: the items listed under "2130 after the audit". Nothing has run on a phone. Sol should audit this version before the kernel is built.
+
+## Phase 2b on the daily driver (2026-11-03)
+
+`plans/lag/next-ff2` is `plans/lag/next-luma`, which is next-keep's staging pool and 2 s hold rest plus `plans/glass/luma-compute.patch`, with `plans/freeform/next-ff.patch` on top. The only hunk that failed was `rebuild-chl.py`'s path fix, which next-luma already had. The luma fix tags `compute_average_luma` and `compute_sum_luma` by name and writes their results back after a dispatch. Freeform's change only passes constants when a pipeline is made, so the two do not overlap. `build.sh` passes with all its host checks, and so does `verify.py`. `chl_vk.c`, `tu_cmd_buffer.cc`, `bgl-launch.c` and `test/` are identical to next-luma's.
+
+`combo-daily-ff-boot.img` has no `sweetdeadman` or `sweetselftest`, so `dev.py` refuses it, and adding them would take it to 610 of 607 bytes. `plans/freeform/build-images.sh` builds `out/ff-owner-boot.img` from the same combined kernel with the same args, without `sweetkeys_ms=5` and with `sweetdeadman=900 sweetselftest=1`, at 594 bytes. Its test body, `selftest/freeform-owner.sh`, opens Freeform and leaves the owner 6 minutes, taking a frame every 30 s.
+
+With `sweetappmetal` off, backboardd differs from next-luma only in the translator's function-constant `[[color(n)]]`. No compositor shader we have uses it: 58 modules give identical NIR. The specialisation code waits for `BGMTL_SPECIALIZE`, which only the trial app sets, and the inject's app mode waits for Freeform's bundle id. 2130 is byte-for-byte 2058 when off (`tests/exec_env_check.py`).
