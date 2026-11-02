@@ -234,3 +234,87 @@ Files for this part:
 - Images `plans/lag/out/lag-{x,xbar,xbar3,kbar,kbar3,p,pbar3,xbar-nohw,kbar-nohw,pbar-nohw}-boot.img`
 
 The xnu tree in `research/xnu-local` has 2140 to 2143 applied. The root has the `fix2` trace build until it is replaced.
+
+## Even pacing at 60 (night of 2026-11-03)
+
+The owner felt keep + astwait as "smoother, but still very jittery", and 30 Hz as "a little better" but rejected it. So the goal is the share of shown frames one 60 Hz vsync apart.
+
+Measured with `plans/lag/tools/pacing.py`, which counts the gaps between shown frames from the kernel's tick ring, and `miss.py`, which splits each frame into stages and calls it on time (1 vsync) or late (2 or more).
+
+### Where the misses come from
+
+**Proven, ast85, 87, 92, 94** (pool + keep + astwait, hw). Shown-frame gaps are 65 to 70% one vsync, 23 to 29% two, and 6 to 8% three or more. The flip rate, how often the gap changes from one frame to the next, is 0.30 to 0.36. Only 36 to 43% of animation time is in steady runs of 6 or more equal gaps.
+
+Light frames, under 30 draws, are always on time. Among heavier frames, 38 to 42% are late, and in every one CoreAnimation started the frame 33 ms after the previous start instead of 17 ms. No frame started on time and finished late.
+
+Late frames split into two kinds:
+
+1. **Render-bound, about 40%.** The next frame starts 0 to 4 ms after the previous GPU end. Start to GPU end takes about 22 ms against 12 to 14 ms on time. The stages are CoreAnimation 0.7, encode 5 to 6, submit 0.8, GPU 13 to 15. There's no GPU queueing, and fence plus copy are under 1.3 ms each.
+2. **Idle, about 40%.** The next frame starts 15 ms or more after the previous GPU end, so CoreAnimation had nothing to draw. **Inferred:** a client (SpringBoard) transaction arrived late.
+
+### Levers measured or ruled out
+
+- **GPU clock, Proven nearly useless.** At level 8 (960 MHz), GPU time per heavy command buffer was 17.9 ms in ast61, against 18.2 and 18.4 ms at 763 MHz in ast55 and ast63. That's 3% less for 26% more clock, and the bandwidth vote follows the level. GPU time grows about 0.13 ms per draw: 11.5 ms at 100 to 140 draws, 18 ms at 140+.
+- **CPU frequency, Proven not a lever.** All clusters are already fixed at max: A520 1.80 GHz, A720 2.40 GHz, A720+ 2.50 GHz.
+- **The renderer forced sysmem.** The root's `/private/var/db/bgmtl/bgmtl-bb.tudebug` holds `sysmem,noubwc,nocb,nolrz` (`bgl-backboardd.log` in every run). The G60 arm tries GMEM.
+- **CPU placement, Proven a big lever.** In ast101 (A60, luma payload, trace with CPU numbers), 57% of heavy command buffers were created and committed on the A520 cores. Median encode for 100 to 160 draws, by the core that committed:
+
+  | Core | Frames | Encode median |
+  |---|---:|---:|
+  | A520 | 339 | 5.4 ms |
+  | A720 | 228 | 2.5 ms |
+  | A720+ | 66 | 1.9 ms |
+
+  The kernel's AMP steering (`sweetamp_prio`, default 31) only chooses among idle cores. During animations the big clusters run at 72 to 100% load, so the render thread often finds none idle.
+
+ast101 by itself: shown 41.0 fps, gaps 65.3% one vsync, flip rate 0.36, steady 35.8%, and 45% of heavy frames late.
+
+### GMEM: no effect (ast101, 103, 104, 105)
+
+**Proven.** Allowing GMEM (`sweettu=noubwc,nocb,nolrz`, which overrides the root file; `bgl-backboardd.log` confirms `TU_DEBUG=noubwc,nocb,nolrz`) left GPU time unchanged. At 100 to 140 draws it was 11.3 and 11.6 ms against 11.4 and 11.6 ms on sysmem. At 140+ it was 18.1 and 18.5 ms against 18.2 and 18.5 ms.
+
+| Run | Arm | Shown fps | 1 vsync | Flip rate | Steady | Heavy late |
+|---|---|---:|---:|---:|---:|---:|
+| ast101 | A60 (sysmem) | 41.0 | 65.3% | 0.36 | 35.8% | 45% |
+| ast104 | A60 | 42.2 | 67.9% | 0.31 | 42.0% | 43% |
+| ast103 | G60 (GMEM) | 43.2 | 69.3% | 0.29 | 50.1% | 42% |
+| ast105 | G60 | 42.7 | 69.0% | 0.32 | 39.5% | 41% |
+
+The difference is within run-to-run noise, and the GPU time shows no cause, so GMEM is dropped. 0 recoveries in all four.
+
+**Inferred:** the reason is Chlorophyll's framebuffer-fetch sync (the tear fix). It forces every pass with a fetch draw to sysmem, and on each such draw it emits `ALL_CLEAN | ALL_INVALIDATE | WAIT_MEM_WRITES | WAIT_FOR_IDLE | WAIT_FOR_ME` (`turnip/tu_cmd_buffer.cc`, `chl_turnip_fetch_sync`). That's a full GPU drain and cache flush, up to about 300 a second. It fits a GPU time that tracks draws (0.137 ms per draw) and not clock or tiling. The trace now counts fetch syncs per command buffer, so the next runs can measure it.
+
+**Proven, ast105:** the render thread runs at `pth_priority` 54 (policy 4, max 63), above the `sweetamp_prio=47` threshold that batch 1 tests.
+
+### Batch 1: big-core steering and the bind cache, no effect (ast113 to 116)
+
+| Run | Arm | Shown fps | 1 vsync | Flip rate | Steady | Heavy late | Heavy on A520 |
+|---|---|---:|---:|---:|---:|---:|---:|
+| ast113 | M47, `sweetamp_prio=47` | 41.8 | 66.7% | 0.31 | 43.6% | 40% | 55% |
+| ast115 | M47 | 40.8 | 65.3% | 0.36 | 34.9% | 45% | 58% |
+| ast114 | BC, `chl-bind-cache.patch` | 41.4 | 67.0% | 0.37 | 32.3% | 40% | 58% |
+| ast116 | BC | 41.0 | 64.9% | 0.35 | 36.4% | 45% | 60% |
+
+**Proven:**
+
+- Raising the steering threshold did not move the render thread. It still committed 55 to 58% of heavy command buffers on the A520 cores (57% in ast101), because the big cores are busy, not mis-steered.
+- The bind cache did not shorten encode: 5.4 ms on A520, as before.
+
+Both are dropped. Steering only chooses among idle cores, so moving the render thread would take a change in the scheduler itself (a reservation or preemption for marked threads). I did not try that tonight.
+
+### The GPU time is the fetch sync (ast113 to 116)
+
+**Proven.** With per-command-buffer fetch-sync counts in the trace, a fit of GPU time on both draws and syncs gives:
+
+| Run | Constant | Per draw | Per fetch sync |
+|---|---:|---:|---:|
+| ast113 | 0.95 ms | +0.013 ms | 0.507 ms |
+| ast115 | 0.78 ms | −0.007 ms | 0.568 ms |
+| ast114 | 0.83 ms | −0.022 ms | 0.644 ms |
+| ast116 | 0.87 ms | −0.045 ms | 0.738 ms |
+
+Draws cost nothing measurable. Command buffers of 100 to 160 draws record a median of 32 or 33 fetch syncs, so 16 to 20 ms of GPU drain per heavy frame. That is the whole GPU stage of a late frame.
+
+The barrier is the tear fix (`analysis/fetch-fix.md`): before every draw whose fragment shader fetches an attachment written since the last sync, it emits a full clean and invalidate of every cache, a wait for memory writes, a wait for idle and a wait for the CP's ME.
+
+**Candidate, `lumafs`.** The same sync with only what this dependency needs, matching Turnip's own barrier for a colour write followed by an input-attachment read: `CCU_CLEAN_COLOR | CACHE_INVALIDATE | CCHE_INVALIDATE | WAIT_FOR_IDLE`. The fetch draw still waits for the earlier draws and reads cleaned memory through freshly invalidated texture caches. Dropped are the depth clean, the UCHE clean, both CCU invalidates, the bindless invalidate, the wait for memory writes and the wait for ME. It passes the host checks, including `tear-check.py`. Whether the label tear stays fixed is **Missing** until the no-hw run's frames (batch 2).
