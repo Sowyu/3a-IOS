@@ -1,0 +1,442 @@
+--- a/Chlorophyll/air/air_to_nir.c
++++ b/Chlorophyll/air/air_to_nir.c
+@@ -801,6 +801,9 @@
+    return air_const_uint(node->ops[i]->value, out);
+ }
+ 
++struct air_ctx;
++static bool md_render_target(struct air_ctx *c, const struct air_md *node, unsigned i, uint64_t *out);
++
+ /* the index of the operand after the key, or -1 */
+ static int
+ md_key(const struct air_md *node, const char *key)
+@@ -2105,7 +2108,7 @@
+          return true;
+       }
+       uint64_t n = 0;
+-      if (!md_int(node, rt_in + 1, &n))
++      if (!md_render_target(c, node, rt_in + 1, &n))
+          return air_error(c, "interface: an air.render_target input without a target");
+       if (n >= MAX_DRAW_BUFFERS)
+          return air_error(c, "interface: air.render_target input %u", (unsigned)n);
+@@ -2244,7 +2247,7 @@
+    int rt = md_key(node, "air.render_target");
+    if (rt >= 0) {
+       uint64_t n = 0, dual = 0;
+-      md_int(node, rt + 1, &n);
++      md_render_target(c, node, rt + 1, &n);   /* unresolved: target 0, as before */
+       md_int(node, rt + 2, &dual);
+       location = FRAG_RESULT_DATA0 + n;
+       index = dual;
+@@ -3644,6 +3647,42 @@
+    }
+ }
+ 
++/* [[color(n)]] whose n is a function-constant expression, as PencilKit's copy_framebuffer_fragment has
++ * ([[color(SOURCE_COLOR_ATTACHMENT_INDEX)]] in, [[color(DESTINATION_COLOR_ATTACHMENT_INDEX)]] out): the metadata then holds a
++ * program-scope global, which the module's air.static_init sets from the constant, or the constant's own global. Read with
++ * the pipeline's constants. Interface translation runs before the body's sc_run_static_init, so this runs it early; the later
++ * call rebuilds the same table. A plain integer is read as before.
++ */
++static bool
++md_render_target(struct air_ctx *c, const struct air_md *node, unsigned i, uint64_t *out)
++{
++   if (md_int(node, i, out))
++      return true;
++   if (!node || i >= node->num_ops || !node->ops[i] || node->ops[i]->kind != AIR_MD_VALUE)
++      return false;
++   struct sc_key key;
++   if (!sc_addr(c, node->ops[i]->value, &key, 0) || key.off)
++      return false;
++   const struct air_global *g = key.g;
++   unsigned bits = g->value_type && g->value_type->kind == AIR_TYPE_INT ? g->value_type->bits : 32;
++   if (g->externally_initialized) {
++      int idx = function_constant_index(c, g);
++      for (unsigned k = 0; idx >= 0 && c->options && k < c->options->num_constants; k++)
++         if (c->options->constants[k].index == (unsigned)idx) {
++            *out = sc_mask(c->options->constants[k].bits, bits);
++            return true;
++         }
++      return false;
++   }
++   if (!c->sc_known)
++      sc_run_static_init(c);
++   struct sc_val *sv = c->sc_known_ok ? sc_known_get(c, &key) : NULL;
++   if (!sv)
++      return false;
++   *out = sc_mask(sv->v, bits);
++   return true;
++}
++
+ /* The blocks in reverse post-order, so that every value is translated before
+  * it is used: LLVM lays blocks out in its own order, and a block whose only
+  * predecessor comes after it in that order is ordinary (a loop's exit, say).
+--- a/Chlorophyll/src/bgmtl.m
++++ b/Chlorophyll/src/bgmtl.m
+@@ -1329,6 +1329,132 @@
+ // ("MTLB"), slice 1 precompiled Apple GPU code. _MTLDevice's own URL/bundle loaders pick the slice through MTLLoader by the
+ // device's target architecture, which this device does not have (assertion "Target device architecture is nil"), so the
+ // AIR slice is taken here and loaded with -newLibraryWithData:, the path every other library of this device takes --
++// BEGIN specialize
++// BGMTL_SPECIALIZE=1 (only the inject's trial app sets it): MTLFunctionConstantValues reach the translator. Apple's
++// -newFunctionWithName:constantValues:error: specializes through the device's compiler, which this device does not have, and
++// the pipelines below always passed the module's defaults (every constant 0), so PencilKit's [[color(COLOR_ATTACHMENT_INDEX)]]
++// and its LIVE_STROKE branches could never be right. Here the setter records each value and the library hands back the plain
++// function with the values attached; both pipeline kinds read them. Scalars only: PencilKit's are bool and uint.
++// ponytail: setConstantValue:type:withName: is not recorded, add it when an app sets constants by name.
++struct bg_constant { unsigned index; uint64_t bits; };   // air_constant_value of nir_air.h, which this file does not include
++_Static_assert(sizeof(struct bg_constant) == 16, "air_constant_value layout");
++static char kBGConstantValues, kBGFunctionConstants;
++static int
++bg_specialize(void)
++{
++   static int on = -1;
++   if (on < 0) on = getenv("BGMTL_SPECIALIZE") && getenv("BGMTL_SPECIALIZE")[0] == '1';
++   return on;
++}
++static unsigned
++bg_constant_size(NSUInteger type)
++{
++   switch (type) {
++   case MTLDataTypeBool: case MTLDataTypeChar: case MTLDataTypeUChar: return 1;
++   case MTLDataTypeShort: case MTLDataTypeUShort: case MTLDataTypeHalf: return 2;
++   case MTLDataTypeInt: case MTLDataTypeUInt: case MTLDataTypeFloat: return 4;
++   case MTLDataTypeLong: case MTLDataTypeULong: return 8;
++   default: return 0;
++   }
++}
++static void
++bg_record_constant(id values, const void *p, NSUInteger type, NSUInteger index)
++{
++   unsigned n = bg_constant_size(type);
++   if (!n || !p) {
++      BG_LOG("specialize: constant %lu of type %lu not recorded (not a scalar)\n", (unsigned long)index, (unsigned long)type);
++      return;
++   }
++   uint64_t bits = 0;
++   memcpy(&bits, p, n);
++   @synchronized(values) {
++      NSMutableDictionary *d = objc_getAssociatedObject(values, &kBGConstantValues);
++      if (!d) {
++         d = [NSMutableDictionary dictionary];
++         objc_setAssociatedObject(values, &kBGConstantValues, d, OBJC_ASSOCIATION_RETAIN);
++      }
++      d[@(index)] = @(bits);
++   }
++}
++static IMP bg_set_one_orig, bg_set_range_orig;
++static void
++bg_set_one(id self, SEL _cmd, const void *p, NSUInteger type, NSUInteger index)
++{
++   bg_record_constant(self, p, type, index);
++   ((void (*)(id, SEL, const void *, NSUInteger, NSUInteger))bg_set_one_orig)(self, _cmd, p, type, index);
++}
++static void
++bg_set_range(id self, SEL _cmd, const void *p, NSUInteger type, NSRange r)
++{
++   unsigned n = bg_constant_size(type);
++   for (NSUInteger k = 0; k < r.length; k++)
++      bg_record_constant(self, n && p ? (const char *)p + k * n : NULL, type, r.location + k);
++   ((void (*)(id, SEL, const void *, NSUInteger, NSRange))bg_set_range_orig)(self, _cmd, p, type, r);
++}
++// the values as air_constant_value[], or nil when the function was not specialized here
++static NSData *
++bg_function_constants(id function)
++{
++   return function ? objc_getAssociatedObject(function, &kBGFunctionConstants) : nil;
++}
++static id
++bg_new_function_specialized(id lib, SEL _cmd, NSString *name, id values, NSError **error)
++{
++   (void)_cmd;
++   id fn = [lib newFunctionWithName:name];
++   if (!fn) {
++      BG_LOG("specialize: %s: no such function\n", name.UTF8String);
++      if (error)
++         *error = [NSError errorWithDomain:@"MTLLibraryErrorDomain" code:5
++                                  userInfo:@{ NSLocalizedDescriptionKey : [NSString stringWithFormat:@"no function %@", name] }];
++      return nil;
++   }
++   NSDictionary *d = nil;
++   if (values) @synchronized(values) { d = [[objc_getAssociatedObject(values, &kBGConstantValues) copy] autorelease]; }
++   NSMutableData *k = [NSMutableData dataWithLength:d.count * sizeof(struct bg_constant)];
++   struct bg_constant *c = k.mutableBytes;
++   char line[256];
++   int len = 0;
++   for (NSNumber *i in [d.allKeys sortedArrayUsingSelector:@selector(compare:)]) {
++      *c = (struct bg_constant){ i.unsignedIntValue, [d[i] unsignedLongLongValue] };
++      if (len < (int)sizeof(line) - 24) len += snprintf(line + len, sizeof(line) - len, " %u=%llu", c->index, (unsigned long long)c->bits);
++      c++;
++   }
++   line[len] = 0;
++   NSData *old = objc_getAssociatedObject(fn, &kBGFunctionConstants);
++   if (old && ![old isEqualToData:k])
++      BG_LOG("specialize: %s: the library handed back a function object it had specialized before, its earlier pipelines must already exist\n",
++             name.UTF8String);
++   objc_setAssociatedObject(fn, &kBGFunctionConstants, k, OBJC_ASSOCIATION_RETAIN);
++   BG_LOG("specialize: %s with %lu constants:%s\n", name.UTF8String, (unsigned long)d.count, line);
++   return fn;
++}
++static void
++bg_specialize_install(Class libclass)
++{
++   static os_unfair_lock lock = OS_UNFAIR_LOCK_INIT;
++   static Class done[4];
++   if (!bg_specialize() || !libclass) return;
++   os_unfair_lock_lock(&lock);
++   int seen = 0;
++   for (int i = 0; i < 4; i++) seen |= done[i] == libclass;
++   if (!seen) {
++      for (int i = 0; i < 4; i++) if (!done[i]) { done[i] = libclass; break; }
++      class_replaceMethod(libclass, @selector(newFunctionWithName:constantValues:error:), (IMP)bg_new_function_specialized, "@@:@@^@");
++      // the setters: on whichever class implements them (a cluster: MTLFunctionConstantValues makes the Internal one)
++      Class vc = objc_getClass("MTLFunctionConstantValuesInternal");
++      if (!vc) vc = objc_getClass("MTLFunctionConstantValues");
++      Method one = vc && !bg_set_one_orig ? class_getInstanceMethod(vc, @selector(setConstantValue:type:atIndex:)) : NULL;
++      Method range = vc && !bg_set_range_orig ? class_getInstanceMethod(vc, @selector(setConstantValues:type:withRange:)) : NULL;
++      if (one) bg_set_one_orig = method_setImplementation(one, (IMP)bg_set_one);
++      if (range) bg_set_range_orig = method_setImplementation(range, (IMP)bg_set_range);
++      BG_LOG("specialize: on for %s, constant setters on %s %s\n", class_getName(libclass), vc ? class_getName(vc) : "-",
++             bg_set_one_orig ? "hooked" : "NOT FOUND");
++   }
++   os_unfair_lock_unlock(&lock);
++}
++// END specialize
++
+ static NSData *
+ bg_air_slice(NSData *d)
+ {
+@@ -1361,6 +1487,7 @@
+    id lib = ((id (*)(id, SEL, dispatch_data_t, NSError **))objc_msgSend)(self, @selector(newLibraryWithData:error:), dd, error);
+    dispatch_release(dd);
+    BG_LOG("library %s: AIR slice %lu bytes -> %s\n", url.path.UTF8String, (unsigned long)air.length, lib ? "loaded" : "refused");
++   if (lib) bg_specialize_install([lib class]);
+    return lib;
+ }
+ 
+@@ -1527,8 +1654,11 @@
+          }
+       }
+    }
+-   pd.vertex = (struct chl_function){ vair.bytes, vair.length, [[vertex name] UTF8String], NULL, 0, nvl ? vlk : NULL, nvl };
+-   if (fair) pd.fragment = (struct chl_function){ fair.bytes, fair.length, [[fragment name] UTF8String], NULL, 0, nfl ? flk : NULL, nfl };
++   NSData *vk = bg_function_constants(vertex), *fk = bg_function_constants(fragment);
++   pd.vertex = (struct chl_function){ vair.bytes, vair.length, [[vertex name] UTF8String], vk.bytes,
++                                      (unsigned)(vk.length / sizeof(struct bg_constant)), nvl ? vlk : NULL, nvl };
++   if (fair) pd.fragment = (struct chl_function){ fair.bytes, fair.length, [[fragment name] UTF8String], fk.bytes,
++                                                  (unsigned)(fk.length / sizeof(struct bg_constant)), nfl ? flk : NULL, nfl };
+    for (unsigned i = 0; i < 8; i++) {
+       MTLRenderPipelineColorAttachmentDescriptor *a = [[descriptor colorAttachments] objectAtIndexedSubscript:i];
+       if (!a) continue;
+@@ -1625,7 +1755,9 @@
+    if (!air.length) return [self bgFail:error with:@"function has no bitcode"];
+    char why[512] = { 0 };
+    struct chl_pipeline_info info;
+-   struct chl_function fn = { air.bytes, air.length, [[function name] UTF8String], NULL, 0, NULL, 0 };
++   NSData *k = bg_function_constants(function);
++   struct chl_function fn = { air.bytes, air.length, [[function name] UTF8String], k.bytes, (unsigned)(k.length / sizeof(struct bg_constant)),
++                              NULL, 0 };
+    struct chl_compute_pipeline *c = chl_compute_pipeline_create(_dev, &fn, &info, why, sizeof(why));
+    if (!c) {
+       bg_fail_dump(why, nil, nil, air, [function name], "c");
+--- a/Chlorophyll/inject/bgmtl_inject.m
++++ b/Chlorophyll/inject/bgmtl_inject.m
+@@ -51,6 +51,7 @@
+ // one and wrote the global kill switch (iOS 26, boot 33b). F_OFF itself stays the manual switch for all of them.
+ static char g_state[192] = F_STATE, g_off[192] = F_OFF;
+ #define F_LOG "/private/var/tmp/bgmtl.log"
++static const char *g_log = F_LOG;
+ 
+ #define F_BB_OFF "/private/var/tmp/bgmtl-bb.off"
+ #define F_BB_ARM "/private/var/tmp/bgmtl-bb.arm"
+@@ -76,7 +77,7 @@
+ static void
+ ilog(const char *fmt, ...)
+ {
+-   FILE *f = fopen(F_LOG, "a");
++   FILE *f = fopen(g_log, "a");
+    if (!f) return;
+    va_list ap;
+    va_start(ap, fmt);
+@@ -285,17 +286,36 @@
+       }
+    }
+    return NULL;
++}
++
++// Recoveries so far (kernel 2055: INFO.flags bit 5, the count in bits 16-31), -1 when the kernel does not say. Same layout as bgmtl.m.
++struct app_gpu_info { uint32_t abi_version, flags, gpu_id, chip_id; uint64_t va_start, va_size; uint32_t last_fence, abi_minor; };
++extern int sweet_drm_info(int fd, struct app_gpu_info *out);
++static int
++app_gpu_epoch(void)
++{
++   struct app_gpu_info in;
++   memset(&in, 0, sizeof(in));
++   if (sweet_drm_info(-1, &in) != 0 || !(in.flags & 0x20)) return -1;
++   return (int)(in.flags >> 16);
+ }
++static int g_app;
+ 
+ static void *
+ watchdog(void *arg)
+ {
+    (void)arg;
++   int epoch = g_app ? app_gpu_epoch() : -1;
+    for (unsigned t = 0;; t++) {
+       sleep(1);
+       unsigned minor = 0;
+       if (bgmtl_gpu_state(&minor) == 2)
+          trip("the kernel reports the GPU lost");
++      // A trial app does not get a second chance to hang the GPU under the compositor, whoever caused this recovery.
++      if (g_app) {
++         int now = app_gpu_epoch();
++         if (epoch >= 0 && now >= 0 && now != epoch) trip("a GPU recovery while this app is on Chlorophyll");
++      }
+       if (t == 15) {
+          write_state(0, 1);
+          ilog("alive for 15 s: dead-man counter reset");
+@@ -447,8 +467,82 @@
+       kill(k->kp_proc.p_pid, SIGTERM);
+    }
+    free(all);
++}
++
++// sweetappmetal=<executable> (kernel 2130 inserts this dylib into that one app). Only com.apple.freeform is accepted here.
++static int
++boot_arg(const char *key, char *val, size_t n)
++{
++   char args[1024] = "";
++   size_t len = sizeof(args) - 1, kl = strlen(key);
++   if (sysctlbyname("kern.bootargs", args, &len, NULL, 0) != 0) return 0;
++   for (char *p = strtok(args, " "); p; p = strtok(NULL, " "))
++      if (!strncmp(p, key, kl) && p[kl] == '=' && strlen(p + kl + 1) < n) { strcpy(val, p + kl + 1); return 1; }
++   return 0;
++}
++
++static int
++app_metal_wanted(const char *bid)
++{
++   char name[32];
++   return !strcmp(bid, "com.apple.freeform") && boot_arg("sweetappmetal", name, sizeof(name)) && !strcmp(name, getprogname());
++}
++
++// The fallback: sweetappstub=1 registers no device and only ignores PencilKit's setComputeFunction:nil, the release assertion that
++// kills Freeform when a drawing starts. No GPU client exists. Strokes do not appear.
++static IMP g_orig_setcompute;
++static void
++app_setcompute(id self, SEL _cmd, id fn)
++{
++   if (fn) ((void (*)(id, SEL, id))g_orig_setcompute)(self, _cmd, fn);
++}
++static void
++app_stub(void)
++{
++   Class c = objc_getClass("MTLComputePipelineDescriptorInternal");
++   Method m = c ? class_getInstanceMethod(c, @selector(setComputeFunction:)) : NULL;
++   if (m) g_orig_setcompute = method_setImplementation(m, (IMP)app_setcompute);
++   ilog("com.apple.freeform: stub mode, no device, setComputeFunction:nil %s", m ? "ignored" : "NOT FOUND");
+ }
+ 
++// What bgl-launch gives backboardd, read the same way: flags in the files first, boot-args over them. The shader cache is the app's
++// own: backboardd has the same uid and Mesa evicts by directory size, so a shared directory would let the app evict the compositor's.
++static void
++app_env(void)
++{
++   char tu[128] = "noubwc,nocb,nolrz", big[256];
++   FILE *f = fopen("/private/var/db/bgmtl/bgmtl-bb.tudebug", "r");
++   if (!f) f = fopen("/private/var/tmp/bgmtl-bb.tudebug", "r");
++   if (f) {
++      if (!fgets(tu, sizeof(tu), f)) tu[0] = 0;
++      tu[strcspn(tu, "\r\n")] = 0;
++      fclose(f);
++   }
++   if (boot_arg("sweettu", big, sizeof(big)) && strlen(big) < sizeof(tu)) strcpy(tu, big);
++   if (tu[0]) setenv("TU_DEBUG", tu, 1);
++   setenv("IR3_SHADER_DEBUG", "nofp16", 1);
++   if (boot_arg("sweetir3", big, sizeof(big)) && strlen(big) < 64) {
++      setenv("IR3_SHADER_DEBUG", !strcmp(big, "fp16") ? "" : big, 1);
++      setenv("MESA_SHADER_CACHE_DISABLE", "true", 1);
++   }
++   setenv("CHL_FETCH_SYNC", "0", 1);
++   if (boot_arg("sweetfetchsync", big, sizeof(big)) && (!strcmp(big, "0") || !strcmp(big, "1")) && strstr(tu, "nocb") && !strstr(tu, "forcecb"))
++      setenv("CHL_FETCH_SYNC", big, 1);
++   if (boot_arg("sweetalign", big, sizeof(big)) && (!strcmp(big, "16") || !strcmp(big, "64"))) setenv("BGMTL_LINEAR_ALIGNMENT", big, 1);
++   if (boot_arg("sweetlinear", big, sizeof(big)) && !strcmp(big, "1")) setenv("CHL_PRIVATE_LINEAR", "1", 1);
++   // No texture pool: it is only for the compositor's per-frame offscreens, and it would hold memory from the shared GPU pool.
++   setenv("BGMTL_TEXPOOL_MB", "0", 1);
++   mkdir("/private/var/tmp/chlorophyll-cache", 01777);
++   mkdir("/private/var/tmp/chlorophyll-cache/freeform", 0700);
++   setenv("MESA_SHADER_CACHE_DIR", "/private/var/tmp/chlorophyll-cache/freeform", 1);
++   // PencilKit's MTLFunctionConstantValues reach the translator (bgmtl.m, BEGIN specialize). Only here: backboardd is unchanged.
++   setenv("BGMTL_SPECIALIZE", "1", 1);
++   // bgmtl.m logs (pipelines, specialize:, UNIMPLEMENTED) and Mesa's errors go to stderr, which an app's launchd job drops
++   int fd = open(g_log, O_WRONLY | O_APPEND | O_CREAT, 0644);
++   if (fd >= 0) { dup2(fd, 2); close(fd); }
++   ilog("com.apple.freeform: TU_DEBUG=%s IR3_SHADER_DEBUG=%s CHL_FETCH_SYNC=%s", tu, getenv("IR3_SHADER_DEBUG"), getenv("CHL_FETCH_SYNC"));
++}
++
+ __attribute__((constructor)) static void
+ bgmtl_inject_init(void)
+ {
+@@ -465,6 +559,12 @@
+       int allowed = 0;
+       for (const char *const *a = kAllow; *a; a++)
+          if (bid && !strcmp([bid UTF8String], *a)) allowed = 1;
++      if (bid && app_metal_wanted([bid UTF8String])) {
++         char stub[8];
++         allowed = g_app = 1;
++         g_log = "/private/var/tmp/bgmtl-app.log";            // bgmtl.log may belong to another user
++         if (boot_arg("sweetappstub", stub, sizeof(stub)) && !strcmp(stub, "1")) { app_stub(); return; }
++      }
+       if (!allowed) return;                                   // gate 1: silent in every other process
+       if (!strcmp([bid UTF8String], "com.apple.springboard")) restart_stale_posterboard();   // not a GPU matter: before the gates
+       // /private/var/tmp/bgmtl.mesalog: Mesa's own log (ir3 compile errors, with the failing shader printed) to a file of
+@@ -477,7 +577,8 @@
+       snprintf(g_state, sizeof(g_state), "%s.%s", F_STATE, [bid UTF8String]);
+       snprintf(g_off, sizeof(g_off), "%s.%s", F_OFF, [bid UTF8String]);
+       if (exists(F_OFF) || exists(g_off)) { ilog("%s: kill switch present, stock", [bid UTF8String]); return; }
+-      if (!exists(F_ARM) && !exists(F_ARM_DB)) { ilog("%s: not armed, stock", [bid UTF8String]); return; }
++      // the boot-arg arms a trial app: the root has no bgmtl.arm, and a push cannot create one
++      if (!g_app && !exists(F_ARM) && !exists(F_ARM_DB)) { ilog("%s: not armed, stock", [bid UTF8String]); return; }
+       // gate 3: the dead-man
+       int unclean = 0, alive = 1;
+       char boot[64] = "";
+@@ -487,6 +588,7 @@
+       if (!alive) unclean++;
+       if (unclean >= 2) trip("two unclean launches in a row");
+       write_state(unclean, 0);
++      if (g_app) app_env();
+       // gate 4
+       unsigned minor = 0;
+       int st = bgmtl_gpu_state(&minor);
+--- a/rebuild-chl.py
++++ b/rebuild-chl.py
+@@ -5,7 +5,7 @@
+ import os, re, shutil, subprocess, sys
+ from pathlib import Path
+ here = Path(__file__).resolve().parent
+-B = here.parent / 'chl-work2/mesa-turnip26/build-ios'
++B = (here.parent / 'chl-work2/mesa-turnip26/build-ios').resolve()   # next-ff: plans/freeform/chl-work2 is a symlink
+ env = dict(os.environ, DEVELOPER_DIR='/Applications/Xcode.app/Contents/Developer')
+ cmds = subprocess.run(['ninja', '-t', 'commands', 'src/freedreno/vulkan/libchlorophyll.dylib'], cwd=B, check=True, text=True, capture_output=True).stdout.splitlines()
+ LIB = 'src/freedreno/vulkan/libchlorophyll.dylib'
+@@ -47,5 +47,19 @@
+     subprocess.run(dc, shell=True, cwd=B, check=True, env=env)
+     assert ' ' + old + ' ' in l
+     l = l.replace(' ' + old + ' ', ' ' + new + ' ')
++    # next-ff: this tree's air_to_nir.c (function-constant [[color(n)]]), swapped into a copy of chl-work2's libair.a
++    ac = [x for x in cmds if re.search(r' -c \S*/air_to_nir\.c\b', x)]
++    assert len(ac) == 1, 'air_to_nir compile command'
++    asrc = re.search(r' -c (\S*/air_to_nir\.c)\b', ac[0]).group(1)
++    aold = re.search(r' -o (\S+) ', ac[0]).group(1)
++    ac = ac[0].replace(asrc, str(here / 'Chlorophyll/air/air_to_nir.c')).replace(' -o ' + aold + ' ', ' -o ' + str(work / 'air_to_nir.c.o') + ' ')
++    ac = re.sub(r' -MF \S+', ' -MF ' + str(work / 'air_to_nir.d'), ac)
++    subprocess.run(ac, shell=True, cwd=B, check=True, env=env)
++    lib = work / 'libair.a'
++    shutil.copy(B / 'src/compiler/air/libair.a', lib)
++    os.chmod(lib, 0o644)
++    subprocess.run([str(here.parent / 'chl-work2/bin/ios-ar'), 'r', str(lib), str(work / 'air_to_nir.c.o')], check=True, env=env)
++    assert ' src/compiler/air/libair.a' in l
++    l = l.replace(' src/compiler/air/libair.a', ' ' + str(lib))
+ subprocess.run(l, shell=True, cwd=B, check=True, env=env)
+ finish(work / 'raw.dylib', out)

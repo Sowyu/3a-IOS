@@ -1,0 +1,78 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -6796,6 +6796,25 @@ sweet_ui_exec_path(const char *p)
+     return *p && !strchr(p,'/') && strcmp(p,".") && strcmp(p,"..");
+ }
+ 
++/*
++ * 2130: sweetappmetal=<executable> gives one top-level app in /Applications the Chlorophyll inject. Off without the boot-arg.
++ * The name has to match the last path component exactly; nested extensions and XPC services never match (sweet_ui_exec_path).
++ */
++static int
++sweet_appmetal_match(const char *path)
++{
++	static char name[32];
++	static int state = -1;
++	if (state < 0) {
++		state = PE_parse_boot_argn("sweetappmetal", name, sizeof(name)) && name[0] != '\0';
++	}
++	if (!state || strncmp(path, "/Applications/", 14) || !sweet_ui_exec_path(path)) {
++		return 0;
++	}
++	const char *base = strrchr(path, '/');
++	return base != NULL && !strcmp(base + 1, name);
++}
++
+ __attribute__((noinline))
+ static int
+ exec_extract_strings(struct image_params *imgp)
+@@ -6809,6 +6828,8 @@ exec_extract_strings(struct image_params *imgp)
+ 	int sweet_sb = 0;
+ 	(void)PE_parse_boot_argn("sweetsb", &sweet_sb, sizeof(sweet_sb));
+ 	const char sweet_insert[] = "DYLD_INSERT_LIBRARIES=/usr/local/lib/sweetsb.dylib";
++	const char sweet_insert_app[] = "DYLD_INSERT_LIBRARIES=/usr/local/lib/bgmtl/bgmtl-inject.dylib";
++	const char sweet_insert_both[] = "DYLD_INSERT_LIBRARIES=/usr/local/lib/sweetsb.dylib:/usr/local/lib/bgmtl/bgmtl-inject.dylib";
+ 	boolean_t sweet_existing = FALSE;
+ 
+ 	/*
+@@ -6972,7 +6993,8 @@ exec_extract_strings(struct image_params *imgp)
+ 			goto bad;
+ 		}
+ 		/* Never propagate our own variable to children, including when dyld skipped it. */
+-		if (sweet_sb && !strcmp(sweet_begin, sweet_insert)) {
++		if ((sweet_sb && !strcmp(sweet_begin, sweet_insert)) || !strcmp(sweet_begin, sweet_insert_app) ||
++		    !strcmp(sweet_begin, sweet_insert_both)) {
+ 			size_t n = (size_t)(imgp->ip_strendp - sweet_begin);
+ 			imgp->ip_strendp = sweet_begin;
+ 			imgp->ip_strspace += n;
+@@ -7037,17 +7059,23 @@ exec_extract_strings(struct image_params *imgp)
+ 	}
+ 
+ 	/* 2058: fail open on insufficient argument space; no fallible append. */
+-	if (sweet_sb && !sweet_existing && sweet_arm64e_enabled() &&
++	boolean_t sweet_app = sweet_appmetal_match(imgp->ip_strings + strlen(EXECUTABLE_KEY));
++	const char *sweet_str = !sweet_app ? sweet_insert : sweet_sb ? sweet_insert_both : sweet_insert_app;
++	size_t sweet_len = strlen(sweet_str) + 1;
++	if ((sweet_sb || sweet_app) && !sweet_existing && sweet_arm64e_enabled() &&
+ 	    (imgp->ip_origcpusubtype & ~CPU_SUBTYPE_MASK) == CPU_SUBTYPE_ARM64E &&
+ 	    !(imgp->ip_origvattr->va_mode & (VSUID | VSGID)) &&
+ 	    sweet_ui_exec_path(imgp->ip_strings + strlen(EXECUTABLE_KEY)) &&
+-	    imgp->ip_argspace >= (int)(sizeof(sweet_insert) + 3 * new_ptr_size) &&
+-	    imgp->ip_strspace >= (int)(sizeof(sweet_insert) + new_ptr_size)) {
+-		memcpy(imgp->ip_strendp, sweet_insert, sizeof(sweet_insert));
+-		imgp->ip_strendp += sizeof(sweet_insert);
+-		imgp->ip_strspace -= sizeof(sweet_insert);
+-		imgp->ip_argspace -= sizeof(sweet_insert) + new_ptr_size;
++	    imgp->ip_argspace >= (int)(sweet_len + 3 * new_ptr_size) &&
++	    imgp->ip_strspace >= (int)(sweet_len + new_ptr_size)) {
++		memcpy(imgp->ip_strendp, sweet_str, sweet_len);
++		imgp->ip_strendp += sweet_len;
++		imgp->ip_strspace -= sweet_len;
++		imgp->ip_argspace -= sweet_len + new_ptr_size;
+ 		imgp->ip_envc++;
++		if (sweet_app) {
++			printf("SWEET EXEC: appmetal inject for %s\n", imgp->ip_strings + strlen(EXECUTABLE_KEY));
++		}
+ 	}
+ 
+ 	/* Save space for envv[] NULL terminator */

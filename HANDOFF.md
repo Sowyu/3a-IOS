@@ -25,7 +25,7 @@ Updated 2026-11-02, about 19:00 AEDT. Update this file whenever the state change
 ## Open, most wanted first
 
 1. **Lag.** 25 to 35 frames/s while animating, and jittery. Frames run one at a time for an unknown reason. It is not `waitUntilScheduled`, the GPU clock, half-precision shaders, or the display copy. See `docs/speed2.md`.
-2. Freeform: compute on the A810, then Metal for one app (`docs/appmetal.md`).
+2. Freeform: desk work done (`docs/freeform.md`, `patches/freeform/`, `tools/freeform/`). Compute likely already works now that 2100 fixed the IB split hangs; two translator gaps (function constants, `[[color(n)]]` from a constant) are fixed in `next-ff`. Next is phase 2a: the compute self-test via `dev.py`, pushed over `/usr/local/bin/hcitest`, then 2b with kernel 2130 and `sweetappmetal=Freeform`.
 3. Wi-Fi, then a modem probe for mobile data. `docs/research-wifi.md`.
 4. Freeform and PencilKit need Metal in apps, and compute on the A810 is unproven. `docs/appmetal.md`.
 5. Sound and a real battery reading, which share the ADSP port. `docs/plan-power.md`.
