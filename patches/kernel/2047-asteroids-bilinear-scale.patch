@@ -1,0 +1,342 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -79,6 +79,8 @@
+ 
+ /* 2045: address-only VIG0 flips; firmware retains timing, DSC and SMMU ownership. */
+ extern "C" void sweet_log_sync(void);
++#include "SweetFbScale.h"
++#define SWEET_ROWS_MAX_THREADS  4
+ extern "C" void (*sweet_fb_panic_copy_hook)(void);
+ extern "C" uint32_t sweet_gpu_epoch(void);
+ extern "C" bool sweet_gpu_fence_done(uint32_t);
+@@ -403,6 +405,10 @@
+ 	uint32_t      fScaleXNum, fScaleXDen, fScaleYNum, fScaleYDen;
+ 	int32_t       fPadX, fPadY;
+ 	uint32_t     *fXMap;
++	/* 2047: bilinear scaling (sweetfb_filter, default on for asteroids). fXFrac: per-column weight, fRowLines: line buffers. */
++	bool          fFilter;
++	uint8_t      *fXFrac;
++	uint32_t     *fRowLines;
+ 	bool          fBarsCleared;
+ 	/*
+ 	 * Poco F1 MDP (SDM845 DPU) page flipping, after ios-topaz 0092/0100/0102:
+@@ -645,6 +651,7 @@
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+ 	void present(const uint8_t *rec, uint32_t copyEpoch);
++	bool astCovered(const uint8_t *rec, uint32_t mask);
+ 	void presentScaled(SweetSurface *s, uintptr_t src, int32_t sx, int32_t sy,
+ 	    int32_t dx, int32_t dy, int32_t w, int32_t h);
+ };
+@@ -787,7 +794,15 @@
+ 		fXMap = (uint32_t *)IOMallocData(fWidth * sizeof(uint32_t));
+ 		if (fXMap == NULL) {
+ 			fScale = 0;
++		}
++		int filter = sweet_board_asteroids() ? 1 : 0;
++		PE_parse_boot_argn("sweetfb_filter", &filter, sizeof(filter));
++		if (filter && fScale != 0) {
++			fXFrac = (uint8_t *)IOMallocData(fWidth);
++			fRowLines = (uint32_t *)IOMallocData((size_t)fWidth * 8 * SWEET_ROWS_MAX_THREADS);
++			fFilter = fXFrac != NULL && fRowLines != NULL;
+ 		}
++		IOLog("SWEET FB: scale %ux%u -> %ux%u %s\n", fLogicalW, fLogicalH, fWidth, fHeight, fFilter ? "bilinear" : "nearest");
+ 	}
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+@@ -3536,9 +3551,10 @@
+ 	int32_t padY;
+ 	uint32_t scaleYNum, scaleYDen;
+ 	int32_t sy, dy, h, px0, n;
++	const struct sfs_job *filter;   /* 2047: set = bilinear, the fields above are unused */
++	uint32_t *lines;
+ };
+ 
+-#define SWEET_ROWS_MAX_THREADS  4
+ #define SWEET_ROWS_MIN_PIXELS   (256 * 1024)    /* below this one core is faster than waking helpers */
+ 
+ 
+@@ -3552,8 +3568,12 @@
+ } sweet_rows;
+ 
+ static void
+-sweet_rows_draw(const struct sweet_rows_job *j, int32_t from, int32_t to)
++sweet_rows_draw(const struct sweet_rows_job *j, int32_t from, int32_t to, unsigned index)
+ {
++	if (j->filter != NULL) {
++		sfs_draw(j->filter, from, to, j->lines + (size_t)index * 2 * j->filter->n);
++		return;
++	}
+ 	for (int32_t py = from; py < to; py++) {
+ 		int32_t ly = (int32_t)((uint64_t)(py - j->padY) * j->scaleYDen / j->scaleYNum) - j->dy;
+ 		ly = ly < 0 ? 0 : (ly >= j->h ? j->h - 1 : ly);
+@@ -3583,7 +3603,7 @@
+ 		struct sweet_rows_job job = sweet_rows.job;
+ 		int32_t from = sweet_rows.band[index], to = sweet_rows.band[index + 1];
+ 		IOLockUnlock(sweet_rows.lock);
+-		sweet_rows_draw(&job, from, to);
++		sweet_rows_draw(&job, from, to, index);
+ 		__asm__ volatile("dsb sy" ::: "memory"); // Complete this CPU's WC stores before publishing done.
+ 		IOLockLock(sweet_rows.lock);
+ 		if (--sweet_rows.pending == 0) {
+@@ -3621,7 +3641,7 @@
+ {
+ 	unsigned parts = sweet_rows.helpers + 1;
+ 	if (parts == 1 || (int64_t)(py1 - py0) * j->n < SWEET_ROWS_MIN_PIXELS) {
+-		sweet_rows_draw(j, py0, py1);
++		sweet_rows_draw(j, py0, py1, 0);
+ 		return;
+ 	}
+ 	IOLockLock(sweet_rows.lock);
+@@ -3633,7 +3653,7 @@
+ 	sweet_rows.gen++;
+ 	IOLockWakeup(sweet_rows.lock, &sweet_rows.gen, false);
+ 	IOLockUnlock(sweet_rows.lock);
+-	sweet_rows_draw(j, sweet_rows.band[0], sweet_rows.band[1]);
++	sweet_rows_draw(j, sweet_rows.band[0], sweet_rows.band[1], 0);
+ 	IOLockLock(sweet_rows.lock);
+ 	while (sweet_rows.pending != 0) {
+ 		IOLockSleep(sweet_rows.lock, &sweet_rows.pending, THREAD_UNINT);
+@@ -3691,6 +3711,31 @@
+ 		py1 = (int32_t)fHeight;
+ 	}
+ 	if (px0 < 0 || py0 < 0 || px1 <= px0 || py1 <= py0) {
++		return;
++	}
++	if (fFilter && w > 1 && h > 1) {
++		/*
++		 * A layer showing part of a canvas-sized surface may sample its neighbours and must redraw the panel pixels that
++		 * mix them in. Any other layer stays inside its own rectangle: the rest of its surface is not its image.
++		 */
++		bool whole = s->width >= fLogicalW && s->height >= fLogicalH && sx == dx && sy == dy &&
++		    (uint64_t)s->offset + (uint64_t)(s->height - 1) * s->bytesPerRow + (uint64_t)s->width * 4 + s->wrapDelta <= s->memory->getLength();
++		if (whole) {
++			px0 = px0 > fPadX ? px0 - 1 : px0;
++			py0 = py0 > fPadY ? py0 - 1 : py0;
++			px1 = px1 < (int32_t)fWidth ? px1 + 1 : px1;
++			py1 = py1 < (int32_t)fHeight ? py1 + 1 : py1;
++		}
++		sfs_build_x(fXMap, fXFrac, px0, px1 - px0, fPadX, fScaleXNum, fScaleXDen, sx - dx,
++		    whole ? 0 : sx, whole ? (int32_t)s->width - 1 : sx + w - 1);
++		struct sfs_job filter = {
++			.base = (const uint8_t *)(src + s->offset), .draw = (uint8_t *)fDraw, .xi = fXMap, .xf = fXFrac,
++			.bpr = s->bytesPerRow, .rowBytes = fRowBytes, .px0 = px0, .n = px1 - px0, .padY = fPadY,
++			.yNum = fScaleYNum, .yDen = fScaleYDen, .yOff = sy - dy,
++			.rowMin = whole ? 0 : sy, .rowMax = whole ? (int32_t)s->height - 1 : sy + h - 1,
++		};
++		struct sweet_rows_job job = { .n = px1 - px0, .filter = &filter, .lines = fRowLines };
++		sweet_rows_run(&job, py0, py1);
+ 		return;
+ 	}
+ 	for (int32_t px = px0; px < px1; px++) {
+@@ -3721,8 +3766,30 @@
+ 			/* Not PE_initialize_console(kPEDisableScreen): its console switch
+ 			 * writes the read-only-late cons_ops_index and panics. */
+ 			sweet_console_muted = 1;
++		}
++	}
++}
++
++bool
++AppleCLCD::astCovered(const uint8_t *rec, uint32_t mask)
++{
++	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
++		const uint8_t *a = rec + 0x64 + 16 * layer, *b = rec + 0xc4 + 16 * layer;
++		uint32_t id = get32(rec, 0x54 + 4 * layer);
++		if (!(mask & (1u << layer)) || id == 0 || get32(a, 0) || get32(a, 4) || get32(b, 0) || get32(b, 4) ||
++		    (int32_t)get32(b, 8) < (int32_t)fLogicalW || (int32_t)get32(b, 12) < (int32_t)fLogicalH) {
++			continue;
+ 		}
++		SweetSurface *s = sweet_surface_copy(id);
++		bool ok = s != NULL && s != fSurface && s->width >= fLogicalW && s->height >= fLogicalH && s->elementWidth == 1 &&
++		    s->elementHeight == 1 && (s->bytesPerElement == 0 || s->bytesPerElement == 4) && s->memory != NULL && s->kernelAddress() != 0 &&
++		    (uint64_t)s->offset + (uint64_t)(fLogicalH - 1) * s->bytesPerRow + (uint64_t)fLogicalW * 4 + s->wrapDelta <= s->memory->getLength();
++		OSSafeReleaseNULL(s);
++		if (ok) {
++			return true;
++		}
+ 	}
++	return false;
+ }
+ 
+ void
+@@ -3772,8 +3839,9 @@
+   back = ast.front == 1 ? 2 : 1;
+   fDrawIdx = back;
+   fDraw = ast.va[back];
+-  // Preserve partial damage outside this swap before the row workers start.
+-  memcpy((void *)fDraw, (const void *)ast.va[ast.front], astBytes);
++  // Preserve partial damage outside this swap before the row workers start. A reading copy from
++  // write-combined memory is slow, so skip it when a layer that will draw covers the whole canvas.
++  if (!astCovered(rec, mask)) memcpy((void *)fDraw, (const void *)ast.va[ast.front], astBytes);
+   // The legacy first-use bar clear erases the entire image, including preserved damage.
+   if (fScale && (fPadX > 0 || fPadY > 0)) {
+    uint32_t right = fPadX + (uint64_t)fLogicalW * fScaleXNum / fScaleXDen;
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetFbScale.h
+@@ -0,0 +1,165 @@
++/*
++ * Bilinear canvas -> panel scaler for the CPU copy path (patch 2047). Host-testable: no kernel headers.
++ * Works both ways: 1242x2751 down to 1080x2392 and 828x1834 up. Each source row is filtered horizontally once into a
++ * per-thread line buffer and panel rows blend two such lines, so every source row is read once per band.
++ * Weights are 8-bit and blending is in gamma space. ponytail: 2 taps, add a third if thin lines visibly shimmer at 0.87x.
++ */
++#ifndef SWEET_FB_SCALE_H
++#define SWEET_FB_SCALE_H
++#include <stdint.h>
++#if defined(__arm64__) || defined(__aarch64__)
++#include <arm_neon.h>
++#define SFS_NEON 1
++#endif
++
++struct sfs_job {
++	const uint8_t *base;    /* surface row 0 */
++	uint8_t *draw;          /* panel row 0 */
++	const uint32_t *xi;     /* per output column: left source column; xi+1 is always readable */
++	const uint8_t *xf;      /* per output column: weight of xi+1 in 1/256 */
++	uint32_t bpr, rowBytes;
++	int32_t px0, n;         /* output columns */
++	int32_t padY;
++	uint32_t yNum, yDen;    /* panel = pad + logical * num / den */
++	int32_t yOff;           /* surface row = logical row + yOff */
++	int32_t rowMin, rowMax; /* readable surface rows, rowMax > rowMin */
++};
++
++/* Source position of a panel pixel centre, Q16, before clamping. */
++static inline int64_t
++sfs_pos(int32_t p, int32_t pad, uint32_t num, uint32_t den, int32_t off)
++{
++	return (int64_t)(2 * (p - pad) + 1) * den * 65536 / (2 * (int64_t)num) - 32768 + ((int64_t)off << 16);
++}
++
++/* Clamp to min..max; past max use the last pair with the largest weight, so index+1 stays readable. */
++static inline void
++sfs_split(int64_t q, int32_t min, int32_t max, int32_t *index, uint32_t *weight)
++{
++	if (q < (int64_t)min << 16) {
++		q = (int64_t)min << 16;
++	}
++	if (q >= (int64_t)max << 16) {
++		*index = max - 1;
++		*weight = 255;
++	} else {
++		*index = (int32_t)(q >> 16);
++		*weight = (uint32_t)(q >> 8) & 0xff;
++	}
++}
++
++static inline void
++sfs_build_x(uint32_t *xi, uint8_t *xf, int32_t px0, int32_t n, int32_t pad, uint32_t num, uint32_t den, int32_t off,
++    int32_t min, int32_t max)
++{
++	for (int32_t i = 0; i < n; i++) {
++		int32_t index;
++		uint32_t weight;
++		sfs_split(sfs_pos(px0 + i, pad, num, den, off), min, max, &index, &weight);
++		xi[i] = (uint32_t)index;
++		xf[i] = (uint8_t)weight;
++	}
++}
++
++static inline uint32_t
++sfs_lerp(uint32_t a, uint32_t b, uint32_t f)
++{
++	uint32_t out = 0;
++	for (int shift = 0; shift < 32; shift += 8) {
++		uint32_t x = (a >> shift) & 0xff, y = (b >> shift) & 0xff;
++		out |= ((x * (256 - f) + y * f + 128) >> 8) << shift;
++	}
++	return out;
++}
++
++static inline void
++sfs_hline_c(uint32_t *out, const uint32_t *src, const uint32_t *xi, const uint8_t *xf, int32_t n)
++{
++	for (int32_t i = 0; i < n; i++) {
++		out[i] = sfs_lerp(src[xi[i]], src[xi[i] + 1], xf[i]);
++	}
++}
++
++static inline void
++sfs_vline_c(uint32_t *out, const uint32_t *a, const uint32_t *b, uint32_t f, int32_t n)
++{
++	for (int32_t i = 0; i < n; i++) {
++		__builtin_memcpy(&out[i], (const uint32_t[1]){ sfs_lerp(a[i], b[i], f) }, 4);
++	}
++}
++
++#if SFS_NEON
++/* a*(256-w) = a*(255-w) + a, so the weight fits 8 bits. Rounded like sfs_lerp. */
++static inline uint8x16_t
++sfs_blend(uint8x16_t a, uint8x16_t b, uint8x8_t wl, uint8x8_t wh)
++{
++	uint16x8_t lo = vaddw_u8(vmlal_u8(vmull_u8(vget_low_u8(a), vmvn_u8(wl)), vget_low_u8(b), wl), vget_low_u8(a));
++	uint16x8_t hi = vaddw_u8(vmlal_u8(vmull_u8(vget_high_u8(a), vmvn_u8(wh)), vget_high_u8(b), wh), vget_high_u8(a));
++	return vcombine_u8(vrshrn_n_u16(lo, 8), vrshrn_n_u16(hi, 8));
++}
++
++static inline void
++sfs_hline(uint32_t *out, const uint32_t *src, const uint32_t *xi, const uint8_t *xf, int32_t n)
++{
++	int32_t i = 0;
++	for (; i + 4 <= n; i += 4) {
++		uint64_t p0, p1, p2, p3;
++		__builtin_memcpy(&p0, src + xi[i], 8);
++		__builtin_memcpy(&p1, src + xi[i + 1], 8);
++		__builtin_memcpy(&p2, src + xi[i + 2], 8);
++		__builtin_memcpy(&p3, src + xi[i + 3], 8);
++		uint32x4x2_t pair = vuzpq_u32(vcombine_u32(vcreate_u32(p0), vcreate_u32(p1)),
++		    vcombine_u32(vcreate_u32(p2), vcreate_u32(p3)));
++		uint8x8_t wl = vcreate_u8((xf[i] | (uint64_t)xf[i + 1] << 32) * 0x01010101u);
++		uint8x8_t wh = vcreate_u8((xf[i + 2] | (uint64_t)xf[i + 3] << 32) * 0x01010101u);
++		vst1q_u8((uint8_t *)(out + i), sfs_blend(vreinterpretq_u8_u32(pair.val[0]), vreinterpretq_u8_u32(pair.val[1]), wl, wh));
++	}
++	sfs_hline_c(out + i, src, xi + i, xf + i, n - i);
++}
++
++/* out may be the panel: st1 .4s needs only 4-byte alignment on any memory type, unlike the str q a plain store may become. */
++static inline void
++sfs_vline(uint32_t *out, const uint32_t *a, const uint32_t *b, uint32_t f, int32_t n)
++{
++	uint8x8_t w = vdup_n_u8((uint8_t)f);
++	int32_t i = 0;
++	for (; i + 4 <= n; i += 4) {
++		uint8x16_t v = sfs_blend(vld1q_u8((const uint8_t *)(a + i)), vld1q_u8((const uint8_t *)(b + i)), w, w);
++		__asm__ volatile("st1 {%1.4s}, [%0]" : : "r"(out + i), "w"(v) : "memory");
++	}
++	sfs_vline_c(out + i, a + i, b + i, f, n - i);
++}
++#else
++#define sfs_hline sfs_hline_c
++#define sfs_vline sfs_vline_c
++#endif
++
++/* One band of panel rows. line: two rows of n uint32_t owned by this thread. */
++static inline void
++sfs_draw(const struct sfs_job *j, int32_t from, int32_t to, uint32_t *line)
++{
++	uint32_t *lo = line, *hi = line + j->n;
++	int32_t loRow = -1, hiRow = -1;
++	for (int32_t py = from; py < to; py++) {
++		int32_t row;
++		uint32_t f;
++		sfs_split(sfs_pos(py, j->padY, j->yNum, j->yDen, j->yOff), j->rowMin, j->rowMax, &row, &f);
++		if (hiRow == row) {     /* moving down one row: the old lower line is the new upper one */
++			uint32_t *t = lo;
++			lo = hi;
++			hi = t;
++			loRow = row;
++			hiRow = -1;
++		}
++		if (loRow != row) {
++			sfs_hline(lo, (const uint32_t *)(j->base + (uint64_t)row * j->bpr), j->xi, j->xf, j->n);
++			loRow = row;
++		}
++		if (hiRow != row + 1) {
++			sfs_hline(hi, (const uint32_t *)(j->base + (uint64_t)(row + 1) * j->bpr), j->xi, j->xf, j->n);
++			hiRow = row + 1;
++		}
++		sfs_vline((uint32_t *)(j->draw + (uint64_t)py * j->rowBytes) + j->px0, lo, hi, f, j->n);
++	}
++}
++#endif

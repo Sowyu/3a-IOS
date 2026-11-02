@@ -1,0 +1,240 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -88,6 +88,8 @@
+  bool enabled, frozen, first;
+  volatile bool stopped;
+  uint32_t front;
++ uint64_t done, latched, latchNS, latchMinNS, latchMaxNS, repeated, epochDrops;
++ uint64_t copyNS, copyMaxNS, copies, logTime;
+ } ast;
+ static const uint32_t astPA[3] = {0xe3940000, 0xe431c000, 0xe4cf8000};
+ static const size_t astBytes = 0x9dad00;
+@@ -110,12 +112,14 @@
+ }
+ static bool astAddress(unsigned idx)
+ {
+- uint32_t frame = ast.intf[0xac/4];
++ uint32_t frame;
+  __asm__ volatile("dsb sy" ::: "memory");
+  ast.pipe[5] = astPA[idx];
+  __asm__ volatile("dsb sy" ::: "memory");
+  ast.ctl[6] = 1; // SSPP_VIG0 = BIT(0); video mode needs no CTL_START.
+  __asm__ volatile("dsb sy" ::: "memory");
++ // Sample AFTER FLUSH: a boundary between the old sample and the write is not completion.
++ frame = ast.intf[0xac/4];
+  return astWait(frame) && ast.pipe[5] == astPA[idx];
+ }
+ static void astPanicCopy(void)
+@@ -128,10 +132,19 @@
+   __asm__ volatile("dsb sy" ::: "memory");
+  }
+ }
++static void astSeedBoot(void)
++{
++ // Boot is idle after the first confirmed flip. Never resurrect the shim image.
++ if (ast.front != 0) {
++  memcpy((void *)ast.va[0], (const void *)ast.va[ast.front], astBytes);
++  __asm__ volatile("dsb sy" ::: "memory");
++ }
++}
+ static void astPanic(void)
+ {
+  // No locks or logging: panic stops the other CPUs. Restore the boot console mapping.
+  ast.stopped = true;
++ astSeedBoot();
+  sweet_fb_panic_copy_hook = astPanicCopy;
+  if (ast.enabled && !astAddress(0)) ast.frozen = true;
+  else __atomic_store_n(&ast.front, 0, __ATOMIC_RELEASE);
+@@ -139,6 +152,7 @@
+ static void astFallback(const char *reason)
+ {
+  ast.stopped = true;
++ astSeedBoot();
+  bool restored = astAddress(0);
+  ast.frozen = !restored;
+  if (restored) __atomic_store_n(&ast.front, 0, __ATOMIC_RELEASE);
+@@ -157,17 +171,25 @@
+    ast.intf[0], ast.intf[1], ast.intf[2], ast.intf[3], ast.intf[7], ast.intf[9], ast.intf[0xa8/4], ast.intf[0xac/4], ast.intf[0xb0/4], ast.mdp[5]);
+   sweet_log_sync();
+  }
++ uint64_t latchStart = mach_absolute_time(), latchNS;
++ ast.done++;
+  if (!astAddress(back)) { astFallback("latch timeout"); return; }
+  uint32_t frame = ast.intf[0xac/4], line = ast.intf[0xb0/4];
+  // Observe a full fetch before reuse, without clearing firmware's interrupt status.
+  if ((ast.first && !astWait(frame)) || line > 3000 || ast.intf[0xb0/4] > 3000 || (ast.mdp[5] & (1u << 26))) {
+   astFallback("counter/INTF1 underrun"); return;
+  }
++ absolutetime_to_nanoseconds(mach_absolute_time() - latchStart, &latchNS);
++ ast.latched++;
++ ast.latchNS += latchNS;
++ if (ast.latched == 1 || latchNS < ast.latchMinNS) ast.latchMinNS = latchNS;
++ if (latchNS > ast.latchMaxNS) ast.latchMaxNS = latchNS;
+  __atomic_store_n(&ast.front, back, __ATOMIC_RELEASE);
+  if (ast.first) {
+   IOLog("SWEET FB AST: first latch ok src=%x frame=%u->%u line=%u->%u irq=%x\n",
+    ast.pipe[5], frame, ast.intf[0xac/4], line, ast.intf[0xb0/4], ast.mdp[5]);
+   sweet_log_sync();
++  astSeedBoot(); // Initialise the published default surface once, while it is idle.
+   ast.first = false;
+  }
+ }
+@@ -622,7 +644,7 @@
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+-	void present(const uint8_t *rec);
++	void present(const uint8_t *rec, uint32_t copyEpoch);
+ 	void presentScaled(SweetSurface *s, uintptr_t src, int32_t sx, int32_t sy,
+ 	    int32_t dx, int32_t dy, int32_t w, int32_t h);
+ };
+@@ -1156,7 +1178,7 @@
+ 		if (fb->fPanel) {
+ 			/* asteroids: the panel itself goes dark (display off, sleep in) on the panel thread */
+ 			if (!fb->fPanelOff) {
+-				if (ast.enabled && !ast.stopped) astFallback("panel off");
++				if (ast.enabled && !ast.stopped) fb->blackout();
+ 				fb->fPanelOff = true;
+ 				sweet_panel_post_power(false);
+ 			}
+@@ -1175,11 +1197,13 @@
+ 	}
+ 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0 && fb->gpuGateOpen(mach_absolute_time());
+ 	uint8_t *rec = NULL;
++	uint32_t copyEpoch = 0;
+ 	SweetSurface *taken[4] = {};
+ 	if (flush) {
+ 		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
+ 		if (rec != NULL) {
+ 			memcpy(rec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
++			copyEpoch = fb->fPendEpoch;
+ 			fb->fDirty = false;
+ 			memcpy(taken, fb->fPendHold, sizeof(taken));
+ 			bzero(fb->fPendHold, sizeof(fb->fPendHold));
+@@ -1187,8 +1211,9 @@
+ 	}
+ 	bool dirty = fb->fDirty;        /* still unshown: not yet worth lighting the panel */
+ 	IOLockUnlock(fb->fLock);
++	if (ast.enabled && rec == NULL) ast.repeated++; // Software presentation ticks with no new frame.
+ 	if (rec != NULL) {
+-		fb->present(rec);
++		fb->present(rec, copyEpoch);
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
+ 	if (fb->fZc) {
+@@ -1410,6 +1435,15 @@
+ 	    fScanGpu && !fScanGpuOff ? (fScanGpuRest ? 2 : 1) : 0, c.scanGpuCopies, c.scanGpuFallbacks,
+ 	    c.scanGpuSubmitFails, c.scanGpuLate, sweet_abs_us(c.scanGpuWaitMaxAbs));
+ 	#undef PER_S
++	if (ast.enabled && (ast.logTime == 0 || sweet_abs_us(now - ast.logTime) >= 10000000)) {
++        ast.logTime = now;
++        IOLog("SWEET FB AST: flips done=%llu latched=%llu repeated=%llu dropped=%llu hold_expired=%llu\n",
++            ast.done, ast.latched, ast.repeated, coalesced + ast.epochDrops, c.gpuHoldTimeouts);
++        IOLog("SWEET FB AST: latch_us min=%llu avg=%llu max=%llu\n",
++            ast.latchMinNS/1000, ast.latched ? ast.latchNS/ast.latched/1000 : 0, ast.latchMaxNS/1000);
++        IOLog("SWEET FB AST: copy_us avg=%llu max=%llu copies=%llu gpu_hold_ticks=%llu\n",
++            ast.copies ? ast.copyNS/ast.copies/1000 : 0, ast.copyMaxNS/1000, ast.copies, c.gpuHolds);
++    }
+ 	sweet_fb_stats_publish(line);
+ 	if (fStLogSecs != 0 && (fStLogT == 0 || sweet_abs_us(now - fStLogT) >= (uint64_t)fStLogSecs * 1000000)) {
+ 		fStLogT = now;
+@@ -2079,7 +2113,13 @@
+ void
+ AppleCLCD::blackout(void)
+ {
+-	if (ast.enabled && !ast.stopped) astFallback("blackout");
++	if (ast.enabled && !ast.stopped) {
++        unsigned back = ast.front == 1 ? 2 : 1;
++        memset((void *)ast.va[back], 0, astBytes);
++        astFlip(back);
++        IOLog("SWEET FB AST: display off; flip retained\n");
++        return;
++    }
+ 	if (ast.frozen) return;
+ 	memset((void *)fPixels, 0, (size_t)fRowBytes * fHeight);
+ 	if (fFlip && (fFront != 0 || fHwOn)) {
+@@ -3544,6 +3584,7 @@
+ 		int32_t from = sweet_rows.band[index], to = sweet_rows.band[index + 1];
+ 		IOLockUnlock(sweet_rows.lock);
+ 		sweet_rows_draw(&job, from, to);
++		__asm__ volatile("dsb sy" ::: "memory"); // Complete this CPU's WC stores before publishing done.
+ 		IOLockLock(sweet_rows.lock);
+ 		if (--sweet_rows.pending == 0) {
+ 			IOLockWakeup(sweet_rows.lock, &sweet_rows.pending, false);
+@@ -3685,11 +3726,11 @@
+ }
+ 
+ void
+-AppleCLCD::present(const uint8_t *rec)
++AppleCLCD::present(const uint8_t *rec, uint32_t copyEpoch)
+ {
+ 	uint32_t mask = get32(rec, 0x104);
+ 	if (ast.frozen) return;
+-	const uint32_t copyEpoch = sweet_gpu_epoch();
++	if (ast.enabled && copyEpoch != sweet_gpu_epoch()) { ast.epochDrops++; return; }
+ 
+ 	fCurSwapID = get32(rec, 0x50);
+ 	quietConsole();
+@@ -3788,16 +3829,11 @@
+ 			    s ? s->pixelFormat : 0, s ? s->bytesPerRow : 0, sx, sy, get32(a, 8),
+ 			    get32(a, 12), dx, dy, w, h);
+ 		}
+-		if (s == fSurface && ast.enabled && !ast.stopped) {
+-			astFallback("default framebuffer surface");
+-			OSSafeReleaseNULL(s);
+-			return;
+-		}
+-		if (s == NULL || s == fSurface) {
++		if (s == NULL || (s == fSurface && !(ast.enabled && !ast.stopped))) {
+ 			OSSafeReleaseNULL(s);
+ 			continue;
+ 		}
+-		uintptr_t src = s->kernelAddress();
++		uintptr_t src = s == fSurface ? fPixels : s->kernelAddress();
+ 		if (src != 0 && s->pooled && sweet_lowpool_cacheable()) {
+ 			/*
+ 			 * 0215: this frame is copied by the CPU through the pool's write-back mapping. Since 0212 a BO_SYNC of a
+@@ -3835,14 +3871,13 @@
+ 			s->release();
+ 			continue;
+ 		}
+-		if (fScale != 0) {
++		if (fScale != 0 && s != fSurface) {
+ 			presentScaled(s, src, sx, sy, dx, dy, w, h);
+ 			s->release();
+ 			continue;
+ 		}
+ 		/* Logical (presented) display coordinates -> panel coordinates. */
+-		dx -= fOffX;
+-		dy -= fOffY;
++		if (s != fSurface) { dx -= fOffX; dy -= fOffY; }
+ 		if (dx < 0) {
+ 			sx -= dx;
+ 			w += dx;
+@@ -3883,12 +3918,24 @@
+ 	if (fHudReady && __atomic_load_n(&sweet_fb_hud, __ATOMIC_RELAXED) != 0 && hudUsable()) {
+ 		hudBlit(fDraw, fHw && fFlip ? fHwStride : fRowBytes);   /* on top of the copied frame, before it is scanned */
+ 	}
+-	if (ast.enabled && !ast.stopped && copyEpoch == sweet_gpu_epoch()) astFlip(back);
++	if (ast.enabled) {
++        uint64_t ns;
++        absolutetime_to_nanoseconds(mach_absolute_time() - tcp0, &ns);
++        ast.copies++;
++        ast.copyNS += ns;
++        if (ns > ast.copyMaxNS) ast.copyMaxNS = ns;
++    }
++    uint64_t astLatchStart = mach_absolute_time();
++    if (ast.enabled && !ast.stopped) {
++        if (copyEpoch == sweet_gpu_epoch()) astFlip(back);
++        else ast.epochDrops++;
++    }
++    uint64_t astLatchAbs = mach_absolute_time() - astLatchStart;
+ 	if (fFlip) {
+ 		scanTo(back);
+ 	}
+ 	uint64_t tcpd = mach_absolute_time() - tcp0;
+-	uint64_t tcpx = (fSt.latchWaitAbs - tlw0) + (fHudDrawAbs - thd0);      /* latch waits and the HUD are not the copy */
++	uint64_t tcpx = astLatchAbs + (fSt.latchWaitAbs - tlw0) + (fHudDrawAbs - thd0);      /* latch waits and the HUD are not the copy */
+ 	tcpd = tcpd > tcpx ? tcpd - tcpx : 0;
+ 	fSt.copy++;
+ 	fSt.copyAbs += tcpd;

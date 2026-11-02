@@ -1,0 +1,85 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -83,9 +83,72 @@
+ 	return v;
+ }
+ 
++/* Asteroids: deliberately read-only until SID 0x40's DMA mapping is proven.
++ * Never enter the older boards' GCC, QUSB2, SMMU or gadget paths here.
++ * Even reads can abort under Gunyah; persist the address before each one.
++ */
++extern void sweet_log_sync(void);
++
++static void
++sweet_usb_asteroids_probe(void)
++{
++	int level = 0;
++	PE_parse_boot_argn("sweetusb", &level, sizeof(level));
++	if (level == 0) {
++		return;
++	}
++	if (level != 1) {
++		printf("ASTEROIDS USB: sweetusb=%d refused; only 0=off, 1=read-only; SID 0x40 DMA unproven\n", level);
++		sweet_log_sync();
++		return;
++	}
++	/* Only the DWC3 global/device registers, not xHCI or wrapper registers. */
++	printf("ASTEROIDS USB: read-only probe; mapping 0x0a60c100+0x700; reads may abort\n");
++	sweet_log_sync();
++	vm_offset_t base = ml_io_map(0x0a60c100, 0x700);
++	if (base == 0) {
++		printf("ASTEROIDS USB: map failed\n");
++		sweet_log_sync();
++		return;
++	}
++	static const struct {
++		const char *name;
++		uint32_t off;
++	} regs[] = {
++		{ "GSNPSID", 0x020 }, { "GCTL", 0x010 },
++		{ "GSTS", 0x018 }, { "GHWPARAMS0", 0x040 },
++		{ "GHWPARAMS1", 0x044 }, { "GHWPARAMS3", 0x04c },
++		{ "GUSB2PHYCFG", 0x100 }, { "GUSB3PIPECTL", 0x1c0 },
++		{ "DCFG", 0x600 }, { "DCTL", 0x604 },
++		{ "DEVTEN", 0x608 }, { "DSTS", 0x60c },
++		{ "DALEPENA", 0x620 }, { "GEVNTADRLO", 0x300 },
++		{ "GEVNTADRHI", 0x304 }, { "GEVNTSIZ", 0x308 },
++		{ "GEVNTCOUNT", 0x30c },
++	};
++	for (unsigned i = 0; i < sizeof(regs) / sizeof(regs[0]); i++) {
++		printf("ASTEROIDS USB: before read %s @0x%08x\n",
++		    regs[i].name, 0x0a60c100 + regs[i].off);
++		sweet_log_sync();
++		uint32_t value = usb_rd(base, regs[i].off);
++		printf("ASTEROIDS USB: %s=0x%08x\n", regs[i].name, value);
++		sweet_log_sync();
++		if (i == 0 && (value == 0 || value == 0xffffffffu)) {
++			printf("ASTEROIDS USB: invalid core ID; stopping\n");
++			sweet_log_sync();
++			return;
++		}
++	}
++	printf("ASTEROIDS USB: probe complete; no register writes, no DMA, no gadget\n");
++	sweet_log_sync();
++}
++
+ void
+ sweet_usb_probe(void)
+ {
++	if (sweet_board_asteroids()) {
++		sweet_usb_asteroids_probe();
++		return;
++	}
+ 	int enabled = 1;
+ 	uint32_t gdscr, cbcr[sizeof(usb_cbcr) / sizeof(usb_cbcr[0])];
+ 	bool clocks_on = true;
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -1304,6 +1304,7 @@
+ 	 * GCC, TLMM, RPMh, DWC3, the A630, the WCN3990): never on another SoC.
+ 	 */
+ 	if (sweet_board_asteroids()) {
++		sweet_usb_probe(); /* default off; asteroids read-only path only */
+ 		/* FocalTech SPI over GPI DMA (sweet_touch_asteroids.c, checks for nothing,asteroids itself) */
+ 		sweet_touch_asteroids_init();
+ 		/* PMK8550 keys over SPMI arbiter v7 and the AI key on TLMM (sweet_keys.c, read only) */

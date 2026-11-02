@@ -1,0 +1,531 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -77,59 +77,99 @@
+ extern "C" uint32_t sweet_gpu_blit(uint64_t src_pa, uint32_t src_pitch, uint64_t dst_pa, uint32_t dst_pitch, uint32_t w, uint32_t h);
+ extern "C" bool sweet_gpu_fence_passed(uint32_t fence);                    /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb_hud (patch 0213) */
+ 
+-/* 2044: display-only survey. Reserved RAM is not proof of a display IOVA mapping.
+- * Do not arm a flip until the bootloader's complete fetch mapping is established.
+- * Even read-only MMIO can abort under Gunyah: persist each block boundary first. */
++/* 2045: address-only VIG0 flips; firmware retains timing, DSC and SMMU ownership. */
+ extern "C" void sweet_log_sync(void);
+-static void
+-sweet_ast_display_probe(void)
+-{
+-	int level = 0;
+-	PE_parse_boot_argn("sweetfb_flip_ast", &level, sizeof(level));
+-	if (level == 0) {
+-		return;
+-	}
+-	if (level != 1 && level != 2) {
+-		IOLog("SWEET FB AST: invalid probe level; copy unchanged\n");
+-		return;
+-	}
+-	const uint32_t blocks[] = { 0x0ae16000, 0x0ae05000, 0x0ae36000 };
+-	const char *names[] = { "CTL0", "SSPP0", "INTF1" };
+-	/* DT offsets are relative to MDSS 0xae00000, not MDP 0xae01000. */
+-	const uint32_t regs[3][8] = {
+-		{ 0x00, 0x14, 0x18, 0x40, 0xe8, 0xf4, 0xfc, 0x110 },
+-		{ 0x00, 0x08, 0x0c, 0x10, 0x14, 0x24, 0x30, 0x38 },
+-		{ 0x00, 0x04, 0x08, 0x0c, 0x1c, 0x24, 0xa8, 0xb0 },
+-	};
+-	for (unsigned b = 0; b < 3; b++) {
+-		IOLog("SWEET FB AST: before %s first access pa=0x%x (read only)\n", names[b], blocks[b]);
+-		sweet_log_sync();
+-		volatile const uint32_t *r = (volatile const uint32_t *)ml_io_map(blocks[b], 0x1000);
+-		if (r == NULL) {
+-			IOLog("SWEET FB AST: map failed; copy unchanged\n");
+-			sweet_log_sync();
+-			return;
+-		}
+-		for (unsigned i = 0; i < 8; i++) {
+-			uint32_t value = r[regs[b][i] / 4];
+-			IOLog("SWEET FB AST: %s +0x%x = 0x%x\n", names[b], regs[b][i], value);
+-		}
+-		if (b == 2) {
+-			/* Counters must already be enabled by firmware. Never enable them here. */
+-			uint32_t enabled = r[0xa8 / 4];
+-			uint32_t frames = r[0xac / 4], line = r[0xb0 / 4];
+-			uint64_t start = mach_absolute_time(), ns;
+-			IOSleep(100);
+-			uint32_t endFrames = r[0xac / 4], endLine = r[0xb0 / 4];
+-			absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);
+-			IOLog("SWEET FB AST: timing count_en=0x%x frames=%u->%u line=%u->%u elapsed_us=%llu\n",
+-			    enabled, frames, endFrames, line, endLine, ns / 1000);
+-		}
+-		sweet_log_sync();
+-	}
+-	IOLog("SWEET FB AST: %s; copy unchanged (splash SMMU coverage unverified)\n",
+-	    level == 2 ? "flip refused" : "probe complete");
+-	sweet_log_sync();
++extern "C" void (*sweet_fb_panic_copy_hook)(void);
++extern "C" uint32_t sweet_gpu_epoch(void);
++extern "C" bool sweet_gpu_fence_done(uint32_t);
++static struct {
++ volatile uint32_t *ctl, *pipe, *intf, *mdp;
++ uintptr_t va[3];
++ bool enabled, frozen, first;
++ volatile bool stopped;
++ uint32_t front;
++} ast;
++static const uint32_t astPA[3] = {0xe3940000, 0xe431c000, 0xe4cf8000};
++static const size_t astBytes = 0x9dad00;
++// Console rasterizers resolve the confirmed front each time, rather than caching ABL's VA.
++extern "C" uintptr_t sweet_fb_console_address(uintptr_t boot);
++uintptr_t sweet_fb_console_address(uintptr_t boot)
++{
++ return ast.enabled && !ast.stopped ? ast.va[__atomic_load_n(&ast.front, __ATOMIC_ACQUIRE)] : boot;
++}
++static bool astWait(uint32_t frame)
++{
++ uint64_t start = mach_absolute_time(), ns;
++ do {
++  __asm__ volatile("dsb sy" ::: "memory");
++  if (!(ast.ctl[6] & 1) && ast.intf[0xac/4] != frame) return true;
++  IODelay(50);
++  absolutetime_to_nanoseconds(mach_absolute_time()-start, &ns);
++ } while (ns < 25000000); // Three 120 Hz frames; bounded even if counters stop.
++ return false;
++}
++static bool astAddress(unsigned idx)
++{
++ uint32_t frame = ast.intf[0xac/4];
++ __asm__ volatile("dsb sy" ::: "memory");
++ ast.pipe[5] = astPA[idx];
++ __asm__ volatile("dsb sy" ::: "memory");
++ ast.ctl[6] = 1; // SSPP_VIG0 = BIT(0); video mode needs no CTL_START.
++ __asm__ volatile("dsb sy" ::: "memory");
++ return astWait(frame) && ast.pipe[5] == astPA[idx];
++}
++static void astPanicCopy(void)
++{
++ // If restoration failed, put panic text into every possible scanout candidate.
++ // Panic is the sole deliberate exception to never writing the scanned buffer.
++ if (ast.frozen) {
++  memcpy((void *)ast.va[1], (const void *)ast.va[0], astBytes);
++  memcpy((void *)ast.va[2], (const void *)ast.va[0], astBytes);
++  __asm__ volatile("dsb sy" ::: "memory");
++ }
++}
++static void astPanic(void)
++{
++ // No locks or logging: panic stops the other CPUs. Restore the boot console mapping.
++ ast.stopped = true;
++ sweet_fb_panic_copy_hook = astPanicCopy;
++ if (ast.enabled && !astAddress(0)) ast.frozen = true;
++ else __atomic_store_n(&ast.front, 0, __ATOMIC_RELEASE);
++}
++static void astFallback(const char *reason)
++{
++ ast.stopped = true;
++ bool restored = astAddress(0);
++ ast.frozen = !restored;
++ if (restored) __atomic_store_n(&ast.front, 0, __ATOMIC_RELEASE);
++ IOLog("SWEET FB AST: fallback %s restore=%u src=%x flush=%x frame=%u line=%u irq=%x; %s\n",
++  reason, restored, ast.pipe[5], ast.ctl[6], ast.intf[0xac/4], ast.intf[0xb0/4], ast.mdp[5],
++  restored ? "copy boot buffer" : "scanout unknown; copies frozen");
++ sweet_log_sync();
++}
++static void astFlip(unsigned back)
++{
++ if (ast.stopped) return;
++ if (ast.first) {
++  IOLog("SWEET FB AST: first flip ctl=ae16000 pipe=ae05000 intf=ae36000 mdp=ae01000 src=%x dst=%x bytes=9dad00 slot=9dc000 end=e6440000 size=%x out=%x xy=%x/%x stride=%x fmt=%x op=%x layer=%x top=%x dsc=%x active=%x fetch=%x iflush=%x flush=%x mask=1 enable=%x config=%x hsync=%x period=%x start=%x endv=%x count=%x frame=%u line=%u irq=%x timeout_us=25000\n",
++   ast.pipe[5], astPA[back], ast.pipe[0], ast.pipe[3], ast.pipe[2], ast.pipe[4], ast.pipe[9], ast.pipe[12], ast.pipe[14],
++   ast.ctl[0], ast.ctl[5], ast.ctl[0xe8/4], ast.ctl[0xf4/4], ast.ctl[0xfc/4], ast.ctl[0x110/4], ast.ctl[6],
++   ast.intf[0], ast.intf[1], ast.intf[2], ast.intf[3], ast.intf[7], ast.intf[9], ast.intf[0xa8/4], ast.intf[0xac/4], ast.intf[0xb0/4], ast.mdp[5]);
++  sweet_log_sync();
++ }
++ if (!astAddress(back)) { astFallback("latch timeout"); return; }
++ uint32_t frame = ast.intf[0xac/4], line = ast.intf[0xb0/4];
++ // Observe a full fetch before reuse, without clearing firmware's interrupt status.
++ if ((ast.first && !astWait(frame)) || line > 3000 || ast.intf[0xb0/4] > 3000 || (ast.mdp[5] & (1u << 26))) {
++  astFallback("counter/INTF1 underrun"); return;
++ }
++ __atomic_store_n(&ast.front, back, __ATOMIC_RELEASE);
++ if (ast.first) {
++  IOLog("SWEET FB AST: first latch ok src=%x frame=%u->%u line=%u->%u irq=%x\n",
++   ast.pipe[5], frame, ast.intf[0xac/4], line, ast.intf[0xb0/4], ast.mdp[5]);
++  sweet_log_sync();
++  ast.first = false;
++ }
+ }
+ 
+ /*
+@@ -363,6 +403,9 @@
+ 	IOMemoryMap  *fBufMap[3];
+ 	void          mdpProbe(void);
+ 	bool          flipSetup(void);
++	void astSetup(void);
++	uint32_t fPendEpoch;
++	bool fPendHoldExpired;
+ 	void          scanTo(uint32_t idx);
+ 	void          scanAddr(uint32_t pa, uint32_t stride, bool hwFrame);
+ 	void          waitLatch(void);
+@@ -912,7 +955,7 @@
+ 			IOLog("SWEET FB: backlight fade off (sweetfb_blfade=0): black in one step\n");
+ 		}
+ 	} else if (sweet_board_asteroids()) {
+-		sweet_ast_display_probe();
++		astSetup();
+ 		/*
+ 		 * Nothing Phone (3a): the AMOLED panel takes DCS commands through DSI0 (bsd/dev/sweet_dsi_asteroids.c, after
+ 		 * rootstockos T37). sweetpanel=1 (default): display off/on follows iOS's power state; 2: also the
+@@ -1017,7 +1060,7 @@
+ 	} else {
+ 		OSSafeReleaseNULL(s);
+ 		uint32_t f = fb->fFlip ? fb->fFront : 0;
+-		src = f < 3 && fb->fFlip ? fb->fBufVA[f] : fb->fPixels;
++		src = ast.enabled ? ast.va[ast.front] : (f < 3 && fb->fFlip ? fb->fBufVA[f] : fb->fPixels);
+ 		if (f != 0 && fb->fHw) {
+ 			w = fb->fLogicalW;
+ 			h = fb->fLogicalH;
+@@ -1113,6 +1156,7 @@
+ 		if (fb->fPanel) {
+ 			/* asteroids: the panel itself goes dark (display off, sleep in) on the panel thread */
+ 			if (!fb->fPanelOff) {
++				if (ast.enabled && !ast.stopped) astFallback("panel off");
+ 				fb->fPanelOff = true;
+ 				sweet_panel_post_power(false);
+ 			}
+@@ -1209,6 +1253,19 @@
+ bool
+ AppleCLCD::gpuGateOpen(uint64_t now)
+ {
++	if (ast.enabled) {
++		if (fPendEpoch != sweet_gpu_epoch()) return false;
++		if (fPendFence == 0 || sweet_gpu_fence_done(fPendFence)) return true;
++        uint64_t cap;
++        nanoseconds_to_absolutetime(sweet_fb_gpuhold_ms() * NSEC_PER_MSEC, &cap);
++        if (!fPendHoldExpired && now - fPendAbs > cap) {
++            fPendHoldExpired = true;
++            fSt.gpuHoldTimeouts++;
++            IOLog("SWEET FB AST: GPU hold expired fence=%u; keeping completed frame\n", fPendFence);
++        }
++		fSt.gpuHolds++;
++		return false; /* gpuhold never authorizes unfinished or voided work. */
++	}
+ 	if (sweet_gpu_fence_passed(fPendFence)) {
+ 		return true;
+ 	}
+@@ -1321,7 +1378,8 @@
+ 	uint64_t dSwW = c.swapWaits - p.swapWaits;
+ 	uint64_t swAvg = dSwW ? sweet_abs_us(c.swapWaitAbs - p.swapWaitAbs) * 100 / dSwW : 0;
+ 	uint64_t lwAvg = dLw ? sweet_abs_us(c.latchWaitAbs - p.latchWaitAbs) * 100 / dLw : 0;
+-	const char *mode = fZc && fZcOK ? (fDirect ? "direct" : "zc") : "copy";
++	const char *mode = ast.enabled ? (ast.frozen ? "ast-frozen" : (ast.stopped ? "ast-copy" : "ast-flip")) :
++	    (fZc && fZcOK ? (fDirect ? "direct" : "zc") : "copy");
+ 	const char *smmu = fSmmuA == -2 ? "untested" : ((fSmmuA == 1 && fSmmuB == 1) ? "bypass" : "translate-or-unknown");
+ 	uint32_t used = 0, total = 0;
+ 	uint64_t pallocs = 0, pfails = 0;
+@@ -1339,7 +1397,7 @@
+ 	    "gpu_holds=%llu gpu_hold_timeouts=%llu empty_swaps=%llu empty_kept=%llu "
+ 	    "scancopy=%d scan_copies=%llu scan_copy_us=%u.%02u scan_copy_us_max=%llu scan_gpu=%d scan_gpu_copies=%llu scan_gpu_fallbacks=%llu "
+ 	    "scan_gpu_submit_fails=%llu scan_gpu_late=%llu scan_gpu_wait_us_max=%llu\n",
+-	    mode, hz, fFlushTicks, fHw ? 1 : 0, fFlip ? 1 : 0, smmu, fZcCleanMode == 0 ? "never" : (fZcCleanMode == 1 ? "always" : (fZcCleanMode == 2 ? "auto" : "tracked")),
++	    mode, hz, fFlushTicks, fHw ? 1 : 0, (fFlip || (ast.enabled && !ast.stopped)) ? 1 : 0, smmu, fZcCleanMode == 0 ? "never" : (fZcCleanMode == 1 ? "always" : (fZcCleanMode == 2 ? "auto" : "tracked")),
+ 	    sweet_abs_us(now) / 1000000, winUS / 1000,
+ 	    swaps, SW_F2(PER_S(dSwaps)), coalesced, SW_F2(PER_S(dCoal)),
+ 	    c.zc, SW_F2(PER_S(dZc)), c.copy, SW_F2(PER_S(dCopy)), c.scanReplaced, SW_F2(PER_S(dRepl)),
+@@ -1445,6 +1503,8 @@
+ 	}
+ 	IOLockLock(fLock);
+ 	fSt.swaps++;
++	fPendHoldExpired = false;
++	fPendEpoch = sweet_gpu_epoch();
+ 	fPendFence = sweet_gpu_fence_snapshot();
+ 	fPendAbs = mach_absolute_time();
+ 	__atomic_store_n(&fSwapNewest, get32(rec, 0x50), __ATOMIC_RELEASE);
+@@ -1801,6 +1861,47 @@
+  * back buffers hold the canvas (fHwStride * fLogicalH, ~11 MB at @3x) and are
+  * spaced a canvas apart: 0x9d400000, +10 MiB, +21 MiB, +32 MiB end < +36 MiB.
+  */
++void
++AppleCLCD::astSetup(void)
++{
++ int requested = 0, quiet = 0;
++ PE_parse_boot_argn("sweetfb_flip_ast", &requested, sizeof(requested));
++ if (requested != 1) return;
++ PE_parse_boot_argn("sweetfb_noconsole", &quiet, sizeof(quiet));
++ if (!quiet || sweet_bootlog_keep() || fPhys != astPA[0] || fWidth != 1080 || fHeight != 2392 || fRowBytes != 4320) {
++  IOLog("SWEET FB AST: setup rejected geometry/console; copy unchanged\n"); return;
++ }
++ IOLog("SWEET FB AST: mapping display blocks including MDP irq status ae01014 (read only)\n");
++ sweet_log_sync();
++ ast.ctl = (volatile uint32_t *)ml_io_map(0xae16000, 0x1000);
++ ast.pipe = (volatile uint32_t *)ml_io_map(0xae05000, 0x1000);
++ ast.intf = (volatile uint32_t *)ml_io_map(0xae36000, 0x1000);
++ ast.mdp = (volatile uint32_t *)ml_io_map(0xae01000, 0x1000);
++ if (!ast.ctl || !ast.pipe || !ast.intf || !ast.mdp) return;
++ if (ast.pipe[5] != astPA[0] || ast.pipe[0] != 0x9580438 || ast.pipe[3] != 0x9580438 ||
++     ast.pipe[2] || ast.pipe[4] || ast.pipe[9] != 4320 || ast.pipe[12] != 0x237ff ||
++     ast.pipe[14] != 0x80000000 || ast.ctl[0] != 0x1000005 || ast.ctl[6] ||
++     ast.intf[0] != 1 || (ast.mdp[5] & (1u << 26))) {
++  IOLog("SWEET FB AST: setup rejected live state/underrun; copy unchanged\n"); return;
++ }
++ uint32_t frame = ast.intf[0xac/4];
++ IOSleep(25);
++ uint32_t delta = ast.intf[0xac/4] - frame;
++ if (delta < 2 || delta > 5) { IOLog("SWEET FB AST: setup rejected frame rate delta=%u\n", delta); return; }
++ ast.va[0] = fPixels;
++ for (unsigned i = 1; i < 3; ++i) {
++  IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(astPA[i], astBytes, kIODirectionInOut);
++  if (!md) return;
++  fBufMap[i] = md->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapWriteCombineCache);
++  md->release();
++  if (!fBufMap[i]) return;
++  ast.va[i] = fBufMap[i]->getVirtualAddress();
++ }
++ ast.enabled = ast.first = true;
++ sweet_fb_panic_hook = astPanic;
++ IOLog("SWEET FB AST: armed address flips; SMMU coverage unverified; frame delta=%u/25ms\n", delta);
++}
++
+ bool
+ AppleCLCD::flipSetup(void)
+ {
+@@ -1978,6 +2079,8 @@
+ void
+ AppleCLCD::blackout(void)
+ {
++	if (ast.enabled && !ast.stopped) astFallback("blackout");
++	if (ast.frozen) return;
+ 	memset((void *)fPixels, 0, (size_t)fRowBytes * fHeight);
+ 	if (fFlip && (fFront != 0 || fHwOn)) {
+ 		scanTo(0);
+@@ -3585,6 +3688,8 @@
+ AppleCLCD::present(const uint8_t *rec)
+ {
+ 	uint32_t mask = get32(rec, 0x104);
++	if (ast.frozen) return;
++	const uint32_t copyEpoch = sweet_gpu_epoch();
+ 
+ 	fCurSwapID = get32(rec, 0x50);
+ 	quietConsole();
+@@ -3622,6 +3727,28 @@
+ 	}
+ 	fDrawIdx = back;
+ 	fDraw = fFlip ? fBufVA[back] : fPixels;
++ if (ast.enabled && !ast.stopped) {
++  back = ast.front == 1 ? 2 : 1;
++  fDrawIdx = back;
++  fDraw = ast.va[back];
++  // Preserve partial damage outside this swap before the row workers start.
++  memcpy((void *)fDraw, (const void *)ast.va[ast.front], astBytes);
++  // The legacy first-use bar clear erases the entire image, including preserved damage.
++  if (fScale && (fPadX > 0 || fPadY > 0)) {
++   uint32_t right = fPadX + (uint64_t)fLogicalW * fScaleXNum / fScaleXDen;
++   uint32_t bottom = fPadY + (uint64_t)fLogicalH * fScaleYNum / fScaleYDen;
++   for (uint32_t y = 0; y < fHeight; ++y) {
++    uintptr_t row = fDraw + (uint64_t)y * fRowBytes;
++    if (y < (uint32_t)fPadY || y >= bottom) memset((void *)row, 0, fRowBytes);
++    else {
++     memset((void *)row, 0, fPadX * 4);
++     if (right < fWidth) memset((void *)(row + right * 4), 0, (fWidth - right) * 4);
++    }
++   }
++  }
++  fBarsMask |= (uint8_t)(1u << back);
++ }
++
+ 	if (fFlip) {
+ 		waitLatch();    /* the buffer we draw into may still be on the panel */
+ 	}
+@@ -3660,6 +3787,11 @@
+ 			    get32(rec, 0x50), layer, id, s ? s->width : 0, s ? s->height : 0,
+ 			    s ? s->pixelFormat : 0, s ? s->bytesPerRow : 0, sx, sy, get32(a, 8),
+ 			    get32(a, 12), dx, dy, w, h);
++		}
++		if (s == fSurface && ast.enabled && !ast.stopped) {
++			astFallback("default framebuffer surface");
++			OSSafeReleaseNULL(s);
++			return;
+ 		}
+ 		if (s == NULL || s == fSurface) {
+ 			OSSafeReleaseNULL(s);
+@@ -3751,6 +3883,7 @@
+ 	if (fHudReady && __atomic_load_n(&sweet_fb_hud, __ATOMIC_RELAXED) != 0 && hudUsable()) {
+ 		hudBlit(fDraw, fHw && fFlip ? fHwStride : fRowBytes);   /* on top of the copied frame, before it is scanned */
+ 	}
++	if (ast.enabled && !ast.stopped && copyEpoch == sweet_gpu_epoch()) astFlip(back);
+ 	if (fFlip) {
+ 		scanTo(back);
+ 	}
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -285,6 +285,7 @@
+ int sweet_console_muted;
+ /* Set by AppleCLCD when it page-flips the panel away from ABL's framebuffer. */
+ void (*sweet_fb_panic_hook)(void);
++void (*sweet_fb_panic_copy_hook)(void);
+ #endif
+ 
+ static inline void
+@@ -312,6 +313,9 @@
+ 		_cnputc(*c, poll);
+ 		c++;
+ 	}
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (panic_active() && sweet_fb_panic_copy_hook) sweet_fb_panic_copy_hook();
++#endif
+ }
+ 
+ /**
+--- a/osfmk/console/video_console.c
++++ b/osfmk/console/video_console.c
+@@ -116,6 +116,18 @@
+  */
+ 
+ struct vc_info vinfo;
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++extern uintptr_t sweet_fb_console_address(uintptr_t boot);
++#endif
++static uintptr_t sweet_console_base(void)
++{
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++ return sweet_fb_console_address(vinfo.v_baseaddr);
++#else
++ return vinfo.v_baseaddr;
++#endif
++}
++
+ 
+ void noroot_icon_test(void);
+ 
+@@ -1395,8 +1407,8 @@
+ 	rowline = vinfo.v_rowscanbytes >> 2;
+ 	rowlongs = vinfo.v_rowbytes >> 2;
+ 
+-	p = (uint32_t*) vinfo.v_baseaddr;
+-	endp = (uint32_t*) vinfo.v_baseaddr;
++	p = (uint32_t*) sweet_console_base();
++	endp = (uint32_t*) sweet_console_base();
+ 
+ 	switch (which) {
+ 	case 0:         /* To end of screen	 */
+@@ -1425,7 +1437,7 @@
+ 
+ 	int lx0, ly0;
+ 	if (vc_logo_origin(&lx0, &ly0)) {
+-		unsigned int py = (unsigned int)((p - (uint32_t *)vinfo.v_baseaddr) / rowlongs);
++		unsigned int py = (unsigned int)((p - (uint32_t *)sweet_console_base()) / rowlongs);
+ 		for (row = p; row < endp; row += rowlongs, py++) {
+ 			for (col = 0; col < rowline; col++) {
+ 				*(row + col) = vc_logo_back(lx0, ly0, (unsigned int)col, py);
+@@ -1491,7 +1503,7 @@
+ 		vc_render_char(ch, vc_rendered_char, 8);
+ 		theChar = (uint32_t*)(vc_rendered_char);
+ 	}
+-	where = (uint32_t*)(vinfo.v_baseaddr +
++	where = (uint32_t*)(sweet_console_base() +
+ 	    (yy * ISO_CHAR_HEIGHT * vinfo.v_rowbytes) +
+ 	    (xx * ISO_CHAR_WIDTH));
+ 
+@@ -1559,7 +1571,7 @@
+ 		vc_render_char(ch, vc_rendered_char, 16);
+ 		theChar = (uint32_t*)(vc_rendered_char);
+ 	}
+-	where = (uint32_t*)(vinfo.v_baseaddr +
++	where = (uint32_t*)(sweet_console_base() +
+ 	    (yy * ISO_CHAR_HEIGHT * vinfo.v_rowbytes) +
+ 	    (xx * ISO_CHAR_WIDTH * 2));
+ 
+@@ -1629,7 +1641,7 @@
+ 	if (attrs_previous) {
+ 		theCharPrevious = NULL;
+ 	}
+-	where = (uint32_t*)(vinfo.v_baseaddr +
++	where = (uint32_t*)(sweet_console_base() +
+ 	    (yy * ISO_CHAR_HEIGHT * vinfo.v_rowbytes) +
+ 	    (xx * ISO_CHAR_WIDTH * 4));
+ 
+@@ -1783,7 +1795,7 @@
+ 		return;
+ 	}
+ 
+-	where = (uint32_t*)(vinfo.v_baseaddr +
++	where = (uint32_t*)(sweet_console_base() +
+ 	    (yy * ISO_CHAR_HEIGHT * vinfo.v_rowbytes) +
+ 	    (xx /** ISO_CHAR_WIDTH*/ * vinfo.v_depth));
+ 	for (line = 0; line < ISO_CHAR_HEIGHT; line++) {
+@@ -1820,7 +1832,7 @@
+ 	rowline = vinfo.v_rowbytes >> 2;
+ 	rowscanline = vinfo.v_rowscanbytes >> 2;
+ 
+-	to = (uint32_t *) vinfo.v_baseaddr + (linelongs * scrreg_bottom)
++	to = (uint32_t *) sweet_console_base() + (linelongs * scrreg_bottom)
+ 	    - (rowline - rowscanline);
+ 	from = to - (linelongs * num);  /* handle multiple line scroll (Michel Pollet) */
+ 
+@@ -1854,7 +1866,7 @@
+ 	rowline = vinfo.v_rowbytes >> 2;
+ 	rowscanline = vinfo.v_rowscanbytes >> 2;
+ 
+-	to = (uint32_t *) vinfo.v_baseaddr + (scrreg_top * linelongs);
++	to = (uint32_t *) sweet_console_base() + (scrreg_top * linelongs);
+ 	from = to + (linelongs * num);  /* handle multiple line scroll (Michel Pollet) */
+ 
+ 	i = (scrreg_bottom - scrreg_top) - num;
+@@ -2042,7 +2054,7 @@
+ 		data = (unsigned int)(uintptr_t)dataPtr;
+ 	}
+ 
+-	dst = (volatile unsigned short *) (vinfo.v_baseaddr +
++	dst = (volatile unsigned short *) (sweet_console_base() +
+ 	    (y * vinfo.v_rowbytes) +
+ 	    (x * 4));
+ 
+@@ -2108,7 +2120,7 @@
+ 	if (backPtr) {
+ 		backPtr += bx;
+ 	}
+-	dst = (volatile unsigned short *) (vinfo.v_baseaddr +
++	dst = (volatile unsigned short *) (sweet_console_base() +
+ 	    (y * vinfo.v_rowbytes) +
+ 	    (x * 2));
+ 
+@@ -2184,7 +2196,7 @@
+ 	if (backPtr) {
+ 		backPtr += bx;
+ 	}
+-	dst = (volatile unsigned int *) (vinfo.v_baseaddr +
++	dst = (volatile unsigned int *) (sweet_console_base() +
+ 	    (y * vinfo.v_rowbytes) +
+ 	    (x * 4));
+ 
+@@ -2259,7 +2271,7 @@
+ 	if (backPtr) {
+ 		backPtr += bx;
+ 	}
+-	dst = (volatile unsigned int *) (vinfo.v_baseaddr +
++	dst = (volatile unsigned int *) (sweet_console_base() +
+ 	    (y * vinfo.v_rowbytes) +
+ 	    (x * 4));
+ 
+@@ -2401,7 +2413,7 @@
+ 
+ 	vc_clean_boot_graphics();
+ 
+-	image_start = (uint32_t *) (vinfo.v_baseaddr + (dst_y * bytes_per_row) + (dst_x * bytes_per_pixel));
++	image_start = (uint32_t *) (sweet_console_base() + (dst_y * bytes_per_row) + (dst_x * bytes_per_pixel));
+ 
+ 	lzss_image_state state = {0, 0, image_width, image_height, bytes_per_row, image_start, clut};
+ 
+@@ -2977,7 +2989,7 @@
+ 	int cw = ISO_CHAR_WIDTH * bl_scale;
+ 
+ 	for (unsigned int py = py0; py < py1 && !bl_stopped; py++) {
+-		uint32_t *line = (uint32_t *)(vinfo.v_baseaddr + py * vinfo.v_rowbytes);
++		uint32_t *line = (uint32_t *)(sweet_console_base() + py * vinfo.v_rowbytes);
+ 		int gy = ((int)py - ty) / bl_scale;
+ 		for (unsigned int px = 0; px < vinfo.v_width; px++) {
+ 			uint32_t v = band ? band : bl_back(x0, y0, logo, px, py);
+@@ -3153,7 +3165,7 @@
+ {
+ 	int verbose = 0, scale = 2;
+ 
+-	if (bl_started || !graphics || vinfo.v_depth != 32 || !vinfo.v_baseaddr || bl_stopped) {
++	if (bl_started || !graphics || vinfo.v_depth != 32 || !sweet_console_base() || bl_stopped) {
+ 		return;
+ 	}
+ 	if (!PE_parse_boot_argn("-v", &verbose, sizeof(verbose))) {

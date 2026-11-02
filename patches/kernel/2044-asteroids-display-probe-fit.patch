@@ -1,0 +1,91 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -76,6 +76,61 @@
+ extern "C" bool sweet_gpu_blit_window(uint64_t pa, uint64_t size);      /* bsd/dev/sweet_a630.c (0240) */
+ extern "C" uint32_t sweet_gpu_blit(uint64_t src_pa, uint32_t src_pitch, uint64_t dst_pa, uint32_t dst_pitch, uint32_t w, uint32_t h);
+ extern "C" bool sweet_gpu_fence_passed(uint32_t fence);                    /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb_hud (patch 0213) */
++
++/* 2044: display-only survey. Reserved RAM is not proof of a display IOVA mapping.
++ * Do not arm a flip until the bootloader's complete fetch mapping is established.
++ * Even read-only MMIO can abort under Gunyah: persist each block boundary first. */
++extern "C" void sweet_log_sync(void);
++static void
++sweet_ast_display_probe(void)
++{
++	int level = 0;
++	PE_parse_boot_argn("sweetfb_flip_ast", &level, sizeof(level));
++	if (level == 0) {
++		return;
++	}
++	if (level != 1 && level != 2) {
++		IOLog("SWEET FB AST: invalid probe level; copy unchanged\n");
++		return;
++	}
++	const uint32_t blocks[] = { 0x0ae16000, 0x0ae05000, 0x0ae36000 };
++	const char *names[] = { "CTL0", "SSPP0", "INTF1" };
++	/* DT offsets are relative to MDSS 0xae00000, not MDP 0xae01000. */
++	const uint32_t regs[3][8] = {
++		{ 0x00, 0x14, 0x18, 0x40, 0xe8, 0xf4, 0xfc, 0x110 },
++		{ 0x00, 0x08, 0x0c, 0x10, 0x14, 0x24, 0x30, 0x38 },
++		{ 0x00, 0x04, 0x08, 0x0c, 0x1c, 0x24, 0xa8, 0xb0 },
++	};
++	for (unsigned b = 0; b < 3; b++) {
++		IOLog("SWEET FB AST: before %s first access pa=0x%x (read only)\n", names[b], blocks[b]);
++		sweet_log_sync();
++		volatile const uint32_t *r = (volatile const uint32_t *)ml_io_map(blocks[b], 0x1000);
++		if (r == NULL) {
++			IOLog("SWEET FB AST: map failed; copy unchanged\n");
++			sweet_log_sync();
++			return;
++		}
++		for (unsigned i = 0; i < 8; i++) {
++			uint32_t value = r[regs[b][i] / 4];
++			IOLog("SWEET FB AST: %s +0x%x = 0x%x\n", names[b], regs[b][i], value);
++		}
++		if (b == 2) {
++			/* Counters must already be enabled by firmware. Never enable them here. */
++			uint32_t enabled = r[0xa8 / 4];
++			uint32_t frames = r[0xac / 4], line = r[0xb0 / 4];
++			uint64_t start = mach_absolute_time(), ns;
++			IOSleep(100);
++			uint32_t endFrames = r[0xac / 4], endLine = r[0xb0 / 4];
++			absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);
++			IOLog("SWEET FB AST: timing count_en=0x%x frames=%u->%u line=%u->%u elapsed_us=%llu\n",
++			    enabled, frames, endFrames, line, endLine, ns / 1000);
++		}
++		sweet_log_sync();
++	}
++	IOLog("SWEET FB AST: %s; copy unchanged (splash SMMU coverage unverified)\n",
++	    level == 2 ? "flip refused" : "probe complete");
++	sweet_log_sync();
++}
+ 
+ /*
+  * 0228: per-frame trace for frame pacing (sysctl kern.sweet_fb_trace). One record per swap id (ring of 128, index id & 127):
+@@ -649,6 +704,18 @@
+ 		fScaleYNum = fHeight;
+ 		fScaleYDen = fLogicalH;
+ 	}
++	/* The 414x917 @2x canvas misses the panel aspect by less than one pixel.
++	 * Fit's floor leaves an unwritten right column. Snap near-exact fits to
++	 * both edges, preserving explicit scale choices and genuinely letterboxed sizes. */
++	if (sweet_board_asteroids() && !scaleGiven && fScale == 1 &&
++	    fWidth - (uint64_t)fLogicalW * fScaleXNum / fScaleXDen <= 1 &&
++	    fHeight - (uint64_t)fLogicalH * fScaleYNum / fScaleYDen <= 1) {
++		fScale = 2;
++		fScaleXNum = fWidth;
++		fScaleXDen = fLogicalW;
++		fScaleYNum = fHeight;
++		fScaleYDen = fLogicalH;
++	}
+ 	if (fScale != 0) {
+ 		fPadX = (int32_t)(fWidth - (uint64_t)fLogicalW * fScaleXNum / fScaleXDen) / 2;
+ 		fPadY = (int32_t)(fHeight - (uint64_t)fLogicalH * fScaleYNum / fScaleYDen) / 2;
+@@ -845,6 +912,7 @@
+ 			IOLog("SWEET FB: backlight fade off (sweetfb_blfade=0): black in one step\n");
+ 		}
+ 	} else if (sweet_board_asteroids()) {
++		sweet_ast_display_probe();
+ 		/*
+ 		 * Nothing Phone (3a): the AMOLED panel takes DCS commands through DSI0 (bsd/dev/sweet_dsi_asteroids.c, after
+ 		 * rootstockos T37). sweetpanel=1 (default): display off/on follows iOS's power state; 2: also the

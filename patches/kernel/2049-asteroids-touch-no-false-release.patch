@@ -1,0 +1,231 @@
+asteroids touch: no false release mid-swipe, latch the IRQ edge
+
+A release with no UP record (all-FF buffer, frame omitting a contact, 30 ms of
+errors) cut a swipe short, and the next down + real lift became a tap. Beryllium
+fixed this in 0113. Also latch falling IRQ edges in the TLMM status bit and check
+every 4 ms instead of 10, so a flick's first sample no longer comes late.
+Boot args: sweettouchhold=MS (0 = off), sweettouchidle_ms=N, sweettouchlog=1.
+
+--- a/bsd/dev/sweet_touch_asteroids.c
++++ b/bsd/dev/sweet_touch_asteroids.c
+@@ -64,6 +64,11 @@
+ /* TLMM */
+ #define GPIO_CFG(n)     ((uint32_t)(n) * 0x1000u)
+ #define GPIO_IO(n)      (GPIO_CFG(n) + 4u)
++#define GPIO_INTR_CFG(n) (GPIO_CFG(n) + 8u)
++#define GPIO_INTR_STATUS(n) (GPIO_CFG(n) + 0xcu)
++/* msm pinctrl layout: RAW_STATUS_EN, INTR_DECT_CTL 2 = falling edge, POL; INTR_ENABLE stays 0, no GIC */
++#define INTR_CFG_MASK   0x1fu
++#define INTR_CFG_FALLING ((1u << 4) | (2u << 2) | (1u << 1))
+ #define PIN_IRQ         19u
+ #define PIN_RESET       20u
+ 
+@@ -216,6 +221,11 @@
+ 	int panel_w, panel_h;
+ 	uint32_t active;
+ 	int x[FTS_MAX], y[FTS_MAX];
++	bool latch;                     /* the TLMM keeps falling edges of the IRQ pin */
++	uint64_t vanish_at;             /* mach time a contact first went missing with no UP record; 0 = none */
++	uint64_t hold_abs, bad_abs;
++	uint32_t reads, torn, held, resumed, log;
++	char why;                       /* sweettouchlog: 'e' edge, 'l' IRQ low, 'a' while touched, 'p' periodic */
+ } at;
+ static int at_sleep_chan;
+ 
+@@ -257,7 +267,10 @@
+ 
+ /* the framebuffer's threads and this poller go to the big cores (osfmk/kern/sched_prim.c) */
+ extern void sweet_amp_mark_big(thread_t thread);
+-static unsigned at_active_us = 2000;    /* poll period while a finger is down (sweettouch_us), 10 ms otherwise */
++static unsigned at_active_us = 2000;    /* poll period while a finger is down (sweettouch_us), at_idle_ms otherwise */
++static unsigned at_idle_ms = 4;         /* IRQ check while idle (sweettouchidle_ms) */
++static unsigned at_hold_ms = 30;        /* a contact missing with no UP record is kept this long (sweettouchhold, 0 = off) */
++static unsigned at_bad_ms = 150;        /* unreadable reports in a row before a forced release */
+ 
+ static bool
+ at_wait_bits(vm_offset_t base, int32_t off, uint32_t mask, uint32_t want, unsigned us)
+@@ -768,6 +781,48 @@
+ 		}
+ 	}
+ 	at.active = mask;
++}
++
++/*
++ * A false release mid-swipe ends the pan and the next down + real lift is a short new touch: iOS takes it as a tap on
++ * whatever is under the finger (the owner's "I swipe and it opens an app"). Same failure as beryllium's 0113, which this
++ * driver never got. We read while touched without waiting for the IRQ (Linux reads only on it), so a read can land on a
++ * buffer being rewritten: all FF, or a valid frame that omits a contact. Release at once only on an UP record; a contact
++ * that merely vanished is kept for at_hold_ms, which covers two report frames at 120 Hz and costs an unannounced real
++ * lift that much latency.
++ */
++static uint32_t
++fts_hold_vanished(uint32_t mask, uint32_t released, int *x, int *y)
++{
++	uint32_t gone = at.active & ~mask & ~released;
++	if (!gone) {
++		if (at.vanish_at && (at.active & mask)) {
++			if (at.resumed++ < 50u) {
++				uint64_t ns;
++				absolutetime_to_nanoseconds(mach_absolute_time() - at.vanish_at, &ns);
++				printf("SWEET TOUCH: contact back after %llu ms with no UP record, kept (%u torn so far)\n",
++				    ns / NSEC_PER_MSEC, at.torn);
++			}
++		}
++		at.vanish_at = 0;
++		return mask;
++	}
++	uint64_t now = mach_absolute_time();
++	if (!at.vanish_at) {
++		at.vanish_at = now;
++	}
++	if (now - at.vanish_at >= at.hold_abs) {
++		at.vanish_at = 0;
++		return mask;
++	}
++	++at.held;
++	for (unsigned id = 0; id < FTS_MAX; ++id) {
++		if (gone & (1u << id)) {
++			x[id] = at.x[id];
++			y[id] = at.y[id];
++		}
++	}
++	return mask | gone;
+ }
+ 
+ /*
+@@ -782,14 +837,17 @@
+ {
+ 	uint8_t b[FTS_REPORT_LEN];
+ 	int x[FTS_MAX] = {0}, y[FTS_MAX] = {0};
+-	uint32_t mask = 0;
++	uint32_t mask = 0, released = 0;
+ 	int err = fts_read(0x01, b, sizeof(b));
++	++at.reads;
+ 	if (err) {
+ 		return err;
+ 	}
+-	if (b[1] == 0xff && b[2] == 0xff && b[3] == 0xff && b[4] == 0xff) {
+-		fts_report_mask(0, at.x, at.y);
+-		return 0;
++	/* All FF, or all zero: nothing in this buffer. A firmware reset that really lost a contact ends in at_bad_ms. */
++	if ((b[1] == 0xff && b[2] == 0xff && b[3] == 0xff && b[4] == 0xff) ||
++	    (b[1] == 0 && b[2] == 0 && b[3] == 0 && b[4] == 0 && b[5] == 0)) {
++		++at.torn;
++		return EAGAIN;
+ 	}
+ 	unsigned type = b[1] >> 4, num = b[1] & 15u;
+ 	if ((type != 0 && type != 2) || num > FTS_MAX) {
+@@ -817,12 +875,20 @@
+ 			return EIO;
+ 		}
+ 		if (flag == FTS_UP) {
++			released |= 1u << id;
+ 			continue;
+ 		}
+ 		mask |= 1u << id;
+ 		x[id] = (int)(px < (unsigned)at.panel_w ? px : (unsigned)at.panel_w - 1u);
+ 		y[id] = (int)(py < (unsigned)at.panel_h ? py : (unsigned)at.panel_h - 1u);
+ 	}
++	mask = fts_hold_vanished(mask, released & ~mask, x, y);
++	if (at.log) {
++		uint64_t ns;
++		absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++		printf("TT %llu %c m=%x a=%x %d,%d | %02x %02x %02x %02x %02x %02x\n", ns / NSEC_PER_MSEC, at.why, mask, at.active,
++		    x[0], y[0], b[1], b[2], b[3], b[4], b[5], b[6]);
++	}
+ 	fts_report_mask(mask, x, y);
+ 	return 0;
+ }
+@@ -835,6 +901,22 @@
+ 	at_wr(at.tlmm, (int32_t)GPIO_CFG(pin), cfg);
+ }
+ 
++/*
++ * Keep falling edges of the IRQ pin in the TLMM status bit, not routed to the GIC (as beryllium, 0101). We only sample the
++ * pin level every at_idle_ms, so a low pulse between two samples was seen only by the 100 ms periodic read: a flick's first
++ * sample then came near its end, and a down + small move + up is a tap.
++ */
++static void
++at_irq_latch(void)
++{
++	uint32_t cfg = (at_rd(at.tlmm, (int32_t)GPIO_INTR_CFG(PIN_IRQ)) & ~INTR_CFG_MASK) | INTR_CFG_FALLING;
++	at_wr(at.tlmm, (int32_t)GPIO_INTR_CFG(PIN_IRQ), cfg);
++	at_wr(at.tlmm, (int32_t)GPIO_INTR_STATUS(PIN_IRQ), 0);
++	at.latch = (at_rd(at.tlmm, (int32_t)GPIO_INTR_CFG(PIN_IRQ)) & INTR_CFG_MASK) == INTR_CFG_FALLING;
++	printf("SWEET TOUCH: IRQ edge latch %s, cfg=%#x, idle %u ms, active %u us, hold %u ms\n", at.latch ? "on" : "off", cfg,
++	    at_idle_ms, at_active_us, at_hold_ms);
++}
++
+ static int
+ at_power(void)
+ {
+@@ -991,28 +1073,44 @@
+ 	}
+ 	printf("SWEET TOUCH: polling %dx%d, IRQ GPIO %u, SPI div %u\n",
+ 	    at.panel_w, at.panel_h, PIN_IRQ, at.div);
+-	unsigned errors = 0, ticks = 0;
++	at_irq_latch();
++	unsigned errors = 0, ticks = 0, edge_only = 0, period = 100u / at_idle_ms;
++	uint64_t bad_since = 0;
+ 	while (!at.dead) {
+-		/* Read on IRQ low (falling edge in DT), while touched, every 100 ms. */
+-		if (!(at_rd(at.tlmm, (int32_t)GPIO_IO(PIN_IRQ)) & 1u) || at.active ||
+-		    (++ticks % 10u) == 0) {
++		/* Read on IRQ low or a latched edge (falling in DT), while touched, every 100 ms. */
++		bool low = !(at_rd(at.tlmm, (int32_t)GPIO_IO(PIN_IRQ)) & 1u), edge = false;
++		if (at.latch && (at_rd(at.tlmm, (int32_t)GPIO_INTR_STATUS(PIN_IRQ)) & 1u)) {
++			at_wr(at.tlmm, (int32_t)GPIO_INTR_STATUS(PIN_IRQ), 0);
++			edge = true;
++		}
++		if (edge && !low && !at.active && edge_only++ < 20u) {
++			printf("SWEET TOUCH: IRQ pulse seen only by the latch (%u)\n", edge_only);
++		}
++		if (low || edge || at.active || (++ticks % period) == 0) {
++			at.why = at.active ? 'a' : edge ? 'e' : low ? 'l' : 'p';
+ 			err = fts_poll();
+ 			if (err) {
+-				if ((errors++ % 100u) == 0) {
++				uint64_t now = mach_absolute_time();
++				if (!bad_since) {
++					bad_since = now;
++				}
++				if (err != EAGAIN && (errors++ % 100u) == 0) {
+ 					printf("SWEET TOUCH: report err=%d gpi=%#x\n", err, at.codes);
+ 				}
+-				if (errors == 10) {
++				if (at.active && now - bad_since >= at.bad_abs) {
++					printf("SWEET TOUCH: no readable report for %u ms while touched; releasing\n", at_bad_ms);
+ 					fts_report_mask(0, at.x, at.y);
+ 				}
+ 			} else {
+ 				errors = 0;
++				bad_since = 0;
+ 			}
+ 		}
+ 		/* HackiOS 8c6ea92: polling every 10 ms while touched added up to 10 ms to every move; 2 ms by default now */
+ 		if (at.active || !(at_rd(at.tlmm, (int32_t)GPIO_IO(PIN_IRQ)) & 1u)) {
+ 			at_wait_us(at_active_us);
+ 		} else {
+-			at_wait(10);
++			at_wait(at_idle_ms);
+ 		}
+ 	}
+ 	fts_report_mask(0, at.x, at.y);
+@@ -1049,6 +1147,17 @@
+ 	if (at_active_us < 500 || at_active_us > 10000) {
+ 		at_active_us = 2000;
+ 	}
++	(void)PE_parse_boot_argn("sweettouchidle_ms", &at_idle_ms, sizeof(at_idle_ms));
++	if (at_idle_ms < 1 || at_idle_ms > 10) {
++		at_idle_ms = 4;
++	}
++	(void)PE_parse_boot_argn("sweettouchhold", &at_hold_ms, sizeof(at_hold_ms));
++	if (at_hold_ms > 100) {
++		at_hold_ms = 30;
++	}
++	(void)PE_parse_boot_argn("sweettouchlog", &at.log, sizeof(at.log));
++	nanoseconds_to_absolutetime((uint64_t)at_hold_ms * NSEC_PER_MSEC, &at.hold_abs);
++	nanoseconds_to_absolutetime((uint64_t)at_bad_ms * NSEC_PER_MSEC, &at.bad_abs);
+ 	kern_return_t kr = kernel_thread_start(at_thread, NULL, &thread);
+ 	if (kr == KERN_SUCCESS) {
+ 		sweet_amp_mark_big(thread);

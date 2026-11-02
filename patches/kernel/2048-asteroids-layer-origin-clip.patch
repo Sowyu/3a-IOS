@@ -1,0 +1,89 @@
+--- a/iokit/Kernel/arm/SweetFbScale.h
++++ b/iokit/Kernel/arm/SweetFbScale.h
+@@ -6,6 +6,7 @@
+  */
+ #ifndef SWEET_FB_SCALE_H
+ #define SWEET_FB_SCALE_H
++#include <stdbool.h>
+ #include <stdint.h>
+ #if defined(__arm64__) || defined(__aarch64__)
+ #include <arm_neon.h>
+@@ -25,11 +26,44 @@
+ 	int32_t rowMin, rowMax; /* readable surface rows, rowMax > rowMin */
+ };
+ 
++/*
++ * Clip a layer's negative origins, each axis on its own, keeping source and destination pixels paired. w and h are the rectangle
++ * size; false when nothing is left. Sizes that do not fit int32 after the move come out empty.
++ */
++static inline bool
++sfs_clip_axis(int32_t *src, int32_t *dst, int32_t *size)
++{
++	int64_t s = *src, d = *dst, n = *size;
++	if (d < 0) {
++		s -= d;
++		n += d;
++		d = 0;
++	}
++	if (s < 0) {
++		d -= s;
++		n += s;
++		s = 0;
++	}
++	if (n <= 0 || s > INT32_MAX || d > INT32_MAX) {
++		return false;
++	}
++	*src = (int32_t)s;
++	*dst = (int32_t)d;
++	*size = (int32_t)n;
++	return true;
++}
++
++static inline bool
++sfs_clip_origin(int32_t *sx, int32_t *sy, int32_t *dx, int32_t *dy, int32_t *w, int32_t *h)
++{
++	return sfs_clip_axis(sx, dx, w) && sfs_clip_axis(sy, dy, h);
++}
++
+ /* Source position of a panel pixel centre, Q16, before clamping. */
+ static inline int64_t
+ sfs_pos(int32_t p, int32_t pad, uint32_t num, uint32_t den, int32_t off)
+ {
+-	return (int64_t)(2 * (p - pad) + 1) * den * 65536 / (2 * (int64_t)num) - 32768 + ((int64_t)off << 16);
++	return (int64_t)(2 * (p - pad) + 1) * den * 65536 / (2 * (int64_t)num) - 32768 + (int64_t)off * 65536;
+ }
+ 
+ /* Clamp to min..max; past max use the last pair with the largest weight, so index+1 stays readable. */
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -2481,12 +2481,8 @@
+ 		h = (int32_t)s->height;
+ 	}
+ 	if (text == NULL) {
+-		if (sx < 0 || sy < 0) {
+-			sx = sy = 0;
+-		}
+-		if (dx < 0 || dy < 0) {
+-			dx = dy = 0;
+-		}
++		/* 2048: a clipped layer has a non-zero origin left, or a negative one if it is empty: neither scans out below. */
++		(void)sfs_clip_origin(&sx, &sy, &dx, &dy, &w, &h);
+ 		if (!fZcOK) {
+ 			why = 2;
+ 			text = "MDP SMMU streams not verified as bypass";
+@@ -3928,11 +3924,10 @@
+ 			w = (int32_t)s->width;
+ 			h = (int32_t)s->height;
+ 		}
+-		if (sx < 0 || sy < 0) {
+-			sx = sy = 0;
+-		}
+-		if (dx < 0 || dy < 0) {
+-			dx = dy = 0;
++		/* 2048: a negative origin moves the other rectangle with it, on that axis only. */
++		if (!sfs_clip_origin(&sx, &sy, &dx, &dy, &w, &h)) {
++			s->release();
++			continue;
+ 		}
+ 		if (fHw) {
+ 			presentCanvas(s, src, sx, sy, dx, dy, w, h);
