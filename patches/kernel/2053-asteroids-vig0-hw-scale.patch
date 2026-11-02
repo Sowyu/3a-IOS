@@ -1,0 +1,232 @@
+2053: VIG0 QSEED3 hardware upscale, CPU copies the canvas 1:1 (sweetfb_ast_hw=1, default off). UNTESTED ON A PHONE, never compiled in a kernel. Higher risk: first write to scaler registers on this DPU.
+What: scans an 840x1860 canvas through bilinear QSEED3 to 1080x2392. Blur and glass are rendered exactly as before. Fallback and panic restore the boot pipe registers first.
+Apply: git apply after 2052, then rebuild the kernel. Host check: plans/speed/test/qseed-check.c. Recovery: remove the boot-arg and RAM boot again.
+
+diff --git a/iokit/Kernel/arm/SweetFbScale.h b/iokit/Kernel/arm/SweetFbScale.h
+index 129ea4c..bb8b6f7 100644
+--- a/iokit/Kernel/arm/SweetFbScale.h
++++ b/iokit/Kernel/arm/SweetFbScale.h
+@@ -28,6 +28,30 @@ sfs_tick_next(uint64_t deadline, uint32_t period, uint64_t now, uint32_t min_wai
+ 	return deadline;
+ }
+ 
++/*
++ * 2053: QSEED3 values for a bilinear upscale, as Linux _dpu_plane_setup_scaler3 and dpu_hw_setup_scaler3 with version > 0x1002:
++ * enable, Y/RGB filter 3 = bilinear, non-DX, blend_cfg, and bilinear alpha when the format has alpha. No coefficient LUT is used.
++ */
++struct sfs_qseed {
++	uint32_t src, dst, stepx, stepy, preload, op;
++};
++
++static inline bool
++sfs_qseed_plan(uint32_t sw, uint32_t sh, uint32_t dw, uint32_t dh, bool alpha, struct sfs_qseed *q)
++{
++	if (sw == 0 || sh == 0 || dw == 0 || dh == 0 || sw > 0xffff || sh > 0xffff || dw > 0xffff || dh > 0xffff ||
++	    sw >= dw * 4 || sh >= dh * 4) {
++		return false;
++	}
++	q->src = (sh << 16) | sw;
++	q->dst = (dh << 16) | dw;
++	q->stepx = (uint32_t)(((uint64_t)sw << 21) / dw) & 0xffffffu;
++	q->stepy = (uint32_t)(((uint64_t)sh << 21) / dh) & 0xffffffu;
++	q->preload = 4u | (3u << 8) | (4u << 16) | (3u << 24);
++	q->op = (1u << 0) | (3u << 16) | (1u << 14) | (1u << 31) | (alpha ? (1u << 10) | (1u << 29) : 0);
++	return true;
++}
++
+ struct sfs_job {
+ 	const uint8_t *base;    /* surface row 0 */
+ 	uint8_t *draw;          /* panel row 0 */
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 0006270..c95236e 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -92,6 +92,7 @@ static struct {
+  uint32_t front;
+  uint64_t done, latched, latchNS, latchMinNS, latchMaxNS, repeated, epochDrops;
+  uint64_t copyNS, copyMaxNS, copies, logTime;
++ bool hw, hwOn; uint32_t hwStride, hwCanvas, hwSaved[6], hwSavedPe[9], hwSavedOp, hwW, hwH, hwVer; /* 2053 */
+  uint64_t swapFlipNS, swapFlips, swapFlipMaxNS, handlerMaxNS, tickGapMaxNS, lastTick, preserves; /* 2052; maxima per log line */
+ } ast;
+ static const uint32_t astPA[3] = {0xe3940000, 0xe431c000, 0xe4cf8000};
+@@ -113,6 +114,48 @@ static bool astWait(uint32_t frame)
+  } while (ns < 25000000); // Three 120 Hz frames; bounded even if counters stop.
+  return false;
+ }
++/* 2053: pipe register indexes as in astSetup; QSEED3 at pipe + 0xa00. Nothing latches before the CTL flush in astAddress. */
++#define AST_Q(reg) (ast.pipe[(0xa00u + (reg)) / 4])
++static void astHwProgram(void)
++{
++ struct sfs_qseed q;
++ if (!sfs_qseed_plan(ast.hwW, ast.hwH, 1080, 2392, (ast.pipe[12] >> 8) & 1, &q)) return;
++ for (unsigned i = 0; i < 5; ++i) ast.hwSaved[i] = ast.pipe[i];
++ ast.hwSaved[5] = ast.pipe[9];
++ ast.hwSavedOp = AST_Q(0x04);
++ for (unsigned i = 0; i < 9; ++i) ast.hwSavedPe[i] = ast.pipe[0x100/4 + (i / 3) * 4 + i % 3];
++ ast.pipe[0] = q.src;
++ ast.pipe[1] = q.src;
++ ast.pipe[9] = ast.hwStride;
++ /* PE: no extension, each component fetches the source size (dpu_hw_sspp_setup_pe_config) */
++ ast.pipe[0x100/4] = ast.pipe[0x104/4] = 0;
++ ast.pipe[0x108/4] = q.src;
++ ast.pipe[0x110/4] = ast.pipe[0x114/4] = 0;
++ ast.pipe[0x118/4] = q.src;
++ ast.pipe[0x120/4] = ast.pipe[0x124/4] = 0;
++ ast.pipe[0x128/4] = q.src;
++ AST_Q(0x90) = AST_Q(0x94) = AST_Q(0x98) = AST_Q(0x9c) = 0;
++ AST_Q(0x10) = q.stepx;
++ AST_Q(0x14) = q.stepy;
++ AST_Q(0x18) = q.stepx;
++ AST_Q(0x1c) = q.stepy;
++ AST_Q(0x20) = q.preload;
++ AST_Q(0x40) = q.src;
++ AST_Q(0x44) = q.src;
++ AST_Q(0x48) = q.dst;
++ AST_Q(0x04) = q.op;
++ ast.hwOn = true;
++}
++/* No locks or logging: the panic path calls this. astAddress flushes it together with the boot address. */
++static void astHwRestore(void)
++{
++ if (!ast.hwOn) return;
++ AST_Q(0x04) = ast.hwSavedOp;
++ for (unsigned i = 0; i < 5; ++i) ast.pipe[i] = ast.hwSaved[i];
++ ast.pipe[9] = ast.hwSaved[5];
++ for (unsigned i = 0; i < 9; ++i) ast.pipe[0x100/4 + (i / 3) * 4 + i % 3] = ast.hwSavedPe[i];
++ ast.hwOn = false;
++}
+ static bool astAddress(unsigned idx)
+ {
+  uint32_t frame;
+@@ -139,7 +182,8 @@ static void astSeedBoot(void)
+ {
+  // Boot is idle after the first confirmed flip. Never resurrect the shim image.
+  if (ast.front != 0) {
+-  memcpy((void *)ast.va[0], (const void *)ast.va[ast.front], astBytes);
++  if (ast.hw) memset((void *)ast.va[0], 0, astBytes); // A canvas does not fit the boot layout: black until the next copy.
++  else memcpy((void *)ast.va[0], (const void *)ast.va[ast.front], astBytes);
+   __asm__ volatile("dsb sy" ::: "memory");
+  }
+ }
+@@ -149,6 +193,7 @@ static void astPanic(void)
+  ast.stopped = true;
+  astSeedBoot();
+  sweet_fb_panic_copy_hook = astPanicCopy;
++ astHwRestore();
+  if (ast.enabled && !astAddress(0)) ast.frozen = true;
+  else __atomic_store_n(&ast.front, 0, __ATOMIC_RELEASE);
+ }
+@@ -156,6 +201,7 @@ static void astFallback(const char *reason)
+ {
+  ast.stopped = true;
+  astSeedBoot();
++ astHwRestore();
+  bool restored = astAddress(0);
+  ast.frozen = !restored;
+  if (restored) __atomic_store_n(&ast.front, 0, __ATOMIC_RELEASE);
+@@ -176,6 +222,11 @@ static void astFlip(unsigned back)
+  }
+  uint64_t latchStart = mach_absolute_time(), latchNS;
+  ast.done++;
++ if (ast.hw && !ast.hwOn) {
++  astHwProgram();
++  IOLog("SWEET FB AST: hw scale programmed %ux%u stride %u qseed ver %x op %x\n", ast.hwW, ast.hwH, ast.hwStride, ast.hwVer, AST_Q(0x04));
++  sweet_log_sync();
++ }
+  if (!astAddress(back)) { astFallback("latch timeout"); return; }
+  uint32_t frame = ast.intf[0xac/4], line = ast.intf[0xb0/4];
+  // Observe a full fetch before reuse, without clearing firmware's interrupt status.
+@@ -1984,6 +2035,24 @@ AppleCLCD::astSetup(void)
+  ast.enabled = ast.first = true;
+  sweet_fb_panic_hook = astPanic;
+  IOLog("SWEET FB AST: armed address flips; SMMU coverage unverified; frame delta=%u/25ms\n", delta);
++ int hw = 0;
++ PE_parse_boot_argn("sweetfb_ast_hw", &hw, sizeof(hw));
++ if (hw == 1) {
++  // The canvas must fill the panel with no bars, and nothing else may draw into the back buffer at panel stride.
++  ast.hwVer = AST_Q(0x00);
++  if (fScale == 0 || fPadX != 0 || fPadY != 0 || fHudReady || ast.hwVer == 0 || ast.hwVer == 0xffffffffu ||
++      fLogicalW >= fWidth || fLogicalH >= fHeight) {
++   IOLog("SWEET FB AST: hw scale refused (scale %u pad %d,%d hud %u ver %x); CPU scaling\n", fScale, fPadX, fPadY, fHudReady ? 1 : 0, ast.hwVer);
++  } else {
++   ast.hwW = fLogicalW;
++   ast.hwH = fLogicalH;
++   ast.hwStride = (fLogicalW * 4 + 63) & ~63u;
++   ast.hwCanvas = ast.hwStride * fLogicalH;
++   ast.hw = true;
++   IOLog("SWEET FB AST: hw scale armed (sweetfb_ast_hw) qseed ver %x\n", ast.hwVer);
++  }
++  sweet_log_sync();
++ }
+ }
+ 
+ bool
+@@ -3583,6 +3652,7 @@ struct sweet_rows_job {
+ 	uint32_t scaleYNum, scaleYDen;
+ 	int32_t sy, dy, h, px0, n;
+ 	const struct sfs_job *filter;   /* 2047: set = bilinear, the fields above are unused */
++	bool plain;                     /* 2053: 1:1 rows; base is the source pixel of (px0, dy), draw the canvas */
+ 	uint32_t *lines;
+ };
+ 
+@@ -3605,6 +3675,13 @@ sweet_rows_draw(const struct sweet_rows_job *j, int32_t from, int32_t to, unsign
+ 		sfs_draw(j->filter, from, to, j->lines + (size_t)index * 2 * j->filter->n);
+ 		return;
+ 	}
++	if (j->plain) {
++		for (int32_t py = from; py < to; py++) {
++			memcpy((void *)(j->draw + (uint64_t)py * j->rowBytes + (uint64_t)j->px0 * 4),
++			    j->base + (uint64_t)(py - j->dy) * j->bpr, (size_t)j->n * 4);
++		}
++		return;
++	}
+ 	for (int32_t py = from; py < to; py++) {
+ 		int32_t ly = (int32_t)((uint64_t)(py - j->padY) * j->scaleYDen / j->scaleYNum) - j->dy;
+ 		ly = ly < 0 ? 0 : (ly >= j->h ? j->h - 1 : ly);
+@@ -3725,6 +3802,14 @@ AppleCLCD::presentScaled(SweetSurface *s, uintptr_t src, int32_t sx, int32_t sy,
+ 	if (last + s->wrapDelta > s->memory->getLength()) {      /* wrapDelta: client memory (topaz 0132) */
+ 		return;
+ 	}
++	if (ast.hw && !ast.stopped) {
++		struct sweet_rows_job job = {
++			.base = (const uint8_t *)(src + s->offset) + (uint64_t)sy * s->bytesPerRow + (uint64_t)sx * 4, .draw = fDraw,
++			.bpr = s->bytesPerRow, .rowBytes = ast.hwStride, .dy = dy, .px0 = dx, .n = w, .plain = true,
++		};
++		sweet_rows_run(&job, dy, dy + h);
++		return;
++	}
+ 	if (!(fBarsMask & (1u << fDrawIdx)) && (fPadX > 0 || fPadY > 0)) {
+ 		for (uint32_t y = 0; y < fHeight; y++) {
+ 			memset((void *)(fDraw + (uint64_t)y * fRowBytes), 0, (size_t)fWidth * 4);
+@@ -3874,7 +3959,9 @@ AppleCLCD::present(const uint8_t *rec, uint32_t copyEpoch)
+   // write-combined memory is slow, so skip it when a layer that will draw covers the whole canvas.
+   if (!astCovered(rec, mask)) {
+    ast.preserves++;
+-   memcpy((void *)fDraw, (const void *)ast.va[ast.front], astBytes);
++   // 2053: before the first canvas the front is in the boot layout, so a partial first frame starts from black.
++   if (ast.hw && !ast.hwOn) memset((void *)fDraw, 0, ast.hwCanvas);
++   else memcpy((void *)fDraw, (const void *)ast.va[ast.front], ast.hw ? ast.hwCanvas : astBytes);
+   }
+   // The legacy first-use bar clear erases the entire image, including preserved damage.
+   if (fScale && (fPadX > 0 || fPadY > 0)) {
+@@ -3931,6 +4018,11 @@ AppleCLCD::present(const uint8_t *rec, uint32_t copyEpoch)
+ 			    s ? s->pixelFormat : 0, s ? s->bytesPerRow : 0, sx, sy, get32(a, 8),
+ 			    get32(a, 12), dx, dy, w, h);
+ 		}
++		if (s == fSurface && ast.hw && !ast.stopped) {
++			astFallback("default surface with hw scale");
++			OSSafeReleaseNULL(s);
++			return;
++		}
+ 		if (s == NULL || (s == fSurface && !(ast.enabled && !ast.stopped))) {
+ 			OSSafeReleaseNULL(s);
+ 			continue;
+@@ -4016,7 +4108,7 @@ AppleCLCD::present(const uint8_t *rec, uint32_t copyEpoch)
+ 		}
+ 		s->release();
+ 	}
+-	if (fHudReady && __atomic_load_n(&sweet_fb_hud, __ATOMIC_RELAXED) != 0 && hudUsable()) {
++	if (!ast.hw && fHudReady && __atomic_load_n(&sweet_fb_hud, __ATOMIC_RELAXED) != 0 && hudUsable()) {
+ 		hudBlit(fDraw, fHw && fFlip ? fHwStride : fRowBytes);   /* on top of the copied frame, before it is scanned */
+ 	}
+ 	if (ast.enabled) {

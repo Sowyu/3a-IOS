@@ -1,0 +1,32 @@
+asteroids A810: tell userland how many recoveries have happened
+
+UNTESTED, not compiled. A recovery makes voided fences read as passed and the wait succeed (2015), so Chlorophyll publishes staging
+whose copy never ran (recheck-audit finding 2). INFO.flags gains capability bit 0x20 and a recovery count in bits 16-31. The struct and
+ABI minor stay the same, so no libdrm rebuild; old clients mask flags with 3. Client side: chlorophyll-epoch.patch in this folder.
+
+Apply: git apply in the kernel tree (-p1). Independent of 2052; they touch different hunks.
+
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -1552,7 +1552,8 @@
+ 		uint64_t v = 0;
+ 		sweet_gpu_lock();
+ 		r.info.abi_version = SWEET_GPU_ABI_VERSION;
+-		r.info.flags = (sweet_gpu_ready() ? 1u : 2u) | (gSboAlias ? SWEET_GPU_INFO_CAP_SBO_ALIAS : 0u);
++		r.info.flags = (sweet_gpu_ready() ? 1u : 2u) | (gSboAlias ? SWEET_GPU_INFO_CAP_SBO_ALIAS : 0u) |
++		    SWEET_GPU_INFO_CAP_EPOCH | (sweet_gpu_epoch() << 16);
+ 		r.info.gpu_id = sweet_gpu_param(SWEET_MSM_PARAM_CHIP_ID, &v) && v != 0x06030001 ? 0 : 630;
+ 		r.info.chip_id = sweet_gpu_param(SWEET_MSM_PARAM_CHIP_ID, &v) ? (uint32_t)v : 0x06030001;
+ 		r.info.va_start = sweet_gpu_param(SWEET_MSM_PARAM_VA_START, &v) ? v : 0;
+--- a/iokit/Kernel/arm/SweetAdrenoABI.h
++++ b/iokit/Kernel/arm/SweetAdrenoABI.h
+@@ -173,6 +173,9 @@
+ /* INFO.flags capability bits (bit0/bit1 above are ready/lost; capabilities start at bit 4). */
+ #define SWEET_GPU_INFO_CAP_SBO_ALIAS    0x10    /* minor 2: SBO_IN_WRITABLE_ALIAS works (absent when boot-arg sweetgpualias=0) */
+ 
++/* 2053: INFO.flags bits 16-31 count GPU recoveries. A recovery makes voided fences read as passed, so a waiter cannot see it. */
++#define SWEET_GPU_INFO_CAP_EPOCH        0x20
++
+ /* IOSurface memory as a BO: the pages of the surface (pixels from byte 0 of its memory) are entered into the
+  * GPU address space. On input handle = SWEET_GPU_DESCRIBE_ONLY asks only for the geometry (no BO is made). */
+ #define SWEET_GPU_DESCRIBE_ONLY         0xffffffffu

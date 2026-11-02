@@ -1,0 +1,27 @@
+--- a/osfmk/kern/host.c
++++ b/osfmk/kern/host.c
+@@ -411,9 +411,24 @@
+ #else
+ 		int master_id               = master_processor->cpu_id;
+ 		user_arch_info->cpu_type    = slot_type(master_id);
+ 		user_arch_info->cpu_subtype = slot_subtype(master_id);
+ #endif
++		/*
++		 * SWEET: this CPU has no PAuth, but with sweetarm64e=1 the whole userland is arm64e (PAC rewritten). MobileGestalt's
++		 * CPUArchitecture is this value's name, and MobileInstallation drops every extension that requires the arm64e capability
++		 * while it reads arm64. hw.cpusubtype and hw.optional.* keep telling the truth.
++		 */
++		extern bool sweet_arm64e_enabled(void);
++		static int sweet_ext = -1;
++		if (sweet_ext < 0) {
++			int v = 0;
++			PE_parse_boot_argn("sweetext", &v, sizeof(v));
++			sweet_ext = v != 0;
++		}
++		if (sweet_ext && sweet_arm64e_enabled() && user_arch_info->cpu_type == CPU_TYPE_ARM64) {
++			user_arch_info->cpu_subtype = CPU_SUBTYPE_ARM64E;
++		}
+ 
+ 
+ 		*count = HOST_PREFERRED_USER_ARCH_COUNT;
+ 

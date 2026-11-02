@@ -1,0 +1,45 @@
+2110: QSEED3 vertical preload 2 on scaler version 0x3000 and up (sweetfb_ast_hw only). UNTESTED ON A PHONE, syntax-checked only.
+Why: Linux _dpu_plane_setup_scaler3 uses DPU_QSEED4_DEFAULT_PRELOAD_V (2) for version >= 0x3000. This DPU reads 0x3003; 2053 wrote 3. This is the only register value of 2053 that differs from Linux.
+Apply: git apply after 2100, then rebuild the kernel. Host check: plans/hwscale/test/qseed-check.c. Recovery: remove sweetfb_ast_hw and RAM boot again.
+
+diff --git a/iokit/Kernel/arm/SweetFbScale.h b/iokit/Kernel/arm/SweetFbScale.h
+--- a/iokit/Kernel/arm/SweetFbScale.h
++++ b/iokit/Kernel/arm/SweetFbScale.h
+@@ -31,13 +31,14 @@
+ /*
+  * 2053: QSEED3 values for a bilinear upscale, as Linux _dpu_plane_setup_scaler3 and dpu_hw_setup_scaler3 with version > 0x1002:
+  * enable, Y/RGB filter 3 = bilinear, non-DX, blend_cfg, and bilinear alpha when the format has alpha. No coefficient LUT is used.
++ * 2110: vertical preload 2 from scaler version 0x3000 on, as _dpu_plane_setup_scaler3 (DPU_QSEED4_DEFAULT_PRELOAD_V).
+  */
+ struct sfs_qseed {
+ 	uint32_t src, dst, stepx, stepy, preload, op;
+ };
+ 
+ static inline bool
+-sfs_qseed_plan(uint32_t sw, uint32_t sh, uint32_t dw, uint32_t dh, bool alpha, struct sfs_qseed *q)
++sfs_qseed_plan(uint32_t sw, uint32_t sh, uint32_t dw, uint32_t dh, bool alpha, uint32_t ver, struct sfs_qseed *q)
+ {
+ 	if (sw == 0 || sh == 0 || dw == 0 || dh == 0 || sw > 0xffff || sh > 0xffff || dw > 0xffff || dh > 0xffff ||
+ 	    sw >= dw * 4 || sh >= dh * 4) {
+@@ -47,7 +48,8 @@
+ 	q->dst = (dh << 16) | dw;
+ 	q->stepx = (uint32_t)(((uint64_t)sw << 21) / dw) & 0xffffffu;
+ 	q->stepy = (uint32_t)(((uint64_t)sh << 21) / dh) & 0xffffffu;
+-	q->preload = 4u | (3u << 8) | (4u << 16) | (3u << 24);
++	uint32_t preloadV = ver >= 0x3000 ? 2 : 3;
++	q->preload = 4u | (preloadV << 8) | (4u << 16) | (preloadV << 24);
+ 	q->op = (1u << 0) | (3u << 16) | (1u << 14) | (1u << 31) | (alpha ? (1u << 10) | (1u << 29) : 0);
+ 	return true;
+ }
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -122,7 +122,7 @@
+ static void astHwProgram(void)
+ {
+  struct sfs_qseed q;
+- if (!sfs_qseed_plan(ast.hwW, ast.hwH, 1080, 2392, (ast.pipe[12] >> 8) & 1, &q)) return;
++ if (!sfs_qseed_plan(ast.hwW, ast.hwH, 1080, 2392, (ast.pipe[12] >> 8) & 1, ast.hwVer, &q)) return;
+  for (unsigned i = 0; i < 5; ++i) ast.hwSaved[i] = ast.pipe[i];
+  ast.hwSaved[5] = ast.pipe[9];
+  ast.hwSavedOp = AST_Q(0x04);

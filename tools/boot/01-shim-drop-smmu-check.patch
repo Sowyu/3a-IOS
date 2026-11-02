@@ -1,0 +1,98 @@
+UNTESTED ON A PHONE. Host check: check-01-shim.sh.
+What: removes smmu_check_ufs() from the shim. The check walks SMRs until it finds stream 0x60, and the hypervisor aborts
+reads of SMR 7, so any boot where ABL leaves the stream later or nowhere ends in the red exception screen with no reason
+about UFS. A translating mapping is still caught: the START STOP UNIT or READ DMA below fails and the shim prints why.
+Apply: cd ios-sweet && git apply ../plans/boot/01-shim-drop-smmu-check.patch
+
+diff --git a/asteroids/shim/ufs.c b/asteroids/shim/ufs.c
+index 952efed..be42e21 100644
+--- a/asteroids/shim/ufs.c
++++ b/asteroids/shim/ufs.c
+@@ -1,7 +1,8 @@
+ /*
+  * Hand the internal UFS to xnu in a usable state. sweet_ufs adopts the host as
+  * the bootloader left it, but on Nothing's ABL 01955 two things stop that:
+- *  - apps_smmu must pass the UFS host's DMA (stream 0x60) straight through,
++ *  - apps_smmu must pass the UFS host's DMA (stream 0x60) straight through. Not checked here: the hypervisor aborts
++ *    reads of some SMRs (0x1500081c, SMR 7), and a mapping that translates fails the DMA below with a reason on screen,
+  *  - the device is in UFS-PowerDown, so every LU answers NOT READY (sense 02/04/02).
+  * Runtime state only: a reset clears it. Wake sequence and register facts from
+  * rootstockos/NativeUfs (BSD-2-Clause-Patent) and Linux ufshcd_set_dev_pwr_mode. MMU off: all memory is Device, DMA needs no cache
+@@ -12,8 +13,6 @@
+ #include "console.h"
+ 
+ #define UFS_BASE	0x01d84000UL
+-#define SMMU_BASE	0x15000000UL	/* apps_smmu */
+-#define UFS_STREAM	0x60		/* iommus = <&apps_smmu 0x60 0x0> */
+ 
+ #define REG_IS		0x20
+ #define REG_IE		0x24
+@@ -32,7 +31,6 @@
+ 
+ static inline uint32_t ufs_rd(uint32_t off) { return *(volatile uint32_t *)(UFS_BASE + off); }
+ static inline void ufs_wr(uint32_t off, uint32_t v) { *(volatile uint32_t *)(UFS_BASE + off) = v; }
+-static inline uint32_t smmu_rd(uint32_t off) { return *(volatile uint32_t *)(SMMU_BASE + off); }
+ 
+ struct utrd {
+ 	uint32_t dw0, dw1, dw2, dw3, ucdba, ucdbau, resp, prdt;
+@@ -129,49 +127,10 @@ static uint32_t scsi(uint8_t lun, const uint8_t *cdb, unsigned cdb_len, void *bu
+ 	return last_status ? 4 : 0;
+ }
+ 
+-/*
+- * The UFS stream must reach physical memory directly. ABL leaves an SMR for it:
+- * keep it if it already does that (S2CR bypass, or a bank with translation off
+- * and VA64 on, since inputs above 32 bits fault otherwise). Stop at the match:
+- * the hypervisor aborts reads of later SMRs (0x1500081c, SMR 7).
+- * ponytail: refuses a translating mapping, repoint it to a free bank (NativeUfs
+- * SmmuTakeover.h) if a firmware ever hands over one.
+- */
+-static const char *smmu_check_ufs(void)
+-{
+-	uint32_t idr0 = smmu_rd(0x20), idr1 = smmu_rd(0x24);
+-	uint32_t groups = idr0 & 255, banks = idr1 & 255;
+-	uint32_t pages = 1u << (((idr1 >> 28) & 7) + 1);
+-
+-	con_hex2("SMMU", "idr0=", idr0, "idr1=", idr1);
+-	if ((idr1 >> 31) || !groups || pages > 128 || banks < 2 || banks > 128)
+-		return "unsupported SMMU geometry";
+-
+-	for (uint32_t i = 0; i < groups; i++) {
+-		uint32_t smr = smmu_rd(0x800 + 4 * i), m = (smr >> 16) & 0x7fff;
+-		if (!(smr & 0x80000000u) || ((smr ^ UFS_STREAM) & 0xffff & ~m))
+-			continue;
+-
+-		uint32_t s2cr = smmu_rd(0xc00 + 4 * i), type = (s2cr >> 16) & 3, idx = s2cr & 255;
+-		uint32_t sctlr = type == 0 ? smmu_rd((pages + idx) * 4096) : 0;
+-		uint32_t cba2r = type == 0 ? smmu_rd(0x1800 + 4 * idx) : 0;
+-
+-		con_hex2("SMR", "slot=", i, "smr=", smr);
+-		con_hex2("S2CR", "v=", s2cr, "sctlr=", sctlr);
+-		con_hex2("CB", "cbar=", type == 0 ? smmu_rd(0x1000 + 4 * idx) : 0, "cba2r=", cba2r);
+-		if (type == 1 || (type == 0 && !(sctlr & 1) && (cba2r & 1)))
+-			return 0;
+-		return "UFS stream is not pass-through";
+-	}
+-	return "no SMR for the UFS stream";
+-}
+-
+ /* Returns 0 when LUN 0 reads, else what stopped it. Leaves our request list in place: sweet_ufs replaces it. */
+ const char *ufs_prepare(void)
+ {
+ 	uint32_t hce = ufs_rd(REG_HCE), hcs = ufs_rd(REG_HCS);
+-	const char *why;
+-
+ 	con_hex2("UFS", "hce=", hce, "hcs=", hcs);
+ 	if (!(hce & 1) || !(hcs & HCS_DP))
+ 		return "host not ready";
+@@ -187,10 +146,6 @@ const char *ufs_prepare(void)
+ 		delay_ms(1);
+ 	}
+ 
+-	why = smmu_check_ufs();
+-	if (why)
+-		return why;
+-
+ 	uintptr_t list = (uintptr_t)utrl;
+ 	ufs_wr(REG_UTRLBA, (uint32_t)list);
+ 	ufs_wr(REG_UTRLBAU, (uint32_t)(list >> 32));

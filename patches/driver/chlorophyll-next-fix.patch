@@ -1,0 +1,925 @@
+diff --color -ruN ../fetch-fix/Chlorophyll/air/chl.h Chlorophyll/air/chl.h
+--- ../fetch-fix/Chlorophyll/air/chl.h	2026-11-02 00:59:05
++++ Chlorophyll/air/chl.h	2026-11-02 11:18:37
+@@ -187,6 +187,10 @@
+ /* Submit. `done` runs on the device's completion thread when the GPU has finished (status 0) or failed (-1). */
+ typedef void (*chl_done_fn)(void *ctx, int status, const char *why);
+ int chl_cmdbuf_commit(struct chl_cmdbuf *cb, chl_done_fn done, void *ctx, char *why, size_t why_size);
++void chl_gpu_timing(uint64_t *busy_ns, uint64_t *between_ns, uint64_t *slowest_ns, uint64_t *count);   /* zero unless bgmtl.gputs; slowest is per call */
++/* What holds Turnip BOs, for the log line that proves the BO list stays flat. Racy reads, fine for a log line. */
++enum { CHL_BO_BUFFERS, CHL_BO_SLABS, CHL_BO_TEXTURES, CHL_BO_CMDBUFS, CHL_BO_PRO_LIVE, CHL_BO_PRO_SUBMITS, CHL_BO_SOURCES };
++void chl_bo_counts(const struct chl_device *dev, unsigned long out[CHL_BO_SOURCES]);
+ int chl_cmdbuf_wait(struct chl_cmdbuf *cb, char *why, size_t why_size);   /* after commit */
+ void chl_cmdbuf_release(struct chl_cmdbuf *cb);   /* before commit: discards; after: when complete */
+ 
+diff --color -ruN ../fetch-fix/Chlorophyll/air/chl_vk.c Chlorophyll/air/chl_vk.c
+--- ../fetch-fix/Chlorophyll/air/chl_vk.c	2026-11-02 01:41:43
++++ Chlorophyll/air/chl_vk.c	2026-11-02 11:18:37
+@@ -74,8 +74,9 @@
+    X(vkBindImageMemory) X(vkCreateImageView) X(vkDestroyImageView) X(vkCreateSampler) X(vkDestroySampler) \
+    X(vkCreateDescriptorSetLayout) X(vkDestroyDescriptorSetLayout) X(vkCreatePipelineLayout) X(vkDestroyPipelineLayout) \
+    X(vkCreateShaderModule) X(vkDestroyShaderModule) X(vkCreateComputePipelines) X(vkCreateGraphicsPipelines) X(vkDestroyPipeline) \
+-   X(vkCreateCommandPool) X(vkDestroyCommandPool) X(vkResetCommandPool) X(vkAllocateCommandBuffers) \
++   X(vkCreateCommandPool) X(vkDestroyCommandPool) X(vkResetCommandPool) X(vkAllocateCommandBuffers) X(vkFreeCommandBuffers) \
+    X(vkBeginCommandBuffer) X(vkEndCommandBuffer) \
++   X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults) \
+    X(vkCmdPipelineBarrier) X(vkCmdBindPipeline) X(vkCmdPushDescriptorSetKHR) X(vkCmdPushConstants) X(vkCmdDispatch) \
+    X(vkCmdCopyBuffer) X(vkCmdFillBuffer) X(vkCmdCopyImage) X(vkCmdCopyBufferToImage) X(vkCmdCopyImageToBuffer) \
+    X(vkCmdBlitImage) X(vkCmdResolveImage) X(vkCmdClearColorImage) \
+@@ -336,6 +337,7 @@
+    VkCommandPool pool;
+    VkCommandBuffer cb;
+    VkFence fence;
++   VkQueryPool ts;   /* /private/var/tmp/bgmtl.gputs: GPU time at the start and end of this command buffer */
+    bool committed, done, failed;
+    chl_done_fn done_fn;
+    void *done_ctx;
+@@ -410,6 +412,7 @@
+    struct chl_obj **pro_held;
+    unsigned n_pro_held, cap_pro_held;
+    struct { VkFence fence; VkCommandBuffer cb; struct chl_obj **held; unsigned n_held; bool waited; } pro_inflight[8];
++   unsigned long bo_counts[CHL_BO_SOURCES];   /* chl_bo_counts */
+ 
+    /* layouts and constexpr samplers shared by every pipeline with the same signature, kept until the device closes:
+     * pipelines that share a layout keep each other's push descriptors, so a switch between them pushes only what changed */
+@@ -495,6 +498,19 @@
+ void chl_render_pipeline_release(struct chl_render_pipeline *p) { obj_release(p ? &p->o : NULL); }
+ void chl_depth_stencil_release(struct chl_depth_stencil *d) { obj_release(d ? &d->o : NULL); }
+ 
++static void
++bo_count(struct chl_device *d, unsigned which, long by)
++{
++   __atomic_add_fetch(&d->bo_counts[which], (unsigned long)by, __ATOMIC_RELAXED);
++}
++
++void
++chl_bo_counts(const struct chl_device *d, unsigned long out[CHL_BO_SOURCES])
++{
++   for (unsigned i = 0; i < CHL_BO_SOURCES; i++)
++      out[i] = __atomic_load_n(&d->bo_counts[i], __ATOMIC_RELAXED);
++}
++
+ /* ---------------------------------------------------------------------------------------------------------------------
+  * The prologue: layout transitions and uploads that every later submission must find done
+  */
+@@ -507,6 +523,7 @@
+                                          VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1 };
+       if (d->vk.vkAllocateCommandBuffers(d->dev, &ai, &d->pro_cb) != VK_SUCCESS)
+          return VK_NULL_HANDLE;
++      bo_count(d, CHL_BO_PRO_LIVE, 1);
+       VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL,
+                                       VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, NULL };
+       d->vk.vkBeginCommandBuffer(d->pro_cb, &bi);
+@@ -529,6 +546,11 @@
+ {
+    d->vk.vkDestroyFence(d->dev, d->pro_inflight[i].fence, NULL);
+    d->pro_inflight[i].fence = VK_NULL_HANDLE;
++   /* ast24: never freed, this kept one Turnip command stream BO per prologue on every later submission's list (5105 at 5188
++    * command buffers). The pool recycles it, so 8 in flight plus the open one bound them. pro_lock guards the pool. */
++   d->vk.vkFreeCommandBuffers(d->dev, d->pro_pool, 1, &d->pro_inflight[i].cb);
++   d->pro_inflight[i].cb = VK_NULL_HANDLE;
++   bo_count(d, CHL_BO_PRO_LIVE, -1);
+    for (unsigned k = 0; k < d->pro_inflight[i].n_held; k++)
+       obj_release(d->pro_inflight[i].held[k]);
+    free(d->pro_inflight[i].held);
+@@ -587,6 +609,7 @@
+    full_barrier(d, d->pro_cb);
+    d->vk.vkEndCommandBuffer(d->pro_cb);
+    d->pro_open = false;
++   bo_count(d, CHL_BO_PRO_SUBMITS, 1);
+    VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, 1, &d->pro_cb, 0, NULL };
+    VkResult r = d->vk.vkQueueSubmit(d->queue, 1, &si, fence);
+    d->pro_inflight[slot].fence = fence;
+@@ -679,6 +702,39 @@
+  */
+ static void cb_retire(struct chl_cmdbuf *cb);
+ 
++/* GPU timing, off unless /private/var/tmp/bgmtl.gputs exists at the first command buffer: it adds GPU commands. Durations only:
++ * the GPU's clock is not lined up with the processor's. Only the completion thread writes these. ponytail: racy reads, fine for a log line */
++static int chl_ts_on = -1;
++static uint64_t chl_ts_busy_ns, chl_ts_gap_ns, chl_ts_max_ns, chl_ts_n, chl_ts_last;
++
++void
++chl_gpu_timing(uint64_t *busy_ns, uint64_t *between_ns, uint64_t *slowest_ns, uint64_t *count)
++{
++   *busy_ns = chl_ts_busy_ns;
++   *between_ns = chl_ts_gap_ns;
++   *slowest_ns = chl_ts_max_ns;
++   *count = chl_ts_n;
++   chl_ts_max_ns = 0;
++}
++
++static void
++cb_timing_read(struct chl_cmdbuf *cb)
++{
++   struct chl_device *d = cb->dev;
++   uint64_t t[2];
++   if (!cb->ts || d->vk.vkGetQueryPoolResults(d->dev, cb->ts, 0, 2, sizeof(t), t, sizeof(t[0]), VK_QUERY_RESULT_64_BIT) != VK_SUCCESS || t[1] < t[0])
++      return;
++   double period = d->props.limits.timestampPeriod;
++   uint64_t busy = (uint64_t)((t[1] - t[0]) * period);
++   chl_ts_busy_ns += busy;
++   if (busy > chl_ts_max_ns)
++      chl_ts_max_ns = busy;
++   if (chl_ts_last && t[0] > chl_ts_last)
++      chl_ts_gap_ns += (uint64_t)((t[0] - chl_ts_last) * period);
++   chl_ts_last = t[1];
++   chl_ts_n++;
++}
++
+ static void *
+ completion_thread(void *arg)
+ {
+@@ -708,6 +764,8 @@
+       if (!d->inflight_head)
+          d->inflight_tail = NULL;
+       pthread_mutex_unlock(&d->done_lock);
++      if (r == VK_SUCCESS)
++         cb_timing_read(cb);
+       /* what it held goes first: once it is reported done, its owner may recycle it (chl_cmdbuf_release) */
+       cb_retire(cb);
+       chl_done_fn fn = cb->done_fn;
+@@ -974,6 +1032,7 @@
+    }
+    VkBufferDeviceAddressInfo dai = { VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, NULL, b->vk };
+    b->addr = d->vk.vkGetBufferDeviceAddress(d->dev, &dai);
++   bo_count(d, CHL_BO_BUFFERS, 1);
+    return b;
+ }
+ 
+@@ -1209,6 +1268,7 @@
+    }
+    t->view = make_view(t, view_type(t->type), 0, mips, 0, layers, true);
+    transition_new_image(d, t);
++   bo_count(d, CHL_BO_TEXTURES, 1);
+    return t;
+ }
+ 
+@@ -1338,6 +1398,7 @@
+    sweet_drm_bo_sync(-1, sb.handle, 0, 0);   /* the processor's dirty lines out before the GPU first reads or writes */
+    t->view = make_view(t, VK_IMAGE_VIEW_TYPE_2D, 0, 1, 0, 1, true);
+    transition_new_image(d, t);
++   bo_count(d, CHL_BO_TEXTURES, 1);
+    return t;
+ }
+ 
+@@ -2038,10 +2099,23 @@
+          free(cb);
+          return NULL;
+       }
++      bo_count(d, CHL_BO_CMDBUFS, 1);
+    }
+    VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+                                    NULL };
+    d->vk.vkBeginCommandBuffer(cb->cb, &bi);
++   if (chl_ts_on < 0)
++      chl_ts_on = access("/private/var/tmp/bgmtl.gputs", F_OK) == 0 && d->props.limits.timestampComputeAndGraphics &&
++                  d->props.limits.timestampPeriod > 0;
++   if (chl_ts_on && !cb->ts) {
++      VkQueryPoolCreateInfo qi = { VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, NULL, 0, VK_QUERY_TYPE_TIMESTAMP, 2, 0 };
++      if (d->vk.vkCreateQueryPool(d->dev, &qi, NULL, &cb->ts) != VK_SUCCESS)
++         cb->ts = VK_NULL_HANDLE;
++   }
++   if (cb->ts) {
++      d->vk.vkCmdResetQueryPool(cb->cb, cb->ts, 0, 2);
++      d->vk.vkCmdWriteTimestamp(cb->cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, cb->ts, 0);
++   }
+    cb->committed = cb->done = cb->failed = false;
+    cb->done_fn = NULL;
+    cb->enc = ENC_NONE;
+@@ -2093,6 +2167,8 @@
+    /* what the GPU wrote is visible to the processor once the fence is in */
+    VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_HOST_READ_BIT };
+    d->vk.vkCmdPipelineBarrier(cb->cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
++   if (cb->ts)
++      d->vk.vkCmdWriteTimestamp(cb->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, cb->ts, 1);
+    d->vk.vkEndCommandBuffer(cb->cb);
+    cb->done_fn = done;
+    cb->done_ctx = ctx;
+@@ -2123,6 +2199,7 @@
+       say(why, why_size, "the GPU did not take the command buffer (VkResult %d)", r);
+       cb_retire(cb);
+       cb->failed = cb->done = true;
++      fprintf(stderr, "[chl] vkQueueSubmit: VkResult %d\n", r);   // the three "submission failed" exits never said which
+       if (done)
+          done(ctx, -1, "submission failed");
+       return -1;
+@@ -2197,6 +2274,7 @@
+             return false;
+          }
+          s->buf->ring = true;
++         bo_count(d, CHL_BO_SLABS, 1);
+       }
+       s->next = cb->slabs;
+       cb->slabs = s;
+@@ -2261,15 +2339,16 @@
+ flush_bindings(struct chl_cmdbuf *cb, VkPipelineBindPoint bp, const struct chl_layout *l, char *why, size_t why_size)
+ {
+    struct chl_device *d = cb->dev;
+-   VkWriteDescriptorSet w[32];
+-   VkDescriptorBufferInfo bi[32];
+-   VkDescriptorImageInfo ii[32];
++   /* 32 resources (make_layout refuses more) plus the constexpr samplers, 16 per stage */
++   VkWriteDescriptorSet w[64];
++   VkDescriptorBufferInfo bi[64];
++   VkDescriptorImageInfo ii[64];
+    uint32_t push[64] = { 0 };
+    unsigned nw = 0;
+    for (unsigned i = 0; i < AIR_VK_MAX_BINDINGS; i++) {
+-      if (!l->bindings.type[i] || l->immutable[i])
++      if (!l->bindings.type[i])
+          continue;
+-      if (nw == 32) {
++      if (nw == 64) {
+          say(why, why_size, "more than 32 resources in one draw or dispatch");
+          return -1;
+       }
+@@ -2277,7 +2356,12 @@
+       const struct chl_stage_bind *sb = &cb->bind[stage];
+       VkDescriptorType t = (VkDescriptorType)(l->bindings.type[i] - 1);
+       w[nw] = (VkWriteDescriptorSet){ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, VK_NULL_HANDLE, i, 0, 1, t, NULL, NULL, NULL };
+-      if (local < AIR_VK_TEXTURE_BINDING) {
++      if (l->immutable[i]) {
++         /* Turnip copies a push set's immutable sampler only when a write names its binding (copy_immutable_samplers in
++          * tu_update_descriptor_sets). Unwritten, the shader reads what the last push left at that offset. */
++         ii[nw] = (VkDescriptorImageInfo){ l->immutable[i], VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED };
++         w[nw].pImageInfo = &ii[nw];
++      } else if (local < AIR_VK_TEXTURE_BINDING) {
+          unsigned n = local;
+          struct chl_buffer *b = sb->buf[n];
+          if (!b) {
+@@ -2554,6 +2638,7 @@
+       struct chl_buffer *b = (struct chl_buffer *)o;
+       d->vk.vkDestroyBuffer(d->dev, b->vk, NULL);
+       d->vk.vkFreeMemory(d->dev, b->mem, NULL);
++      bo_count(d, CHL_BO_BUFFERS, -1);
+       break;
+    }
+    case K_TEXTURE: {
+@@ -2571,6 +2656,7 @@
+          d->vk.vkDestroyImage(d->dev, t->image, NULL);
+          if (t->mem)
+             d->vk.vkFreeMemory(d->dev, t->mem, NULL);
++         bo_count(d, CHL_BO_TEXTURES, -1);
+       }
+       break;
+    }
+diff --color -ruN ../fetch-fix/Chlorophyll/src/bgmtl.m Chlorophyll/src/bgmtl.m
+--- ../fetch-fix/Chlorophyll/src/bgmtl.m	2026-11-02 01:37:43
++++ Chlorophyll/src/bgmtl.m	2026-11-02 14:56:49
+@@ -208,6 +208,44 @@
+ struct bg_capture_image { struct chl_buffer *st; unsigned w, h, fmt, pass, bpp; };
+ static unsigned long bg_cap_start, bg_cap_last;
+ static unsigned bg_cap_surface, bg_cap_busy, bg_cap_counts[2];
++// "v2 0 launch" in shatter.capture: no periodic captures. A capture when a draw first samples a portrait client image (a launch
++// image, a snapshot), and one after the stripe detector fires on a finished frame. Off without that third word.
++static unsigned bg_cap_launch, bg_cap_launch_n, bg_cap_force;
++static unsigned long bg_cap_launch_last;
++#define BG_CAP_LAUNCH_MAX 8
++static BOOL bg_cap_launch_take(unsigned long seq, unsigned long gap)
++{
++   if (__atomic_load_n(&bg_cap_launch_n, __ATOMIC_RELAXED) >= BG_CAP_LAUNCH_MAX) return NO;
++   unsigned long last = __atomic_load_n(&bg_cap_launch_last, __ATOMIC_RELAXED);
++   if (last && seq - last < gap) return NO;
++   __atomic_store_n(&bg_cap_launch_last, seq, __ATOMIC_RELAXED);
++   __atomic_add_fetch(&bg_cap_launch_n, 1, __ATOMIC_RELAXED);
++   return YES;
++}
++// BEGIN stripe detector (test/launch-check.py runs this text)
++// Three strips of 4x256 BGRA8 pixels from across a frame, 4096 bytes each. Full-width lines step in luma at the same rows in all
++// three; text and icons do not. Returns how many rows do, and the first few of them. ponytail: fixed rows at mid-screen, widen
++// the strips if a pattern with a period above 40 rows gets missed.
++#define BG_STRIPE_MIN 12
++static unsigned bg_stripe_rows(const uint8_t *strips, unsigned *first, unsigned nfirst)
++{
++   int l[3][256];
++   for (unsigned i = 0; i < 3; i++)
++      for (unsigned y = 0; y < 256; y++) {
++         const uint8_t *r = strips + i * 4096 + y * 16;
++         int sum = 0;
++         for (unsigned x = 0; x < 4; x++) sum += r[4 * x] + r[4 * x + 1] + r[4 * x + 2];
++         l[i][y] = sum / 12;
++      }
++   unsigned n = 0;
++   for (unsigned y = 0; y + 1 < 256; y++) {
++      BOOL all = YES;
++      for (unsigned i = 0; i < 3; i++) if (abs(l[i][y + 1] - l[i][y]) < 24) all = NO;
++      if (all) { if (n < nfirst) first[n] = y; n++; }
++   }
++   return n;
++}
++// END stripe detector
+ static BOOL bg_cap_eligible(unsigned kind, unsigned long seq)
+ { return kind < 2 && __atomic_load_n(&bg_cap_counts[kind], __ATOMIC_RELAXED) < 3 && seq >= 300 && (!__atomic_load_n(&bg_cap_last, __ATOMIC_RELAXED) || seq - __atomic_load_n(&bg_cap_last, __ATOMIC_RELAXED) >= 300); }
+ static void bg_cap_config(void)
+@@ -215,14 +253,19 @@
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+       FILE *f = fopen("/private/var/db/bgmtl/shatter.capture", "r");
+-      char mode[32] = {0};
+-      if (f) { if (fscanf(f, "%31s %u", mode, &bg_cap_surface) == 2 && !strcmp(mode,"v2")) bg_cap_start=1; fclose(f); }
++      char mode[32] = {0}, extra[32] = {0};
++      if (f) {
++         int got = fscanf(f, "%31s %u %31s", mode, &bg_cap_surface, extra);
++         if (got >= 2 && !strcmp(mode,"v2")) bg_cap_start=1;
++         if (got == 3 && bg_cap_start && !strcmp(extra,"launch")) bg_cap_launch=1;
++         fclose(f);
++      }
+    });
+ }
+ // Serialized on the dump queue, also across process restarts. Never called on the render thread.
+ static BOOL bg_cap_claim(unsigned mask)
+ {
+-   struct { char boot[40]; unsigned count[2]; } m = {0};
++   struct { char boot[40]; unsigned count[3]; } m = {0};
+    int fd=open("/private/var/tmp/shatter-captures-v2",O_RDWR|O_CREAT|O_NOFOLLOW|O_CLOEXEC,0666);
+    if(fd<0) return NO;
+    BOOL ok=NO;
+@@ -231,7 +274,7 @@
+          memset(&m,0,sizeof(m)); strlcpy(m.boot,bg_dump_boot(),sizeof(m.boot));
+       }
+       unsigned accepted=0;
+-      for(unsigned k=0;k<2;k++) if((mask&(1u<<k)) && m.count[k]<3) {m.count[k]++;accepted++;}
++      for(unsigned k=0;k<3;k++) if((mask&(1u<<k)) && m.count[k]<(k==2?8u:3u)) {m.count[k]++;accepted++;}
+       ok=accepted && pwrite(fd,&m,sizeof(m),0)==sizeof(m);
+    }
+    close(fd); return ok;
+@@ -556,7 +599,7 @@
+ bg_perf_on(void)
+ {
+    static int on = -1;
+-   if (on < 0) on = access("/private/var/tmp/bgmtl.perf", F_OK) == 0;
++   if (on < 0) on = access("/private/var/tmp/bgmtl.perf", F_OK) == 0 || access("/private/var/db/bgmtl/bgmtl.perf", F_OK) == 0;   // db: dirs_cleaner empties tmp at boot
+    return on;
+ }
+ static void
+@@ -742,6 +785,105 @@
+ - (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(id)descriptor;
+ @end
+ 
++// BEGIN hold gate
++// On in backboardd unless /usr/local/lib/bgmtl/holdwait starts with 0 (read once): a commit that renders into a surface the framebuffer still
++// holds waits for the hold to go. In copy mode SwapWait answers at once, so CoreAnimation recycles the surface of swap N-1 while the
++// kernel may still be copying it, and that copy reads the black fill CoreAnimation draws first (analysis/blackbars2.md).
++// ponytail: the hold also covers the flip's latch wait. Release it right after the copy if wait_us shows up in the frame rate.
++#define BG_HOLD_TARGETS 4
++#define BG_HOLD_MAX_US 50000
++static struct { uint64_t commits, busy, wait_us, max_us, timeouts, skipped, log_ns; unsigned stuck, rest; } g_hold;
++static void
++bg_hold_gate(IOSurfaceRef *s, unsigned n)
++{
++   g_hold.commits++;
++   BOOL busy = NO, clear = NO;
++   uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC), us = 0;
++   for (unsigned i = 0; i < n; i++) busy = busy || IOSurfaceIsInUse(s[i]);
++   if (busy && g_hold.rest) {          // a hold that never goes (display off, a frozen copy) must not cost every frame the limit
++      g_hold.rest--;
++      g_hold.skipped++;
++      busy = NO;
++   }
++   if (busy) {
++      g_hold.busy++;
++      while (!clear && us < BG_HOLD_MAX_US) {
++         usleep(200);
++         us = (clock_gettime_nsec_np(CLOCK_MONOTONIC) - t0) / 1000;
++         clear = YES;
++         for (unsigned i = 0; i < n; i++) clear = clear && !IOSurfaceIsInUse(s[i]);
++      }
++      g_hold.wait_us += us;
++      if (us > g_hold.max_us) g_hold.max_us = us;
++      if (clear) {
++         g_hold.stuck = 0;
++      } else {
++         g_hold.timeouts++;
++         if (++g_hold.stuck >= 4) { g_hold.stuck = 0; g_hold.rest = 120; }
++      }
++   } else {
++      g_hold.stuck = 0;
++   }
++   uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC);
++   if (now - g_hold.log_ns >= 10000000000ull) {
++      char line[200];
++      g_hold.log_ns = now;
++      snprintf(line, sizeof(line), "hold wait: commits=%llu busy=%llu wait_us total=%llu max=%llu timeouts=%llu skipped=%llu",
++               g_hold.commits, g_hold.busy, g_hold.wait_us, g_hold.max_us, g_hold.timeouts, g_hold.skipped);
++      bgmtl_note_line(line);
++      g_hold.max_us = 0;
++   }
++}
++// END hold gate
++// BEGIN sched nowait
++// On in backboardd unless /usr/local/lib/bgmtl/holdwait's second byte is 0 (read once): waitUntilScheduled returns once the commit is queued, as Metal
++// documents, instead of waiting for the GPU. The kernel's fence gate already keeps a swap off the panel until its GPU work is done, and
++// the hold gate keeps CoreAnimation off a surface the kernel holds. Waits stay for command buffers that publish at completion. The line
++// counts every wait either way, so a run also shows whether CoreAnimation calls these at all (analysis/speed2.md).
++static struct { uint64_t sched, sched_ns, sched_max_ns, skipped, completed, completed_ns, log_ns; } g_sw;
++static BOOL
++bg_sched_async(void)
++{
++   static int on = -1;
++   if (on < 0) {
++      // on in backboardd unless the file's second byte is 0: a file push cannot create a new path on the root
++      FILE *f = fopen("/usr/local/lib/bgmtl/holdwait", "r");
++      on = !strcmp(getprogname(), "backboardd") && !(f && fgetc(f) != EOF && fgetc(f) == '0');
++      if (f) fclose(f);
++      if (on) bgmtl_note_line("sched wait: async");
++   }
++   return on;
++}
++static void
++bg_sw_note(BOOL completed, uint64_t ns)
++{
++   if (completed) { g_sw.completed++; g_sw.completed_ns += ns; }
++   else { g_sw.sched++; g_sw.sched_ns += ns; if (ns > g_sw.sched_max_ns) g_sw.sched_max_ns = ns; }
++   uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC);
++   if (now - g_sw.log_ns >= 10000000000ull) {
++      char line[200];
++      g_sw.log_ns = now;
++      snprintf(line, sizeof(line), "sched wait: scheduled calls=%llu ms=%llu max_ms=%llu skipped=%llu; completed calls=%llu ms=%llu",
++               g_sw.sched, g_sw.sched_ns / 1000000, g_sw.sched_max_ns / 1000000, g_sw.skipped, g_sw.completed, g_sw.completed_ns / 1000000);
++      bgmtl_note_line(line);
++      g_sw.sched_max_ns = 0;
++   }
++}
++// END sched nowait
++static BOOL
++bg_hold_on(void)
++{
++   static int on = -1;
++   if (on < 0) {
++      // on in backboardd unless that file starts with 0: a file push cannot create a new path on the root
++      FILE *f = fopen("/usr/local/lib/bgmtl/holdwait", "r");
++      on = !strcmp(getprogname(), "backboardd") && !(f && fgetc(f) == '0');
++      if (f) fclose(f);
++      if (on) bgmtl_note_line("hold wait: on");
++   }
++   return on;
++}
++
+ @interface BGMTLCommandBuffer : _MTLCommandBuffer {
+  @public
+    BGMTLCommandQueue *_queue;
+@@ -751,6 +893,8 @@
+    NSInteger _status;
+    NSMutableArray *_completed, *_scheduled, *_presents;   // handlers; drawables to present once the work has completed
+    dispatch_group_t _done;                                 // left when the completion has run: waitUntilCompleted
++   IOSurfaceRef _holdTargets[BG_HOLD_TARGETS];             // retained: surfaces it renders into, checked at commit (bg_hold_gate)
++   unsigned _nHoldTargets;
+    int _slotReturned;                                      // the base queue's in-flight slot given back (bg_return_slot)
+    NSMutableSet *_linWritten;                              // buffer-backed textures this command buffer writes
+    NSMutableSet *_written;                                 // textures rendered or resolved into (IOSurface sync, XR10 write-back)
+@@ -763,6 +907,8 @@
+    unsigned _capturePass, _captureCount;
+    struct bg_capture_image _captureImages[59];
+    unsigned _captureKinds, _captureIcons, _captureMasks;
++   struct chl_buffer *_stripeStaging;
++   NSMutableArray *_captureClient;   // launch mode: the caller's bytes of no-copy client images sampled in this command buffer
+    BOOL _labelProbeAttempted;
+    BOOL _tearAfter;
+    uint64_t _captureBytes;
+@@ -773,6 +919,8 @@
+    NSData *_capInline[2][BG_MAX_BINDINGS];
+    unsigned _draws;
+    uint64_t _t_first;                                      // the first encoder (encode time for bgmtl.perf)
++   int _epoch;                                             // bg_gpu_epoch before this command buffer was submitted, when it stages copies
++   BOOL _hasEpoch;
+ }
+ - (instancetype)initWithBGQueue:(BGMTLCommandQueue *)queue;
+ - (struct chl_cmdbuf *)bgChl;                         // the Vulkan command buffer, noting when encoding began
+@@ -782,6 +930,8 @@
+ - (void)bgCapture:(NSString *)line;
+ - (void)bgCaptureTexture:(BGMTLTexture *)t level:(unsigned)level slice:(unsigned)slice pass:(unsigned)pass;
+ - (void)bgCaptureFinish:(BOOL)ok;
++- (void)bgStripeProbe;
++- (void)bgCaptureClientBytes:(BGMTLTexture *)root;
+ - (void)bgSkip:(const char *)what why:(const char *)why;
+ - (void)bgFailWith:(NSString *)why code:(NSInteger)code;
+ - (void)bgCompleteFrom:(uint64_t)t_begin;
+@@ -832,6 +982,7 @@
+    BOOL _surfFresh;      // _surfSeed is valid: the surface was decoded or written back at least once (a seed may be 0)
+    struct chl_buffer *_wbSpare;   // the compositor's staging buffer for this copied surface, kept between frames (taken atomically)
+    BOOL _poolDirty;      // taken from the pool, still holds its last user's pixels: zeroed before the first use that could see them
++   BOOL _capSeen;        // launch capture: already sampled or rendered to, so not a new client image
+    BOOL _ncHashed;       // _ncHash is what the texture holds
+    uint64_t _ncHash;     // of the caller's bytes at the last upload
+    unsigned long _ncSeq; // the command buffer that last checked them (once per command buffer)
+@@ -847,6 +998,10 @@
+ - (struct chl_texture *)chlTexture;
+ - (struct chl_texture *)chlTextureFor:(BGMTLCommandBuffer *)cb;   // refreshed from whatever its pixels come from, once per command buffer
+ - (BGMTLTexture *)bgRoot;
++- (BOOL)bgCapNewClientImage;
++- (void)bgCapMarkSeen;
++- (NSData *)bgNoCopyData;
++- (BOOL)bgCapIsNoCopy;
+ - (BOOL)bgCopiedPlain;
+ - (const struct chl_texture_desc *)bgDesc;
+ - (struct chl_buffer *)bgWbTake:(size_t)bytes;
+@@ -1453,8 +1608,8 @@
+    bg_cap_config();
+    if(bg_cap_start) p->_captureState=[[NSString alloc] initWithFormat:@"%@\nvertex-air-base64=%@\nfragment-air-base64=%@\n",descriptor,[vair base64EncodedStringWithOptions:0],[fair base64EncodedStringWithOptions:0]];
+    snprintf(p->_names, sizeof(p->_names), "%s+%s", [[vertex name] UTF8String], fragment ? [[fragment name] UTF8String] : "-");
+-   BG_LOG("render pipeline %s: vertex buffers %#x, fragment buffers %#x textures %#x samplers %#x (%.1f ms)\n", p->_names,
+-          info.buffers_used[0], info.buffers_used[1], info.textures_used[1], info.samplers_used[1], (pt1 - pt0) / 1e6);
++   BG_LOG("render pipeline %s: vertex buffers %#x, fragment buffers %#x textures %#x samplers %#x (%.1f ms) at %llu ms\n", p->_names,
++          info.buffers_used[0], info.buffers_used[1], info.textures_used[1], info.samplers_used[1], (pt1 - pt0) / 1e6, clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000000ull);
+    return p;
+ }
+ 
+@@ -1812,7 +1967,7 @@
+    _seq = __atomic_add_fetch(&g_bg_cb_seq, 1, __ATOMIC_RELAXED);
+    bg_cap_config();
+    if (getenv("BGMTL_BB") && bg_cap_start &&
+-       (bg_cap_eligible(0,_seq) || bg_cap_eligible(1,_seq)) &&
++       (bg_cap_launch ? __atomic_load_n(&bg_cap_launch_n, __ATOMIC_RELAXED) < BG_CAP_LAUNCH_MAX : (bg_cap_eligible(0,_seq) || bg_cap_eligible(1,_seq))) &&
+        !__atomic_exchange_n(&bg_cap_busy, 1, __ATOMIC_ACQ_REL)) {
+       _capture = [[NSMutableString alloc] initWithFormat:@"capture-v2 cb=%lu targetSurface=%u\n", _seq, bg_cap_surface];
+       _captureSources = [NSMutableSet new];
+@@ -1831,6 +1986,7 @@
+    if (_ccb) chl_cmdbuf_release(_ccb);   // never committed: discarded; committed: complete by now (the completion holds a reference)
+    [_queue release]; [_error release]; [_completed release]; [_scheduled release]; [_presents release];
+    [_linWritten release]; [_written release]; [_noCopy release];
++   for (unsigned i = 0; i < _nHoldTargets; i++) CFRelease(_holdTargets[i]);
+    if (_done) dispatch_release(_done);
+    [super dealloc];
+ }
+@@ -1856,7 +2012,14 @@
+    @synchronized(self) { now = _status >= 4; if (!now) [_completed addObject:[[block copy] autorelease]]; }
+    if (now) block(self);
+ }
+-- (void)waitUntilScheduled { if (_status >= 2 && getenv("BGMTL_BB")) dispatch_group_wait(_done, DISPATCH_TIME_FOREVER); }
++- (void)waitUntilScheduled
++{
++   if (_status < 2 || !getenv("BGMTL_BB")) return;
++   if (bg_sched_async() && !_nWbRecs && !_capture && ![_linWritten count]) { g_sw.skipped++; bg_sw_note(NO, 0); return; }
++   uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
++   dispatch_group_wait(_done, DISPATCH_TIME_FOREVER);
++   bg_sw_note(NO, clock_gettime_nsec_np(CLOCK_MONOTONIC) - t0);
++}
+ 
+ - (void)bgFailWith:(NSString *)why code:(NSInteger)code
+ {
+@@ -1900,12 +2063,12 @@
+    static int on = -1;
+    static uint64_t win_start, last_end, n, draws, enc, sub, wait, gap, enc_max, wait_max;
+    static uint64_t last_begin, burst_ns, burst_frames, bin[4];
+-   if (on < 0) on = access("/private/var/tmp/bgmtl.perf", F_OK) == 0;
++   if (on < 0) on = access("/private/var/tmp/bgmtl.perf", F_OK) == 0 || access("/private/var/db/bgmtl/bgmtl.perf", F_OK) == 0;   // db: dirs_cleaner empties tmp at boot
+    if (!on) return;
+    if (last_begin && t_begin > last_begin && t_begin - last_begin < 100000000ull) {
+       uint64_t d = t_begin - last_begin;
+       burst_ns += d; burst_frames++;
+-      bin[d <= 17000000ull ? 0 : d <= 200000000ull ? 1 : d <= 34000000ull ? 2 : 3]++;
++      bin[d <= 17000000ull ? 0 : d <= 25000000ull ? 1 : d <= 34000000ull ? 2 : 3]++;
+    }
+    last_begin = t_begin;
+    if (win_start == 0) win_start = t_begin;
+@@ -1954,6 +2117,28 @@
+    return [all autorelease];
+ }
+ 
++struct bg_gpu_info { uint32_t abi_version, flags, gpu_id, chip_id; uint64_t va_start, va_size; uint32_t last_fence, abi_minor; };
++extern int sweet_drm_info(int fd, struct bg_gpu_info *out);
++
++// Recoveries so far (kernel 2053: INFO.flags bit 5 says bits 16-31 count them), or -1 from a kernel without it. A recovery makes
++// the fences of the work it threw away read as passed and the wait succeed (2015), so only this tells a staged copy that never ran
++// from one that did (recheck-audit finding 2).
++static int
++bg_gpu_epoch(void)
++{
++   struct bg_gpu_info in;
++   memset(&in, 0, sizeof(in));
++   if (sweet_drm_info(-1, &in) != 0 || !(in.flags & 0x20)) return -1;
++   return (int)(in.flags >> 16);
++}
++
++// -1 on either side (no kernel support, a failed query) never voids: the behaviour before this check.
++static inline int
++bg_epoch_voided(int before, int after)
++{
++   return before >= 0 && after >= 0 && before != after;
++}
++
+ struct bg_done_ctx { BGMTLCommandBuffer *cb; uint64_t t_begin, t_flushed; };
+ 
+ static void
+@@ -1982,6 +2167,7 @@
+    for (BGMTLBuffer *b in _noCopy) [b bgRefresh];
+    for (BGMTLTexture *t in _linWritten) [t bgLinearPending:1];
+    if (_captureTarget && _captureKinds) [self bgCaptureTexture:_captureTarget level:0 slice:0 pass:0];
++   [self bgStripeProbe];
+    [self bgWbRecord];
+    dispatch_group_enter(_done);
+    // "scheduled" before the GPU has finished, unless BGMTL_DEFER_SCHEDULED=1 (the kernel holds a swap until the GPU work before
+@@ -1991,6 +2177,8 @@
+    // "scheduled" lets the render server swap, and the kernel's hold only waits for the GPU: a surface published at completion must
+    // be published first, so this command buffer's handlers wait for bgCompleteFrom.
+    BOOL defer = defer_scheduled || _nWbRecs;
++   if (_nWbRecs || _captureSources || [_linWritten count] || (!getenv("BGMTL_BB") && [_written count])) { _epoch = bg_gpu_epoch(); _hasEpoch = YES; }   // every path that publishes CPU-visible data
++   if (_nHoldTargets) bg_hold_gate(_holdTargets, _nHoldTargets);
+    static int sync_commit = -1;     // BGMTL_SYNC=1 or /private/var/tmp/bgmtl.sync: wait inline
+    if (sync_commit < 0)
+       sync_commit = (getenv("BGMTL_SYNC") && getenv("BGMTL_SYNC")[0] == '1') || access("/private/var/tmp/bgmtl.sync", F_OK) == 0;
+@@ -2064,7 +2252,7 @@
+ {
+    if (!_capture || !t || _captureCount >= 59 || !_ccb || level >= [(id<MTLTexture>)t mipmapLevelCount] || level >= 32) return;
+    id<MTLTexture> mt = (id)t;
+-   unsigned fmt = (unsigned)[mt pixelFormat], bpp = fmt == 1 ? 1 : fmt == 115 ? 8 : (fmt == 70 || fmt == 71 || fmt == 80 || fmt == 81) ? 4 : 0;
++   unsigned fmt = (unsigned)[mt pixelFormat], bpp = fmt == 1 ? 1 : fmt == 115 ? 8 : (fmt == 70 || fmt == 71 || fmt == 80 || fmt == 81 || fmt == 500 || fmt == 550) ? 4 : 0;
+    unsigned w = MAX(1, [mt width] >> level), h = MAX(1, [mt height] >> level);
+    uint64_t bytes = (uint64_t)w * h * bpp;
+    if (!bpp || [mt sampleCount] > 1 || bytes > BG_DUMP_TARGET_MAX || _captureBytes + bytes > 128ull*1024*1024) {
+@@ -2099,8 +2287,48 @@
+    _captureImages[_captureCount++]=(struct bg_capture_image){st,w,h,fmt,_capturePass,bpp};
+    return YES;
+ }
++// Launch mode: three small strips of the finished frame, copied in its own stream and read when it completes.
++- (void)bgStripeProbe
++{
++   if (!bg_cap_launch || !_capture || !_captureTarget || !_ccb || _stripeStaging) return;
++   id<MTLTexture> mt = (id)_captureTarget;
++   unsigned w = (unsigned)mt.width, h = (unsigned)mt.height, fmt = (unsigned)mt.pixelFormat;
++   if ((fmt != 80 && fmt != 81 && fmt != 70 && fmt != 71) || mt.sampleCount > 1 || w < 16 || h < 256) return;
++   char why[256];
++   struct chl_buffer *st = chl_buffer_create([(BGMTLDevice *)[self device] chl], 3 * 4096, why, sizeof(why));
++   if (!st) return;
++   const unsigned sz[3] = { 4, 256, 1 };
++   for (unsigned i = 0; i < 3; i++) {
++      const unsigned o[3] = { w * (i + 1) / 4, h / 2 - 128, 0 };
++      chl_copy_texture_to_buffer(_ccb, [_captureTarget chlTexture], 0, 0, o, sz, st, i * 4096, 16, 4096);
++   }
++   _stripeStaging = st;
++}
++- (void)bgCaptureClientBytes:(BGMTLTexture *)root
++{
++   NSData *d = [root bgNoCopyData];
++   if (!d) return;
++   if (!_captureClient) _captureClient = [NSMutableArray new];
++   [_captureClient addObject:d];
++   [self bgCapture:[NSString stringWithFormat:@"client-bytes %lu tex=%p length=%lu\n", (unsigned long)[_captureClient count] - 1, root, (unsigned long)d.length]];
++}
+ - (void)bgCaptureFinish:(BOOL)ok
+ {
++   if (_stripeStaging) {
++      if (ok) {
++         unsigned first[6] = { 0 };
++         unsigned n = bg_stripe_rows(chl_buffer_contents(_stripeStaging), first, 6);
++         if (n >= BG_STRIPE_MIN) {
++            id<MTLTexture> mt = (id)_captureTarget;
++            BG_LOG("stripes cb=%lu target %lux%lu surface %u: %u rows step together, first at +%u +%u +%u +%u +%u +%u of the 256 at mid-screen\n", _seq,
++                   (unsigned long)mt.width, (unsigned long)mt.height, mt.iosurface ? IOSurfaceGetID((IOSurfaceRef)mt.iosurface) : 0, n,
++                   first[0], first[1], first[2], first[3], first[4], first[5]);
++            __atomic_store_n(&bg_cap_force, 1, __ATOMIC_RELEASE);
++         }
++      }
++      chl_buffer_release(_stripeStaging);
++      _stripeStaging = NULL;
++   }
+    if (!_capture) return;
+    BOOL save = ok && _captureTarget && _captureKinds;
+    __block BOOL claimed = NO;
+@@ -2124,6 +2352,14 @@
+       bg_dump_async(BG_DUMP_CAPTURE, bytes, "pass image", path,
+          ^BOOL(FILE *f) { return claimed && fwrite(chl_buffer_contents(r.st),1,bytes,f)==bytes; }, ^{ chl_buffer_release(r.st); });
+    }
++   if (save) for (NSUInteger i = 0; i < [_captureClient count]; i++) {
++      NSData *d = [_captureClient[i] retain];
++      char path[192];
++      snprintf(path, sizeof(path), "/private/var/tmp/shatter-%s-%d-%lu-client%lu.bin", bg_capture_session(), getpid(), _seq, (unsigned long)i);
++      bg_dump_async(BG_DUMP_CAPTURE, d.length, "client bytes", path,
++         ^BOOL(FILE *f) { return claimed && fwrite(d.bytes,1,d.length,f)==d.length; }, ^{ [d release]; });
++   }
++   [_captureClient release]; _captureClient=nil;
+    BG_LOG("shatter candidate cb=%lu passes=%u images=%u matched=%d completed=%d\n", _seq,_capturePass,_captureCount,_captureTarget!=nil,ok);
+    [_captureTarget release]; _captureTarget=nil;
+    [_capture release]; _capture=nil; _captureCount=0;
+@@ -2215,12 +2451,18 @@
+ {
+    uint64_t t_done = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+    bg_return_slot(self, _queue);
+-   [self bgCaptureFinish:_status == 4];
+-   [self bgWbFinish:_status == 4];                              // before anything that can swap or present these surfaces
++   BOOL good = _status == 4;
++   if (good && _hasEpoch && bg_epoch_voided(_epoch, bg_gpu_epoch())) {
++      static volatile unsigned said;
++      if (__sync_add_and_fetch(&said, 1) <= 16) BG_LOG("recovery during this command buffer: its %u staged copies are not published\n", _nWbRecs);
++      good = NO;    // handlers still run with a Completed status: three failures would switch Metal off (bgmtl_note_failure)
++   }
++   [self bgCaptureFinish:good];
++   [self bgWbFinish:good];                                      // before anything that can swap or present these surfaces
+    for (void (^h)(id) in bg_take(self, _scheduled)) h(self);    // left here by the compositor's deferral (see commit)
+    // buffer-backed textures: the GPU's result goes back into their buffers before any completed handler reads them
+    for (BGMTLTexture *t in _linWritten) {
+-      if (_status == 4) [t bgLinearWriteBack];
++      if (good) [t bgLinearWriteBack];
+       [t bgLinearPending:-1];
+    }
+    [_linWritten removeAllObjects];
+@@ -2229,7 +2471,7 @@
+    // cache clean there. A GPU write does not move an IOSurface's seed but consumers cache by it, so a write lock/unlock bumps it.
+    static int in_compositor = -1;
+    if (in_compositor < 0) in_compositor = getenv("BGMTL_BB") != NULL;
+-   if (_status == 4 && !in_compositor) {
++   if (good && !in_compositor) {
+       NSMutableSet *surfaces = nil, *xr = nil;
+       for (BGMTLTexture *t in _written) {
+          BGMTLTexture *root = [t bgRoot];
+@@ -2288,12 +2530,33 @@
+       g_st.create_max_us = 0;   // per line; the rest are totals
+       g_st.done_max_us = 0;
+       bgmtl_note_line(line);
++      struct chl_device *cd = [(BGMTLDevice *)[self device] chl];
++      if (cd) {   // the kernel's "names N BOs" is these plus Turnip's own (pipelines, device state); only the first columns may grow with use
++         unsigned long bo[CHL_BO_SOURCES];
++         chl_bo_counts(cd, bo);
++         snprintf(line, sizeof(line), "bo sources: buffers %lu (ring slabs made %lu), textures %lu, command buffers made %lu, prologue cbs live %lu of %lu submitted",
++                  bo[CHL_BO_BUFFERS], bo[CHL_BO_SLABS], bo[CHL_BO_TEXTURES], bo[CHL_BO_CMDBUFS], bo[CHL_BO_PRO_LIVE], bo[CHL_BO_PRO_SUBMITS]);
++         bgmtl_note_line(line);
++      }
++      uint64_t gb, gg, gm, gn;
++      chl_gpu_timing(&gb, &gg, &gm, &gn);
++      if (gn) {   // totals as above; commit to done minus GPU busy is what the queue, kernel and completion thread add
++         snprintf(line, sizeof(line), "gpu timing: %llu cbufs, busy %llu ms, between %llu ms, slowest %.1f ms", (unsigned long long)gn,
++                  (unsigned long long)(gb / 1000000), (unsigned long long)(gg / 1000000), gm / 1e6);
++         bgmtl_note_line(line);
++      }
+       st_last = st_now; st_cbs = g_st.cbs; st_lines++;
+    }
+    bg_idle_trim_schedule();
+ }
+ 
+-- (void)waitUntilCompleted { if (_status >= 2) dispatch_group_wait(_done, DISPATCH_TIME_FOREVER); }
++- (void)waitUntilCompleted
++{
++   if (_status < 2) return;
++   uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
++   dispatch_group_wait(_done, DISPATCH_TIME_FOREVER);
++   bg_sw_note(YES, clock_gettime_nsec_np(CLOCK_MONOTONIC) - t0);
++}
+ 
+ - (id)computeCommandEncoder { return [[[BGMTLComputeEncoder alloc] initWithBGCommandBuffer:self] autorelease]; }
+ - (id)computeCommandEncoderWithDescriptor:(id)d { (void)d; return [self computeCommandEncoder]; }
+@@ -2314,6 +2577,16 @@
+              (unsigned long)t.pixelFormat, (unsigned long)d.colorAttachments[0].level, (unsigned long)d.colorAttachments[0].loadAction,
+              (unsigned long)d.colorAttachments[0].storeAction, surf0);
+    }
++   if (bg_hold_on()) {
++      for (unsigned i = 0; i < BG_HOLD_TARGETS; i++) {
++         id<MTLTexture> t = d.colorAttachments[i].texture;
++         IOSurfaceRef sf = t && [t respondsToSelector:@selector(iosurface)] ? (IOSurfaceRef)[(BGMTLTexture *)t iosurface] : NULL;
++         if (!sf || IOSurfaceGetWidth(sf) < 700 || IOSurfaceGetHeight(sf) < 1000) continue;   // canvas surfaces: only those are swapped
++         BOOL seen = NO;
++         for (unsigned j = 0; j < _nHoldTargets; j++) seen = seen || _holdTargets[j] == sf;
++         if (!seen && _nHoldTargets < BG_HOLD_TARGETS) _holdTargets[_nHoldTargets++] = (IOSurfaceRef)CFRetain(sf);
++      }
++   }
+    return [[[BGMTLRenderEncoder alloc] initWithBGCommandBuffer:self descriptor:d] autorelease];
+ }
+ - (id)blitCommandEncoder { return [[[BGMTLBlitEncoder alloc] initWithBGCommandBuffer:self] autorelease]; }
+@@ -2620,6 +2893,16 @@
+          char why2[256] = { 0 };
+          _tex = chl_texture_create([device chl], &_desc, why2, sizeof(why2));
+          if (_tex) _surfCopy = YES;
++         if (_tex && (plane || IOSurfaceGetPlaneCount(sf) >= 2)) {
++            // ponytail: the refresh below reads the surface's base at its top-level pitch, wrong for a plane; fix it if this line ever appears
++            static unsigned planes_logged;
++            if (__atomic_add_fetch(&planes_logged, 1, __ATOMIC_RELAXED) <= 8) {
++               char line[160];
++               snprintf(line, sizeof(line), "plane %lu of %zu-plane surface %u wrapped as %ux%u fmt %lu, refreshed through the plain copy", (unsigned long)plane,
++                        IOSurfaceGetPlaneCount(sf), IOSurfaceGetID(sf), _desc.width, _desc.height, (unsigned long)[d pixelFormat]);
++               bgmtl_note_line(line);
++            }
++         }
+          else snprintf(why, sizeof(why), "IOSurface %u (%ux%u fmt %lu): not imported, own memory refused: %s", IOSurfaceGetID(sf),
+                        _desc.width, _desc.height, (unsigned long)[d pixelFormat], why2);
+       }
+@@ -2725,6 +3008,16 @@
+ - (BGMTLTexture *)bgRoot { BGMTLTexture *t = self; while (t->_parent) t = t->_parent; return t; }
+ - (void *)iosurface { return _parent ? [_parent iosurface] : (void *)_surface; }
+ - (NSUInteger)iosurfacePlane { return _plane; }
++// Launch capture: a portrait client image (caller's bytes or another process's surface) sampled for the first time.
++- (BOOL)bgCapNewClientImage
++{
++   if (_capSeen || !(_ncBytes || _surface)) return NO;
++   _capSeen = YES;
++   return _desc.width >= 400 && _desc.height >= _desc.width * 3 / 2 && _desc.pixel_format != 115;
++}
++- (void)bgCapMarkSeen { _capSeen = YES; }
++- (BOOL)bgCapIsNoCopy { return _ncBytes != NULL; }
++- (NSData *)bgNoCopyData { return _ncBytes && _ncLength <= 16u * 1024 * 1024 ? [NSData dataWithBytes:_ncBytes length:_ncLength] : nil; }
+ - (BOOL)isDrawable { return _surface != NULL; }
+ - (struct chl_texture *)chlTexture { return _tex; }
+ - (void)bgSettle
+@@ -2736,6 +3029,20 @@
+    BG_ST(zero_us, BG_US(t0)); BG_ST(zeroed, 1);
+ }
+ 
++// BEGIN no-copy pitch (test/launch-check.py runs this text)
++// newTextureWithBytesNoCopy gives bytes and a length, no pitch, and the length can be a rounded-up mapping: an 840x1860 ASTC launch
++// image is 1562400 bytes in a 1572864-byte mapping. length / rows then says 3382 for rows of 3360, every row starts 22 bytes later
++// than the last, and only each eighth row of blocks stays on a block boundary: full-width lines over the whole image. Compressed
++// rows are tight. An uncompressed image keeps its pitch only when the length is an exact number of rows.
++static size_t
++bg_nc_pitch(size_t length, size_t rows, size_t tight, unsigned bw, unsigned bh, unsigned levels)
++{
++   if (levels > 1 || bw > 1 || bh > 1 || !rows) return tight;
++   size_t pitch = length / rows;
++   return pitch >= tight && pitch * rows == length ? pitch : tight;
++}
++// END no-copy pitch
++
+ // A 64-bit hash of a caller's bytes (ponytail: a collision keeps one stale image; a 64-bit mix makes that not worth more code).
+ static uint64_t
+ bg_hash(const void *bytes, size_t n)
+@@ -2935,8 +3242,16 @@
+       unsigned bw = 1, bh = 1, bb = 4;
+       chl_format_block(_desc.pixel_format, &bw, &bh, &bb);
+       const size_t rows = (_desc.height + bh - 1) / bh, tight = (size_t)((_desc.width + bw - 1) / bw) * bb;
+-      size_t pitch = rows ? _ncLength / rows : tight;
+-      if (_desc.mip_levels > 1) pitch = tight;
++      size_t pitch = bg_nc_pitch(_ncLength, rows, tight, bw, bh, _desc.mip_levels);
++      if (rows && (size_t)_ncLength != pitch * rows && _desc.mip_levels <= 1) {
++         static unsigned noted;   // the first few lengths that do not settle the pitch, in bgmtl.log
++         if (__atomic_add_fetch(&noted, 1, __ATOMIC_RELAXED) <= 8) {
++            char line[160];
++            snprintf(line, sizeof(line), "no-copy image %ux%u fmt %lu: length %lu is not rows x pitch, pitch %zu (length / rows is %zu)", _desc.width,
++                     _desc.height, (unsigned long)_desc.pixel_format, (unsigned long)_ncLength, pitch, (size_t)_ncLength / rows);
++            bgmtl_note_line(line);
++         }
++      }
+       if ((size_t)_ncLength < tight * rows)   /* less than the image: reading it would run past the caller's memory */
+          BG_LOG("no-copy texture refresh skipped: %lu bytes for %zu rows of %zu (%ux%u fmt %lu)\n", (unsigned long)_ncLength, rows,
+                 tight, _desc.width, _desc.height, (unsigned long)_desc.pixel_format);
+@@ -3266,6 +3581,7 @@
+       BGMTLTexture *t = (id)a.texture;
+       unsigned sid = t.iosurface ? IOSurfaceGetID((IOSurfaceRef)t.iosurface) : 0;
+       [cb bgCapture:[NSString stringWithFormat:@"attachment tex=%p gpu=%p surface=%u size=%lux%lu fmt=%lu samples=%lu level=%lu slice=%lu load=%u store=%u resolve=%p resolveLevel=%lu resolveSlice=%lu\n",t,out->texture,sid,t.width,t.height,t.pixelFormat,t.sampleCount,a.level,a.slice,out->load_action,out->store_action,a.resolveTexture,a.resolveLevel,a.resolveSlice]];
++      [[t bgRoot] bgCapMarkSeen];   // a render target is not a new client image
+       if (t && t.iosurface && (bg_cap_surface ? sid == bg_cap_surface : t.width >= 700 && t.height >= 1000)) {
+          t = [t bgRoot]; [t retain]; [cb->_captureTarget release]; cb->_captureTarget=t;
+       }
+@@ -3452,9 +3768,28 @@
+          big |= t && t.width>=1500 && (t.pixelFormat==70 || t.pixelFormat==80 || t.pixelFormat==115);
+          icon |= t && t.width==204 && t.height==204 && (t.pixelFormat==115 || t.pixelFormat==70);
+       }
+-      if(big && bg_cap_eligible(0,_cb->_seq)) _cb->_captureKinds |= 1;
+-      if((icon || mask || label) && bg_cap_eligible(1,_cb->_seq)) _cb->_captureKinds |= 2;
+-      BOOL wanted=big || icon || mask || label || strstr(_pipeline->_names,"Tmua") || _captureDescriptor.colorAttachments[0].level>0;
++      BOOL launchHit=NO;
++      if(bg_cap_launch) {
++         for(unsigned i=0;i<BG_MAX_TEX;i++) {
++            if (!(_pipeline->_info.textures_used[1] & (1u<<i))) continue;
++            id<MTLTexture> t=_cb->_capTex[1][i];
++            BGMTLTexture *root=t ? [(BGMTLTexture *)t bgRoot] : nil;
++            if(!root || ![root bgCapNewClientImage] || !bg_cap_launch_take(_cb->_seq,3)) continue;
++            launchHit=YES;
++            _cb->_captureKinds |= 4;
++            [_cb bgCaptureClientBytes:root];
++            BG_LOG("launch capture cb=%lu client image %lux%lu fmt %lu surface %u plane %lu no-copy %d in pipeline %s\n", _cb->_seq,(unsigned long)t.width,(unsigned long)t.height,
++                   (unsigned long)t.pixelFormat,t.iosurface?IOSurfaceGetID((IOSurfaceRef)t.iosurface):0,(unsigned long)t.iosurfacePlane,[root bgCapIsNoCopy],_pipeline->_names);
++         }
++         if(__atomic_load_n(&bg_cap_force,__ATOMIC_ACQUIRE) && bg_cap_launch_take(_cb->_seq,3)) {
++            __atomic_store_n(&bg_cap_force,0,__ATOMIC_RELEASE);
++            _cb->_captureKinds |= 4;
++            BG_LOG("stripe capture cb=%lu\n",_cb->_seq);
++         }
++      }
++      if(!bg_cap_launch && big && bg_cap_eligible(0,_cb->_seq)) _cb->_captureKinds |= 1;
++      if(!bg_cap_launch && (icon || mask || label) && bg_cap_eligible(1,_cb->_seq)) _cb->_captureKinds |= 2;
++      BOOL wanted=bg_cap_launch ? launchHit : big || icon || mask || label || strstr(_pipeline->_names,"Tmua") || _captureDescriptor.colorAttachments[0].level>0;
+       if(wanted && _cb->_captureKinds) {
+          for(unsigned i=0;i<BG_MAX_TEX;i++) {
+             if (!(_pipeline->_info.textures_used[1] & (1u<<i))) continue;
+@@ -3565,9 +3900,6 @@
+ @end
+ 
+ // ---- GPU state, as the kernel reports it (SWEET_GPU_SEL_INFO): -1 no answer, 0 not ready, 1 ready, 2 LOST ----
+-struct bg_gpu_info { uint32_t abi_version, flags, gpu_id, chip_id; uint64_t va_start, va_size; uint32_t last_fence, abi_minor; };
+-extern int sweet_drm_info(int fd, struct bg_gpu_info *out);
+-
+ int
+ bgmtl_gpu_state(unsigned *abi_minor)
+ {
+--- ../fetch-fix/launch/bgl-launch.c	2026-11-02 01:41:43
++++ launch/bgl-launch.c	2026-11-02 09:54:45
+@@ -114,6 +114,12 @@
+  return 1;
+ }
+ 
++static int tu_flag_set(const char *list, const char *flag) {
++	size_t n = strlen(flag);
++	for (const char *p = list; (p = strstr(p, flag)); p += n)
++		if ((p == list || p[-1] == ',') && (p[n] == 0 || p[n] == ',')) return 1;
++	return 0;
++}
+ static int boot_uuid(char *out, size_t n)
+ {
+ #ifdef BGL_TEST
+@@ -612,6 +618,8 @@
+ 		setenv("CHL_FETCH_SYNC","0",1);
+ 		if (has_arg(args,"sweetfetchsync",big,sizeof big) &&
+ 		    (!strcmp(big,"0") || !strcmp(big,"1"))) setenv("CHL_FETCH_SYNC",big,1);
++		/* the sync helper emits no BR/BV rendezvous: only cleared for nocb without forcecb (fetch-fix-audit finding 1) */
++		if (!tu_flag_set(tud,"nocb") || tu_flag_set(tud,"forcecb")) setenv("CHL_FETCH_SYNC","0",1);
+ 		if (has_arg(args,"sweetprobe",big,sizeof big) && !strcmp(big,"1")) setenv("BGMTL_TEAR_PROBE","1",1);
+ 		if (stat(LOG_PATH, &st) == 0 && st.st_size > (1 << 20))
+ 			unlink(LOG_PATH);

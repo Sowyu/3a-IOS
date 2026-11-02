@@ -1,0 +1,70 @@
+2051: re-arm the vsync tick from an absolute deadline (sweetfb_tickfix=1, default off). UNTESTED ON A PHONE, never compiled in a kernel.
+What: vsyncFired runs the copy and the flip, then arms the next tick a full period later, so every flip costs an extra tick.
+ast19/21/22 fit tick 17.6 ms + 17 ms per flip, a ceiling of about 29 flips/s while swaps reach 35 to 57/s and are dropped.
+Apply: git apply this file against research/xnu-local/dxb/xnu's state of SweetFramebuffer.cpp and SweetFbScale.h, then rebuild the kernel. Host check: plans/speed/test/tick-check.c.
+
+diff --git a/iokit/Kernel/arm/SweetFbScale.h b/iokit/Kernel/arm/SweetFbScale.h
+index 5ff0e96..129ea4c 100644
+--- a/iokit/Kernel/arm/SweetFbScale.h
++++ b/iokit/Kernel/arm/SweetFbScale.h
+@@ -13,6 +13,21 @@
+ #define SFS_NEON 1
+ #endif
+ 
++/*
++ * 2051: the next tick's deadline and the wait to arm for it, in us. A tick that ran late restarts the schedule min_wait from
++ * now, so a long copy or a stall gives no burst of catch-up ticks.
++ */
++static inline uint64_t
++sfs_tick_next(uint64_t deadline, uint32_t period, uint64_t now, uint32_t min_wait, uint32_t *wait)
++{
++	deadline += period;
++	if (deadline < now + min_wait) {
++		deadline = now + min_wait;
++	}
++	*wait = (uint32_t)(deadline - now);
++	return deadline;
++}
++
+ struct sfs_job {
+ 	const uint8_t *base;    /* surface row 0 */
+ 	uint8_t *draw;          /* panel row 0 */
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 28a6beb..dad1b03 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -515,6 +515,8 @@ public:
+ 	bool          fWatching;        /* a frame is queued: the swap timer polls for its latch every 500 us */
+ 	void          latchWatch(void);
+ 	bool          fVsyncAlign;      /* sweetfb_vsyncalign: the vsync timer follows the latch times SwapWait observed */
++	bool          fTickFix;         /* 2051 sweetfb_tickfix: the next tick is a deadline, not a period after the copy */
++	uint64_t      fTickDeadlineUS;
+ 	uint64_t      fPhaseAbs;        /* a latch (vsync) as observed by SwapWait, abs time; 0 = none yet */
+ 	uint64_t      fPeriodAbs;       /* vsync period, abs units */
+ 	IOReturn      swapWait(uint32_t id);
+@@ -1046,6 +1048,14 @@ AppleCLCD::start(IOService *provider)
+ 		fVsyncUS = 1000000u / hz;
+ 		fFlushTicks = 1;
+ 	}
++	{
++		int tf = 0;
++		PE_parse_boot_argn("sweetfb_tickfix", &tf, sizeof(tf));
++		fTickFix = tf != 0;
++		if (fTickFix) {
++			IOLog("SWEET FB: vsync tick on a deadline (sweetfb_tickfix)\n");
++		}
++	}
+ 	fVsync->setTimeoutUS(fVsyncUS);
+ 	if (fEarly) {
+ 		fSwapTimer = IOTimerEventSource::timerEventSource(this, &AppleCLCD::swapFired);
+@@ -1262,6 +1272,10 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	sweet_hold_release(taken);      /* copied: CA may render into them again */
+ 	fb->statsTick(now);
+ 	fb->hudTick(now);
++	if (fb->fTickFix && !fb->fVsyncAlign) {
++		fb->fTickDeadlineUS = sfs_tick_next(fb->fTickDeadlineUS ? fb->fTickDeadlineUS : sweet_abs_us(now), fb->fVsyncUS,
++		    sweet_abs_us(mach_absolute_time()), 250, &nextUS);
++	}
+ 	sender->setTimeoutUS(nextUS);
+ }
+ 

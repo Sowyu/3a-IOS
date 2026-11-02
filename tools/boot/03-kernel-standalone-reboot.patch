@@ -1,0 +1,110 @@
+UNTESTED ON A PHONE. Host check: check-03-kernel.sh.
+What: on asteroids with boot-arg sweetflashed=1, restart honours kern.sweet_reboot_mode (normal resets into boot_a,
+default still fastboot), and power off tries PSCI SYSTEM_OFF, falling back to fastboot. Without the boot-arg nothing changes,
+so RAM boots over a stock boot_a can never plain-reset into Android.
+Apply: cp to xnu/patches-12377/2060-asteroids-standalone-reboot.patch for CI, or in a kernel tree of your own:
+  git apply plans/boot/03-kernel-standalone-reboot.patch. Do not apply it to research/xnu-local without agreeing that with whoever is using that tree.
+
+diff --git a/bsd/dev/sweet_reboot.c b/bsd/dev/sweet_reboot.c
+index aeb83e3..d0d00c5 100644
+--- a/bsd/dev/sweet_reboot.c
++++ b/bsd/dev/sweet_reboot.c
+@@ -215,6 +215,8 @@ sr_pon_set_reason(unsigned magic)
+ #define SA_PPID_SDAM71  0x071u
+ #define SA_REASON_REG   0x48u           /* in peripheral 0x71: 0x7148 */
+ #define SA_REASON_BOOTLOADER 0x02u
++#define SA_REASON_RECOVERY   0x01u
++#define SA_REASON_NORMAL     0x00u
+ 
+ static volatile uint32_t *sa_obs, *sa_chnl;
+ static int sa_apid = -1;
+@@ -301,9 +303,23 @@ sweet_reboot_asteroids_init(void)
+ 	    reason, reason >> 1);
+ }
+ 
++/*
++ * Which reason a restart stores. Only a boot image flashed to both slots passes boot-arg sweetflashed=1: there a plain
++ * reset starts iOS again. A RAM boot over stock boot_a keeps going to fastboot whatever the sysctl says, because a plain
++ * reset there boots Android, which formats userdata. The default stays fastboot so that a boot loop stops at the ABL menu.
++ */
++static uint8_t
++sa_restart_reason(bool flashed, int override)
++{
++	if (!flashed) {
++		return SA_REASON_BOOTLOADER;
++	}
++	return override == SR_NORMAL ? SA_REASON_NORMAL : override == SR_RECOVERY ? SA_REASON_RECOVERY : SA_REASON_BOOTLOADER;
++}
++
+ /* Returns only if it did not reset (nothing was reset, the reason may or may not be stored). */
+ static void
+-sa_reboot_bootloader(void)
++sa_reboot_reason(uint8_t reason)
+ {
+ 	uint8_t old = 0, back = 0, upd;
+ 	uint32_t st;
+@@ -312,7 +328,7 @@ sa_reboot_bootloader(void)
+ 		printf("SWEET REBOOT: asteroids: reason register not ready, no reset\n");
+ 		return;
+ 	}
+-	upd = (uint8_t)((old & 0x01u) | (SA_REASON_BOOTLOADER << 1));
++	upd = (uint8_t)((old & 0x01u) | (reason << 1));
+ 	if (upd != old) {
+ 		sa_chnl[0x10 / 4] = upd;                                    /* WDATA0 */
+ 		__asm__ volatile ("dsb sy" ::: "memory");
+@@ -323,23 +339,41 @@ sa_reboot_bootloader(void)
+ 			return;
+ 		}
+ 	}
+-	if (!sa_read(&back) || (back >> 1) != SA_REASON_BOOTLOADER) {
+-		printf("SWEET REBOOT: asteroids: reason reads back 0x%02x, not bootloader, no reset\n", back);
++	if (!sa_read(&back) || (back >> 1) != reason) {
++		printf("SWEET REBOOT: asteroids: reason reads back 0x%02x, not %u, no reset\n", back, reason);
+ 		return;
+ 	}
+-	printf("SWEET REBOOT: asteroids: 0x7148 0x%02x -> 0x%02x (bootloader), PSCI SYSTEM_RESET\n", old, back);
++	printf("SWEET REBOOT: asteroids: 0x7148 0x%02x -> 0x%02x (reason %u), PSCI SYSTEM_RESET\n", old, back, reason);
+ 	delay(100 * 1000);
+ 	sr_psci_system_reset();
+ 	delay(2000 * 1000);
+ 	printf("SWEET REBOOT: asteroids: PSCI SYSTEM_RESET returned\n");
+ }
+ 
+-/* SweetPlatformExpert: power off on asteroids also goes to fastboot (a later power-on would boot Android). */
++static bool
++sa_flashed(void)
++{
++	uint32_t flashed = 0;
++
++	return PE_parse_boot_argn("sweetflashed", &flashed, sizeof(flashed)) && flashed == 1;
++}
++
++/* SweetPlatformExpert: power off on asteroids also goes to fastboot (a later power-on would boot Android), unless flashed. */
+ void
+ sweet_reboot_asteroids_halt(void)
+ {
+ 	(void)sweet_ufs_flush_final();
+-	sa_reboot_bootloader();
++	if (sa_flashed()) {
++		/* PSCI SYSTEM_OFF. Returning means the hypervisor refused it: fall through to fastboot. */
++		register uint64_t x0 __asm__("x0") = 0x84000008ULL;
++		printf("SWEET REBOOT: asteroids: PSCI SYSTEM_OFF\n");
++		delay(100 * 1000);
++		__asm__ volatile ("smc #0" : "+r"(x0) : : "x1", "x2", "x3", "x4", "x5", "x6", "x7",
++		    "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "cc", "memory");
++		delay(2000 * 1000);
++		printf("SWEET REBOOT: asteroids: PSCI SYSTEM_OFF returned %lld\n", (long long)x0);
++	}
++	sa_reboot_reason(SA_REASON_BOOTLOADER);
+ 	panic("SWEET: iOS asked to power off and the reboot to fastboot did not happen. On the Nothing Phone (3a) a "
+ 	    "power cycle boots Android, which formats the iOS root: hold Power + Volume down for fastboot instead");
+ }
+@@ -375,7 +409,7 @@ sweet_reboot_restart(int panic_restart)
+ 	 * Panics keep their own screen.
+ 	 */
+ 	if (sweet_board_asteroids() && !panic_restart && !sr_in_panic) {
+-		sa_reboot_bootloader();
++		sa_reboot_reason(sa_restart_reason(sa_flashed(), sr_override));
+ 		panic("SWEET: iOS asked to restart and the reboot to fastboot did not happen. On the Nothing Phone (3a) a "
+ 		    "reset boots Android, which formats the iOS root: hold Power + Volume down for fastboot, then fastboot "
+ 		    "boot the iOS image again");

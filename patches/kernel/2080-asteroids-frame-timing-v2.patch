@@ -1,0 +1,109 @@
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -948,6 +948,9 @@
+ 	uint32_t ibn[SUBMIT_CMDS_MAX];
+ 	uint32_t totalRelocs = 0;
+ 	IOReturn ret;
++	/* 2080: what a submission costs as its BO list grows, one line per 512 submissions. Written under the GPU lock. */
++	static uint64_t subN, subAbs, subMaxAbs, subLockAbs, subSweepAbs, subSweepMaxAbs, subBos;
++	uint64_t subT0 = mach_absolute_time(), subTLock = 0, subTSweep = 0;
+ 
+ 	if (r->nr_bos == 0 || r->nr_bos > SUBMIT_BOS_MAX || r->nr_cmds == 0 || r->nr_cmds > SUBMIT_CMDS_MAX) {
+ 		IOLog("SWEET GPU: submit refused: %u BOs, %u cmds\n", r->nr_bos, r->nr_cmds);
+@@ -1010,6 +1013,7 @@
+ 	}
+ 
+ 	sweet_gpu_lock();
++	subTLock = mach_absolute_time();
+ 	if (!sweet_gpu_ready()) {
+ 		ret = kIOReturnNotReady;
+ 		goto unlock;
+@@ -1047,6 +1051,7 @@
+ 		{
+ 			uint32_t fixed = 0;
+ 			bool sweep = (++gWcSubmits & 31) == 0;
++			uint64_t sweepT0 = mach_absolute_time();
+ 			for (uint32_t i = 0; i < r->nr_bos; i++) {
+ 				bool is_cmd = false;
+ 				for (uint32_t k = 0; k < r->nr_cmds && !is_cmd; k++) {
+@@ -1054,6 +1059,13 @@
+ 				}
+ 				if (sweep || is_cmd) {
+ 					fixed += wcReassert(objs[i]);
++				}
++			}
++			subTSweep = mach_absolute_time() - sweepT0;
++			if (sweep) {
++				subSweepAbs += subTSweep;
++				if (subTSweep > subSweepMaxAbs) {
++					subSweepMaxAbs = subTSweep;
+ 				}
+ 			}
+ 			if (fixed) {
+@@ -1105,6 +1117,27 @@
+ 		r->fence_fd = -1;
+ 		quarantineDrain(false);
+ 		ret = kIOReturnSuccess;
++		{
++			uint64_t d = mach_absolute_time() - subT0;
++			subN++;
++			subAbs += d;
++			subLockAbs += subTLock - subT0;
++			subBos += r->nr_bos;
++			if (d > subMaxAbs) {
++				subMaxAbs = d;
++			}
++			if ((subN & 511) == 0) {
++				uint64_t a, m, l, s, sm;
++				absolutetime_to_nanoseconds(subAbs / 512, &a);
++				absolutetime_to_nanoseconds(subMaxAbs, &m);
++				absolutetime_to_nanoseconds(subLockAbs / 512, &l);
++				absolutetime_to_nanoseconds(subSweepAbs / 16, &s);
++				absolutetime_to_nanoseconds(subSweepMaxAbs, &sm);
++				IOLog("SWEET GPU: submit_us avg=%llu max=%llu lock_wait=%llu sweep_avg=%llu sweep_max=%llu bos_avg=%llu\n",
++				    a / 1000, m / 1000, l / 1000, s / 1000, sm / 1000, subBos / 512);
++				subAbs = subMaxAbs = subLockAbs = subSweepAbs = subSweepMaxAbs = subBos = 0;
++			}
++		}
+ 	}
+ unlock:
+ 	sweet_gpu_unlock();
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -94,6 +94,7 @@
+  uint64_t copyNS, copyMaxNS, copies, logTime;
+  bool hw, hwOn; uint32_t hwStride, hwCanvas, hwSaved[6], hwSavedPe[9], hwSavedOp, hwW, hwH, hwVer; /* 2053 */
+  uint64_t swapFlipNS, swapFlips, swapFlipMaxNS, handlerMaxNS, tickGapMaxNS, lastTick, preserves; /* 2052; maxima per log line */
++ uint64_t logFlipNS, logFlips, dropDone, dropHeld; /* 2080: the window mean, and whether a replaced swap had finished on the GPU */
+ } ast;
+ static const uint32_t astPA[3] = {0xe3940000, 0xe431c000, 0xe4cf8000};
+ static const size_t astBytes = 0x9dad00;
+@@ -1541,8 +1542,11 @@
+             ast.latchMinNS/1000, ast.latched ? ast.latchNS/ast.latched/1000 : 0, ast.latchMaxNS/1000);
+         IOLog("SWEET FB AST: copy_us avg=%llu max=%llu copies=%llu gpu_hold_ticks=%llu\n",
+             ast.copies ? ast.copyNS/ast.copies/1000 : 0, ast.copyMaxNS/1000, ast.copies, c.gpuHolds);
+-        IOLog("SWEET FB AST: timing swap_to_flip_us avg=%llu max=%llu handler_us max=%llu tick_gap_us max=%llu preserves=%llu\n",
+-            ast.swapFlips ? ast.swapFlipNS/ast.swapFlips/1000 : 0, ast.swapFlipMaxNS/1000, ast.handlerMaxNS/1000, ast.tickGapMaxNS/1000, ast.preserves);
++        IOLog("SWEET FB AST: timing swap_to_flip_us avg=%llu max=%llu handler_us max=%llu tick_gap_us max=%llu preserves=%llu win_avg=%llu drop_done=%llu drop_held=%llu\n",
++            ast.swapFlips ? ast.swapFlipNS/ast.swapFlips/1000 : 0, ast.swapFlipMaxNS/1000, ast.handlerMaxNS/1000, ast.tickGapMaxNS/1000, ast.preserves,
++            ast.swapFlips > ast.logFlips ? (ast.swapFlipNS - ast.logFlipNS)/(ast.swapFlips - ast.logFlips)/1000 : 0, ast.dropDone, ast.dropHeld);
++        ast.logFlipNS = ast.swapFlipNS;
++        ast.logFlips = ast.swapFlips;
+         ast.swapFlipMaxNS = ast.handlerMaxNS = ast.tickGapMaxNS = 0;
+     }
+ 	sweet_fb_stats_publish(line);
+@@ -1638,6 +1642,14 @@
+ 	}
+ 	IOLockLock(fLock);
+ 	fSt.swaps++;
++	if (fDirty && ast.enabled) {
++		/* 2080: done means the tick was the limit, held means the GPU was */
++		if (fPendEpoch == sweet_gpu_epoch() && (fPendFence == 0 || sweet_gpu_fence_done(fPendFence))) {
++			ast.dropDone++;
++		} else {
++			ast.dropHeld++;
++		}
++	}
+ 	fPendHoldExpired = false;
+ 	fPendEpoch = sweet_gpu_epoch();
+ 	fPendFence = sweet_gpu_fence_snapshot();

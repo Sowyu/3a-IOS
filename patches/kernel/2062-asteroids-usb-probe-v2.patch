@@ -1,0 +1,155 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 45bf1e0..240b0f7 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -89,6 +89,106 @@ usb_rd(vm_offset_t base, uint32_t off)
+  */
+ extern void sweet_log_sync(void);
+ 
++/* Single plain ldr: Gunyah cannot emulate a load with writeback on a trapped block and injects an external abort
++ * (ESR 0x96000010, ISV 0). The shim's aborts at 0x15000020/24 were compiled post-index loads. */
++static uint32_t
++ua_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v;
++	__asm__ volatile ("ldr %w0, [%1]" : "=r"(v) : "r"(base + off) : "memory");
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++#define UA_GCC_PA       0x00139000u     /* USB30_PRIM: live DT GDSC 0x139004; gcc-milos.c branch offsets */
++#define UA_SMMU_PA      0x15000000u
++#define UA_SID          0x40u           /* live DT dwc3 iommus = <&apps_smmu 0x40 0> */
++#define UA_SPMI_CORE_PA 0x0c400000u
++#define UA_SPMI_CNFG_PA 0x0c42d000u
++#define UA_PPID_REPEATER 0x8fdu         /* PMIV0104 SID 8, eusb2-repeater@fd00 */
++
++/* The controller's power and clocks, and whether its registers can be read without hanging the bus. */
++static int
++ua_clocks_on(void)
++{
++	static const struct {
++		const char *name;
++		uint32_t off;
++	} branch[] = {
++		{ "master", 0x18 }, { "sleep", 0x24 }, { "mock_utmi", 0x28 }, { "cfg_noc_axi", 0x8c }, { "aggre_axi", 0x90 },
++	};
++	vm_offset_t gcc = ml_io_map(UA_GCC_PA, 0x1000);
++	int on = 1;
++	if (gcc == 0) {
++		printf("ASTEROIDS USB: GCC map failed\n");
++		return 0;
++	}
++	uint32_t gdscr = ua_rd(gcc, 0x04);
++	printf("ASTEROIDS USB: GDSCR=0x%08x\n", gdscr);
++	on &= gdscr >> 31;                      /* PWR_ON */
++	for (unsigned i = 0; i < sizeof(branch) / sizeof(branch[0]); i++) {
++		uint32_t cbcr = ua_rd(gcc, branch[i].off);
++		printf("ASTEROIDS USB: CBCR %s=0x%08x\n", branch[i].name, cbcr);
++		on &= !(cbcr >> 31);            /* CLK_OFF */
++	}
++	return on;
++}
++
++/* What ABL left for the stream: the same reads sweet_touch_asteroids.c's route scan makes on every boot, plus the
++ * matched bank as the shim's smmu_check_ufs reads bank 0. No writes. */
++static void
++ua_smmu(void)
++{
++	vm_offset_t gr0 = ml_io_map(UA_SMMU_PA, 0x2000);
++	if (gr0 == 0) {
++		printf("ASTEROIDS USB: SMMU map failed\n");
++		return;
++	}
++	uint32_t id0 = ua_rd(gr0, 0x20), id1 = ua_rd(gr0, 0x24), id2 = ua_rd(gr0, 0x28);
++	uint32_t pages = 1u << (((id1 >> 28) & 7) + 1), banks = id1 & 255, count = id0 & 255;
++	int match = -1;
++	printf("ASTEROIDS USB: SMMU id0=0x%08x id1=0x%08x id2=0x%08x sCR0=0x%08x sGFSR=0x%08x\n", id0, id1, id2,
++	    ua_rd(gr0, 0), ua_rd(gr0, 0x48));
++	sweet_log_sync();
++	for (uint32_t i = 0; i < count; i++) {
++		uint32_t smr = ua_rd(gr0, 0x800 + 4 * i);
++		if (!(smr >> 31)) {
++			continue;
++		}
++		uint32_t s2cr = ua_rd(gr0, 0xc00 + 4 * i), mask = (smr >> 16) & 0x7fff;
++		printf("ASTEROIDS USB: SMR %u smr=0x%08x s2cr=0x%08x\n", i, smr, s2cr);
++		if (!((smr ^ UA_SID) & 0x7fff & ~mask)) {
++			match = (int)i;
++			if (((s2cr >> 16) & 3) == 0 && (s2cr & 255) < banks && pages <= 128) {
++				uint32_t idx = s2cr & 255;
++				vm_offset_t cb = ml_io_map(UA_SMMU_PA + (pages + idx) * 4096, 0x1000);
++				printf("ASTEROIDS USB: SID 0x40 bank %u cbar=0x%08x cba2r=0x%08x sctlr=0x%08x\n", idx,
++				    ua_rd(gr0, 0x1000 + 4 * idx), ua_rd(gr0, 0x1800 + 4 * idx), cb ? ua_rd(cb, 0) : 0);
++			}
++		}
++	}
++	printf("ASTEROIDS USB: SID 0x40 %s\n", match >= 0 ? "has an SMR" : "has no SMR");
++	sweet_log_sync();
++}
++
++/* Whether this EE may ever write the eUSB2 repeater (the writes abort if another EE owns it). */
++static void
++ua_repeater_owner(void)
++{
++	vm_offset_t core = ml_io_map(UA_SPMI_CORE_PA, 0x3000), cnfg = ml_io_map(UA_SPMI_CNFG_PA, 0x4000);
++	if (core == 0 || cnfg == 0) {
++		return;
++	}
++	uint32_t count = ua_rd(core, 4) & 0x7ffu;
++	for (uint32_t n = 0; n < count && n < 0x380u; n++) {
++		if (((ua_rd(core, 0x2000 + 4 * n) >> 8) & 0xfffu) == UA_PPID_REPEATER) {
++			printf("ASTEROIDS USB: repeater PPID 0x8fd APID %u owner EE %u\n", n, ua_rd(cnfg, 4 * n) & 7u);
++			return;
++		}
++	}
++	printf("ASTEROIDS USB: repeater PPID 0x8fd not in the arbiter map\n");
++}
++
+ static void
+ sweet_usb_asteroids_probe(void)
+ {
+@@ -102,8 +202,19 @@ sweet_usb_asteroids_probe(void)
+ 		sweet_log_sync();
+ 		return;
+ 	}
++	printf("ASTEROIDS USB: read-only probe: SMMU, SPMI owner, GCC, then DWC3 and PHY if clocked\n");
++	sweet_log_sync();
++	ua_smmu();
++	ua_repeater_owner();
++	int clocked = ua_clocks_on();
++	sweet_log_sync();
++	if (!clocked) {
++		printf("ASTEROIDS USB: controller not powered and clocked; DWC3 not read\n");
++		sweet_log_sync();
++		return;
++	}
+ 	/* Only the DWC3 global/device registers, not xHCI or wrapper registers. */
+-	printf("ASTEROIDS USB: read-only probe; mapping 0x0a60c100+0x700; reads may abort\n");
++	printf("ASTEROIDS USB: mapping 0x0a60c100+0x700; reads may abort\n");
+ 	sweet_log_sync();
+ 	vm_offset_t base = ml_io_map(0x0a60c100, 0x700);
+ 	if (base == 0) {
+@@ -129,7 +240,7 @@ sweet_usb_asteroids_probe(void)
+ 		printf("ASTEROIDS USB: before read %s @0x%08x\n",
+ 		    regs[i].name, 0x0a60c100 + regs[i].off);
+ 		sweet_log_sync();
+-		uint32_t value = usb_rd(base, regs[i].off);
++		uint32_t value = ua_rd(base, regs[i].off);
+ 		printf("ASTEROIDS USB: %s=0x%08x\n", regs[i].name, value);
+ 		sweet_log_sync();
+ 		if (i == 0 && (value == 0 || value == 0xffffffffu)) {
+@@ -138,6 +249,13 @@ sweet_usb_asteroids_probe(void)
+ 			return;
+ 		}
+ 	}
++	/* The eUSB2 PHY's whole register block (live DT 0x088e3000+0x154). */
++	printf("ASTEROIDS USB: before reads of the eUSB2 PHY @0x088e3000\n");
++	sweet_log_sync();
++	vm_offset_t phy = ml_io_map(0x088e3000, 0x154);
++	for (uint32_t off = 0; phy != 0 && off < 0x154; off += 4) {
++		printf("ASTEROIDS USB: PHY+0x%03x=0x%08x\n", off, ua_rd(phy, off));
++	}
+ 	printf("ASTEROIDS USB: probe complete; no register writes, no DMA, no gadget\n");
+ 	sweet_log_sync();
+ }

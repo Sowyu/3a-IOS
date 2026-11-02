@@ -1,0 +1,451 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 09c5807..ade7123 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -110,6 +110,7 @@ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_touch_asteroids.c		standard
+ bsd/dev/sweet_dsi_asteroids.c		standard
+ bsd/dev/sweet_rtc_asteroids.c		standard
++bsd/dev/sweet_thermal_asteroids.c	standard
+ bsd/dev/sweet_a810.c			standard
+ bsd/dev/sweet_a810_smmu.c		standard
+ bsd/dev/sweet_a810_hfi.c		standard
+diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
+index 4e1f857..90f8e68 100644
+--- a/bsd/dev/sweet_cpufreq.c
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -195,6 +195,7 @@ static struct cf_domain {
+ 	uint32_t load;                  /* last load, % */
+ 	uint32_t changes;
+ 	uint32_t down_cnt;
++	int therm_seen;                 /* the thermal ceiling this domain last acted on */
+ 	bool percore;                   /* EPSS DCVS_CTRL bit 0: vote every CPU's PERF_STATE row */
+ 	uint32_t khz[CPUFREQ_LUT_MAX];  /* states, ascending */
+ 	uint8_t hw[CPUFREQ_LUT_MAX];    /* LUT row of each state: the PERF_STATE value */
+@@ -239,6 +240,8 @@ static volatile uint64_t cf_in_until;
+ static uint32_t cf_in_events;
+ static uint32_t cf_in_khz = 1766400;    /* sweetcpuinput_khz */
+ static uint32_t cf_in_ms = 300;
++/* Thermal ceiling, % of each domain's top clock (sweet_thermal_asteroids.c). cf_request enforces it for every caller. */
++static volatile int cf_therm_pct = 100;
+ 
+ static inline uint32_t
+ cf_rd(const struct cf_domain *d, uint32_t off)
+@@ -288,10 +291,20 @@ cf_sleep_ms(unsigned ms)
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
++static uint32_t cf_pick(const struct cf_domain *d, int pct);
++
+ /* One MMIO store (EPSS per-core DCVS: one per CPU of the domain) + barrier: cheap, lock-free. */
+ static void
+ cf_request(struct cf_domain *d, uint32_t idx)
+ {
++	uint32_t ceil_idx = cf_therm_pct < 100 ? cf_pick(d, cf_therm_pct) : d->top;
++
++	if (idx > ceil_idx) {
++		idx = ceil_idx;
++		if (d->req == idx) {
++			return;         /* already held at the ceiling: no store every governor sample */
++		}
++	}
+ 	uint32_t row = d->hw[idx];
+ 
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+@@ -460,6 +473,7 @@ cf_setup(unsigned id, struct cf_domain *d)
+ 	/* gov starts at the cap and lets the first idle samples bring it down */
+ 	d->eff_cap = d->cap;
+ 	d->in_idx = d->cap;
++	d->therm_seen = 100;
+ 	if (id == 0 && cf_in_khz) {
+ 		uint32_t i = 0;
+ 		while (i < d->top && d->khz[i] < cf_in_khz) {
+@@ -774,6 +788,18 @@ cf_thread(void *arg __unused, wait_result_t wr __unused)
+ 				d->tis_ns[cur] += wall_ns;      /* the state held during this interval */
+ 			}
+ 			cf_gov_step(i, d, wall);
++			/* The thermal ceiling moved: fixed mode has no governor to follow it, and gov must drop now. */
++			int tp = cf_therm_pct;
++			if (tp != d->therm_seen) {
++				uint32_t ti = tp < 100 ? cf_pick(d, tp) : d->top;
++				d->therm_seen = tp;
++				if (cf_mode == MODE_FIXED) {
++					cf_request(d, MIN(d->cap, ti));
++				} else if (cf_mode == MODE_GOV && d->req > ti) {
++					cf_request(d, ti);
++				}
++				printf("SWEET CPUFREQ: cluster%u thermal ceiling %d%% -> state %u (%u kHz)\n", i, tp, ti, d->khz[ti]);
++			}
+ 		}
+ 		uint64_t since_log_ns;
+ 		absolutetime_to_nanoseconds(now - last_log, &since_log_ns);
+@@ -791,6 +817,14 @@ out:
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
++/* Called by the thermal guard; takes effect at the next sample of cf_thread and on every later request. */
++void sweet_cpufreq_thermal_limit(int pct);
++void
++sweet_cpufreq_thermal_limit(int pct)
++{
++	cf_therm_pct = pct < 10 ? 10 : pct > 100 ? 100 : pct;
++}
++
+ static int
+ cf_percent_arg(const char *name, int dflt)
+ {
+diff --git a/bsd/dev/sweet_thermal_asteroids.c b/bsd/dev/sweet_thermal_asteroids.c
+new file mode 100644
+index 0000000..97853ae
+--- /dev/null
++++ b/bsd/dev/sweet_thermal_asteroids.c
+@@ -0,0 +1,211 @@
++/*
++ * Nothing Phone (3a) (SM7635, asteroids): thermal guard. Reads the SoC's two TSENS controllers once a second, lowers the
++ * CPU ceiling through sweet_cpufreq.c above a limit, and shuts down above a higher one. Nothing else in this kernel throttles.
++ *
++ * Register facts: Linux drivers/thermal/qcom/tsens-v2.c (TM_Sn_STATUS 0xa0 + 4n, LAST_TEMP 11:0 in tenths of a degree, VALID
++ * bit 21) and the live DT (tsens0 TM 0xc228000, 15 sensors; tsens1 TM 0xc229000, 14 sensors; first reg is TM, as in mainline
++ * milos.dtsi). Reads only, TM window only; the SROT window is never touched. tsens1 sensor 6 has no thermal zone in the DT.
++ *
++ * Boot-args: sweetthermal=0 off, 1 log only, 2 also throttle, 3 (default) also shut down.
++ * sweetthermal_on / _off / _fast / _soft / _hard, whole degrees C (defaults 80 / 70 / 90 / 100 / 108). The DT's own trips are
++ * 95 (GPU), 110 (CPU) and 115 ("reset-mon"), all junction temperatures; the limits here are below them on purpose and are
++ * not calibrated against the phone's skin temperature.
++ * ponytail: hottest junction only, add the battery and skin NTCs once the ADSP or ADC path exists. A kernel hang stops this too.
++ *
++ * Shutdown ends in fastboot, not power off (sweet_reboot_asteroids_halt): a power cycle would boot Android.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/reboot.h>
++#include <sys/sysctl.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include "sweet_board.h"
++#include "sweet_thermal_policy.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
++extern void sweet_log_sync(void);
++extern void sweet_reboot_asteroids_halt(void);
++extern void sweet_cpufreq_thermal_limit(int pct);
++void sweet_thermal_start(void);
++
++#define ST_TM_PAGE_PA   0x0c228000u     /* both TM windows sit in this 16 KiB kernel page */
++#define ST_TM1_OFF      0x1000u
++#define ST_STATUS(n)    (0xa0u + 4u * (n))
++#define ST_MASK0        0x7fffu         /* tsens0: 0..14 */
++#define ST_MASK1        0x3fbfu         /* tsens1: 0..13 without 6 */
++
++static vm_offset_t st_tm;
++static int st_mode = 3;
++static struct st_limits st_lim = { 800, 700, 900, 1000, 1080 };
++static struct st_state st_s;
++static volatile int st_hot_dc;
++static volatile int st_hot_id = -1;
++static volatile unsigned st_bad;
++
++/* Hottest usable sensor; false when none is. VALID drops for a few AHB cycles during an update, so retry. */
++static bool
++st_read(int *hot, int *id)
++{
++	bool any = false;
++
++	for (unsigned c = 0; c < 2; c++) {
++		uint32_t mask = c ? ST_MASK1 : ST_MASK0;
++		vm_offset_t base = st_tm + (c ? ST_TM1_OFF : 0);
++		for (unsigned n = 0; n < 16; n++) {
++			int dc = 0;
++			bool ok = false;
++			if (!(mask & (1u << n))) {
++				continue;
++			}
++			for (unsigned t = 0; t < 3 && !ok; t++) {
++				ok = st_decode(*(volatile uint32_t *)(base + ST_STATUS(n)), &dc);
++				if (!ok) {
++					delay(1);
++				}
++			}
++			if (ok && (!any || dc > *hot)) {
++				*hot = dc;
++				*id = (int)(c * 100 + n);
++				any = true;
++			}
++		}
++	}
++	return any;
++}
++
++static void
++st_sleep_ms(unsigned ms)
++{
++	static int chan;
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++st_shutdown_thread(void *arg, wait_result_t wr)
++{
++	(void)arg;
++	(void)wr;
++	/* The normal path: unmount, then kPEHaltCPU -> fastboot. The guard's thread goes hard if this stalls. */
++	(void)reboot_kernel(RB_HALT, NULL);
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++st_apply(unsigned step)
++{
++	sweet_cpufreq_thermal_limit(st_cpu_pct(step));
++}
++
++static void
++st_thread(void *arg, wait_result_t wr)
++{
++	unsigned last_step = 0, quiet = 0;
++
++	(void)arg;
++	(void)wr;
++	st_sleep_ms(20000);     /* the log thread runs by now, so a bad first read leaves a trace */
++	printf("SWEET THERMAL: next: first TSENS read at %#x, sweetthermal=%d\n", ST_TM_PAGE_PA, st_mode);
++	sweet_log_sync();
++	for (;;) {
++		int hot = 0, id = -1;
++		bool valid = st_read(&hot, &id);
++		enum st_action act = st_poll(&st_s, &st_lim, valid, hot);
++
++		if (valid) {
++			st_hot_dc = hot;
++			st_hot_id = id;
++		} else {
++			st_bad++;
++		}
++		if (st_mode >= 2 && st_s.step != last_step) {
++			st_apply(st_s.step);
++		}
++		if (st_s.step != last_step || ++quiet >= 60) {
++			quiet = 0;
++			printf("SWEET THERMAL: hottest %d.%d C sensor %d valid %d step %u cpu %d%% bad %u\n", hot / 10,
++			    (hot < 0 ? -hot : hot) % 10, id, valid, st_s.step, st_cpu_pct(st_s.step), st_bad);
++			last_step = st_s.step;
++		}
++		if (act != ST_NONE) {
++			printf("SWEET THERMAL: %s at %d.%d C sensor %d%s\n", act == ST_HARD ? "HARD shutdown" : "clean shutdown",
++			    hot / 10, (hot < 0 ? -hot : hot) % 10, id, st_mode >= 3 ? "" : " (not acting, sweetthermal<3)");
++			sweet_log_sync();
++		}
++		if (st_mode >= 3 && act == ST_HARD) {
++			sweet_cpufreq_thermal_limit(10);
++			sweet_reboot_asteroids_halt();  /* fastboot, or a panic with the reason */
++		} else if (st_mode >= 3 && act == ST_SOFT) {
++			thread_t t;
++			sweet_cpufreq_thermal_limit(10);
++			if (kernel_thread_start(st_shutdown_thread, NULL, &t) == KERN_SUCCESS) {
++				thread_deallocate(t);
++			} else {
++				sweet_reboot_asteroids_halt();
++			}
++		}
++		st_sleep_ms(1000);
++	}
++}
++
++static int
++st_deg_arg(const char *name, int dflt_dc)
++{
++	int v = 0;
++	if (PE_parse_boot_argn(name, &v, sizeof(v)) && v >= 40 && v <= 115) {
++		return v * 10;
++	}
++	return dflt_dc;
++}
++
++void
++sweet_thermal_start(void)
++{
++	thread_t t;
++
++	if (!sweet_board_asteroids()) {
++		return;
++	}
++	(void)PE_parse_boot_argn("sweetthermal", &st_mode, sizeof(st_mode));
++	if (st_mode <= 0) {
++		printf("SWEET THERMAL: off (sweetthermal=0): nothing watches the temperature\n");
++		return;
++	}
++	st_lim.on_dc = st_deg_arg("sweetthermal_on", st_lim.on_dc);
++	st_lim.off_dc = st_deg_arg("sweetthermal_off", st_lim.off_dc);
++	st_lim.fast_dc = st_deg_arg("sweetthermal_fast", st_lim.fast_dc);
++	st_lim.soft_dc = st_deg_arg("sweetthermal_soft", st_lim.soft_dc);
++	st_lim.hard_dc = st_deg_arg("sweetthermal_hard", st_lim.hard_dc);
++	st_tm = ml_io_map(ST_TM_PAGE_PA, PAGE_SIZE);
++	if (st_tm == 0) {
++		printf("SWEET THERMAL: TM map failed: nothing watches the temperature\n");
++		return;
++	}
++	if (kernel_thread_start(st_thread, NULL, &t) == KERN_SUCCESS) {
++		thread_deallocate(t);
++	} else {
++		printf("SWEET THERMAL: kernel_thread_start failed\n");
++	}
++}
++
++static int
++st_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	char buf[128];
++	int n = snprintf(buf, sizeof(buf), "mode=%d hot_dc=%d sensor=%d step=%u cpu_pct=%d bad=%u", st_mode, st_hot_dc, st_hot_id,
++	    st_s.step, st_cpu_pct(st_s.step), st_bad);
++	return sysctl_handle_string(oidp, buf, n + 1, req);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_thermal, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, st_sysctl, "A",
++    "Nothing Phone (3a) thermal guard state (bsd/dev/sweet_thermal_asteroids.c)");
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_thermal_policy.h b/bsd/dev/sweet_thermal_policy.h
+new file mode 100644
+index 0000000..d67687e
+--- /dev/null
++++ b/bsd/dev/sweet_thermal_policy.h
+@@ -0,0 +1,111 @@
++/*
++ * Nothing Phone (3a) thermal guard policy: pure logic, no kernel headers, so plans/power/host-check can run it on a Mac.
++ * One call per second with the hottest TSENS reading in tenths of a degree C.
++ */
++#ifndef SWEET_THERMAL_POLICY_H
++#define SWEET_THERMAL_POLICY_H
++#include <stdbool.h>
++#include <stdint.h>
++
++#define ST_STEPS        7u
++#define ST_BLIND_STEP   3u      /* no valid sensor for ST_BLIND_POLLS: hold at least this step */
++#define ST_BLIND_POLLS  10u
++#define ST_UP_POLLS     5u      /* over on_dc this long: one step down in clock */
++#define ST_DOWN_POLLS   10u     /* at or under off_dc this long: one step back up */
++#define ST_SOFT_POLLS   3u
++#define ST_HARD_POLLS   2u
++#define ST_SOFT_TIMEOUT 30u     /* clean shutdown still running after this long: go hard */
++
++enum st_action { ST_NONE, ST_SOFT, ST_HARD };
++
++struct st_limits {
++	int on_dc, off_dc, fast_dc, soft_dc, hard_dc;
++};
++
++struct st_state {
++	unsigned step;
++	unsigned up, down, soft, hard, blind, soft_age;
++	bool soft_sent, hard_sent;
++};
++
++/* CPU ceiling per step, percent of each domain's top clock. */
++static inline int
++st_cpu_pct(unsigned step)
++{
++	static const int pct[ST_STEPS] = { 100, 85, 70, 55, 40, 25, 10 };
++	return pct[step < ST_STEPS ? step : ST_STEPS - 1];
++}
++
++/* A raw TM_Sn_STATUS word to tenths of a degree: bit 21 valid, bits 11:0 signed. False when unusable. */
++static inline bool
++st_decode(uint32_t status, int *dc)
++{
++	int v = (int)(status & 0xfffu);
++
++	if (!(status & (1u << 21))) {
++		return false;
++	}
++	if (v & 0x800) {
++		v -= 0x1000;
++	}
++	if (v < -400 || v > 1500) {
++		return false;
++	}
++	*dc = v;
++	return true;
++}
++
++static inline enum st_action
++st_poll(struct st_state *s, const struct st_limits *l, bool valid, int hottest_dc)
++{
++	if (s->soft_sent && !s->hard_sent && ++s->soft_age >= ST_SOFT_TIMEOUT) {
++		s->hard_sent = true;
++		return ST_HARD;
++	}
++	if (!valid) {
++		/* Blind: no shutdown on no data, but do not stay at full clocks. */
++		if (++s->blind >= ST_BLIND_POLLS && s->step < ST_BLIND_STEP) {
++			s->step = ST_BLIND_STEP;
++		}
++		return ST_NONE;
++	}
++	s->blind = 0;
++	s->hard = hottest_dc >= l->hard_dc ? s->hard + 1 : 0;
++	s->soft = hottest_dc >= l->soft_dc ? s->soft + 1 : 0;
++	if (hottest_dc >= l->fast_dc) {
++		s->up = 0;
++		s->down = 0;
++		if (s->step < ST_STEPS - 1) {
++			s->step++;
++		}
++	} else if (hottest_dc >= l->on_dc) {
++		s->down = 0;
++		if (++s->up >= ST_UP_POLLS) {
++			s->up = 0;
++			if (s->step < ST_STEPS - 1) {
++				s->step++;
++			}
++		}
++	} else if (hottest_dc <= l->off_dc) {
++		s->up = 0;
++		if (++s->down >= ST_DOWN_POLLS) {
++			s->down = 0;
++			if (s->step > 0) {
++				s->step--;
++			}
++		}
++	} else {
++		s->up = 0;
++		s->down = 0;
++	}
++	if (s->hard >= ST_HARD_POLLS && !s->hard_sent) {
++		s->hard_sent = true;
++		return ST_HARD;
++	}
++	if (s->soft >= ST_SOFT_POLLS && !s->soft_sent && !s->hard_sent) {
++		s->soft_sent = true;
++		return ST_SOFT;
++	}
++	return ST_NONE;
++}
++#endif /* SWEET_THERMAL_POLICY_H */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 2abf22a..167a860 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -77,6 +77,7 @@ extern void beryllium_wlan_init(void);
+ extern void sweet80211_init(void);
+ extern void sweet_usb_probe(void);
+ extern void sweet_cpufreq_max(void);
++extern void sweet_thermal_start(void);
+ extern void sweet_charger_start(void);
+ extern void sweet_a630_probe(void);
+ 
+@@ -1315,6 +1316,8 @@ sweet_ufs_init(void)
+ 		sweet_a810_probe();
+ 		/* EPSS CPU frequency (sweet_cpufreq.c) */
+ 		sweet_cpufreq_max();
++		/* TSENS thermal guard (sweet_thermal_asteroids.c, boot-arg sweetthermal) */
++		sweet_thermal_start();
+ 		printf("SWEET UFS: Nothing Phone (3a): no SM7150/SDM845 drivers (USB, charger, GPU, Wi-Fi)\n");
+ 		return 0;
+ 	}

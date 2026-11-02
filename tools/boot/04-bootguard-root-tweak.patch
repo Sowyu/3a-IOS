@@ -1,0 +1,56 @@
+UNTESTED ON A PHONE. Host check: check-04-bootguard.sh.
+What: root tweak adding a launchd job that allows restart-into-iOS for up to 3 boots in a row that die within 5 minutes.
+Needs patch 03 and /var/jb/usr/sbin/sysctl (in the current root). Takes effect in the next root build or `renegade update`.
+Apply: cd ios-asteroids && git apply ../plans/boot/04-bootguard-root-tweak.patch
+
+diff --git a/tools/renegade/root_tweaks18.py b/tools/renegade/root_tweaks18.py
+index acde212..c61dbcf 100755
+--- a/tools/renegade/root_tweaks18.py
++++ b/tools/renegade/root_tweaks18.py
+@@ -1281,6 +1281,38 @@ def firstboot(root, appreg=True, jb=True, wallpaper=True, metal=False):
+         FIRSTBOOT_LABEL, n, 'on' if appreg else 'off', 'on' if wallpaper else 'off', 'if present' if jb else 'off'))
+ 
+ 
++BOOTGUARD_LABEL = 'org.bergamota.renegade-bootguard'
++BOOTGUARD_SH = 'usr/local/libexec/renegade-bootguard.sh'
++# Standalone boot (kernel boot-arg sweetflashed=1): a restart stays in iOS only while this job says so. Up to 3 boots in a
++# row that do not stay up 5 minutes may restart into iOS; after that restarts stop at the ABL fastboot menu (START boots).
++BOOTGUARD_SCRIPT = '''#!/bin/sh
++T=${SWEET_BOOT_TRIES:-/private/var/db/.renegade-boot-tries}
++PATH=/var/jb/usr/sbin:/usr/sbin:/sbin:/usr/bin:/bin
++export PATH
++n=0
++[ -f "$T" ] && n=$(cat "$T")
++case "$n" in ''|*[!0-9]*) n=0 ;; esac
++n=$((n+1))
++echo $n >"$T"
++[ $n -le 3 ] && sysctl -w kern.sweet_reboot_mode=normal
++sleep ${SWEET_BOOT_STABLE:-300}
++echo 0 >"$T"
++exit 0
++'''
++
++
++def bootguard(root):
++    """The job behind the kernel's sweetflashed=1 restart policy; without that boot-arg the sysctl it sets is ignored."""
++    p = os.path.join(root, BOOTGUARD_SH)
++    os.makedirs(os.path.dirname(p), exist_ok=True)
++    with open(p, 'w') as f:
++        f.write(BOOTGUARD_SCRIPT)
++    os.chmod(p, 0o755)
++    add_job(root, BOOTGUARD_LABEL, {
++        'Label': BOOTGUARD_LABEL, 'ProgramArguments': ['/bin/sh', '/' + BOOTGUARD_SH],
++        'RunAtLoad': True, 'UserName': 'root', 'StandardErrorPath': '/dev/console'})
++
++
+ def jailbreak_userland(root, owners_out, force=False, prestaged=False):
+     """Procursus rootless + Sileo + TrollStore into /private/var/jb (jailbreak.py image_stage); /var stays the
+     symlink to private/var. Skipped when the pinned versions are already installed (force: reinstall)."""
+@@ -1601,6 +1633,7 @@ def auto(root):
+     if os.environ.get('RENEGADE_NO_BGMTL') != '1' and os.environ.get('RENEGADE_BGMTL') != '0':
+         metal = bgmtl(root)
+     firstboot(root, appreg=enabled('appreg'), jb=enabled('jb'), wallpaper=enabled('wallpaper'), metal=metal)
++    bootguard(root)
+     if enabled('bglrender'):
+         bglrender(root)
+     if os.environ.get('RENEGADE_DISABLE_CRYPTEXD') == '1':      # opt-in, off by default

@@ -1,0 +1,85 @@
+2052: per-frame flip timing in the kernel log and kern.sweet_fb_trace (always on, a few additions per flip). UNTESTED ON A PHONE, never compiled in a kernel.
+What: adds a "SWEET FB AST: timing" line every 10 s (swap to flip, handler time, largest tick gap, whole-buffer preserve copies) and fills scan/latch/done in the existing trace for the flip path.
+Apply: git apply after 2051, then rebuild the kernel. Reads only; no display behaviour changes.
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index dad1b03..0006270 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -92,6 +92,7 @@ static struct {
+  uint32_t front;
+  uint64_t done, latched, latchNS, latchMinNS, latchMaxNS, repeated, epochDrops;
+  uint64_t copyNS, copyMaxNS, copies, logTime;
++ uint64_t swapFlipNS, swapFlips, swapFlipMaxNS, handlerMaxNS, tickGapMaxNS, lastTick, preserves; /* 2052; maxima per log line */
+ } ast;
+ static const uint32_t astPA[3] = {0xe3940000, 0xe431c000, 0xe4cf8000};
+ static const size_t astBytes = 0x9dad00;
+@@ -1143,6 +1144,16 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
+ 	fb->fSt.ticks++;
++	if (ast.enabled) {
++		uint64_t gapNS = 0;
++		if (ast.lastTick != 0) {
++			absolutetime_to_nanoseconds(now - ast.lastTick, &gapNS);
++		}
++		if (gapNS > ast.tickGapMaxNS) {
++			ast.tickGapMaxNS = gapNS;
++		}
++		ast.lastTick = now;
++	}
+ 	/*
+ 	 * 0216: with sweetfb_vsyncalign the notification carries the time of the latest panel vsync that SwapWait saw (the
+ 	 * MDP latch, a real vsync of the panel) projected forward by whole periods, and the timer is re-armed for the next
+@@ -1240,6 +1251,13 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	if (rec != NULL) {
+ 		fb->present(rec, copyEpoch);
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
++		if (ast.enabled) {
++			uint64_t handlerNS;
++			absolutetime_to_nanoseconds(mach_absolute_time() - now, &handlerNS);
++			if (handlerNS > ast.handlerMaxNS) {
++				ast.handlerMaxNS = handlerNS;
++			}
++		}
+ 	}
+ 	if (fb->fZc) {
+ 		fb->zcPoll();
+@@ -1472,6 +1490,9 @@ AppleCLCD::statsTick(uint64_t now)
+             ast.latchMinNS/1000, ast.latched ? ast.latchNS/ast.latched/1000 : 0, ast.latchMaxNS/1000);
+         IOLog("SWEET FB AST: copy_us avg=%llu max=%llu copies=%llu gpu_hold_ticks=%llu\n",
+             ast.copies ? ast.copyNS/ast.copies/1000 : 0, ast.copyMaxNS/1000, ast.copies, c.gpuHolds);
++        IOLog("SWEET FB AST: timing swap_to_flip_us avg=%llu max=%llu handler_us max=%llu tick_gap_us max=%llu preserves=%llu\n",
++            ast.swapFlips ? ast.swapFlipNS/ast.swapFlips/1000 : 0, ast.swapFlipMaxNS/1000, ast.handlerMaxNS/1000, ast.tickGapMaxNS/1000, ast.preserves);
++        ast.swapFlipMaxNS = ast.handlerMaxNS = ast.tickGapMaxNS = 0;
+     }
+ 	sweet_fb_stats_publish(line);
+ 	if (fStLogSecs != 0 && (fStLogT == 0 || sweet_abs_us(now - fStLogT) >= (uint64_t)fStLogSecs * 1000000)) {
+@@ -3851,7 +3872,10 @@ AppleCLCD::present(const uint8_t *rec, uint32_t copyEpoch)
+   fDraw = ast.va[back];
+   // Preserve partial damage outside this swap before the row workers start. A reading copy from
+   // write-combined memory is slow, so skip it when a layer that will draw covers the whole canvas.
+-  if (!astCovered(rec, mask)) memcpy((void *)fDraw, (const void *)ast.va[ast.front], astBytes);
++  if (!astCovered(rec, mask)) {
++   ast.preserves++;
++   memcpy((void *)fDraw, (const void *)ast.va[ast.front], astBytes);
++  }
+   // The legacy first-use bar clear erases the entire image, including preserved damage.
+   if (fScale && (fPadX > 0 || fPadY > 0)) {
+    uint32_t right = fPadX + (uint64_t)fLogicalW * fScaleXNum / fScaleXDen;
+@@ -4008,6 +4032,15 @@ AppleCLCD::present(const uint8_t *rec, uint32_t copyEpoch)
+         else ast.epochDrops++;
+     }
+     uint64_t astLatchAbs = mach_absolute_time() - astLatchStart;
++    if (struct sweet_fb_trace_rec *tr = ast.enabled ? sweet_fb_trace_of(fCurSwapID) : NULL) {
++        uint64_t end = astLatchStart + astLatchAbs, ns;
++        tr->scan = tcp0;
++        tr->latch = tr->done = end;
++        absolutetime_to_nanoseconds(end - tr->swap, &ns);
++        ast.swapFlipNS += ns;
++        ast.swapFlips++;
++        if (ns > ast.swapFlipMaxNS) ast.swapFlipMaxNS = ns;
++    }
+ 	if (fFlip) {
+ 		scanTo(back);
+ 	}

@@ -1,0 +1,32 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -509,6 +509,7 @@
+ 	 * framebuffer (console, panics, power-off fade).
+ 	 */
+ 	SweetSurface *fPendHold[4];     /* in-use holds of the swap not yet copied */
++	SweetSurface **fCopyHold;       /* 2120: the holds of the swap present() is copying, let go when the copy ends */
+ 	/* 2082 sweetfb_keep=1: the swap the pending one replaced. While the newest waits for the GPU, a tick shows this one if it has finished */
+ 	uint8_t fPrev[SWEET_FB_SWAP_REC_SIZE];
+ 	SweetSurface *fPrevHold[4];
+@@ -1374,7 +1375,9 @@
+ 	IOLockUnlock(fb->fLock);
+ 	if (ast.enabled && rec == NULL) ast.repeated++; // Software presentation ticks with no new frame.
+ 	if (rec != NULL) {
++		fb->fCopyHold = taken;
+ 		fb->present(rec, copyEpoch);
++		fb->fCopyHold = NULL;
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 		if (ast.enabled) {
+ 			uint64_t handlerNS;
+@@ -4292,6 +4295,11 @@
+         ast.copyNS += ns;
+         if (ns > ast.copyMaxNS) ast.copyMaxNS = ns;
+         if (ast.bar && !ast.stopped) astBarCheck(back, barSrc, barBpr, barW, barH, fCurSwapID, ns);
++    }
++    if (ast.enabled && fCopyHold != NULL) {
++        /* 2120: the surface was read in full above; the latch wait below touches only the flip buffers. hold-wait.patch waits on this hold */
++        __asm__ volatile("dsb sy" ::: "memory");
++        sweet_hold_release(fCopyHold);
+     }
+     uint64_t astLatchStart = mach_absolute_time();
+     if (ast.enabled && !ast.stopped) {

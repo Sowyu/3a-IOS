@@ -1,0 +1,119 @@
+asteroids A810: dump the first four hangs of a boot, with the submissions before them
+
+UNTESTED on the phone, syntax-checked only. dumpHang ran once a boot, so ast24's RECOVERY 2 and 3 left no IB. It now runs for four, and every hang prints the last 8 submissions: fence, pid, time, IB, BO count, whether the ring had drained, whether the client changed. A line every 1024 submissions gives the BO list size, so a flat list is visible. Diagnostics only, no change to what reaches the GPU. Pairs with chlorophyll-prologue-free.patch, whose "render pipeline" lines use the same clock.
+
+Apply: git apply in the kernel tree (-p1), after 2059.
+
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -501,11 +501,45 @@ wcReassert(struct sweet_gem *g)
+ 	return fixed;
+ }
+ 
++/*
++ * 2063: the submissions before a hang, printed with it. The first-IB2 hangs are suspected of following a drained ring or a client
++ * change; only a log with both can say. Under the GPU lock. Same clock as the client's CLOCK_UPTIME_RAW.
++ */
++#define SUBMIT_HIST             8
++static struct {
++	uint64_t ib, t;
++	uint32_t fence, dwords, cmds, bos;
++	int32_t  pid;
++	bool     drained, switched;
++} gHist[SUBMIT_HIST];
++static uint32_t gHistNext;
++
++static void
++histPrint(void)
++{
++	uint64_t now = mach_absolute_time(), nowns = 0;
++	absolutetime_to_nanoseconds(now, &nowns);
++	IOLog("SWEET HANG hist: now %llu ms\n", nowns / NSEC_PER_MSEC);
++	for (uint32_t n = 0; n < SUBMIT_HIST; n++) {
++		const uint32_t i = (gHistNext + n) % SUBMIT_HIST;
++		uint64_t ns = 0;
++		if (gHist[i].fence == 0) {
++			continue;
++		}
++		absolutetime_to_nanoseconds(gHist[i].t, &ns);
++		IOLog("SWEET HANG hist: fence %u pid %d at %llu ms, IB %#llx %u dwords, %u cmds, %u BOs, ring drained %d, client changed %d\n",
++		    gHist[i].fence, gHist[i].pid, ns / NSEC_PER_MSEC, gHist[i].ib, gHist[i].dwords, gHist[i].cmds, gHist[i].bos,
++		    gHist[i].drained, gHist[i].switched);
++	}
++}
++
+ /*
+  * 2014: a hang's command streams in the kernel log, for decoding offline (Mesa's cffdec): the BR and BV pipes' IB1/IB2/IB3
+  * pointers, then the dwords of each IB that lies in one of this client's BOs with a kernel alias (Turnip's command-stream
+- * BOs are GEM_NEW ones). Up to 4096 dwords an IB, eight a line: "SWEET HANG <what> <iova>: w0 .. w7". Once a boot.
++ * BOs are GEM_NEW ones). Up to 4096 dwords an IB, eight a line: "SWEET HANG <what> <iova>: w0 .. w7". The first HANG_DUMPS hangs of
++ * a boot (2063: was one, and ast24's second and third hang left no IB to read).
+  */
++#define HANG_DUMPS              4
+ void
+ SweetAdrenoUserClient::dumpIova(const char *what, uint64_t iova, uint32_t dwords, uint32_t at)
+ {
+@@ -543,12 +577,13 @@ SweetAdrenoUserClient::dumpIova(const char *what, uint64_t iova, uint32_t dwords
+ void
+ SweetAdrenoUserClient::dumpHang(void)
+ {
+-	static bool done;
++	static unsigned dumps;
+ 	uint32_t s[24];
+-	if (done || !sweet_gpu_ib_state(s)) {
++	histPrint();
++	if (dumps >= HANG_DUMPS || !sweet_gpu_ib_state(s)) {
+ 		return;
+ 	}
+-	done = true;
++	dumps++;
+ 	static const char *const names[6] = {"BR-IB1", "BR-IB2", "BR-IB3", "BV-IB1", "BV-IB2", "BV-IB3"};
+ 	for (unsigned k = 0; k < 6; k++) {
+ 		const uint32_t *r = &s[(k / 3) * 12 + (k % 3) * 4];
+@@ -944,6 +979,7 @@ SweetAdrenoUserClient::submit(struct sweet_msm_gem_submit *r)
+ 	struct sweet_msm_gem_submit_cmd *cmds = NULL;
+ 	struct sweet_msm_gem_submit_reloc *relocs = NULL;
+ 	struct sweet_gem **objs = NULL;
++	bool switched = false;
+ 	uint64_t ib[SUBMIT_CMDS_MAX];
+ 	uint32_t ibn[SUBMIT_CMDS_MAX];
+ 	uint32_t totalRelocs = 0;
+@@ -1067,6 +1103,7 @@ SweetAdrenoUserClient::submit(struct sweet_msm_gem_submit *r)
+ 		/* 2020: another client than the last one submits: the full context entry first */
+ 		if (gLastSubmitter != this) {
+ 			gLastSubmitter = this;
++			switched = true;
+ 			sweet_gpu_context_switch();
+ 		}
+ 		/* validated: patch, then submit */
+@@ -1087,12 +1124,30 @@ SweetAdrenoUserClient::submit(struct sweet_msm_gem_submit *r)
+ 		}
+ 	}
+ 	{
++		const bool drained = sweet_gpu_fence_done(sweet_gpu_fence_last());
+ 		uint32_t fence = sweet_gpu_submit(ib, ibn, r->nr_cmds);
+ 		if (fence == 0) {
+ 			IOLog("SWEET GPU: submit: the ring refused it (%u cmds, last fence %u, ready %d)\n", r->nr_cmds, sweet_gpu_fence_last(), sweet_gpu_ready());
+ 			ret = kIOReturnNoResources;
+ 			goto unlock;
+ 		}
++		{
++			const uint32_t h = gHistNext++ % SUBMIT_HIST;
++			gHistNext %= SUBMIT_HIST;
++			gHist[h].ib = ib[0];
++			gHist[h].t = mach_absolute_time();
++			gHist[h].fence = fence;
++			gHist[h].dwords = ibn[0];
++			gHist[h].cmds = r->nr_cmds;
++			gHist[h].bos = r->nr_bos;
++			gHist[h].pid = fPid;
++			gHist[h].drained = drained;
++			gHist[h].switched = switched;
++			static uint32_t named;
++			if ((++named & 1023) == 0) {   /* "now name" only says when the list grew; this says it stayed flat */
++				IOLog("SWEET GPU: submission %u names %u BOs (pid %d)\n", named, r->nr_bos, fPid);
++			}
++		}
+ 		for (uint32_t i = 0; i < r->nr_bos; i++) {
+ 			objs[i]->lastFence = fence;
+ 			objs[i]->submitted = true;

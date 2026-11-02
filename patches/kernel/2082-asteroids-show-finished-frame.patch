@@ -1,0 +1,123 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -95,6 +95,7 @@
+  bool hw, hwOn; uint32_t hwStride, hwCanvas, hwSaved[6], hwSavedPe[9], hwSavedOp, hwW, hwH, hwVer; /* 2053 */
+  uint64_t swapFlipNS, swapFlips, swapFlipMaxNS, handlerMaxNS, tickGapMaxNS, lastTick, preserves; /* 2052; maxima per log line */
+  uint64_t logFlipNS, logFlips, dropDone, dropHeld; /* 2080: the window mean, and whether a replaced swap had finished on the GPU */
++ uint64_t keptShown; /* 2082 */
+ } ast;
+ static const uint32_t astPA[3] = {0xe3940000, 0xe431c000, 0xe4cf8000};
+ static const size_t astBytes = 0x9dad00;
+@@ -471,6 +472,11 @@
+ 	 * framebuffer (console, panics, power-off fade).
+ 	 */
+ 	SweetSurface *fPendHold[4];     /* in-use holds of the swap not yet copied */
++	/* 2082 sweetfb_keep=1: the swap the pending one replaced. While the newest waits for the GPU, a tick shows this one if it has finished */
++	uint8_t fPrev[SWEET_FB_SWAP_REC_SIZE];
++	SweetSurface *fPrevHold[4];
++	uint32_t fPrevEpoch, fPrevFence;
++	bool fPrevValid, fKeepPrev;
+ 	uintptr_t     fDraw;            /* where present() draws */
+ 	uint32_t      fDrawIdx;
+ 	uint8_t       fBarsMask;        /* frames whose scaling bars are black */
+@@ -1111,6 +1117,11 @@
+ 			IOLog("SWEET FB: vsync tick on a deadline (sweetfb_tickfix)\n");
+ 		}
+ 	}
++	{
++		int keep = 0;
++		PE_parse_boot_argn("sweetfb_keep", &keep, sizeof(keep));
++		fKeepPrev = keep != 0 && !fEarly;
++	}
+ 	fTickUS = fVsyncUS;
+ 	fNotifyDiv = 1;
+ 	if (hz >= 120 && fTickFix && !fVsyncAlign) {
+@@ -1297,17 +1308,31 @@
+ 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0 && fb->gpuGateOpen(mach_absolute_time());
+ 	uint8_t *rec = NULL;
+ 	uint32_t copyEpoch = 0;
+-	SweetSurface *taken[4] = {};
+-	if (flush) {
++	SweetSurface *taken[4] = {}, *stale[4] = {};
++	bool prevVoid = fb->fPrevValid && fb->fPrevEpoch != sweet_gpu_epoch();
++	bool usePrev = !flush && !prevVoid && fb->fPrevValid && (fb->fPrevFence == 0 || sweet_gpu_fence_done(fb->fPrevFence));
++	if (flush || usePrev) {
+ 		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
+-		if (rec != NULL) {
++		if (rec != NULL && flush) {
+ 			memcpy(rec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
+ 			copyEpoch = fb->fPendEpoch;
+ 			fb->fDirty = false;
+ 			memcpy(taken, fb->fPendHold, sizeof(taken));
+ 			bzero(fb->fPendHold, sizeof(fb->fPendHold));
++		} else if (rec != NULL) {
++			memcpy(rec, fb->fPrev, SWEET_FB_SWAP_REC_SIZE);
++			copyEpoch = fb->fPrevEpoch;
++			memcpy(taken, fb->fPrevHold, sizeof(taken));
++			bzero(fb->fPrevHold, sizeof(fb->fPrevHold));
++			fb->fPrevValid = false;
++			ast.keptShown++;
+ 		}
+ 	}
++	if (fb->fPrevValid && (prevVoid || (flush && rec != NULL))) {   /* voided by a recovery, or older than what is shown now */
++		memcpy(stale, fb->fPrevHold, sizeof(stale));
++		bzero(fb->fPrevHold, sizeof(fb->fPrevHold));
++		fb->fPrevValid = false;
++	}
+ 	bool dirty = fb->fDirty;        /* still unshown: not yet worth lighting the panel */
+ 	IOLockUnlock(fb->fLock);
+ 	if (ast.enabled && rec == NULL) ast.repeated++; // Software presentation ticks with no new frame.
+@@ -1351,6 +1376,7 @@
+ 		}
+ 	}
+ 	sweet_hold_release(taken);      /* copied: CA may render into them again */
++	sweet_hold_release(stale);
+ 	fb->statsTick(now);
+ 	fb->hudTick(now);
+ 	if (fb->fTickFix && !fb->fVsyncAlign) {
+@@ -1553,9 +1579,9 @@
+             ast.latchMinNS/1000, ast.latched ? ast.latchNS/ast.latched/1000 : 0, ast.latchMaxNS/1000);
+         IOLog("SWEET FB AST: copy_us avg=%llu max=%llu copies=%llu gpu_hold_ticks=%llu\n",
+             ast.copies ? ast.copyNS/ast.copies/1000 : 0, ast.copyMaxNS/1000, ast.copies, c.gpuHolds);
+-        IOLog("SWEET FB AST: timing swap_to_flip_us avg=%llu max=%llu handler_us max=%llu tick_gap_us max=%llu preserves=%llu win_avg=%llu drop_done=%llu drop_held=%llu\n",
++        IOLog("SWEET FB AST: timing swap_to_flip_us avg=%llu max=%llu handler_us max=%llu tick_gap_us max=%llu preserves=%llu win_avg=%llu drop_done=%llu drop_held=%llu kept=%llu\n",
+             ast.swapFlips ? ast.swapFlipNS/ast.swapFlips/1000 : 0, ast.swapFlipMaxNS/1000, ast.handlerMaxNS/1000, ast.tickGapMaxNS/1000, ast.preserves,
+-            ast.swapFlips > ast.logFlips ? (ast.swapFlipNS - ast.logFlipNS)/(ast.swapFlips - ast.logFlips)/1000 : 0, ast.dropDone, ast.dropHeld);
++            ast.swapFlips > ast.logFlips ? (ast.swapFlipNS - ast.logFlipNS)/(ast.swapFlips - ast.logFlips)/1000 : 0, ast.dropDone, ast.dropHeld, ast.keptShown);
+         ast.logFlipNS = ast.swapFlipNS;
+         ast.logFlips = ast.swapFlips;
+         ast.swapFlipMaxNS = ast.handlerMaxNS = ast.tickGapMaxNS = 0;
+@@ -1653,6 +1679,7 @@
+ 	}
+ 	IOLockLock(fLock);
+ 	fSt.swaps++;
++	uint32_t oldEpoch = fPendEpoch, oldFence = fPendFence;
+ 	if (fDirty && ast.enabled) {
+ 		/* 2080: done means the tick was the limit, held means the GPU was */
+ 		if (fPendEpoch == sweet_gpu_epoch() && (fPendFence == 0 || sweet_gpu_fence_done(fPendFence))) {
+@@ -1673,11 +1700,23 @@
+ 		tr->swap = mach_absolute_time();
+ 	}
+ 	if (fDirty) {
+-		fSt.coalesced++;        /* the previous swap never reached the panel */
++		fSt.coalesced++;        /* the previous swap never reached the panel (2082: unless kept= counts it later) */
+ 	}
++	bool keep = fKeepPrev && ast.enabled && fDirty;
++	if (keep) {
++		memcpy(fPrev, fPending, SWEET_FB_SWAP_REC_SIZE);
++	}
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fDirty = true;
+-	memcpy(dropped, fPendHold, sizeof(dropped));     /* replaced before it was copied */
++	if (keep) {
++		memcpy(dropped, fPrevHold, sizeof(dropped));     /* two swaps old now: this one is gone */
++		memcpy(fPrevHold, fPendHold, sizeof(fPrevHold));
++		fPrevEpoch = oldEpoch;
++		fPrevFence = oldFence;
++		fPrevValid = true;
++	} else {
++		memcpy(dropped, fPendHold, sizeof(dropped));     /* replaced before it was copied */
++	}
+ 	memcpy(fPendHold, held, sizeof(held));
+ 	IOLockUnlock(fLock);
+ 	sweet_hold_release(dropped);

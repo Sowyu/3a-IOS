@@ -1,0 +1,70 @@
+asteroids: audit fixups for 2058 and the watch (next2-audit findings 2, 3, 6)
+
+UNTESTED on the phone. The noinline goes back on exec_extract_strings; sweetsb skips setuid and setgid executables; the 1 s fast verdict needs RBBM_HANG_DETECT up for the whole frozen stretch. Check: plans/gpu-next/tests/watch_fast_check.c
+
+--- a/bsd/kern/kern_exec.c	2026-11-02 11:26:04
++++ b/bsd/kern/kern_exec.c	2026-11-02 11:26:25
+@@ -6773,7 +6773,6 @@
+  * Note:	The argument and environment vectors are user space pointers
+  *		to arrays of user space pointers.
+  */
+-__attribute__((noinline))
+ /* Shared by patch 2058 and the host check. Only top-level application executables.
+  * No nested frameworks, XPC services, PlugIns, extensions, or path traversal. */
+ static int
+@@ -6797,6 +6796,7 @@
+     return *p && !strchr(p,'/') && strcmp(p,".") && strcmp(p,"..");
+ }
+ 
++__attribute__((noinline))
+ static int
+ exec_extract_strings(struct image_params *imgp)
+ {
+@@ -7039,6 +7039,7 @@
+ 	/* 2058: fail open on insufficient argument space; no fallible append. */
+ 	if (sweet_sb && !sweet_existing && sweet_arm64e_enabled() &&
+ 	    (imgp->ip_origcpusubtype & ~CPU_SUBTYPE_MASK) == CPU_SUBTYPE_ARM64E &&
++	    !(imgp->ip_origvattr->va_mode & (VSUID | VSGID)) &&
+ 	    sweet_ui_exec_path(imgp->ip_strings + strlen(EXECUTABLE_KEY)) &&
+ 	    imgp->ip_argspace >= (int)(sizeof(sweet_insert) + 3 * new_ptr_size) &&
+ 	    imgp->ip_strspace >= (int)(sizeof(sweet_insert) + new_ptr_size)) {
+--- a/iokit/Kernel/arm/SweetAdrenoWatch.h	2026-11-02 11:26:04
++++ b/iokit/Kernel/arm/SweetAdrenoWatch.h	2026-11-02 11:26:25
+@@ -31,7 +31,7 @@
+ 
+ struct sweet_watch {
+ 	uint32_t last[SWEET_WATCH_WORDS];
+-	uint64_t sampled, frozen_since, fence_since;
++	uint64_t sampled, frozen_since, fence_since, hang_since;
+ 	uint32_t same;
+ 	int      valid, would_fast;
+ };
+@@ -46,6 +46,7 @@
+ sweet_watch_reset(struct sweet_watch *w)
+ {
+ 	w->valid = 0;
++	w->hang_since = 0;
+ 	w->same = 0;
+ 	w->would_fast = 0;
+ }
+@@ -77,6 +78,11 @@
+ 	if (fence_moved) {
+ 		w->fence_since = now;
+ 	}
++	if (moved || !(int0 & SWEET_WATCH_HANG_DETECT)) {
++		w->hang_since = (int0 & SWEET_WATCH_HANG_DETECT) ? now : 0;     /* the fast path needs the bit up the whole frozen stretch, not a sticky last sample */
++	} else if (w->hang_since == 0) {
++		w->hang_since = now;
++	}
+ 	if (moved) {
+ 		w->frozen_since = now;
+ 		w->same = 0;
+@@ -88,7 +94,7 @@
+ 		return SWEET_WATCH_HUNG;
+ 	}
+ 	if ((int0 & SWEET_WATCH_HANG_DETECT) && w->same >= 2) {
+-		if (l->fast != 0 && now - w->frozen_since >= l->fast) {
++		if (l->fast != 0 && w->hang_since != 0 && now - w->hang_since >= l->fast && now - w->frozen_since >= l->fast) {
+ 			return SWEET_WATCH_FAST;
+ 		}
+ 		if (l->fast == 0) {

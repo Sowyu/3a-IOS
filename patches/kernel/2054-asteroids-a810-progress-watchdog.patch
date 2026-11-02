@@ -1,0 +1,321 @@
+asteroids A810: recover on no progress, not on elapsed time
+
+UNTESTED: nothing here has run on a phone or been compiled in the kernel tree. Replaces the parked 2050, which reset a healthy
+job after 5 s (merged-audit finding 1). A wait of 1 s or more samples RPTR, RBBM_STATUS, the fence word, the BV read pointer and
+the BR and BV IB1/IB2 base and remaining count every 250 ms, across waiters. Five seconds with none of them moving recovers, which
+also covers the ast16 freeze where no single wait lasted 5 s. A single long wait whose registers move no longer resets; 30 s with no
+fence resets regardless. New boot-arg sweetgpufast=MS recovers after MS frozen with RBBM_HANG_DETECT up (default 0: logs only). The
+kick line now prints RBBM_INT_0.
+
+Apply: git apply --check, then git apply, in the kernel tree (iokit and bsd paths, -p1), after 2049. Do not also apply 2050.
+Check: python3 plans/stability/2052-progress-watchdog/watch_check.py
+
+--- a/bsd/dev/sweet_a630.c
++++ b/bsd/dev/sweet_a630.c
+@@ -3009,6 +3009,13 @@
+ 	return sweet_board_asteroids() && sweet_a810_ib_state(out);
+ }
+ 
++/* 2052: the progress check's sample; false on the A630, which keeps the plain 5 s rule. */
++bool
++sweet_gpu_progress(uint32_t out[12], uint32_t *int0)
++{
++	return sweet_board_asteroids() && sweet_a810_progress(out, int0);
++}
++
+ /* The GPU stopped answering; no recovery is attempted (docs/GPU_KERNEL.md, risks): nothing more is submitted. */
+ void
+ sweet_gpu_mark_lost(void)
+--- a/bsd/dev/sweet_a810.c
++++ b/bsd/dev/sweet_a810.c
+@@ -1723,7 +1723,7 @@
+ int
+ sweet_a810_kick(void)
+ {
+-	uint32_t rptr = 0, wptr = 0, rbbm = 0;
++	uint32_t rptr = 0, wptr = 0, rbbm = 0, int0 = 0;
+ 	int st;
+ 	if (!a810_cp_started) {
+ 		return -1;
+@@ -1732,12 +1732,45 @@
+ 	a810_reg_read(NULL, A810_CP_RB_RPTR, &rptr);
+ 	a810_reg_read(NULL, A810_CP_RB_WPTR, &wptr);
+ 	a810_reg_read(NULL, A810_RBBM_STATUS, &rbbm);
++	a810_reg_read(NULL, A810_RBBM_INT_0_STATUS, &int0);
+ 	st = a810_ring_kick(&a810_ring);
+ 	lck_mtx_unlock(&a810_lck);
+-	A810_LOG("SWEET A810: stalled fence: WPTR written again (rptr %#x wptr %#x rbbm %#x) -> %d\n", rptr, wptr, rbbm, st);
++	A810_LOG("SWEET A810: stalled fence: WPTR written again (rptr %#x wptr %#x rbbm %#x int %#x) -> %d\n", rptr, wptr, rbbm, int0, st);
+ 	return st;
+ }
+ 
++/*
++ * 2052: one look at what moves while the CP works (order: SweetAdrenoWatch.h), for SweetAdreno's progress check. Same registers as
++ * the hang report and the kick; only the fence word and the two read pointer shadows come from memory.
++ */
++bool
++sweet_a810_progress(uint32_t out[12], uint32_t *int0)
++{
++	uint32_t ib[24];
++	if (!sweet_a810_ib_state(ib)) {
++		return false;
++	}
++	const volatile uint32_t *m = a810_gbuf[A810_GPU_MEMPTRS].cpu;
++	lck_mtx_lock(&a810_lck);
++	out[0] = out[1] = *int0 = 0;
++	a810_reg_read(NULL, A810_CP_RB_RPTR, &out[0]);
++	a810_reg_read(NULL, A810_RBBM_STATUS, &out[1]);
++	a810_reg_read(NULL, A810_RBBM_INT_0_STATUS, int0);
++	lck_mtx_unlock(&a810_lck);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	out[2] = m ? m[1] : 0;
++	out[3] = m ? m[2] : 0;
++	out[4] = ib[0];         /* BR IB1 base, rem; IB2 base, rem */
++	out[5] = ib[2];
++	out[6] = ib[4];
++	out[7] = ib[6];
++	out[8] = ib[12];        /* BV */
++	out[9] = ib[14];
++	out[10] = ib[16];
++	out[11] = ib[18];
++	return true;
++}
++
+ /* The CP's indirect-buffer pointers (a6xx.xml A8XX-: CP_IB1_BASE 0x900, REM 0x902, INIT 0x903, IB2 0x904.., IB3 0x908..), for
+  * the BR pipe (out[0..11]) and the BV pipe (out[12..23]): base lo/hi, remaining and initial dwords of IB1, IB2, IB3. */
+ bool
+--- a/bsd/dev/sweet_a810_api.h
++++ b/bsd/dev/sweet_a810_api.h
+@@ -51,6 +51,8 @@
+ bool sweet_a810_msm_fault_check(void);
+ /* CP_IB1/2/3 base, remaining and initial size for BR (0..11) and BV (12..23); false before the CP ran. */
+ bool sweet_a810_ib_state(uint32_t out[24]);
++/* 2052: what moves while the CP works, for the progress check (SweetAdrenoWatch.h); false before the CP ran. */
++bool sweet_a810_progress(uint32_t out[12], uint32_t *int0);
+ /* CP soft reset after a hang (2015): 1 when the GPU answers again; at most 64 a boot. */
+ int sweet_a810_recover(const char *why);
+ uint32_t sweet_a810_recoveries(void);
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -38,6 +38,8 @@
+ #include "SweetAdrenoABI.h"
+ #include "SweetSurface.h"
+ 
++#include "SweetAdrenoWatch.h"
++
+ extern "C" {
+ /* bsd/dev/sweet_a630.c: the kept-up GPU. Not thread safe; this file holds gAdrenoLock around every call. */
+ bool sweet_gpu_ready(void);
+@@ -59,6 +61,7 @@
+ void sweet_gpu_mark_lost(void);
+ void sweet_gpu_report(const char *why);
+ bool sweet_gpu_ib_state(uint32_t out[24]);
++bool sweet_gpu_progress(uint32_t out[12], uint32_t *int0);
+ void sweet_gpu_context_switch(void);
+ bool sweet_gpu_kick(void);
+ unsigned int pmap_cache_attributes(ppnum_t pn);
+@@ -75,6 +78,9 @@
+ #define SUBMIT_CMDS_MAX         128
+ #define SUBMIT_RELOCS_MAX       65536
+ #define WAIT_PATIENCE_MS        5000    /* a wait that asks for more than this is cut here and the GPU declared lost */
++#define WATCH_SAMPLE_MS         250     /* 2052: progress samples while a wait of 1 s or more is out, whoever waits */
++#define WATCH_GAP_MS            1000    /* samples further apart prove nothing about the time between them */
++#define WATCH_MAX_MS            30000   /* moving but no fence for this long: reset anyway */
+ #define CLOSE_PATIENCE_MS       2000
+ #define IOVA_UNSET              0
+ #define GPU_PAGE                0x1000ull       /* SMMU granule; never PAGE_SIZE (16 KiB) */
+@@ -338,12 +344,58 @@
+ 	}
+ 	md->release();
+ 	return ret;
++}
++
++/*
++ * 2052 (replaces the parked 2050): ast16 froze for good with fence 730 stuck, because every BO is on every Turnip submission, each
++ * close waited its CLOSE_PATIENCE_MS and no single wait reached WAIT_PATIENCE_MS. Time alone is no proof, though (merged-audit
++ * finding 1): a job over 5 s is healthy. So the clock runs across all waiters, and only while the registers do not move.
++ * Lock held. Boot-arg sweetgpufast=MS: recover after MS frozen with RBBM_HANG_DETECT up (default 0: only log that it would have).
++ */
++static struct sweet_watch gWatch;
++
++static enum sweet_watch_verdict
++watchLook(uint64_t now)
++{
++	static struct sweet_watch_limits lim;
++	static uint64_t sample;
++	uint32_t s[SWEET_WATCH_WORDS], int0 = 0;
++
++	if (sample == 0) {
++		uint32_t fast_ms = 0;
++		(void)PE_parse_boot_argn("sweetgpufast", &fast_ms, sizeof(fast_ms));
++		nanoseconds_to_absolutetime((uint64_t)WATCH_SAMPLE_MS * NSEC_PER_MSEC, &sample);
++		nanoseconds_to_absolutetime((uint64_t)WATCH_GAP_MS * NSEC_PER_MSEC, &lim.gap);
++		nanoseconds_to_absolutetime((uint64_t)fast_ms * NSEC_PER_MSEC, &lim.fast);
++		nanoseconds_to_absolutetime((uint64_t)WAIT_PATIENCE_MS * NSEC_PER_MSEC, &lim.cap);
++		nanoseconds_to_absolutetime((uint64_t)WATCH_MAX_MS * NSEC_PER_MSEC, &lim.max);
++	}
++	if (gWatch.valid && now - gWatch.sampled < sample) {
++		return SWEET_WATCH_WAIT;
++	}
++	if (!sweet_gpu_progress(s, &int0)) {
++		return SWEET_WATCH_WAIT;
++	}
++	int said = gWatch.would_fast;
++	enum sweet_watch_verdict v = sweet_watch_feed(&gWatch, &lim, now, s, int0);
++	if (gWatch.would_fast && !said) {
++		uint64_t ns = 0;
++		absolutetime_to_nanoseconds(now - gWatch.frozen_since, &ns);
++		IOLog("SWEET GPU: watch: frozen %llu ms with the hang bit up, rptr %#x rbbm %#x int %#x (sweetgpufast would recover here)\n",
++		    ns / NSEC_PER_MSEC, s[0], s[1], int0);
++	}
++	if (v != SWEET_WATCH_WAIT) {
++		IOLog("SWEET GPU: watch: %s, rptr %#x rbbm %#x int %#x fence word %u, BR IB1 %#x rem %u IB2 %#x rem %u, %u still samples\n",
++		    v == SWEET_WATCH_MAX ? "moving but no fence for 30 s" : v == SWEET_WATCH_FAST ? "frozen with the hang bit up" : "frozen",
++		    s[0], s[1], int0, s[2], s[4], s[5], s[6], s[7], gWatch.same);
++	}
++	return v;
+ }
+ 
+ /*
+  * Wait for sequence number `fence` (lock held, dropped while waiting). ns == 0 polls once.
+- * A wait that runs into WAIT_PATIENCE_MS (or its own limit when that is longer than 1 s)
+- * declares the GPU lost: nothing is recovered, nothing more is submitted.
++ * A wait of 1 s or more recovers the GPU when the progress check says so (2052); on the A630 a wait that runs into
++ * WAIT_PATIENCE_MS (or its own limit when that is longer than 1 s) declares it lost, as before.
+  */
+ bool
+ SweetAdrenoUserClient::waitFence(uint32_t fence, uint64_t ns)
+@@ -351,6 +403,7 @@
+ 	uint64_t began = mach_absolute_time(), limit, cap, early, kick_at;
+ 	uint32_t epoch = sweet_gpu_epoch();
+ 	bool kicked = false;
++	uint32_t watch_probe[SWEET_WATCH_WORDS], watch_int0;
+ 
+ 	if (fence == 0 || sweet_gpu_fence_done(fence)) {
+ 		return true;
+@@ -358,6 +411,7 @@
+ 	if (ns == 0) {
+ 		return false;
+ 	}
++	const bool watched = ns >= NSEC_PER_SEC && sweet_gpu_progress(watch_probe, &watch_int0);
+ 	nanoseconds_to_absolutetime(ns, &limit);
+ 	nanoseconds_to_absolutetime((uint64_t)WAIT_PATIENCE_MS * NSEC_PER_MSEC, &cap);
+ 	nanoseconds_to_absolutetime(2 * NSEC_PER_MSEC, &early);
+@@ -376,15 +430,25 @@
+ 		if (!kicked && waited >= kick_at) {
+ 			kicked = true;          /* 2020: 50 ms without the fence: the write pointer once more before anything else */
+ 			sweet_gpu_kick();
++		}
++		static uint32_t reported;
++		if (watched && watchLook(began + waited) != SWEET_WATCH_WAIT) {
++			if (reported != fence) {
++				reported = fence;
++				sweet_gpu_report("wait timed out");
++				dumpHang();
++			}
++			sweet_gpu_mark_lost();
++			sweet_watch_reset(&gWatch);
++			return false;
+ 		}
+ 		if (waited >= limit || waited >= cap) {
+-			static uint32_t reported;
+-			if (ns >= 100 * NSEC_PER_MSEC && reported != fence) {
++			if (ns >= 100 * NSEC_PER_MSEC && reported != fence && !(watched && waited >= cap)) {
+ 				reported = fence;
+ 				sweet_gpu_report("wait timed out");
+ 				dumpHang();
+ 			}
+-			if (ns >= NSEC_PER_SEC && waited >= cap) {
++			if (!watched && ns >= NSEC_PER_SEC && waited >= cap) {     /* the A630, or the CP not up */
+ 				sweet_gpu_mark_lost();
+ 			}
+ 			return false;
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetAdrenoWatch.h
+@@ -0,0 +1,86 @@
++/*
++ * 2052: is the A810 still working on a fence that has not come back? Plain C, no kernel headers, so
++ * plans/stability/2052-progress-watchdog/watch_check.py replays the logged sessions through it on a Mac.
++ *
++ * A sample is every register the kernel already reads while a fence is out: a hung CP freezes all of them (ast16: rptr 0x282
++ * and RBBM 0xec0405 in 177 of 177 kicks over 311 s), a long job moves the IB pointers or flickers the busy bits. WPTR is left out
++ * on purpose: new submissions behind a hung CP must not look like progress.
++ *
++ * ponytail: frozen pointers plus static busy bits for WATCH cap is taken as a hang; a real job that holds every bit still for
++ * that long is reset as the base kernel already did. Add a RBBM_PERFCTR_GPU_BUSY read if a log ever shows such a job.
++ */
++#ifndef SWEET_ADRENO_WATCH_H
++#define SWEET_ADRENO_WATCH_H
++
++#define SWEET_WATCH_WORDS       12      /* rptr, rbbm, fence word, BV rptr shadow, then base/rem of IB1 and IB2 for BR and BV */
++#define SWEET_WATCH_HANG_DETECT (1u << 23)      /* RBBM_INT_0 RBBM_HANG_DETECT: a8xx_gpu.c recovers on this interrupt */
++
++enum sweet_watch_verdict {
++	SWEET_WATCH_WAIT = 0,   /* keep waiting */
++	SWEET_WATCH_FAST,       /* frozen for `fast` with the hardware's own hang bit up */
++	SWEET_WATCH_HUNG,       /* frozen for `cap` */
++	SWEET_WATCH_MAX,        /* moving, but no fence for `max` */
++};
++
++struct sweet_watch {
++	uint32_t last[SWEET_WATCH_WORDS];
++	uint64_t sampled, frozen_since, fence_since;
++	uint32_t same;
++	int      valid, would_fast;
++};
++
++struct sweet_watch_limits {
++	uint64_t gap;           /* samples further apart than this: what happened between them is unknown, start over */
++	uint64_t fast;          /* 0: the fast verdict is only noted in would_fast (boot-arg sweetgpufast) */
++	uint64_t cap, max;
++};
++
++static inline void
++sweet_watch_reset(struct sweet_watch *w)
++{
++	w->valid = 0;
++	w->same = 0;
++	w->would_fast = 0;
++}
++
++static inline enum sweet_watch_verdict
++sweet_watch_feed(struct sweet_watch *w, const struct sweet_watch_limits *l, uint64_t now, const uint32_t s[SWEET_WATCH_WORDS],
++    uint32_t int0)
++{
++	int moved = !w->valid, fence_moved = !w->valid || w->last[2] != s[2];
++
++	if (w->valid && now - w->sampled > l->gap) {
++		moved = fence_moved = 1;
++	}
++	for (unsigned i = 0; !moved && i < SWEET_WATCH_WORDS; i++) {
++		moved = w->last[i] != s[i];
++	}
++	for (unsigned i = 0; i < SWEET_WATCH_WORDS; i++) {
++		w->last[i] = s[i];
++	}
++	w->sampled = now;
++	w->valid = 1;
++	if (fence_moved) {
++		w->fence_since = now;
++	}
++	if (moved) {
++		w->frozen_since = now;
++		w->same = 0;
++		w->would_fast = 0;
++		return now - w->fence_since >= l->max ? SWEET_WATCH_MAX : SWEET_WATCH_WAIT;
++	}
++	w->same++;
++	if (now - w->frozen_since >= l->cap) {
++		return SWEET_WATCH_HUNG;
++	}
++	if ((int0 & SWEET_WATCH_HANG_DETECT) && w->same >= 2) {
++		if (l->fast != 0 && now - w->frozen_since >= l->fast) {
++			return SWEET_WATCH_FAST;
++		}
++		if (l->fast == 0) {
++			w->would_fast = 1;
++		}
++	}
++	return now - w->fence_since >= l->max ? SWEET_WATCH_MAX : SWEET_WATCH_WAIT;
++}
++#endif /* SWEET_ADRENO_WATCH_H */

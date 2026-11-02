@@ -1,0 +1,144 @@
+2111: sweetfb_hwtest=SECONDS draws a position chart instead of the frame for that long after the first frame, and logs the latched scaler, multirect and LM registers once. Default off. UNTESTED ON A PHONE, syntax-checked only.
+Why: kern.sweet_fb_shot cannot read the canvas under sweetfb_ast_hw, so a phone photo is the only witness of the scan-out. Works with and without sweetfb_ast_hw so the two photos can be compared.
+Apply: git apply after 2100, in any order with 2110, then rebuild the kernel. Host check: plans/hwscale/test/chart-check.c. Recovery: remove the boot-arg.
+
+diff --git a/iokit/Kernel/arm/SweetFbScale.h b/iokit/Kernel/arm/SweetFbScale.h
+--- a/iokit/Kernel/arm/SweetFbScale.h
++++ b/iokit/Kernel/arm/SweetFbScale.h
+@@ -136,8 +136,54 @@
+ 		}
+ 	}
+ 	return h;
++}
++
++/*
++ * 2111 sweetfb_hwtest: an opaque chart in canvas coordinates. Each edge has 4 stripes of 4 px, the outermost on the edge pixel, with
++ * black between them: left red, right green, top blue, bottom yellow. White ticks every 100 canvas px count from column and row 0,
++ * longer every 500. White centre lines, a magenta square 600x600 for aspect, and a cyan bar where the battery fill ended in ast43.
++ */
++static inline uint32_t
++sfs_pattern_px(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
++{
++	if (w == 840 && x >= 814 && x < 816 && y >= 37 && y < 62) {
++		return 0xff00ffffu;
++	}
++	uint32_t l = x, r = w - 1 - x, t = y, b = h - 1 - y;
++	uint32_t dx = l < r ? l : r, dy = t < b ? t : b, d = dx < dy ? dx : dy;
++	if (d < 32) {
++		if ((d / 4) & 1) {
++			return 0xff000000u;
++		}
++		return d == l ? 0xffff0000u : d == r ? 0xff00ff00u : d == t ? 0xff0000ffu : 0xffffff00u;
++	}
++	uint32_t cx = w / 2, cy = h / 2;
++	if ((x == cx || x == cx - 1) || (y == cy || y == cy - 1)) {
++		return 0xffffffffu;
++	}
++	if (x >= cx - 300 && x < cx + 300 && y >= cy - 300 && y < cy + 300 &&
++	    (x < cx - 297 || x >= cx + 297 || y < cy - 297 || y >= cy + 297)) {
++		return 0xffff00ffu;
++	}
++	if ((dx < (y % 500 < 2 ? 80u : 56u) && y % 100 < 2) || (dy < (x % 500 < 2 ? 80u : 56u) && x % 100 < 2)) {
++		return 0xffffffffu;
++	}
++	return 0xff404040u;
+ }
+ 
++/* dw x dh is what the scan-out buffer holds: the canvas under sweetfb_ast_hw, the panel with the CPU scaler (nearest, for comparison). */
++static inline void
++sfs_pattern_fill(uint8_t *draw, uint32_t rowBytes, uint32_t dw, uint32_t dh, uint32_t cw, uint32_t ch)
++{
++	for (uint32_t py = 0; py < dh; py++) {
++		volatile uint32_t *row = (volatile uint32_t *)(draw + (uint64_t)py * rowBytes);
++		uint32_t cy = (uint32_t)((uint64_t)py * ch / dh);
++		for (uint32_t px = 0; px < dw; px++) {
++			row[px] = sfs_pattern_px((uint32_t)((uint64_t)px * cw / dw), cy, cw, ch);
++		}
++	}
++}
++
+ struct sfs_job {
+ 	const uint8_t *base;    /* surface row 0 */
+ 	uint8_t *draw;          /* panel row 0 */
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -97,6 +97,7 @@
+  uint64_t swapFlipNS, swapFlips, swapFlipMaxNS, handlerMaxNS, tickGapMaxNS, lastTick, preserves; /* 2052; maxima per log line */
+  uint64_t logFlipNS, logFlips, dropDone, dropHeld; /* 2080: the window mean, and whether a replaced swap had finished on the GPU */
+  uint64_t keptShown; /* 2082 */
++ uint32_t testSecs; uint64_t testEnd; bool testRegs; volatile uint32_t *lm; /* 2111 sweetfb_hwtest */
+ } ast;
+ static const uint32_t astPA[3] = {0xe3940000, 0xe431c000, 0xe4cf8000};
+ static const size_t astBytes = 0x9dad00;
+@@ -179,7 +180,42 @@
+   memcpy((void *)ast.va[1], (const void *)ast.va[0], astBytes);
+   memcpy((void *)ast.va[2], (const void *)ast.va[0], astBytes);
+   __asm__ volatile("dsb sy" ::: "memory");
++ }
++}
++/* 2111: the registers as latched, for the items no earlier log shows: multirect, exclusion rect, LM size, the written scaler. */
++static void astTestLog(void)
++{
++ #define AST_R(i) ast.pipe[(i) / 4]
++ IOLog("SWEET FB HWTEST: sspp size=%x img=%x xy=%x out=%x outxy=%x addr=%x stride=%x fmt=%x op=%x multirect=%x excl=%x/%x pe=%x/%x/%x\n",
++  AST_R(0x00), AST_R(0x04), AST_R(0x08), AST_R(0x0c), AST_R(0x10), AST_R(0x14), AST_R(0x24), AST_R(0x30), AST_R(0x38), AST_R(0x170), AST_R(0x1b4), AST_R(0x1b8), AST_R(0x100), AST_R(0x104), AST_R(0x108));
++ IOLog("SWEET FB HWTEST: qseed op=%x step=%x/%x/%x/%x preload=%x src=%x/%x dst=%x phase=%x/%x/%x/%x\n",
++  AST_Q(0x04), AST_Q(0x10), AST_Q(0x14), AST_Q(0x18), AST_Q(0x1c), AST_Q(0x20), AST_Q(0x40), AST_Q(0x44), AST_Q(0x48), AST_Q(0x90), AST_Q(0x94), AST_Q(0x98), AST_Q(0x9c));
++ IOLog("SWEET FB HWTEST: ctl layer=%x ext=%x lm op=%x out=%x\n", ast.ctl[0], ast.ctl[0x40/4], ast.lm ? ast.lm[0] : 0, ast.lm ? ast.lm[1] : 0);
++ #undef AST_R
++ sweet_log_sync();
++}
++/* 2111: replaces this frame with the chart until the time is up, counted from the first frame. Off without the boot-arg. */
++static void astTestFrame(uintptr_t draw, uint32_t rowBytes, uint32_t w, uint32_t h, uint32_t cw, uint32_t ch)
++{
++ uint64_t now = mach_absolute_time();
++ if (ast.testEnd == 0) {
++  nanoseconds_to_absolutetime((uint64_t)ast.testSecs * NSEC_PER_SEC, &ast.testEnd);
++  ast.testEnd += now;
++  IOLog("SWEET FB HWTEST: chart on for %u s, canvas %ux%u in a buffer of %ux%u\n", ast.testSecs, cw, ch, w, h);
++  sweet_log_sync();
++ }
++ if (now >= ast.testEnd) {
++  ast.testSecs = 0;
++  IOLog("SWEET FB HWTEST: chart off\n");
++  sweet_log_sync();
++  return;
++ }
++ if (!ast.testRegs && ast.front != 0) {
++  ast.testRegs = true;
++  astTestLog();
+  }
++ sfs_pattern_fill((uint8_t *)draw, rowBytes, w, h, cw, ch);
++ __asm__ volatile("dsb sy" ::: "memory");
+ }
+ static void astSeedBoot(void)
+ {
+@@ -2124,6 +2160,13 @@
+  PE_parse_boot_argn("sweetfb_barcheck", &barcheck, sizeof(barcheck));
+  ast.bar = barcheck == 1 && !ast.hw;
+  if (ast.bar) IOLog("SWEET FB BAR: armed, every %d rows, %d columns\n", SFS_BAR_STEP, SFS_BAR_COLS);
++ int hwtest = 0;
++ PE_parse_boot_argn("sweetfb_hwtest", &hwtest, sizeof(hwtest));
++ if (hwtest > 0) {
++  ast.testSecs = hwtest > 120 ? 120 : (uint32_t)hwtest;
++  ast.lm = (volatile uint32_t *)ml_io_map(0xae45000, 0x1000);
++  IOLog("SWEET FB HWTEST: armed for %u s\n", ast.testSecs);
++ }
+ }
+ 
+ bool
+@@ -4235,6 +4278,13 @@
+ 	if (!ast.hw && fHudReady && __atomic_load_n(&sweet_fb_hud, __ATOMIC_RELAXED) != 0 && hudUsable()) {
+ 		hudBlit(fDraw, fHw && fFlip ? fHwStride : fRowBytes);   /* on top of the copied frame, before it is scanned */
+ 	}
++	if (ast.testSecs != 0 && ast.enabled && !ast.stopped && (fPadX == 0 && fPadY == 0)) {
++		if (ast.hw) {
++			astTestFrame(fDraw, ast.hwStride, fLogicalW, fLogicalH, fLogicalW, fLogicalH);
++		} else {
++			astTestFrame(fDraw, fRowBytes, fWidth, fHeight, fLogicalW, fLogicalH);
++		}
++	}
+ 	if (ast.enabled) {
+         uint64_t ns;
+         absolutetime_to_nanoseconds(mach_absolute_time() - tcp0, &ns);

@@ -1,0 +1,69 @@
+asteroids A810: VBIF_GX flicker is not progress in the watch
+
+UNTESTED on the phone, syntax-checked only. ast24 RECOVERY 2 waited 30 s, the MAX path, because bit 5 of RBBM_STATUS flickered (0xec0425/0xec0405) while RPTR, the fence and every IB pointer stayed still. That was the Safari keyboard freeze. With no pipeline block busy the bit is now ignored, so this class recovers at the 5 s cap. A busy pipeline block keeps today's behaviour. The verdict line gains BV's IB pointers. Host check: watch_check.py.
+
+Apply: git apply in the kernel tree (-p1), after 2052.
+
+--- a/iokit/Kernel/arm/SweetAdrenoWatch.h
++++ b/iokit/Kernel/arm/SweetAdrenoWatch.h
+@@ -8,12 +8,19 @@
+  *
+  * ponytail: frozen pointers plus static busy bits for WATCH cap is taken as a hang; a real job that holds every bit still for
+  * that long is reset as the base kernel already did. Add a RBBM_PERFCTR_GPU_BUSY read if a log ever shows such a job.
++ *
++ * 2059: VBIF_GX_BUSY alone is not movement. ast24 RECOVERY 2: BR sat on CP_WAIT_TIMESTAMP for BV's fence (RPTR just past it, the
++ * memptrs one behind), and its polling reads flickered bit 5 of 0xec0425 for 30 s while nothing else moved. With a pipeline block
++ * busy (a long shader) the bit stays significant.
++ * ponytail: a CP-only wait over 5 s with frozen pointers counts as hung; add a BV perfcounter if a log shows one was healthy.
+  */
+ #ifndef SWEET_ADRENO_WATCH_H
+ #define SWEET_ADRENO_WATCH_H
+ 
+ #define SWEET_WATCH_WORDS       12      /* rptr, rbbm, fence word, BV rptr shadow, then base/rem of IB1 and IB2 for BR and BV */
+ #define SWEET_WATCH_HANG_DETECT (1u << 23)      /* RBBM_INT_0 RBBM_HANG_DETECT: a8xx_gpu.c recovers on this interrupt */
++#define SWEET_WATCH_VBIF_GX     (1u << 5)       /* RBBM_STATUS VBIF_GX_BUSY */
++#define SWEET_WATCH_PIPE_BUSY   0x7bc0u         /* RBBM_STATUS DCMP, CMP, PC, VPC, VSC, HLSQ, UFC, UNSLICE_TOP */
+ 
+ enum sweet_watch_verdict {
+ 	SWEET_WATCH_WAIT = 0,   /* keep waiting */
+@@ -43,6 +50,13 @@ sweet_watch_reset(struct sweet_watch *w)
+ 	w->would_fast = 0;
+ }
+ 
++/* What counts in a sample's word i */
++static inline uint32_t
++sweet_watch_word(unsigned i, uint32_t v)
++{
++	return i == 1 && !(v & SWEET_WATCH_PIPE_BUSY) ? v & ~SWEET_WATCH_VBIF_GX : v;
++}
++
+ static inline enum sweet_watch_verdict
+ sweet_watch_feed(struct sweet_watch *w, const struct sweet_watch_limits *l, uint64_t now, const uint32_t s[SWEET_WATCH_WORDS],
+     uint32_t int0)
+@@ -53,10 +67,10 @@ sweet_watch_feed(struct sweet_watch *w, const struct sweet_watch_limits *l, uint
+ 		moved = fence_moved = 1;
+ 	}
+ 	for (unsigned i = 0; !moved && i < SWEET_WATCH_WORDS; i++) {
+-		moved = w->last[i] != s[i];
++		moved = w->last[i] != sweet_watch_word(i, s[i]);
+ 	}
+ 	for (unsigned i = 0; i < SWEET_WATCH_WORDS; i++) {
+-		w->last[i] = s[i];
++		w->last[i] = sweet_watch_word(i, s[i]);
+ 	}
+ 	w->sampled = now;
+ 	w->valid = 1;
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -385,9 +385,9 @@ watchLook(uint64_t now)
+ 		    ns / NSEC_PER_MSEC, s[0], s[1], int0);
+ 	}
+ 	if (v != SWEET_WATCH_WAIT) {
+-		IOLog("SWEET GPU: watch: %s, rptr %#x rbbm %#x int %#x fence word %u, BR IB1 %#x rem %u IB2 %#x rem %u, %u still samples\n",
++		IOLog("SWEET GPU: watch: %s, rptr %#x rbbm %#x int %#x fence word %u, BR IB1 %#x rem %u IB2 %#x rem %u, BV IB1 %#x rem %u IB2 %#x rem %u, %u still samples\n",
+ 		    v == SWEET_WATCH_MAX ? "moving but no fence for 30 s" : v == SWEET_WATCH_FAST ? "frozen with the hang bit up" : "frozen",
+-		    s[0], s[1], int0, s[2], s[4], s[5], s[6], s[7], gWatch.same);
++		    s[0], s[1], int0, s[2], s[4], s[5], s[6], s[7], s[8], s[9], s[10], s[11], gWatch.same);
+ 	}
+ 	return v;
+ }

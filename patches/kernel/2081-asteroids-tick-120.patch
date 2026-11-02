@@ -1,0 +1,71 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -569,6 +569,8 @@
+ 	void          latchWatch(void);
+ 	bool          fVsyncAlign;      /* sweetfb_vsyncalign: the vsync timer follows the latch times SwapWait observed */
+ 	bool          fTickFix;         /* 2051 sweetfb_tickfix: the next tick is a deadline, not a period after the copy */
++	uint32_t      fTickUS;          /* 2081 sweetfb_hz=120: how often the tick looks for a frame. fVsyncUS stays what CoreAnimation is told */
++	uint32_t      fNotifyDiv;       /* 2081 ticks per vsync notification; sweetfb_ca120=1 tells CoreAnimation every tick */
+ 	uint64_t      fTickDeadlineUS;
+ 	uint64_t      fPhaseAbs;        /* a latch (vsync) as observed by SwapWait, abs time; 0 = none yet */
+ 	uint64_t      fPeriodAbs;       /* vsync period, abs units */
+@@ -1102,14 +1104,23 @@
+ 		fFlushTicks = 1;
+ 	}
+ 	{
+-		int tf = 0;
++		int tf = 1;     /* 2081: ast24 measured it, on unless sweetfb_tickfix=0 (and 18 bytes back on the boot line) */
+ 		PE_parse_boot_argn("sweetfb_tickfix", &tf, sizeof(tf));
+ 		fTickFix = tf != 0;
+ 		if (fTickFix) {
+ 			IOLog("SWEET FB: vsync tick on a deadline (sweetfb_tickfix)\n");
+ 		}
+ 	}
+-	fVsync->setTimeoutUS(fVsyncUS);
++	fTickUS = fVsyncUS;
++	fNotifyDiv = 1;
++	if (hz >= 120 && fTickFix && !fVsyncAlign) {
++		int ca120 = 0;
++		PE_parse_boot_argn("sweetfb_ca120", &ca120, sizeof(ca120));
++		fTickUS = 8333;
++		fNotifyDiv = ca120 ? 1 : 2;
++		IOLog("SWEET FB: tick every %u us, CoreAnimation told every %u ticks\n", fTickUS, fNotifyDiv);
++	}
++	fVsync->setTimeoutUS(fTickUS);
+ 	if (fEarly) {
+ 		fSwapTimer = IOTimerEventSource::timerEventSource(this, &AppleCLCD::swapFired);
+ 		if (fSwapTimer == NULL || fWorkLoop->addEventSource(fSwapTimer) != kIOReturnSuccess) {
+@@ -1212,7 +1223,7 @@
+ 	 * one, so CoreAnimation's display link runs on the panel's phase instead of on a free-running 60 Hz clock.
+ 	 */
+ 	uint64_t stamp = now;
+-	uint32_t nextUS = fb->fVsyncUS;
++	uint32_t nextUS = fb->fTickUS;
+ 	if (fb->fVsyncAlign) {
+ 		uint64_t ph = __atomic_load_n(&fb->fPhaseAbs, __ATOMIC_ACQUIRE);
+ 		if (fb->fPeriodAbs == 0) {
+@@ -1239,13 +1250,13 @@
+ 		fb->fLastStamp = stamp;
+ 	}
+ 	uint64_t values[6] = {
+-		(uint32_t)count, (uint32_t)(count >> 32),
++		(uint32_t)(count / fb->fNotifyDiv), (uint32_t)((count / fb->fNotifyDiv) >> 32),
+ 		(uint32_t)stamp, (uint32_t)(stamp >> 32),
+ 		0, 0,
+ 	};
+ 
+ 	IOLockLock(fb->fLock);
+-	for (unsigned int i = 0; i < fb->fClients->getCount(); i++) {
++	for (unsigned int i = 0; (count % fb->fNotifyDiv) == 0 && i < fb->fClients->getCount(); i++) {
+ 		IOMobileFramebufferUserClient *client =
+ 		    (IOMobileFramebufferUserClient *)fb->fClients->getObject(i);
+ 		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
+@@ -1343,7 +1354,7 @@
+ 	fb->statsTick(now);
+ 	fb->hudTick(now);
+ 	if (fb->fTickFix && !fb->fVsyncAlign) {
+-		fb->fTickDeadlineUS = sfs_tick_next(fb->fTickDeadlineUS ? fb->fTickDeadlineUS : sweet_abs_us(now), fb->fVsyncUS,
++		fb->fTickDeadlineUS = sfs_tick_next(fb->fTickDeadlineUS ? fb->fTickDeadlineUS : sweet_abs_us(now), fb->fTickUS,
+ 		    sweet_abs_us(mach_absolute_time()), 250, &nextUS);
+ 	}
+ 	sender->setTimeoutUS(nextUS);

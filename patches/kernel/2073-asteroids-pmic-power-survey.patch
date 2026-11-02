@@ -1,0 +1,187 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index ade7123..f2ea82a 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -111,6 +111,7 @@ bsd/dev/sweet_touch_asteroids.c		standard
+ bsd/dev/sweet_dsi_asteroids.c		standard
+ bsd/dev/sweet_rtc_asteroids.c		standard
+ bsd/dev/sweet_thermal_asteroids.c	standard
++bsd/dev/sweet_power_survey.c		standard
+ bsd/dev/sweet_a810.c			standard
+ bsd/dev/sweet_a810_smmu.c		standard
+ bsd/dev/sweet_a810_hfi.c		standard
+diff --git a/bsd/dev/sweet_power_survey.c b/bsd/dev/sweet_power_survey.c
+new file mode 100644
+index 0000000..9ff6832
+--- /dev/null
++++ b/bsd/dev/sweet_power_survey.c
+@@ -0,0 +1,148 @@
++/*
++ * Nothing Phone (3a): read-only PMIC survey for the charging question (boot-arg sweetpowersurvey=1, default off). Once, every
++ * peripheral on SPMI bus 0 with its owner, type and subtype, so the charger block can be identified; then once a minute the
++ * PMIV0104 BCL block (SID 8, 0x4700: live DT pmiv0104_bcl), whose VBAT and IBAT readings are the only battery data reachable
++ * without the ADSP. The trend with a charger on or off shows whether the phone charges under iOS.
++ *
++ * Register facts: Nothing's drivers/thermal/qcom/qti_bcl_pmic5.c (revision2 +0x01 is the digital major; VBAT +0x76, IBAT
++ * +0x86; major >= 5: two bytes, VBAT 194637 nV/bit, IBAT 61037 nA/bit two's complement, 0x7fff = no VBAT reading; major < 5: one byte,
++ * VBAT 49827 uV/bit with 127 = no reading). Decoding happens in the log reader, so a wrong scale costs nothing here.
++ * Reads only: the sole MMIO write is the observer's EXT_READL command, as in sweet_keys.c and sweet_rtc_asteroids.c.
++ * ponytail: BCL may need a conversion request write under some revisions; if readings stay "no reading", add it deliberately.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include "sweet_board.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern void sweet_log_sync(void);
++extern kern_return_t thread_terminate(thread_t);
++void sweet_power_survey_start(void);
++
++#define PS_CORE_PA      0x0c400000u
++#define PS_CORE_SIZE    0x3000u
++#define PS_CNFG_PA      0x0c42d000u
++#define PS_CNFG_SIZE    0x4000u
++#define PS_OBS_PA       0x0c440000u
++#define PS_OBS_SIZE     0x8000u
++#define PS_OBS_STRIDE   0x20u
++#define PS_MAP_OFF      0x2000u
++#define PS_MAX_APIDS    0x380u
++#define PS_PPID_BCL     0x847u
++
++static vm_offset_t ps_core, ps_cnfg, ps_obs;
++
++static inline uint32_t
++ps_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static bool
++ps_read(uint32_t apid, uint8_t off8, uint8_t *out)
++{
++	uint32_t off = PS_OBS_STRIDE * apid;
++
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(ps_obs + off) = (1u << 27) | ((uint32_t)off8 << 4);
++	__asm__ volatile("dsb osh" ::: "memory");
++	for (unsigned i = 0; i < 1000; i++) {
++		uint32_t st = ps_rd(ps_obs, off + 0x08u);
++		if (st & 1u) {
++			if (st & 0x0eu) {
++				return false;
++			}
++			*out = (uint8_t)ps_rd(ps_obs, off + 0x18u);
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static void
++ps_sleep_s(unsigned s)
++{
++	static int chan;
++	uint64_t deadline;
++	clock_interval_to_deadline(s, NSEC_PER_SEC, &deadline);
++	(void)assert_wait_deadline(&chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++ps_thread(void *arg, wait_result_t wr)
++{
++	uint32_t count = ps_rd(ps_core, 4) & 0x7ffu, bcl = PS_MAX_APIDS;
++
++	(void)arg;
++	(void)wr;
++	ps_sleep_s(30);
++	if (count == 0 || count > PS_MAX_APIDS) {
++		printf("SWEET POWER: unexpected APID count %u, stopping\n", count);
++		goto out;
++	}
++	for (uint32_t i = 0; i < count; i++) {
++		uint32_t ppid = (ps_rd(ps_core, PS_MAP_OFF + 4u * i) >> 8) & 0xfffu;
++		uint8_t type = 0, sub = 0;
++		if (ppid == 0) {
++			continue;
++		}
++		if (ppid == PS_PPID_BCL) {
++			bcl = i;
++		}
++		/* The keys thread and the clock own these observer channels: a shared one could garble their reads. */
++		bool busy = ppid == 0x013u || ppid == 0x18du || ppid == 0x061u;
++		bool ok = !busy && ps_read(i, 0x04, &type) && ps_read(i, 0x05, &sub);
++		printf("SWEET POWER: apid %u ppid %#x owner %u type %#x sub %#x ok %d\n", i, ppid, ps_rd(ps_cnfg, 4u * i) & 7u, type, sub, ok);
++	}
++	sweet_log_sync();
++	if (bcl == PS_MAX_APIDS) {
++		printf("SWEET POWER: no BCL peripheral on this bus\n");
++		goto out;
++	}
++	for (;;) {
++		static const uint8_t regs[] = { 0x00, 0x01, 0x08, 0x0e, 0x0f, 0x46, 0x76, 0x77, 0x86, 0x87 };
++		uint8_t v[sizeof(regs)] = {};
++		bool ok = true;
++		for (unsigned i = 0; i < sizeof(regs); i++) {
++			ok = ps_read(bcl, regs[i], &v[i]) && ok;
++		}
++		printf("SWEET POWER: bcl ok %d rev %02x %02x irq %02x param %02x %02x en %02x vbat %02x %02x ibat %02x %02x up_s %llu\n", ok,
++		    v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], mach_absolute_time() / 19200000ULL);
++		ps_sleep_s(60);
++	}
++out:
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++sweet_power_survey_start(void)
++{
++	int on = 0;
++	thread_t t;
++
++	if (!sweet_board_asteroids() || !PE_parse_boot_argn("sweetpowersurvey", &on, sizeof(on)) || on <= 0) {
++		return;
++	}
++	ps_core = ml_io_map(PS_CORE_PA, PS_CORE_SIZE);
++	ps_cnfg = ml_io_map(PS_CNFG_PA, PS_CNFG_SIZE);
++	ps_obs = ml_io_map(PS_OBS_PA, PS_OBS_SIZE);
++	if (!ps_core || !ps_cnfg || !ps_obs) {
++		printf("SWEET POWER: map failed\n");
++		return;
++	}
++	if (kernel_thread_start(ps_thread, NULL, &t) == KERN_SUCCESS) {
++		thread_deallocate(t);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 167a860..02a6384 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -78,6 +78,7 @@ extern void sweet80211_init(void);
+ extern void sweet_usb_probe(void);
+ extern void sweet_cpufreq_max(void);
+ extern void sweet_thermal_start(void);
++extern void sweet_power_survey_start(void);
+ extern void sweet_charger_start(void);
+ extern void sweet_a630_probe(void);
+ 
+@@ -1318,6 +1319,8 @@ sweet_ufs_init(void)
+ 		sweet_cpufreq_max();
+ 		/* TSENS thermal guard (sweet_thermal_asteroids.c, boot-arg sweetthermal) */
+ 		sweet_thermal_start();
++		/* read-only PMIC survey (sweet_power_survey.c, boot-arg sweetpowersurvey=1, default off) */
++		sweet_power_survey_start();
+ 		printf("SWEET UFS: Nothing Phone (3a): no SM7150/SDM845 drivers (USB, charger, GPU, Wi-Fi)\n");
+ 		return 0;
+ 	}

@@ -1,0 +1,88 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -6774,6 +6774,29 @@
+  *		to arrays of user space pointers.
+  */
+ __attribute__((noinline))
++/* Shared by patch 2058 and the host check. Only top-level application executables.
++ * No nested frameworks, XPC services, PlugIns, extensions, or path traversal. */
++static int
++sweet_ui_exec_path(const char *p)
++{
++    const char *s;
++    if (!strcmp(p, "/System/Library/CoreServices/SpringBoard.app/SpringBoard")) return 1;
++    if (!strncmp(p,"/Applications/",14)) p += 14;
++    else {
++        const char *prefix="/private/var/containers/Bundle/Application/";
++        size_t n=strlen(prefix);
++        if (strncmp(p,prefix,n)) return 0;
++        p+=n;
++        s=strchr(p,'/');
++        if (!s || s==p || (s-p==1 && *p=='.') || (s-p==2 && !strncmp(p,"..",2))) return 0;
++        p=s+1;
++    }
++    s=strchr(p,'/');
++    if (!s || s-p<5 || strncmp(s-4,".app",4)) return 0;
++    p=s+1;
++    return *p && !strchr(p,'/') && strcmp(p,".") && strcmp(p,"..");
++}
++
+ static int
+ exec_extract_strings(struct image_params *imgp)
+ {
+@@ -6782,6 +6805,11 @@
+ 	int new_ptr_size = (imgp->ip_flags & IMGPF_IS_64BIT_ADDR) ? 8 : 4;
+ 	user_addr_t     argv = imgp->ip_user_argv;
+ 	user_addr_t     envv = imgp->ip_user_envv;
++	/* 2058: opt-in UI-only injection; AMFI 0131 supplies allowInsertFailures. */
++	int sweet_sb = 0;
++	(void)PE_parse_boot_argn("sweetsb", &sweet_sb, sizeof(sweet_sb));
++	const char sweet_insert[] = "DYLD_INSERT_LIBRARIES=/usr/local/lib/sweetsb.dylib";
++	boolean_t sweet_existing = FALSE;
+ 
+ 	/*
+ 	 * Adjust space reserved for the path name by however much padding it
+@@ -6934,6 +6962,7 @@
+ 		/*
+ 		 * av[n...] = env[n]
+ 		 */
++		char *sweet_begin = imgp->ip_strendp;
+ 		error = exec_add_user_string(imgp, env, imgp->ip_seg, TRUE);
+ 		if (error) {
+ 			goto bad;
+@@ -6942,6 +6971,15 @@
+ 			error = E2BIG;
+ 			goto bad;
+ 		}
++		/* Never propagate our own variable to children, including when dyld skipped it. */
++		if (sweet_sb && !strcmp(sweet_begin, sweet_insert)) {
++			size_t n = (size_t)(imgp->ip_strendp - sweet_begin);
++			imgp->ip_strendp = sweet_begin;
++			imgp->ip_strspace += n;
++			imgp->ip_argspace += n;
++			continue;
++		}
++		if (!strncmp(sweet_begin, "DYLD_INSERT_LIBRARIES=", 22)) sweet_existing = TRUE;
+ 		imgp->ip_argspace -= new_ptr_size; /* to hold envv[] entry */
+ 		imgp->ip_envc++;
+ 	}
+@@ -6996,6 +7034,19 @@
+ 			}
+ 			group = *end != '\0' ? end + 1 : end;
+ 		}
++	}
++
++	/* 2058: fail open on insufficient argument space; no fallible append. */
++	if (sweet_sb && !sweet_existing && sweet_arm64e_enabled() &&
++	    (imgp->ip_origcpusubtype & ~CPU_SUBTYPE_MASK) == CPU_SUBTYPE_ARM64E &&
++	    sweet_ui_exec_path(imgp->ip_strings + strlen(EXECUTABLE_KEY)) &&
++	    imgp->ip_argspace >= (int)(sizeof(sweet_insert) + 3 * new_ptr_size) &&
++	    imgp->ip_strspace >= (int)(sizeof(sweet_insert) + new_ptr_size)) {
++		memcpy(imgp->ip_strendp, sweet_insert, sizeof(sweet_insert));
++		imgp->ip_strendp += sizeof(sweet_insert);
++		imgp->ip_strspace -= sizeof(sweet_insert);
++		imgp->ip_argspace -= sizeof(sweet_insert) + new_ptr_size;
++		imgp->ip_envc++;
+ 	}
+ 
+ 	/* Save space for envv[] NULL terminator */

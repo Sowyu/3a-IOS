@@ -1,0 +1,127 @@
+asteroids A810: all IBs of a submission in one frame, one fence
+
+UNTESTED on the phone, compiled with the build's flags only. Turnip's command stream continues across IBs when its BO fills. A frame per IB put a fence and CP_SET_THREAD_BOTH between the two halves, usually after the pass's CP_THREAD_CONTROL(BR | CONCURRENT_BIN_DISABLE) and before its IB2, so that pass's draws also ran on BV. 75 of 75 hung submissions with a history had two IBs, against 4 of the 525 submissions before them. Linux's a7xx_submit uses one frame. sweetibsplit=1 keeps the old framing for a control run. Each several-IB submission is logged, up to 64 a boot.
+
+Apply: git apply in the kernel tree (-p1), after 2059 and 2063.
+
+--- a/bsd/dev/sweet_a810.c
++++ b/bsd/dev/sweet_a810.c
+@@ -1481,22 +1481,31 @@
+ }
+ 
+ int
+-sweet_a810_submit_ib(uint64_t iova, uint32_t dwords, uint32_t *seqno)
++sweet_a810_submit_ibs(const uint64_t *iova, const uint32_t *dwords, unsigned count, uint32_t *seqno)
+ {
+-	uint32_t words[4];
++	static uint32_t words[4 * 128];         /* under a810_lck; 128 is sweet_a810_msm_submit's limit, the ring holds 8192 dwords */
++	uint32_t header = 0;
+ 	if (!seqno) {
+ 		return EINVAL;
+ 	}
+ 	*seqno = 0;
+-	if (!dwords || dwords > 0xfffff || (iova & 3) || iova < SWEET_A810_VA_START || iova >= SWEET_A810_VA_END ||
+-	    (uint64_t)dwords * 4 > SWEET_A810_VA_END - iova || a810_pm4_type7(GPB_CP_INDIRECT_BUFFER, 3, &words[0])) {
++	if (!count || count > 128 || a810_pm4_type7(GPB_CP_INDIRECT_BUFFER, 3, &header)) {
+ 		return EINVAL;
+ 	}
+-	words[1] = (uint32_t)iova;
+-	words[2] = (uint32_t)(iova >> 32);
+-	words[3] = dwords;
++	for (unsigned i = 0; i < count; i++) {
++		if (!dwords[i] || dwords[i] > 0xfffff || (iova[i] & 3) || iova[i] < SWEET_A810_VA_START || iova[i] >= SWEET_A810_VA_END ||
++		    (uint64_t)dwords[i] * 4 > SWEET_A810_VA_END - iova[i]) {
++			return EINVAL;
++		}
++	}
+ 	lck_mtx_lock(&a810_lck);
+-	int st = sweet_a810_ready() ? a810_ring_submit_framed(&a810_ring, words, 4, seqno) : A810_RING_NOT_READY;
++	for (unsigned i = 0; i < count; i++) {
++		words[4 * i] = header;
++		words[4 * i + 1] = (uint32_t)iova[i];
++		words[4 * i + 2] = (uint32_t)(iova[i] >> 32);
++		words[4 * i + 3] = dwords[i];
++	}
++	int st = sweet_a810_ready() ? a810_ring_submit_framed(&a810_ring, words, 4 * count, seqno) : A810_RING_NOT_READY;
+ 	lck_mtx_unlock(&a810_lck);
+ 	switch (st) {
+ 	case A810_RING_OK: return 0;
+--- a/bsd/dev/sweet_a810_api.h
++++ b/bsd/dev/sweet_a810_api.h
+@@ -33,9 +33,10 @@
+ 
+ /* Stages 1-16 passed: GX on, CP running out of secure mode, the GPU context ready. */
+ bool sweet_a810_ready(void);
+-/* One CP_INDIRECT_BUFFER of `dwords` (1..0xfffff) at `iova`, with the A7XX/A8XX BR/BV framing and a ring timestamp
+- * fence (the first call after the bring-up also carries the context-reset entry). *seqno receives the fence number. */
+-int sweet_a810_submit_ib(uint64_t iova, uint32_t dwords, uint32_t *seqno);
++/* `count` (1..128) CP_INDIRECT_BUFFERs of `dwords[i]` (1..0xfffff) at `iova[i]` inside one A7XX/A8XX BR/BV frame with one ring
++ * timestamp fence, as Linux's a7xx_submit (the first call after the bring-up also carries the context-reset entry). *seqno
++ * receives the fence number. */
++int sweet_a810_submit_ibs(const uint64_t *iova, const uint32_t *dwords, unsigned count, uint32_t *seqno);
+ /* True once the CP wrote a timestamp >= seqno (wrap-safe for 2^31 submissions). Never blocks. */
+ bool sweet_a810_fence_passed(uint32_t seqno);
+ /* Map `bytes` (4 KiB multiple) of physically contiguous memory at `pa` to `iova` (both 4 KiB aligned) with
+--- a/bsd/dev/sweet_a810_msm.c
++++ b/bsd/dev/sweet_a810_msm.c
+@@ -12,7 +12,9 @@
+  *   - Page maps are collected into physically contiguous runs and entered at vm_flush (each sweet_a810_vm_map is one
+  *     TLB invalidate). A bitmap of mapped pages lets a map over a page that is still mapped replace it (the A630's
+  *     page-table write did) and lets an unmap skip pages that were never mapped.
+- *   - A submission of several IBs is one sweet_a810_submit_ib per IB; the fence is the last one's.
++ *   - A submission of several IBs is one frame and one fence (2100). Turnip cuts one command stream into IBs wherever a BO
++ *     fills, often between a pass's CP_THREAD_CONTROL(BR) and its IB2 call. A frame per IB put CP_SET_THREAD_BOTH in that
++ *     gap, so the pass's draws also went to BV: all 61 dumped first-IB2 hangs from ast7 to ast46.
+  *   - SMMU faults of the GPU bank are polled while a client waits (sweet_a810_msm_fault_check): each new faulting page is
+  *     logged with what the address is to this backend (mapped, inside a live allocation, free, or a recently freed range)
+  *     and the fault status cleared. No recovery yet: a submission that does not come back marks the GPU lost.
+@@ -26,6 +28,7 @@
+ #include <kern/clock.h>
+ #include <kern/locks.h>
+ #include <kern/kalloc.h>
++#include <pexpert/pexpert.h>
+ #include "sweet_board.h"
+ #include "sweet_a810_api.h"
+ 
+@@ -327,17 +330,24 @@
+ uint32_t
+ sweet_a810_msm_submit(const uint64_t *ib_iova, const uint32_t *ib_dwords, unsigned count)
+ {
++	static int split = -1;                  /* 2100: sweetibsplit=1 keeps the old frame per IB, for a control run only */
++	static uint32_t several;
+ 	uint32_t seq = 0;
+ 
+ 	if (!sweet_a810_msm_ready() || count == 0 || count > 128) {
+ 		return 0;
+ 	}
++	if (split < 0) {
++		int v = 0;
++		split = PE_parse_boot_argn("sweetibsplit", &v, sizeof(v)) && v;
++	}
+ 	(void)am_run_flush();
+-	for (unsigned i = 0; i < count; i++) {
++	const unsigned step = split ? 1 : count;
++	for (unsigned i = 0; i < count; i += step) {
+ 		int err = ENOSPC;
+ 		/* a full ring: wait for the CP for up to 2 s, as the A630's submit does */
+ 		for (unsigned tries = 0; tries < 2000 && err == ENOSPC; tries++) {
+-			err = sweet_a810_submit_ib(ib_iova[i], ib_dwords[i], &seq);
++			err = sweet_a810_submit_ibs(&ib_iova[i], &ib_dwords[i], step, &seq);
+ 			if (err == ENOSPC) {
+ 				delay(1000);
+ 			}
+@@ -351,9 +361,12 @@
+ 		}
+ 	}
+ 	am_last = seq;
++	if (count > 1 && ++several <= 64) {     /* what 2100 is about, so a run says how many survived */
++		printf("SWEET GPU: A810 submission of %u IBs, fence %u, first %u dwords, split %d\n", count, seq, ib_dwords[0], split);
++	}
+ 	if (++am_submits == 1 || (am_submits & 1023) == 0) {
+-		printf("SWEET GPU: A810 %u submissions, fence %u, %u maps, %llu of %llu GPU pages taken\n", am_submits, seq, am_maps,
+-		    am_used_pages, (uint64_t)AM_PAGES);
++		printf("SWEET GPU: A810 %u submissions, fence %u, %u maps, %llu of %llu GPU pages taken, %u with several IBs\n", am_submits, seq,
++		    am_maps, am_used_pages, (uint64_t)AM_PAGES, several);
+ 	}
+ 	return seq;
+ }

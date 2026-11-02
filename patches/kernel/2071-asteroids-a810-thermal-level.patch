@@ -1,0 +1,80 @@
+diff --git a/bsd/dev/sweet_a810.c b/bsd/dev/sweet_a810.c
+index df2bc8e..751d952 100644
+--- a/bsd/dev/sweet_a810.c
++++ b/bsd/dev/sweet_a810.c
+@@ -1696,6 +1696,30 @@ out:
+ 	return ok;
+ }
+ 
++int
++sweet_a810_thermal_level(unsigned drop)
++{
++	unsigned base = 6, bw = 0;
++	uint32_t error = 0;
++	int st;
++
++	PE_parse_boot_argn("sweeta810level", &base, sizeof(base));
++	/* Try-lock: recovery holds this lock for a long time, and the thermal guard must keep polling meanwhile. */
++	if (!lck_mtx_try_lock(&a810_lck)) {
++		return EBUSY;
++	}
++	if (!sweet_a810_ready()) {
++		lck_mtx_unlock(&a810_lck);
++		return ENXIO;
++	}
++	const unsigned perf = ShengGmuPerfVote(drop >= base ? 1 : base - drop, &bw);
++	st = a810_gx_vote(NULL, perf, bw, &error);      /* blocking HFI, at most about 100 ms */
++	lck_mtx_unlock(&a810_lck);
++	A810_LOG("SWEET A810: thermal vote perf %u bw %u (%llu MHz) rc %d fw %u\n", perf, bw,
++	    sweet_a810_gpu_level_hz(perf) / 1000000, st, error);
++	return st || error ? EIO : 0;
++}
++
+ uint32_t
+ sweet_a810_recoveries(void)
+ {
+diff --git a/bsd/dev/sweet_a810_api.h b/bsd/dev/sweet_a810_api.h
+index a3e2657..659fb9b 100644
+--- a/bsd/dev/sweet_a810_api.h
++++ b/bsd/dev/sweet_a810_api.h
+@@ -57,6 +57,9 @@ uint32_t sweet_a810_recoveries(void);
+ /* 2020: the next submission carries the full context entry (another client submits); a stalled ring gets its WPTR again. */
+ void sweet_a810_context_switch(void);
+ int sweet_a810_kick(void);
++/* 2071: vote the boot level (sweeta810level) minus `drop`, at least level 1, for the thermal guard. Never waits for the lock:
++ * EBUSY means try again later, ENXIO the GPU is not up, EIO the GMU refused. */
++int sweet_a810_thermal_level(unsigned drop);
+ 
+ /* sweet_a810_msm.c: the sweet_gpu_* functions of sweet_a630.c forward to these on asteroids (same meanings). */
+ bool sweet_a810_msm_ready(void);
+diff --git a/bsd/dev/sweet_thermal_asteroids.c b/bsd/dev/sweet_thermal_asteroids.c
+index 97853ae..b787bd9 100644
+--- a/bsd/dev/sweet_thermal_asteroids.c
++++ b/bsd/dev/sweet_thermal_asteroids.c
+@@ -32,6 +32,7 @@ extern kern_return_t thread_terminate(thread_t);
+ extern void sweet_log_sync(void);
+ extern void sweet_reboot_asteroids_halt(void);
+ extern void sweet_cpufreq_thermal_limit(int pct);
++extern int sweet_a810_thermal_level(unsigned drop);
+ void sweet_thermal_start(void);
+ 
+ #define ST_TM_PAGE_PA   0x0c228000u     /* both TM windows sit in this 16 KiB kernel page */
+@@ -47,6 +48,7 @@ static struct st_state st_s;
+ static volatile int st_hot_dc;
+ static volatile int st_hot_id = -1;
+ static volatile unsigned st_bad;
++static unsigned st_gpu_step;
+ 
+ /* Hottest usable sensor; false when none is. VALID drops for a few AHB cycles during an update, so retry. */
+ static bool
+@@ -130,6 +132,10 @@ st_thread(void *arg, wait_result_t wr)
+ 		if (st_mode >= 2 && st_s.step != last_step) {
+ 			st_apply(st_s.step);
+ 		}
++		/* Retried each poll: the GPU may not be up yet, or recovery may hold its lock. ENXIO at step 0 needs nothing. */
++		if (st_mode >= 2 && st_s.step != st_gpu_step && sweet_a810_thermal_level(st_s.step) == 0) {
++			st_gpu_step = st_s.step;
++		}
+ 		if (st_s.step != last_step || ++quiet >= 60) {
+ 			quiet = 0;
+ 			printf("SWEET THERMAL: hottest %d.%d C sensor %d valid %d step %u cpu %d%% bad %u\n", hot / 10,

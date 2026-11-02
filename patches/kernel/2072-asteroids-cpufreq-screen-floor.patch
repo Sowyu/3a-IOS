@@ -1,0 +1,78 @@
+diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
+index 90f8e68..0522355 100644
+--- a/bsd/dev/sweet_cpufreq.c
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -185,6 +185,7 @@ static struct cf_domain {
+ 	uint32_t n;
+ 	uint32_t top;                   /* highest-frequency LUT index */
+ 	uint32_t cap;                   /* base policy ceiling (LUT index) */
++	uint32_t floor_idx;             /* 2072: lowest state while the display is on */
+ 	uint32_t eff_cap;               /* current ceiling: cap, or higher while boosted */
+ 	uint32_t boost_top;             /* highest index the boost may reach */
+ 	uint32_t in_idx;                /* touch boost: floor and, if higher, ceiling while the input hold runs */
+@@ -242,6 +243,9 @@ static uint32_t cf_in_khz = 1766400;    /* sweetcpuinput_khz */
+ static uint32_t cf_in_ms = 300;
+ /* Thermal ceiling, % of each domain's top clock (sweet_thermal_asteroids.c). cf_request enforces it for every caller. */
+ static volatile int cf_therm_pct = 100;
++/* 2072: gov floor while the display is on, % of top (sweetcpufreq_little_min, sweetcpufreq_big_min; 0 = none) */
++static int cf_floor_little, cf_floor_big;
++extern bool sweet_panel_display_on(void);
+ 
+ static inline uint32_t
+ cf_rd(const struct cf_domain *d, uint32_t off)
+@@ -474,6 +478,10 @@ cf_setup(unsigned id, struct cf_domain *d)
+ 	d->eff_cap = d->cap;
+ 	d->in_idx = d->cap;
+ 	d->therm_seen = 100;
++	{
++		int fp = id == 0 ? cf_floor_little : cf_floor_big;
++		d->floor_idx = fp > 0 ? MIN(cf_pick(d, fp), d->cap) : 0;
++	}
+ 	if (id == 0 && cf_in_khz) {
+ 		uint32_t i = 0;
+ 		while (i < d->top && d->khz[i] < cf_in_khz) {
+@@ -582,6 +590,9 @@ cf_gov_step(unsigned id, struct cf_domain *d, uint64_t wall)
+ 	if (in_act && target < d->in_idx) {
+ 		target = d->in_idx;
+ 	}
++	if (target < d->floor_idx && sweet_panel_display_on()) {
++		target = d->floor_idx;  /* a burst starts here, not at the bottom state; the floor goes with the screen */
++	}
+ 	uint32_t next = cur;
+ 	if (target > cur) {
+ 		next = target;
+@@ -911,6 +922,8 @@ sweet_cpufreq_max(void)
+ 		cf_mode = MODE_GOV;
+ 		int little = cf_percent_arg("sweetcpufreq_little_max", 50);
+ 		cf_set_percent(little, cf_percent_arg("sweetcpufreq_big_max", 100));
++		cf_floor_little = cf_percent_arg("sweetcpufreq_little_min", 0);
++		cf_floor_big = cf_percent_arg("sweetcpufreq_big_min", 0);
+ 	}
+ 	int v = 10;
+ 	(void)PE_parse_boot_argn("sweetcpufreq_log", &v, sizeof(v));
+diff --git a/bsd/dev/sweet_dsi_asteroids.c b/bsd/dev/sweet_dsi_asteroids.c
+index f7c669f..cedea99 100644
+--- a/bsd/dev/sweet_dsi_asteroids.c
++++ b/bsd/dev/sweet_dsi_asteroids.c
+@@ -33,6 +33,7 @@
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ 
+ int sweet_panel_mode(void);
++bool sweet_panel_display_on(void);
+ void sweet_panel_post_level(uint32_t level);
+ void sweet_panel_post_power(bool on);
+ 
+@@ -244,6 +245,13 @@ sweet_panel_mode(void)
+ 	return panel_mode;
+ }
+ 
++/* 2072: true unless iOS turned the display off and the panel driver followed; always true with sweetpanel=0. */
++bool
++sweet_panel_display_on(void)
++{
++	return panel_on;
++}
++
+ void
+ sweet_panel_post_level(uint32_t level)
+ {

@@ -1,0 +1,56 @@
+asteroids A810: name the limit behind the ~3800 command buffer exits, and lift one suspect
+
+UNTESTED, not compiled. backboardd exits after three "submission failed" at 3626 to 4042 completed command buffers (ast9, ast14, ast19, ast22 twice), restarting the whole UI. SUBMIT_BOS_MAX goes from 4096 to GEM_MAX because Turnip names every live BO on every submission; if that was the limit the exits stop. Refused submissions and GEM_NEWs now log why, and the BO list size is logged as it grows.
+Pair with chlorophyll-submit-log.patch, which prints the VkResult. The per-submission cost of a longer list is already paid at 4096: stamping is linear in nr_bos.
+
+Apply: git apply in the kernel tree (-p1). Independent of 2052 and 2053.
+
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -71,7 +71,7 @@
+ static const void *gLastSubmitter;     /* 2020: the client whose submission went last (the context entry on a change) */
+ #define GEM_SIZE_MAX            (256ull << 20)
+ #define QUEUE_IDS               64
+-#define SUBMIT_BOS_MAX          4096
++#define SUBMIT_BOS_MAX          GEM_MAX /* 2054: Turnip names every live BO on every submission; 4096 is one suspect for the ~3800 command buffer exits */
+ #define SUBMIT_CMDS_MAX         128
+ #define SUBMIT_RELOCS_MAX       65536
+ #define WAIT_PATIENCE_MS        5000    /* a wait that asks for more than this is cut here and the GPU declared lost */
+@@ -781,6 +781,10 @@
+ 	sweet_gpu_unlock();
+ 	if (ret != kIOReturnSuccess) {
+ 		buf->release();
++		static uint32_t said;
++		if (said++ < 16) {
++			IOLog("SWEET GPU: GEM_NEW refused: %#x, %llu bytes (pid %d, the table holds %u handles)\n", ret, size, fPid, GEM_MAX);
++		}
+ 	}
+ 	return ret;
+ }
+@@ -882,8 +886,18 @@
+ 	IOReturn ret;
+ 
+ 	if (r->nr_bos == 0 || r->nr_bos > SUBMIT_BOS_MAX || r->nr_cmds == 0 || r->nr_cmds > SUBMIT_CMDS_MAX) {
++		IOLog("SWEET GPU: submit refused: %u BOs, %u cmds\n", r->nr_bos, r->nr_cmds);
+ 		return kIOReturnBadArgument;
+ 	}
++	{
++		/* 2054: backboardd exits after 3 failed submissions every ~3800 command buffers (ast9, ast14, ast19, ast22): the BO list's
++		 * size at every doubling names or clears this limit on the next boot */
++		static uint32_t bosHigh = 1024;
++		if (r->nr_bos >= bosHigh) {
++			IOLog("SWEET GPU: submissions now name %u BOs (pid %d)\n", r->nr_bos, fPid);
++			bosHigh = r->nr_bos + r->nr_bos / 4;
++		}
++	}
+ 	if ((r->flags & ~SWEET_MSM_SUBMIT_NO_IMPLICIT) != 0 || r->nr_in_syncobjs != 0 || r->nr_out_syncobjs != 0 ||
+ 	    r->in_syncobjs != 0 || r->out_syncobjs != 0 || (r->queueid >= QUEUE_IDS) ||
+ 	    (r->queueid != 0 && !(fQueues & (1ull << r->queueid)))) {
+@@ -1011,6 +1025,7 @@
+ 	{
+ 		uint32_t fence = sweet_gpu_submit(ib, ibn, r->nr_cmds);
+ 		if (fence == 0) {
++			IOLog("SWEET GPU: submit: the ring refused it (%u cmds, last fence %u, ready %d)\n", r->nr_cmds, sweet_gpu_fence_last(), sweet_gpu_ready());
+ 			ret = kIOReturnNoResources;
+ 			goto unlock;
+ 		}

@@ -1,0 +1,353 @@
+diff --git a/bsd/dev/sweet_reboot.c b/bsd/dev/sweet_reboot.c
+index aeb83e3..2fa765b 100644
+--- a/bsd/dev/sweet_reboot.c
++++ b/bsd/dev/sweet_reboot.c
+@@ -42,6 +42,9 @@
+ #include <sys/systm.h>
+ #include <sys/sysctl.h>
+ #include <sys/errno.h>
++#include <sys/reboot.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ #include "sweet_spmi.h"
+@@ -50,6 +53,12 @@
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void delay(int usec);
+ extern int sweet_ufs_flush_final(void);      /* bsd/dev/sweet_ufs.c: SYNCHRONIZE CACHE (patch 0221) */
++extern void sweet_log_sync(void);
++extern void sweet_log_flush_panic(void);     /* bsd/dev/sweet_ufs.c */
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern kern_return_t thread_terminate(thread_t);
++extern void thread_deallocate(thread_t);
++extern int reboot_kernel(int, char *);
+ 
+ #define SR_PSHOLD_PA     0x0c264000u
+ #define SR_IMEM_PA       0x146bf000u
+@@ -257,7 +266,10 @@ sa_read(uint8_t *out)
+ 	return true;
+ }
+ 
+-/* Boot time, read only: find and map what the reboot needs, and say what the reason byte holds now. */
++static void sa_handsfree_init(void);
++
++/* Boot time, read only unless a boot-arg asks (sa_handsfree_init): find and map what the reboot needs, and say what
++ * the reason byte holds now. */
+ void
+ sweet_reboot_asteroids_init(void)
+ {
+@@ -299,32 +311,56 @@ sweet_reboot_asteroids_init(void)
+ 	sa_ready = true;
+ 	printf("SWEET REBOOT: asteroids: 0x7148 = 0x%02x (reason %u); restart and power off go to fastboot\n",
+ 	    reason, reason >> 1);
++	sa_handsfree_init();
+ }
+ 
+-/* Returns only if it did not reset (nothing was reset, the reason may or may not be stored). */
+-static void
+-sa_reboot_bootloader(void)
++static bool
++sa_write_reason(uint8_t value, uint32_t *status)
++{
++	sa_chnl[0x10 / 4] = value;                                  /* WDATA0 */
++	__asm__ volatile ("dsb sy" ::: "memory");
++	sa_chnl[0x00 / 4] = (0u << 27) | (SA_REASON_REG << 4);       /* EXT_WRITEL, one byte */
++	__asm__ volatile ("dsb sy" ::: "memory");
++	return sa_wait(sa_chnl, status);
++}
++
++static unsigned sa_gwdt_secs;            /* the hypervisor watchdog's timeout when armed (2061), else 0 */
++#define sa_gwdt_ping() do { } while (0)
++
++/* HANDS-FREE LOGIC BEGIN (host check: plans/usb/host/check_failsafe.py) */
++/* Bits [7:1] of 0x7148 = bootloader, bit 0 kept; true only when it reads back so. Resets nothing. */
++static bool
++sa_store_bootloader(uint8_t *was, uint8_t *now)
+ {
+ 	uint8_t old = 0, back = 0, upd;
+ 	uint32_t st;
+ 
+ 	if (!sa_ready || !sa_read(&old)) {
+-		printf("SWEET REBOOT: asteroids: reason register not ready, no reset\n");
+-		return;
++		printf("SWEET REBOOT: asteroids: reason register not ready\n");
++		return false;
+ 	}
+ 	upd = (uint8_t)((old & 0x01u) | (SA_REASON_BOOTLOADER << 1));
+-	if (upd != old) {
+-		sa_chnl[0x10 / 4] = upd;                                    /* WDATA0 */
+-		__asm__ volatile ("dsb sy" ::: "memory");
+-		sa_chnl[0x00 / 4] = (0u << 27) | (SA_REASON_REG << 4);       /* EXT_WRITEL, one byte */
+-		__asm__ volatile ("dsb sy" ::: "memory");
+-		if (!sa_wait(sa_chnl, &st)) {
+-			printf("SWEET REBOOT: asteroids: reason write 0x%02x -> 0x%02x failed (status %#x), no reset\n", old, upd, st);
+-			return;
+-		}
++	if (upd != old && !sa_write_reason(upd, &st)) {
++		printf("SWEET REBOOT: asteroids: reason write 0x%02x -> 0x%02x failed (status %#x)\n", old, upd, st);
++		return false;
+ 	}
+ 	if (!sa_read(&back) || (back >> 1) != SA_REASON_BOOTLOADER) {
+-		printf("SWEET REBOOT: asteroids: reason reads back 0x%02x, not bootloader, no reset\n", back);
++		printf("SWEET REBOOT: asteroids: reason reads back 0x%02x, not bootloader\n", back);
++		return false;
++	}
++	*was = old;
++	*now = back;
++	return true;
++}
++
++/* Returns only if it did not reset (nothing was reset, the reason may or may not be stored). */
++static void
++sa_reboot_bootloader(void)
++{
++	uint8_t old = 0, back = 0;
++
++	if (!sa_store_bootloader(&old, &back)) {
++		printf("SWEET REBOOT: asteroids: no reset\n");
+ 		return;
+ 	}
+ 	printf("SWEET REBOOT: asteroids: 0x7148 0x%02x -> 0x%02x (bootloader), PSCI SYSTEM_RESET\n", old, back);
+@@ -334,6 +370,101 @@ sa_reboot_bootloader(void)
+ 	printf("SWEET REBOOT: asteroids: PSCI SYSTEM_RESET returned\n");
+ }
+ 
++/*
++ * Test loop without a button, all off unless a boot-arg asks. Every path ends in ABL fastboot, never Android.
++ *   sweetfbarm=1      store the bootloader reason at boot, so an uncontrolled reset (long press, hypervisor
++ *                     watchdog, firmware) also lands in fastboot; ABL clears the field when it reads it
++ *   sweetpanicfb=N    after a panic: flush the log, keep the panic screen N seconds (1..600), reset into fastboot
++ *   sweetdeadman=N    N seconds (30..86400) after this point: clean reboot into fastboot; if that has not reset
++ *                     SA_DEADMAN_GRACE_S later, flush and reset anyway (HFS may be dirty then)
++ */
++#define SA_DEADMAN_GRACE_S 30u
++static unsigned sa_panic_secs, sa_deadman_secs;
++static bool sa_armed, sa_panic_entered;
++
++/* The seconds to hold the panic screen: long enough to photograph, shorter than any armed hardware watchdog. */
++static unsigned
++sa_panic_hold(unsigned wanted, unsigned wdt_secs)
++{
++	if (wdt_secs != 0 && wanted + 5u > wdt_secs) {
++		return wdt_secs > 5u ? wdt_secs - 5u : 0u;
++	}
++	return wanted;
++}
++
++void
++sweet_reboot_asteroids_panic(void)
++{
++	if (!sweet_board_asteroids() || sa_panic_secs == 0) {
++		return;
++	}
++	if (!sa_panic_entered) {                /* a nested panic goes straight to the reset */
++		sa_panic_entered = true;
++		sa_gwdt_ping();
++		sweet_log_flush_panic();
++		(void)sweet_ufs_flush_final();
++		delay((int)sa_panic_hold(sa_panic_secs, sa_gwdt_secs) * 1000 * 1000);
++	}
++	sa_reboot_bootloader();
++}
++
++static void
++sa_deadman_backstop(__unused void *arg, __unused wait_result_t wr)
++{
++	delay_for_interval(SA_DEADMAN_GRACE_S, NSEC_PER_SEC);
++	printf("SWEET REBOOT: deadman: clean reboot did not finish in %u s, resetting\n", SA_DEADMAN_GRACE_S);
++	sweet_log_sync();
++	(void)sweet_ufs_flush_final();
++	sa_reboot_bootloader();
++	thread_terminate(current_thread());
++}
++
++static void
++sa_deadman(__unused void *arg, __unused wait_result_t wr)
++{
++	thread_t backstop;
++
++	delay_for_interval(sa_deadman_secs, NSEC_PER_SEC);
++	printf("SWEET REBOOT: deadman: %u s are up, rebooting into fastboot\n", sa_deadman_secs);
++	sweet_log_sync();
++	if (kernel_thread_start(sa_deadman_backstop, NULL, &backstop) == KERN_SUCCESS) {
++		thread_deallocate(backstop);
++	}
++	(void)reboot_kernel(RB_AUTOBOOT, NULL);         /* syncs, unmounts, ends in sweet_reboot_restart */
++	thread_terminate(current_thread());
++}
++
++/* The end of sweet_reboot_asteroids_init, once the reason register works. */
++static void
++sa_handsfree_init(void)
++{
++	unsigned arm = 0, panic_secs = 0, deadman = 0;
++	uint8_t old = 0, back = 0;
++	thread_t thread;
++
++	PE_parse_boot_argn("sweetfbarm", &arm, sizeof(arm));
++	PE_parse_boot_argn("sweetpanicfb", &panic_secs, sizeof(panic_secs));
++	PE_parse_boot_argn("sweetdeadman", &deadman, sizeof(deadman));
++	if (arm) {
++		sa_armed = sa_store_bootloader(&old, &back);
++		printf("SWEET REBOOT: sweetfbarm: %s (0x7148 0x%02x -> 0x%02x)\n", sa_armed ? "armed" : "NOT armed", old, back);
++	}
++	sa_panic_secs = panic_secs > 600u ? 600u : panic_secs;
++	if (deadman != 0 && (deadman < 30u || deadman > 86400u)) {
++		printf("SWEET REBOOT: sweetdeadman=%u refused (30..86400)\n", deadman);
++		deadman = 0;
++	}
++	sa_deadman_secs = deadman;
++	if (deadman != 0 && kernel_thread_start(sa_deadman, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++		printf("SWEET REBOOT: deadman in %u s\n", deadman);
++	}
++	if (sa_panic_secs != 0) {
++		printf("SWEET REBOOT: a panic resets into fastboot after %u s\n", sa_panic_secs);
++	}
++}
++/* HANDS-FREE LOGIC END */
++
+ /* SweetPlatformExpert: power off on asteroids also goes to fastboot (a later power-on would boot Android). */
+ void
+ sweet_reboot_asteroids_halt(void)
+@@ -380,6 +511,9 @@ sweet_reboot_restart(int panic_restart)
+ 		    "reset boots Android, which formats the iOS root: hold Power + Volume down for fastboot, then fastboot "
+ 		    "boot the iOS image again");
+ 	}
++	if (panic_restart || sr_in_panic) {
++		sweet_reboot_asteroids_panic();         /* returns unless sweetpanicfb is set, or if the reset failed */
++	}
+ 	if (!sr_ready) {
+ 		return -1;
+ 	}
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 2abf22a..5ba1748 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -1406,12 +1406,43 @@ struct sweet_log_header {
+ 	uint64_t total, seq;
+ };
+ 
++/* Console bytes [pos, total) and the header, then SYNCHRONIZE CACHE. The caller holds sweet_ufs_lock. */
++static int
++sweet_log_write_locked(uint64_t base, uint64_t pos, uint64_t total, uint64_t seq)
++{
++	void *bounce = (void *)(su.dma + DMA_BOUNCE);
++	int error = 0;
++
++	while (pos < total && !error) {
++		uint32_t off = (uint32_t)(pos % SWEET_LOG_SIZE);
++		uint32_t blk = off / UFS_BLOCK;
++		uint64_t need = ((uint64_t)off % UFS_BLOCK + (total - pos) + UFS_BLOCK - 1) / UFS_BLOCK;
++		uint32_t n = (uint32_t)MIN(MIN(need, (uint64_t)(SWEET_LOG_SIZE / UFS_BLOCK - blk)),
++		    (uint64_t)(BOUNCE_SIZE / UFS_BLOCK));
++		memcpy(bounce, sweet_log_ring + (uint64_t)blk * UFS_BLOCK, n * UFS_BLOCK);
++		error = ufs_write_blocks(base + 1 + blk, n);
++		pos += (uint64_t)(blk + n) * UFS_BLOCK - off;
++	}
++	if (!error) {
++		struct sweet_log_header h = {
++			.magic = { 'S', 'W', 'E', 'E', 'T', 'L', 'O', 'G' },
++			.version = 1, .size = SWEET_LOG_SIZE, .total = total, .seq = seq,
++		};
++		bzero(bounce, UFS_BLOCK);
++		memcpy(bounce, &h, sizeof(h));
++		error = ufs_write_blocks(base, 1);
++	}
++	if (!error) {
++		error = ufs_sync_cache();
++	}
++	return error;
++}
++
+ static void
+ sweet_log_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+ 	uint64_t base = su.first_block + su.nblocks - SWEET_LOG_BLOCKS;
+ 	uint64_t flushed = 0, seq = 0;
+-	void *bounce = (void *)(su.dma + DMA_BOUNCE);
+ 
+ 	printf("SWEET LOG: console log to the last %u KiB of the partition (block 0x%llx)\n",
+ 	    SWEET_LOG_BLOCKS * UFS_BLOCK >> 10, base);
+@@ -1422,31 +1453,10 @@ sweet_log_thread(__unused void *arg, __unused wait_result_t wr)
+ 			continue;
+ 		}
+ 		uint64_t pos = total - flushed >= SWEET_LOG_SIZE ? total - SWEET_LOG_SIZE : flushed;
+-		int error = 0;
++		int error;
+ 
+ 		lck_mtx_lock(&sweet_ufs_lock);
+-		while (pos < total && !error) {
+-			uint32_t off = (uint32_t)(pos % SWEET_LOG_SIZE);
+-			uint32_t blk = off / UFS_BLOCK;
+-			uint64_t need = ((uint64_t)off % UFS_BLOCK + (total - pos) + UFS_BLOCK - 1) / UFS_BLOCK;
+-			uint32_t n = (uint32_t)MIN(MIN(need, (uint64_t)(SWEET_LOG_SIZE / UFS_BLOCK - blk)),
+-			    (uint64_t)(BOUNCE_SIZE / UFS_BLOCK));
+-			memcpy(bounce, sweet_log_ring + (uint64_t)blk * UFS_BLOCK, n * UFS_BLOCK);
+-			error = ufs_write_blocks(base + 1 + blk, n);
+-			pos += (uint64_t)(blk + n) * UFS_BLOCK - off;
+-		}
+-		if (!error) {
+-			struct sweet_log_header h = {
+-				.magic = { 'S', 'W', 'E', 'E', 'T', 'L', 'O', 'G' },
+-				.version = 1, .size = SWEET_LOG_SIZE, .total = total, .seq = ++seq,
+-			};
+-			bzero(bounce, UFS_BLOCK);
+-			memcpy(bounce, &h, sizeof(h));
+-			error = ufs_write_blocks(base, 1);
+-		}
+-		if (!error) {
+-			error = ufs_sync_cache();
+-		}
++		error = sweet_log_write_locked(base, pos, total, ++seq);
+ 		lck_mtx_unlock(&sweet_ufs_lock);
+ 		if (error) {
+ 			printf("SWEET LOG: write failed (%d), stopping\n", error);
+@@ -1457,6 +1467,31 @@ sweet_log_thread(__unused void *arg, __unused wait_result_t wr)
+ 	}
+ }
+ 
++/*
++ * The panic text before a reset (sweet_reboot_asteroids_panic): the log thread cannot run in a panic, so this CPU
++ * writes the ring itself. UFS commands poll with interrupts off. A panic inside a UFS command owns the mutex; then
++ * the flush is skipped, as in sweet_ufs_flush_final, and only the screen has the panic.
++ */
++void sweet_log_flush_panic(void);
++
++void
++sweet_log_flush_panic(void)
++{
++	if (!os_atomic_load(&sweet_log_running, acquire) || !su.ready || !su.writable) {
++		return;
++	}
++	if (!lck_mtx_try_lock(&sweet_ufs_lock)) {
++		return;
++	}
++	uint64_t total = os_atomic_load(&sweet_log_total, relaxed);
++	uint64_t pos = os_atomic_load(&sweet_log_flushed, acquire);
++	if (total - pos >= SWEET_LOG_SIZE) {
++		pos = total - SWEET_LOG_SIZE;
++	}
++	(void)sweet_log_write_locked(su.first_block + su.nblocks - SWEET_LOG_BLOCKS, pos, total, UINT64_MAX);
++	lck_mtx_unlock(&sweet_ufs_lock);
++}
++
+ /*
+  * Flush the console ring to the partition now and wait (bounded, 500 ms)
+  * for it, so the lines before a step that may hang the SoC survive the
+diff --git a/osfmk/kern/debug.c b/osfmk/kern/debug.c
+index e816c9f..195d313 100644
+--- a/osfmk/kern/debug.c
++++ b/osfmk/kern/debug.c
+@@ -1378,6 +1378,10 @@ panic_trap_to_debugger(const char *panic_format_str, va_list *panic_args, unsign
+ void __attribute__((noinline, optnone))
+ panic_spin_forever(void)
+ {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	extern void sweet_reboot_asteroids_panic(void);
++	sweet_reboot_asteroids_panic();         /* sweetpanicfb: into fastboot instead of spinning; else returns */
++#endif
+ 	for (;;) {
+ #if defined(__arm__) || defined(__arm64__)
+ 		/* On arm32, which doesn't have a WFE timeout, this may not return.  But that should be OK on this path. */

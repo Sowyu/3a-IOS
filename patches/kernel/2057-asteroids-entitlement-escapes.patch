@@ -1,0 +1,52 @@
+SWEET AMFI: parse entitlements that contain &quot;
+
+UNTESTED on a phone, not compiled. OSUnserializeXML rejects any entity except &amp; &lt; &gt;, so every signature whose XML has &quot; was granted nothing: "unreadable entitlements" for chronod, deviceaccessd, photoanalysisd and Podcasts on every boot. This is the first thing to try for widgets stuck on Waiting: chronod is their host and holds com.apple.private.chrono-extension-host.
+The change only reaches these four binaries; any other parses as before. Expect photoanalysisd to do more work once entitled, so watch CPU.
+
+Apply: git apply in the kernel tree (-p1). Independent of the other patches.
+Check: python3 plans/stability/2055-entitlement-escapes/ent_check.py
+
+--- a/iokit/Kernel/arm/SweetEntitlements.cpp
++++ b/iokit/Kernel/arm/SweetEntitlements.cpp
+@@ -56,6 +56,29 @@
+ 	return OSDynamicCast(SweetEntitlements, (OSObject *)(uintptr_t)obj);
+ }
+ 
++/*
++ * 2055: OSUnserializeXML knows only &amp; &lt; &gt; and fails the whole document on anything else. chronod, deviceaccessd,
++ * photoanalysisd and Podcasts have &quot; in their temporary-exception SBPL, so they ran with no entitlements at all. Rewrites
++ * &quot; and &apos; in place, for the parser's copy only: csops still returns the signed XML. Returns the new length.
++ */
++static size_t
++sweet_ent_plain_quotes(char *t, size_t n)
++{
++	size_t o = 0;
++	for (size_t i = 0; i < n;) {
++		if (n - i >= 6 && memcmp(&t[i], "&quot;", 6) == 0) {
++			t[o++] = '"';
++			i += 6;
++		} else if (n - i >= 6 && memcmp(&t[i], "&apos;", 6) == 0) {
++			t[o++] = '\'';
++			i += 6;
++		} else {
++			t[o++] = t[i++];
++		}
++	}
++	return o;
++}
++
+ extern "C" {
+ /* Parsed entitlements for one XML blob (header included), or NULL. Retained. */
+ void *
+@@ -74,8 +97,9 @@
+ 		return NULL;
+ 	}
+ 	memcpy(text, blob->data, text_len);
+-	text[text_len] = '\0';
+-	OSObject *parsed = OSUnserializeXML(text, text_len + 1);
++	size_t plain_len = sweet_ent_plain_quotes(text, text_len);
++	text[plain_len] = '\0';
++	OSObject *parsed = OSUnserializeXML(text, plain_len + 1);
+ 	kfree_data(text, text_len + 1);
+ 
+ 	OSDictionary *dict = OSDynamicCast(OSDictionary, parsed);

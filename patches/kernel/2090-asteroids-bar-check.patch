@@ -1,0 +1,222 @@
+2090: sweetfb_barcheck=1 samples each frame's slot right before the flip for dark bars, classifies them against the source surface, and checks the two display invariants on the device (a slot is never written while scanned, a source never changes during its copy). Boot-arg off: one bool test per present. UNTESTED ON A PHONE, syntax-checked with the kernel's flags, scan logic host-tested by plans/blackbars/test/bar-test.c.
+What it prints: see analysis/blackbars.md. Grep "SWEET FB BAR:".
+Apply: git apply after 2053, then rebuild the kernel. Reads only; no display behaviour changes.
+
+diff --git a/iokit/Kernel/arm/SweetFbScale.h b/iokit/Kernel/arm/SweetFbScale.h
+index bb8b6f7..f211388 100644
+--- a/iokit/Kernel/arm/SweetFbScale.h
++++ b/iokit/Kernel/arm/SweetFbScale.h
+@@ -52,6 +52,92 @@ sfs_qseed_plan(uint32_t sw, uint32_t sh, uint32_t dw, uint32_t dh, bool alpha, s
+ 	return true;
+ }
+ 
++/*
++ * 2090 sweetfb_barcheck: sample a frame for dark bars before it is shown. Every 16th panel row, 8 columns; a row is dark when 3
++ * adjacent samples are black or flat grey up to 64 (the glass band is 60,60,60). A run of 3 or more dark rows is a bar. An icon
++ * spans at most 2 columns. ponytail: a bar under 48 rows or under 3 columns is missed, narrow the steps if one is seen anyway.
++ */
++#define SFS_BAR_STEP 16
++#define SFS_BAR_COLS 8
++#define SFS_BAR_MIN_ROWS 3
++#define SFS_BAR_RUNS 3
++
++struct sfs_bar {
++	int32_t from[SFS_BAR_RUNS], to[SFS_BAR_RUNS];   /* panel rows, to is exclusive */
++	uint32_t px[SFS_BAR_RUNS];                      /* the first dark sample of the run */
++	uint32_t runs, sig;                             /* sig: runs found, to log each change once */
++};
++
++static inline bool
++sfs_bar_dark(uint32_t px)
++{
++	uint32_t b = px & 0xff, g = (px >> 8) & 0xff, r = (px >> 16) & 0xff;
++	uint32_t hi = r > g ? r : g, lo = r < g ? r : g;
++	hi = b > hi ? b : hi;
++	lo = b < lo ? b : lo;
++	return hi <= 64 && hi - lo <= 2;
++}
++
++/* One row of a mapped image; the pixel is read once, the mapping may be device-like. True with *first set when the row is dark. */
++static inline bool
++sfs_bar_row(const uint8_t *row, uint32_t width, uint32_t *first)
++{
++	uint32_t adjacent = 0;
++	for (uint32_t i = 0; i < SFS_BAR_COLS; i++) {
++		uint32_t px = *(const volatile uint32_t *)(row + (uint64_t)(width * (2 * i + 1) / (2 * SFS_BAR_COLS)) * 4);
++		adjacent = sfs_bar_dark(px) ? adjacent + 1 : 0;
++		if (adjacent == 1) {
++			*first = px;
++		}
++		if (adjacent == 3) {
++			return true;
++		}
++	}
++	return false;
++}
++
++static inline void
++sfs_bar_scan(const uint8_t *image, uint32_t rowBytes, uint32_t width, uint32_t height, struct sfs_bar *bar)
++{
++	int32_t start = -1;
++	uint32_t px = 0, startPx = 0;
++	bar->runs = 0;
++	bar->sig = 0;
++	for (uint32_t y = 0;; y = y + SFS_BAR_STEP < height ? y + SFS_BAR_STEP : height) {
++		bool dark = y < height && sfs_bar_row(image + (uint64_t)y * rowBytes, width, &px);
++		if (dark && start < 0) {
++			start = (int32_t)y;
++			startPx = px;
++		} else if (!dark && start >= 0) {
++			if ((y - (uint32_t)start + SFS_BAR_STEP - 1) / SFS_BAR_STEP >= SFS_BAR_MIN_ROWS && bar->runs < SFS_BAR_RUNS) {
++				bar->from[bar->runs] = start;
++				bar->to[bar->runs] = (int32_t)y;
++				bar->px[bar->runs] = startPx;
++				bar->sig = (bar->sig ^ (uint32_t)start ^ ((uint32_t)y << 12)) * 16777619u;
++				bar->runs++;
++			}
++			start = -1;
++		}
++		if (y == height) {
++			break;
++		}
++	}
++}
++
++/* Samples of a surface, to see whether it changes during its own copy. */
++static inline uint32_t
++sfs_bar_hash(const uint8_t *image, uint32_t rowBytes, uint32_t width, uint32_t height)
++{
++	uint32_t h = 2166136261u;
++	for (uint32_t y = 0; y < 16; y++) {
++		const uint8_t *row = image + (uint64_t)(height * (2 * y + 1) / 32) * rowBytes;
++		for (uint32_t i = 0; i < SFS_BAR_COLS; i++) {
++			h = (h ^ *(const volatile uint32_t *)(row + (uint64_t)(width * (2 * i + 1) / (2 * SFS_BAR_COLS)) * 4)) * 16777619u;
++		}
++	}
++	return h;
++}
++
+ struct sfs_job {
+ 	const uint8_t *base;    /* surface row 0 */
+ 	uint8_t *draw;          /* panel row 0 */
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index c95236e..426903b 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -91,6 +91,7 @@ static struct {
+  volatile bool stopped;
+  uint32_t front;
+  uint64_t done, latched, latchNS, latchMinNS, latchMaxNS, repeated, epochDrops;
++ bool bar; uint64_t barChecks, barHits, barSrcDark, barSlotOnly, barMoved, barScanned, barMaxNS; uint32_t barSig, barLines; /* 2090 sweetfb_barcheck */
+  uint64_t copyNS, copyMaxNS, copies, logTime;
+  bool hw, hwOn; uint32_t hwStride, hwCanvas, hwSaved[6], hwSavedPe[9], hwSavedOp, hwW, hwH, hwVer; /* 2053 */
+  uint64_t swapFlipNS, swapFlips, swapFlipMaxNS, handlerMaxNS, tickGapMaxNS, lastTick, preserves; /* 2052; maxima per log line */
+@@ -1535,6 +1536,10 @@ AppleCLCD::statsTick(uint64_t now)
+ 	#undef PER_S
+ 	if (ast.enabled && (ast.logTime == 0 || sweet_abs_us(now - ast.logTime) >= 10000000)) {
+         ast.logTime = now;
++        if (ast.bar) {
++            IOLog("SWEET FB BAR: checks=%llu hits=%llu src_dark=%llu slot_only=%llu src_moved=%llu scanned_writes=%llu check_us max=%llu irq=%x intf_irq=%x\n",
++                ast.barChecks, ast.barHits, ast.barSrcDark, ast.barSlotOnly, ast.barMoved, ast.barScanned, ast.barMaxNS/1000, ast.mdp[5], ast.intf[0x1c4/4]);
++        }
+         IOLog("SWEET FB AST: flips done=%llu latched=%llu repeated=%llu dropped=%llu hold_expired=%llu\n",
+             ast.done, ast.latched, ast.repeated, coalesced + ast.epochDrops, c.gpuHoldTimeouts);
+         IOLog("SWEET FB AST: latch_us min=%llu avg=%llu max=%llu\n",
+@@ -2053,6 +2058,10 @@ AppleCLCD::astSetup(void)
+   }
+   sweet_log_sync();
+  }
++ int barcheck = 0;
++ PE_parse_boot_argn("sweetfb_barcheck", &barcheck, sizeof(barcheck));
++ ast.bar = barcheck == 1 && !ast.hw;
++ if (ast.bar) IOLog("SWEET FB BAR: armed, every %d rows, %d columns\n", SFS_BAR_STEP, SFS_BAR_COLS);
+ }
+ 
+ bool
+@@ -3908,10 +3917,45 @@ AppleCLCD::astCovered(const uint8_t *rec, uint32_t mask)
+ 	return false;
+ }
+ 
++/*
++ * 2090: runs right before the flip, while the swap still holds the source. src is the surface's first pixel, 0 when no canvas-sized
++ * surface was copied. One line per bar each time the set of bars changes, 256 lines a boot; the 10 s counters keep counting.
++ */
++static void
++astBarCheck(unsigned back, const uint8_t *src, uint32_t bpr, uint32_t srcW, uint32_t srcH, uint32_t swapID, uint64_t copyNS)
++{
++	struct sfs_bar bar;
++	uint64_t start = mach_absolute_time(), ns;
++	sfs_bar_scan((const uint8_t *)ast.va[back], 4320, 1080, 2392, &bar);
++	ast.barChecks++;
++	bool changed = bar.sig != ast.barSig;
++	ast.barSig = bar.sig;
++	for (uint32_t i = 0; i < bar.runs; i++) {
++		uint32_t first = 0;
++		bool dark = false;
++		if (src != NULL) {
++			uint32_t row = (uint32_t)(((uint64_t)bar.from[i] + bar.to[i]) / 2 * srcH / 2392);
++			dark = sfs_bar_row(src + (uint64_t)row * bpr, srcW, &first);
++		}
++		ast.barHits++;
++		if (dark) ast.barSrcDark++;
++		else if (src != NULL) ast.barSlotOnly++;
++		if (changed && ast.barLines < 256) {
++			ast.barLines++;
++			IOLog("SWEET FB BAR: swap=%u slot=%u rows=%d-%d px=%08x src=%s band_edges=%d,%d copy_us=%llu\n", swapID, back, bar.from[i], bar.to[i],
++			    bar.px[i], src == NULL ? "none" : (dark ? "dark" : "not-dark"), sweet_rows.band[1], sweet_rows.band[2], copyNS / 1000);
++		}
++	}
++	absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);
++	if (ns > ast.barMaxNS) ast.barMaxNS = ns;
++}
++
+ void
+ AppleCLCD::present(const uint8_t *rec, uint32_t copyEpoch)
+ {
+ 	uint32_t mask = get32(rec, 0x104);
++	const uint8_t *barSrc = NULL;
++	uint32_t barBpr = 0, barW = 0, barH = 0;
+ 	if (ast.frozen) return;
+ 	if (ast.enabled && copyEpoch != sweet_gpu_epoch()) { ast.epochDrops++; return; }
+ 
+@@ -3955,6 +3999,10 @@ AppleCLCD::present(const uint8_t *rec, uint32_t copyEpoch)
+   back = ast.front == 1 ? 2 : 1;
+   fDrawIdx = back;
+   fDraw = ast.va[back];
++  if (ast.bar && (ast.pipe[5] == astPA[back] || (ast.ctl[6] & 1))) {
++   // 2090: never expected. The slot about to be written is on the panel, or the last flip has not latched.
++   if (ast.barScanned++ < 16) IOLog("SWEET FB BAR: writing a scanned slot %u src=%x flush=%x line=%u\n", back, ast.pipe[5], ast.ctl[6], ast.intf[0xb0/4]);
++  }
+   // Preserve partial damage outside this swap before the row workers start. A reading copy from
+   // write-combined memory is slow, so skip it when a layer that will draw covers the whole canvas.
+   if (!astCovered(rec, mask)) {
+@@ -4065,7 +4113,21 @@ AppleCLCD::present(const uint8_t *rec, uint32_t copyEpoch)
+ 			continue;
+ 		}
+ 		if (fScale != 0 && s != fSurface) {
++			/* 2090: only a whole canvas in bounds, as astCovered checks it */
++			bool barWhole = ast.bar && src != 0 && s->width >= fLogicalW && s->height >= fLogicalH && s->memory != NULL &&
++			    (uint64_t)s->offset + (uint64_t)(fLogicalH - 1) * s->bytesPerRow + (uint64_t)fLogicalW * 4 + s->wrapDelta <= s->memory->getLength();
++			uint32_t barHash = 0;
++			if (barWhole) {
++				barSrc = (const uint8_t *)(src + s->offset);
++				barBpr = s->bytesPerRow;
++				barW = fLogicalW;
++				barH = fLogicalH;
++				barHash = sfs_bar_hash(barSrc, barBpr, barW, barH);
++			}
+ 			presentScaled(s, src, sx, sy, dx, dy, w, h);
++			if (barWhole && sfs_bar_hash(barSrc, barBpr, barW, barH) != barHash && ast.barMoved++ < 64) {
++				IOLog("SWEET FB BAR: source changed during its copy swap=%u surface=%u fence last=%u\n", fCurSwapID, id, sweet_gpu_fence_snapshot());
++			}
+ 			s->release();
+ 			continue;
+ 		}
+@@ -4117,6 +4179,7 @@ AppleCLCD::present(const uint8_t *rec, uint32_t copyEpoch)
+         ast.copies++;
+         ast.copyNS += ns;
+         if (ns > ast.copyMaxNS) ast.copyMaxNS = ns;
++        if (ast.bar && !ast.stopped) astBarCheck(back, barSrc, barBpr, barW, barH, fCurSwapID, ns);
+     }
+     uint64_t astLatchStart = mach_absolute_time();
+     if (ast.enabled && !ast.stopped) {

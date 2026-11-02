@@ -1,0 +1,114 @@
+diff --git a/bsd/dev/sweet_reboot.c b/bsd/dev/sweet_reboot.c
+index 2fa765b..5f1588f 100644
+--- a/bsd/dev/sweet_reboot.c
++++ b/bsd/dev/sweet_reboot.c
+@@ -324,8 +324,40 @@ sa_write_reason(uint8_t value, uint32_t *status)
+ 	return sa_wait(sa_chnl, status);
+ }
+ 
+-static unsigned sa_gwdt_secs;            /* the hypervisor watchdog's timeout when armed (2061), else 0 */
+-#define sa_gwdt_ping() do { } while (0)
++/*
++ * Gunyah's per-VM watchdog (live DT qcom,gh-watchdog; Linux drivers/watchdog/gunyah_wdt.c): the only thing here that
++ * still acts when every CPU is wedged. Boot-arg sweetgwdt=N (1..32 s, 16-bit ms argument limit), off by default.
++ * A bite resets the phone with no chance to write a reason, and a reset without the reason boots Android, which
++ * formats userdata: so it refuses to start unless sweetfbarm armed the reason on this boot.
++ */
++#define SA_GWDT_CONTROL 0x86000005u
++#define SA_GWDT_STATUS  0x86000006u
++#define SA_GWDT_PING    0x86000007u
++#define SA_GWDT_SET     0x86000008u
++#define SA_GWDT_ON      3u              /* WDT_CTRL_ENABLE: bits 1 and 0 */
++#define SA_GWDT_OFF     2u              /* WDT_CTRL_DISABLE: bit 1 */
++#define SA_GWDT_PET_S   5u              /* as rootstockos UniXNU-asteroids BootWatchdogPolicy.c */
++
++static unsigned sa_gwdt_secs;            /* its timeout when armed, else 0 */
++
++static uint64_t
++sa_gwdt_call(uint32_t id, uint32_t a1, uint32_t a2)
++{
++	register uint64_t x0 __asm__("x0") = id;
++	register uint64_t x1 __asm__("x1") = a1;
++	register uint64_t x2 __asm__("x2") = a2;
++	__asm__ volatile ("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2) : : "x3", "x4", "x5", "x6", "x7",
++	    "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "cc", "memory");
++	return x0;
++}
++
++static void
++sa_gwdt_ping(void)
++{
++	if (sa_gwdt_secs != 0) {
++		(void)sa_gwdt_call(SA_GWDT_PING, 0, 0);
++	}
++}
+ 
+ /* HANDS-FREE LOGIC BEGIN (host check: plans/usb/host/check_failsafe.py) */
+ /* Bits [7:1] of 0x7148 = bootloader, bit 0 kept; true only when it reads back so. Resets nothing. */
+@@ -434,11 +466,56 @@ sa_deadman(__unused void *arg, __unused wait_result_t wr)
+ 	thread_terminate(current_thread());
+ }
+ 
++static void
++sa_gwdt_pet(__unused void *arg, __unused wait_result_t wr)
++{
++	for (;;) {
++		sa_gwdt_ping();
++		delay_for_interval(SA_GWDT_PET_S, NSEC_PER_SEC);
++	}
++}
++
++/* Refuses without the armed reason. Any hypervisor error leaves the watchdog disabled. */
++static void
++sa_gwdt_start(unsigned secs)
++{
++	thread_t thread;
++	uint64_t status, set, on;
++
++	if (secs == 0) {
++		return;
++	}
++	if (!sa_armed || secs < 15u || secs > 32u) {
++		printf("SWEET REBOOT: sweetgwdt=%u refused (armed %d; needs sweetfbarm=1 and 15..32 s)\n", secs, sa_armed);
++		return;
++	}
++	status = sa_gwdt_call(SA_GWDT_STATUS, 0, 0);
++	if (status != 0) {
++		printf("SWEET REBOOT: sweetgwdt: status %#llx, no watchdog\n", status);
++		return;
++	}
++	(void)sa_gwdt_call(SA_GWDT_CONTROL, SA_GWDT_OFF, 0);
++	set = sa_gwdt_call(SA_GWDT_SET, secs * 1000u, secs * 1000u);
++	if (set != 0 || kernel_thread_start(sa_gwdt_pet, NULL, &thread) != KERN_SUCCESS) {
++		printf("SWEET REBOOT: sweetgwdt: set %#llx, not started\n", set);
++		return;
++	}
++	thread_deallocate(thread);
++	on = sa_gwdt_call(SA_GWDT_CONTROL, SA_GWDT_ON, 0);
++	if (on != 0) {
++		printf("SWEET REBOOT: sweetgwdt: enable %#llx, not started\n", on);
++		return;
++	}
++	sa_gwdt_secs = secs;
++	sa_gwdt_ping();
++	printf("SWEET REBOOT: sweetgwdt: hypervisor watchdog %u s, pet every %u s\n", secs, SA_GWDT_PET_S);
++}
++
+ /* The end of sweet_reboot_asteroids_init, once the reason register works. */
+ static void
+ sa_handsfree_init(void)
+ {
+-	unsigned arm = 0, panic_secs = 0, deadman = 0;
++	unsigned arm = 0, panic_secs = 0, deadman = 0, gwdt = 0;
+ 	uint8_t old = 0, back = 0;
+ 	thread_t thread;
+ 
+@@ -449,6 +526,8 @@ sa_handsfree_init(void)
+ 		sa_armed = sa_store_bootloader(&old, &back);
+ 		printf("SWEET REBOOT: sweetfbarm: %s (0x7148 0x%02x -> 0x%02x)\n", sa_armed ? "armed" : "NOT armed", old, back);
+ 	}
++	PE_parse_boot_argn("sweetgwdt", &gwdt, sizeof(gwdt));
++	sa_gwdt_start(gwdt);
+ 	sa_panic_secs = panic_secs > 600u ? 600u : panic_secs;
+ 	if (deadman != 0 && (deadman < 30u || deadman > 86400u)) {
+ 		printf("SWEET REBOOT: sweetdeadman=%u refused (30..86400)\n", deadman);
