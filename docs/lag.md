@@ -290,7 +290,7 @@ The difference is within run-to-run noise, and the GPU time shows no cause, so G
 
 | Run | Arm | Shown fps | 1 vsync | Flip rate | Steady | Heavy late | Heavy on A520 |
 |---|---|---:|---:|---:|---:|---:|---:|
-| ast113 | M47, `sweetamp_prio=47` | 41.8 | 66.7% | 0.31 | 43.6% | 40% | 55% |
+| ast113 | M47, `sweetamp_prio=47` (no effect possible, see below) | 41.8 | 66.7% | 0.31 | 43.6% | 40% | 55% |
 | ast115 | M47 | 40.8 | 65.3% | 0.36 | 34.9% | 45% | 58% |
 | ast114 | BC, `chl-bind-cache.patch` | 41.4 | 67.0% | 0.37 | 32.3% | 40% | 58% |
 | ast116 | BC | 41.0 | 64.9% | 0.35 | 36.4% | 45% | 60% |
@@ -352,3 +352,78 @@ The second light run (ast118) was already running and finished. The no-hw run of
 That points at memory traffic in sysmem rendering.
 
 **Next, `GF`:** force GMEM (`sweettu=gmem,...`) with the fetch sync off, on stock Turnip. In GMEM a fetch reads on-chip tile memory, ordered by `FLUSH_PER_OVERLAP` as Turnip intends, so it could fix the tear and cut memory traffic together. No-hw first, for the tear and for recoveries, since GMEM hung often before the 2100 fix.
+
+### Forced GMEM with the sync off: slower and torn (ast121)
+
+**Proven:**
+
+- GPU time rose to 15.0 ms at 100 to 160 draws and 30.6 ms at 160+, against about 11.4 and 18.3 ms in sysmem.
+- New artifacts appear on the App Store, Wallet, Settings and Photos icons in the home-screen frame.
+- 0 recoveries.
+
+Dropped. Nothing cheap is left on the GPU side. At this resolution the glass passes cost what they cost.
+
+### CPU placement: the steering never ran (ast122 and the build config)
+
+**Proven:**
+
+- The sweet kernel is built without `CONFIG_SCHED_SMT`. Its compile flags define only `CONFIG_SCHED_AUTO_JOIN`, `CONFIG_SCHED_DEFERRED_AST`, `CONFIG_SCHED_SFI` and `CONFIG_SCHED_TIMESHARE_CORE`.
+- The AMP steering (`sweet_amp_wanted_map`, `sweetamp`, `sweetamp_prio`) exists only inside `choose_processor_smt()`, so it was never compiled. The "idle-core steering on" log line only means the masks were set. That is why M47 changed nothing: **ast113 and ast115 were not a real steering test**, since `sweetamp_prio` had no code behind it.
+- The compiled `choose_processor()` takes `lsb_first(idle_map)`, the lowest-numbered idle CPU. CPUs 0 to 3 are the A520 cores.
+- ast122 sampled per-process CPU once a second (`proc_pidinfo`) during the 51 animating seconds. User processes used about 1.5 of 8 cores: backboardd 624 ms/s, SpringBoard 294, MobileSafari 82, Preferences 82, PerfPowerServices 75, MTLCompilerService 55, the rest under 50 each.
+- Clusters 1 and 2 (A720, A720+) idle at 0 to 4% load. Cluster 0's constant 100% is one A520 core that never idles. It is likely a kernel thread, not a user process, and it is not followed up here.
+
+So the big cores sit mostly idle while the render thread runs on an A520 57% of the time, at about twice the encode time.
+
+**Fix, 2144** (`plans/lag/patches/2144-asteroids-amp-steering-in-choose-processor.patch`; numbered 2160 at first, which the USB gadget work already uses), built in `research/xnu-local` (my tree, with 2140 to 2143). A copy of `xnu-combined` did not build: its build directory kept absolute paths into the original tree, so headers came in twice. Both scheduler arms therefore run on the same 2144 kernel, which lacks 2130 and 2150 to 2153, none of which the pace images use. Stock placement is `sweetamp=0`; the test arm is `sweetamp_ui=47`.
+
+1. The steering moves into the `choose_processor()` that is compiled: an idle core of the thread's class first, and an idle hint of the wrong class is dropped when one of the right class is free.
+2. A new boot arg, `sweetamp_ui=N`: a thread at `base_pri >= N` that finds no idle big core preempts the big core running the lowest priority below its own, instead of taking an idle little core.
+
+### 2144 measured: placement fixed, pacing not (ast123 to 126)
+
+Same 2144 kernel in both arms. The payload is `lumatrace` with CPU numbers and the process CPU sampler.
+
+| Run | Arm | Heavy on A520 | Encode 100-160 on A520 / A720 | Shown fps | 1 vsync | Flip rate | Steady |
+|---|---|---:|---|---:|---:|---:|---:|
+| ast123 | stock (`sweetamp=0`) | 56% | 5.3 / 2.3 ms | 43.1 | 70.3% | 0.31 | 42.8% |
+| ast125 | stock | 59% | 5.5 / 2.8 ms | 41.0 | 64.9% | 0.31 | 41.1% |
+| ast124 | `sweetamp_ui=47` | 25% | 5.0 / 2.3 ms | 41.1 | 65.9% | 0.29 | 45.1% |
+| ast126 | `sweetamp_ui=47` | 24% | 5.2 / 2.7 ms | 41.9 | 67.5% | 0.36 | 34.4% |
+
+**Proven:**
+
+- The steering works. Heavy command buffers on the A520 cores fell from 56 to 59% to 24 to 25%.
+- On-time frames encode faster: 1.9 against 2.5 ms in ast124.
+- CoreAnimation started 67% of heavy frames within one vsync of the previous start in ast124, against 57 to 62% in ast101, 104 and 123.
+- Panel pacing did not change beyond noise.
+- 0 recoveries in all four runs.
+
+**Inferred:** frames that start on time still reach the panel a vsync late when their GPU work (14 to 15 ms on heavy glass frames) ends after the tick.
+
+**Proven, gate:** the next frame's start does not line up with any event of the previous frame. Relative to the previous GPU end, completion, handlers, swap, SwapWait return, tick or hold release, it spreads over several milliseconds (`/tmp/lag-gate2.py`, ast123 and ast124). The "render-bound" kind above is a timing coincidence, not a gate. **Inferred:** CoreAnimation's own pacing decides, at each vsync, whether to start a frame.
+
+2144 is not kept for the daily image: it shows no pacing gain, and it is a scheduler change. The patch stays in `plans/lag/patches/` if placement matters later, for battery or for other work.
+
+### UBWC: GPU time down by a third to a half, encode doubled (ast127)
+
+`sweettu=sysmem,nocb,nolrz` turns on the hardware's lossless framebuffer compression (UBWC) and keeps sysmem. Turnip compresses only its private, optimally tiled images; IOSurfaces stay linear. **Proven, ast127:**
+
+| Measure | sysmem, no UBWC (ast101 to 126) | UBWC (ast127) |
+|---|---:|---:|
+| GPU, 100 to 140 draws | 11.3 to 11.6 ms | **7.4 ms** |
+| GPU, 140+ draws | 18.1 to 18.5 ms | **10.2 ms** |
+| Encode, late heavy frames | about 5 ms | **11.0 ms** |
+| Shown fps | 41 to 43 | 40.7 |
+| 1 vsync | 65 to 70% | 64.2% |
+| Flip rate | 0.29 to 0.36 | 0.30 |
+
+0 recoveries.
+
+**The reason encode doubled:** bgmtl turns its texture pool off unless `noubwc` is set (`bg_texpool_cap`), so every intermediate texture became a fresh kernel allocation. The rule exists because a pooled texture is zeroed on the CPU, which "only reads as clear without UBWC". But the zero covers the whole allocation, metadata included, so a pooled texture ends up byte for byte the same as a fresh one, UBWC or not. Most takes are also cleared on the GPU by their first render pass (`zero_kept`).
+
+**Next, `lumaub`:** UBWC with the pool kept. Two hw runs for timing, and one no-hw run so the frames show whether UBWC itself changes anything visible.
+
+### CoreAnimation pacing switches (batch 8)
+
+`bgl-launch` (`plans/lag/arms/calat`) sets `CA_DISABLE_LOW_LATENCY=1` (`sweetcalat=1`) or `CA_DISABLE_SERVER_TIMER_EARLY_WAKEUP=1` (`sweetcalat=2`) for backboardd, one per boot. It is built from next-luma's launcher, which is the one on the root; without the boot arg it behaves the same.
