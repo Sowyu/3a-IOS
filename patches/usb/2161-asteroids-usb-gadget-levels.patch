@@ -1,0 +1,700 @@
+From: asteroids USB gadget, part 2 of 2
+Subject: [PATCH 2161] asteroids: USB gadget levels 2 to 4 behind sweetusb, off by default
+
+sweetusb=2 owns the halted DWC3 (event buffer moved off ABL's 0xD017B000 onto our own permanent, canaried DMA area,
+ep0 commands, one CmdIOC event proving the DMA write), 3 soft-connects and enumerates with ep0 only and then
+disconnects, 4 brings up CDC-ECM ue0 (192.168.7.2/24, fe80::5eff:fe77:ee02). +16 forces high speed. sweetusb unset,
+0 or 1 behaves as before. See plans/usb/gadget/README.md.
+
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -47,6 +47,7 @@
+ extern int sweet_smmu_map_sid(unsigned sid);
+ void sweet_usb_probe(void);
+ static void sweet_usb_gadget_start(vm_offset_t dwc);
++static void ua_gadget(int arg);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ /* iokit/Kernel/arm/SweetNetwork.cpp */
+ extern int sweet_net_publish(const char *bsd_name, const char *prefix, unsigned unit,
+@@ -198,8 +199,8 @@
+ 	if (level == 0) {
+ 		return;
+ 	}
+-	if (level != 1) {
+-		printf("ASTEROIDS USB: sweetusb=%d refused; only 0=off, 1=read-only; SID 0x40 DMA unproven\n", level);
++	if ((level & 0xf) < UG_LEVEL_PROBE || (level & 0xf) > UG_LEVEL_ECM || (level & ~(0xf | UG_FLAG_HS)) != 0) {
++		printf("ASTEROIDS USB: sweetusb=%d refused; 1 read-only probe, 2 own, 3 enumerate, 4 ECM, +16 high speed\n", level);
+ 		sweet_log_sync();
+ 		return;
+ 	}
+@@ -259,6 +260,9 @@
+ 	}
+ 	printf("ASTEROIDS USB: probe complete; no register writes, no DMA, no gadget\n");
+ 	sweet_log_sync();
++	if ((level & 0xf) >= UG_LEVEL_OWN) {
++		ua_gadget(level);
++	}
+ }
+ 
+ void
+@@ -589,6 +593,7 @@
+ static void ud_link_event(bool up);
+ static void ud_route_kick(void);
+ static void ud_net_start(void);
++static void ua_if_inet6(void);
+ 
+ /* NETWORK_CONNECTION notification: the host brings its link up on it. */
+ static void
+@@ -1042,6 +1047,9 @@
+ 	}
+ 	ifnet_set_flags(ud.ifp, IFF_UP | IFF_RUNNING, IFF_UP | IFF_RUNNING);
+ 	printf("SWEET USB: ue0 192.168.7.2/24 %s (err %d)\n", err ? "NOT configured" : "up", err);
++	if (sweet_board_asteroids()) {
++		ua_if_inet6();
++	}
+ }
+ 
+ /*
+@@ -1533,6 +1541,641 @@
+ 	if (livelog && ud.ifp != NULL && kernel_thread_start(ud_log_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
++}
++
++/*
++ * Asteroids gadget, sweetusb=2..4 (+16 forces high speed). Off by default; level 1 stays the read-only probe above and
++ * runs first on every level. plans/usb/gadget/README.md has the evidence for each step.
++ *
++ *   2 own:       gates (core ID and device mode, SID 0x40 routed straight through, core halted), a DMA area of our own
++ *                kept for good with a canary page each side, GEVNTADR moved off ABL's 0xD017B000 onto our event
++ *                buffer, ep0 commands, one CmdIOC event to prove the controller writes into our buffer. No RUN_STOP.
++ *   3 enumerate: level 2, then VBUS override and RUN_STOP with a vendor interface that has no endpoints: only ep0 moves
++ *                data. 20 s after the host configures it (or 120 s without), soft-disconnect and log the verdict.
++ *   4 ECM:       level 2, then the Poco F1's CDC-ECM function and ue0 (192.168.7.2/24 and fe80::5eff:fe77:ee02), up
++ *                for the rest of the boot.
++ *
++ * Any failed gate after the first register write ends in ua_stop(): transfers ended, RUN_STOP cleared, VBUS override
++ * restored. GEVNTADR stays on our event buffer, which is never freed, so a late controller write lands in our memory.
++ */
++#include <netinet6/in6_var.h>
++
++extern unsigned long gPhysBase, gPhysSize;  /* osfmk/mach/arm/vm_param.h, Mach-private */
++
++#define UA_DWC3_PA      0x0a600000u
++#define UA_DWC3_SIZE    0x0000d000u
++#define UA_PHY_PA       0x088e3000u     /* eUSB2 PHY, read only (the probe reads the same block) */
++#define DEPCMD_CMDIOC   (1u << 8)
++#define GEVNTSIZ_INTMASK (1u << 31)
++#define UA_L3_HOLD_S    20              /* level 3: connected this long after SET_CONFIGURATION, then disconnect */
++#define UA_ENUM_WAIT_S  120             /* level 3 gives up, level 4 logs, without a SET_CONFIGURATION by then */
++
++static struct {
++	int         level;
++	vm_offset_t area;               /* canary page, DMA area (ud.dma), canary page */
++	uint64_t    area_pa;
++	vm_size_t   area_size;
++	vm_offset_t qs;                 /* QSCRATCH */
++	uint32_t    qs_hs, qs_ss;       /* as found, restored at stop */
++	bool        qs_set;
++	int         speed;              /* DSTS.CONNECTSPD at connect done */
++	uint64_t    t_run, t_cfg;       /* mach_absolute_time of RUN_STOP and of SET_CONFIGURATION(1) */
++	uint32_t    setups, connects;
++	bool        up_logged;
++} ua = { .speed = UG_SPEED_HS };
++
++/* QSCRATCH writes, one plain str each like dwc_wr. */
++static void
++ua_wr(vm_offset_t addr, uint32_t v)
++{
++	__asm__ volatile ("str %w0, [%1]" :: "r"(v), "r"(addr) : "memory");
++	__asm__ volatile ("dsb sy" ::: "memory");
+ }
+ 
++static uint64_t
++ua_secs_since(uint64_t t)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time() - t, &ns);
++	return ns / NSEC_PER_SEC;
++}
++
++/* Both canary pages still hold the pattern. Invalidate first, so a device write is seen, not the cached copy. */
++static bool
++ua_canaries_ok(const char *when)
++{
++	vm_offset_t page[2] = { ua.area, ua.area + ua.area_size - PAGE_SIZE };
++	if (ua.area == 0) {
++		return true;
++	}
++	for (int i = 0; i < 2; i++) {
++		sweet_dma_sync_va((const void *)page[i], PAGE_SIZE);
++		long bad = ug_canary_check((const volatile uint32_t *)page[i], PAGE_SIZE / 4);
++		if (bad >= 0) {
++			printf("ASTEROIDS USB GATE: canary %s page word %ld = 0x%08x, %s\n", i ? "after" : "before", bad,
++			    ((const volatile uint32_t *)page[i])[bad], when);
++			return false;
++		}
++	}
++	return true;
++}
++
++/*
++ * SID 0x40 must match exactly one valid SMR, and that SMR must pass addresses through: S2CR bypass, or translate to a
++ * context bank whose SCTLR.M is 0 (the probe saw SMR3 -> bank 3, SCTLR 0xE0). No SMMU write ever. Also returns the
++ * SMMU's output address size, which bounds where the DMA area may sit.
++ */
++static bool
++ua_smmu_through(unsigned *oas_bits)
++{
++	static const uint8_t oas[] = { 32, 36, 40, 42, 44, 48 };
++	vm_offset_t gr0 = ml_io_map(UA_SMMU_PA, 0x2000);
++	if (gr0 == 0) {
++		return false;
++	}
++	uint32_t id0 = ua_rd(gr0, 0x20), id1 = ua_rd(gr0, 0x24), id2 = ua_rd(gr0, 0x28);
++	uint32_t pages = 1u << (((id1 >> 28) & 7) + 1), banks = id1 & 255, count = id0 & 255, o = (id2 >> 4) & 15;
++	int matches = 0;
++	bool through = false;
++
++	*oas_bits = o < sizeof(oas) ? oas[o] : 32;
++	for (uint32_t i = 0; i < count; i++) {
++		uint32_t smr = ua_rd(gr0, 0x800 + 4 * i), mask = (smr >> 16) & 0x7fff;
++		if (!(smr >> 31) || ((smr ^ UA_SID) & 0x7fff & ~mask)) {
++			continue;
++		}
++		uint32_t s2cr = ua_rd(gr0, 0xc00 + 4 * i), type = (s2cr >> 16) & 3, idx = s2cr & 255, sctlr = ~0u;
++		matches++;
++		if (type == 1) {
++			through = true;
++		} else if (type == 0 && idx < banks && (id1 >> 31) == 0 && pages <= 128) {
++			vm_offset_t cb = ml_io_map(UA_SMMU_PA + (pages + idx) * 4096, 0x1000);
++			sctlr = cb ? ua_rd(cb, 0) : ~0u;
++			through = (sctlr & 1) == 0;
++		}
++		printf("ASTEROIDS USB: SID 0x40 SMR %u smr=0x%08x s2cr=0x%08x type %u bank %u sctlr=0x%08x\n", i, smr, s2cr,
++		    type, idx, sctlr);
++	}
++	printf("ASTEROIDS USB: SID 0x40 %d matching SMR(s), %s; SMMU output %u bits\n", matches,
++	    through ? "addresses pass through" : "NOT pass-through", *oas_bits);
++	return matches == 1 && through;
++}
++
++static bool
++ua_halted(void)
++{
++	return !(dwc_rd(DCTL) & DCTL_RUN_STOP) && (dwc_rd(DSTS) & DSTS_DEVCTRLHLT);
++}
++
++/* Clear RUN_STOP and wait for the halt, 500 ms at most. */
++static bool
++ua_halt(void)
++{
++	dwc_wr(DCTL, dwc_rd(DCTL) & ~DCTL_RUN_STOP);
++	for (int i = 0; i < 500 && !(dwc_rd(DSTS) & DSTS_DEVCTRLHLT); i++) {
++		delay(1000);
++	}
++	return ua_halted();
++}
++
++/* Soft-disconnect and stop. Safe from the setup path and the event thread; never frees the DMA area. */
++static void
++ua_stop(const char *why)
++{
++	if (ud.stopped) {
++		return;
++	}
++	if (ud.lock != NULL) {
++		lck_mtx_lock(ud.lock);
++	}
++	ud.configured = false;
++	ud.stopped = true;              /* ud_start_trb refuses from here on */
++	if (ud.lock != NULL) {
++		lck_mtx_unlock(ud.lock);
++	}
++	for (unsigned ep = 0; ep < 6; ep++) {
++		if (ud.xfer_active[ep]) {
++			ud_epcmd(ep, DEPCMD_ENDTRANSFER | DEPCMD_FORCERM | ((uint32_t)ud.xfer_res[ep] << 16), 0, 0, 0);
++			ud.xfer_active[ep] = false;
++		}
++	}
++	dwc_wr(DEVTEN, 0);
++	bool halted = ua_halt();
++	dwc_wr(DALEPENA, 0);
++	if (ua.qs_set) {
++		ua_wr(ua.qs + QSCRATCH_HS_PHY_CTRL, ua.qs_hs);
++		ua_wr(ua.qs + QSCRATCH_SS_PHY_CTRL, ua.qs_ss);
++		ua.qs_set = false;
++	}
++	ud_link_event(false);
++	bool canaries = ua_canaries_ok("at stop");
++	printf("ASTEROIDS USB STOP: %s; halted %s, DSTS 0x%08x, GEVNTADR stays on our 0x%llx, events %u setups %u, "
++	    "canaries %s\n", why, halted ? "yes" : "NO", dwc_rd(DSTS), ud.dma_pa + UD_EVT, ud.events, ua.setups,
++	    canaries ? "intact" : "HIT");
++	sweet_log_sync();
++}
++
++/* The registers that tell why a host saw nothing: link state, VBUS session, eUSB2 PHY enable and power-down bits. */
++static void
++ua_link_diag(void)
++{
++	vm_offset_t phy = ml_io_map(UA_PHY_PA, 0x1000);
++	printf("ASTEROIDS USB DIAG: DCTL 0x%08x DSTS 0x%08x (link state %u) GSTS 0x%08x DCFG 0x%08x\n", dwc_rd(DCTL),
++	    dwc_rd(DSTS), (dwc_rd(DSTS) >> 18) & 0xf, dwc_rd(0xc118), dwc_rd(DCFG));
++	if (ua.qs != 0) {
++		printf("ASTEROIDS USB DIAG: QSCRATCH HS_PHY_CTRL 0x%08x SS_PHY_CTRL 0x%08x GENERAL_CFG 0x%08x\n",
++		    ua_rd(ua.qs, QSCRATCH_HS_PHY_CTRL), ua_rd(ua.qs, QSCRATCH_SS_PHY_CTRL), ua_rd(ua.qs, 0x08));
++	}
++	/* phy-snps-eusb2.c: UTMI_CTRL0 0x3c (SLEEPM), UTMI_CTRL5 0x50 (POR), COMMON0 0x54 (PHY_ENABLE, SIDDQ_SEL, SIDDQ),
++	 * HS_PHY_CTRL2 0x64 (VBUSVLDEXT0, USB2_SUSPEND_N(_SEL), VBUS_DET_EXT_SEL), CFG0 0x94 */
++	if (phy != 0) {
++		printf("ASTEROIDS USB DIAG: eUSB2 UTMI_CTRL0 0x%08x UTMI_CTRL5 0x%08x COMMON0 0x%08x HS_PHY_CTRL2 0x%08x "
++		    "CFG0 0x%08x\n", ua_rd(phy, 0x3c), ua_rd(phy, 0x50), ua_rd(phy, 0x54), ua_rd(phy, 0x64), ua_rd(phy, 0x94));
++	}
++	sweet_log_sync();
++}
++
++/* SET_CONFIGURATION(1) at level 4: bulk IN/OUT and the interrupt endpoint, max packet by link speed. */
++static void
++ua_configure(void)
++{
++	uint32_t mps = ug_bulk_mps(ua.speed);
++
++	if (ud.configured) {
++		return;
++	}
++	if (ud_epcmd(0, DEPCMD_DEPSTARTCFG | (2u << 16), 0, 0, 0) ||
++	    ud_epcmd(EP_RX, DEPCMD_SETEPCONFIG, (2u << 1) | (mps << 3), (1u << 8) | ((uint32_t)EP_RX << 25), 0) ||
++	    ud_epcmd(EP_RX, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) ||
++	    ud_epcmd(EP_TX, DEPCMD_SETEPCONFIG, (2u << 1) | (mps << 3) | (1u << 17), (1u << 8) | ((uint32_t)EP_TX << 25), 0) ||
++	    ud_epcmd(EP_TX, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) ||
++	    ud_epcmd(EP_INT, DEPCMD_SETEPCONFIG, (3u << 1) | (16u << 3) | (2u << 17),
++	    (1u << 8) | (8u << 16) | ((uint32_t)EP_INT << 25), 0) ||
++	    ud_epcmd(EP_INT, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) {
++		printf("ASTEROIDS USB L4: FAIL data endpoint commands\n");
++		return;
++	}
++	dwc_wr(DALEPENA, dwc_rd(DALEPENA) | (1u << EP_RX) | (1u << EP_TX) | (1u << EP_INT));
++	lck_mtx_lock(ud.lock);
++	ud.bulk_mps = mps;
++	ud.configured = true;
++	lck_mtx_unlock(ud.lock);
++	ud_rx_arm();
++	printf("ASTEROIDS USB L4: ECM endpoints configured, bulk max packet %u\n", mps);
++}
++
++static void
++ua_setup(void)
++{
++	const uint8_t *st = (const uint8_t *)(ud.dma + UD_SETUP);
++	struct ug_ctx c = { ua.level, ua.speed, ud.configured, ud.data_alt };
++	struct ug_plan p = ug_setup_plan(st, &c, (uint8_t *)(ud.dma + UD_DATA));
++
++	ua.setups++;
++	printf("ASTEROIDS USB: setup %02x %02x %02x%02x %02x%02x len %u -> stage %d len %u action %d\n", st[0], st[1],
++	    st[3], st[2], st[5], st[4], st[6] | st[7] << 8, p.stage, p.len, p.action);
++	ud.data_in = (st[0] & 0x80) != 0;
++	switch (p.action) {
++	case UG_ACT_ADDRESS:
++		dwc_wr(DCFG, (dwc_rd(DCFG) & ~(0x7fu << 3)) | ((uint32_t)p.arg << 3));
++		break;
++	case UG_ACT_CONFIG:
++		if (p.arg == 1 && ua.level == UG_LEVEL_ECM) {
++			ua_configure();
++		} else if (p.arg == 1) {
++			ud.configured = true;   /* level 3: no endpoints to start */
++		}
++		if (p.arg == 1 && ua.t_cfg == 0) {
++			ua.t_cfg = mach_absolute_time();
++			printf("ASTEROIDS USB L%d: configured by the host at speed %d after %llu s, %u setups\n", ua.level,
++			    ua.speed, ua_secs_since(ua.t_run), ua.setups);
++		}
++		break;
++	case UG_ACT_ALT:
++		ud.data_alt = (uint8_t)p.arg;
++		if (p.arg == 1 && ud.configured) {
++			ud_notify_connected();
++			ud_link_event(true);
++			if (!ua.up_logged) {
++				ua.up_logged = true;
++				printf("ASTEROIDS USB L4: up: ue0 192.168.7.2 and fe80::5eff:fe77:ee02, speed %d\n", ua.speed);
++			}
++		}
++		break;
++	default:
++		break;
++	}
++	switch (p.stage) {
++	case UG_STALL:
++		ud_stall();
++		break;
++	case UG_NODATA:
++		ud.state = EP0_WAIT_STATUS2;
++		break;
++	case UG_IN:
++		ud.state = EP0_DATA;
++		ud_start(1, UD_DATA, p.len, TRBCTL_DATA);
++		break;
++	default:
++		ud.state = EP0_DATA;
++		ud_start(0, UD_DATA, p.len, TRBCTL_DATA);
++		break;
++	}
++}
++
++/* ud_event with the speed-aware connect done and ua_setup; the data endpoints are the Poco F1's. */
++static void
++ua_event(uint32_t ev)
++{
++	if (ev & 1) {
++		uint32_t type = (ev >> 8) & 0xf;
++		if (type == 1) {
++			dwc_wr(DCFG, dwc_rd(DCFG) & ~(0x7fu << 3));
++			ud_bus_reset("bus reset");
++		} else if (type == 2) {
++			uint32_t mps0;
++			ua.speed = (int)(dwc_rd(DSTS) & 7);
++			mps0 = ug_mps0(ua.speed);
++			ua.connects++;
++			ud_epcmd(0, DEPCMD_SETEPCONFIG, (0u << 1) | (mps0 << 3) | (2u << 30), (1u << 8) | (1u << 10) | (0u << 25), 0);
++			ud_epcmd(1, DEPCMD_SETEPCONFIG, (0u << 1) | (mps0 << 3) | (2u << 30), (1u << 8) | (1u << 10) | (1u << 25), 0);
++			printf("ASTEROIDS USB: connect done #%u, speed %d (%s), ep0 max packet %u\n", ua.connects, ua.speed,
++			    ua.speed == UG_SPEED_SS ? "super" : ua.speed == UG_SPEED_HS ? "high" : "full or other", mps0);
++		} else if (type == 0) {
++			ud_bus_reset("disconnect");
++		}
++		return;
++	}
++	unsigned ep = (ev >> 1) & 0x1f;
++	unsigned type = (ev >> 6) & 0xf;
++	unsigned status = (ev >> 12) & 0xf;
++
++	if (type == 1 && ep < 6) {
++		ud.xfer_active[ep] = false;
++	}
++	if (ep == EP_INT && type == 1) {
++		if (ud.notify_stage == 1 && ud.configured) {
++			ud_notify_speed();
++		}
++		return;
++	}
++	if (ep == EP_RX && type == 1) {
++		ud_rx_done();
++		return;
++	}
++	if (ep == EP_TX && type == 1) {
++		lck_mtx_lock(ud.lock);
++		ud.tx_busy = false;
++		ud_tx_kick_locked();
++		lck_mtx_unlock(ud.lock);
++		return;
++	}
++	if (ep > 1) {
++		return;
++	}
++	if (type == 1) {
++		switch (ud.state) {
++		case EP0_SETUP:
++			ud_sync(UD_SETUP, 8);
++			ua_setup();
++			break;
++		case EP0_DATA:
++			ud.state = EP0_WAIT_STATUS3;
++			break;
++		case EP0_STATUS:
++			ud_start_setup();
++			break;
++		default:
++			break;
++		}
++		return;
++	}
++	if (type == 3 && status == 2) {
++		if (ud.state == EP0_WAIT_STATUS2 || ud.state == EP0_WAIT_STATUS3) {
++			uint32_t ctl = ud.state == EP0_WAIT_STATUS3 ? TRBCTL_STATUS3 : TRBCTL_STATUS2;
++			ud.state = EP0_STATUS;
++			ud_start(ep, UD_DATA, 0, ctl);
++		}
++	}
++}
++
++static void
++ua_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	uint32_t ticks = 0;
++	bool waited = false;
++
++	for (;;) {
++		uint32_t count = dwc_rd(GEVNTCOUNT) & 0xffff;
++		if (count) {
++			if (!ug_evt_count_ok(count)) {
++				printf("ASTEROIDS USB GATE: GEVNTCOUNT 0x%x is not whole events in our 4 KiB buffer\n", count);
++				ua_stop("bad event count");
++				break;
++			}
++			ud_sync(UD_EVT, UD_EVT_SIZE);
++			for (uint32_t done = 0; done < count; done += 4) {
++				uint32_t ev = *(volatile uint32_t *)(ud.dma + UD_EVT + ud.evt_pos);
++				ud.evt_pos = ug_evt_next(ud.evt_pos);
++				bool routine = !(ev & 1) && ((ev >> 6) & 0xf) == 1 &&
++				    (((ev >> 1) & 0x1f) == EP_RX || ((ev >> 1) & 0x1f) == EP_TX);
++				if (ud.events++ < 200 || (!routine && ud.events < 5000)) {
++					printf("ASTEROIDS USB: event 0x%08x\n", ev);
++				}
++				ua_event(ev);
++			}
++			dwc_wr(GEVNTCOUNT, count);
++		}
++		if (ud.gate != NULL) {
++			ua_stop(ud.gate);
++			break;
++		}
++		if ((++ticks % 1000) == 0 && !ua_canaries_ok("while running")) {
++			ua_stop("canary hit");
++			break;
++		}
++		if (ua.level == UG_LEVEL_ENUM && ua.t_cfg != 0 && ua_secs_since(ua.t_cfg) >= UA_L3_HOLD_S) {
++			ua_stop("level 3 hold time over");
++			printf("ASTEROIDS USB L3: PASS enumerated at speed %d, %u connects, %u resets, %u setups, %u events\n",
++			    ua.speed, ua.connects, ud.resets, ua.setups, ud.events);
++			sweet_log_sync();
++			break;
++		}
++		if (!waited && ua.t_cfg == 0 && ua_secs_since(ua.t_run) >= UA_ENUM_WAIT_S) {
++			waited = true;
++			ua_link_diag();
++			if (ua.level == UG_LEVEL_ENUM) {
++				ua_stop("level 3 saw no SET_CONFIGURATION");
++				printf("ASTEROIDS USB L3: FAIL no SET_CONFIGURATION in %d s: %u connects, %u resets, %u setups\n",
++				    UA_ENUM_WAIT_S, ua.connects, ud.resets, ua.setups);
++				sweet_log_sync();
++				break;
++			}
++			printf("ASTEROIDS USB L4: no SET_CONFIGURATION in %d s (%u connects, %u resets), still waiting\n",
++			    UA_ENUM_WAIT_S, ua.connects, ud.resets);
++		}
++		if (ua.level == UG_LEVEL_ECM && (ticks % 30000) == 0) {
++			printf("ASTEROIDS USB L4: ue0 rx %llu tx %llu frames; cfg %d alt %u txq %u; resets %u; DSTS 0x%08x\n",
++			    ud.rx_frames, ud.tx_frames, ud.configured, ud.data_alt, ud.txq_count, ud.resets, dwc_rd(DSTS));
++		}
++		ud_sleep_ms(1);
++	}
++}
++
++/* ue0's IPv6 link-local address, fixed from its MAC, so the Mac reaches it as fe80::5eff:fe77:ee02%enN with no setup. */
++static void
++ua_if_inet6(void)
++{
++	static const uint8_t ll[16] = { 0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x00, 0x00, 0x5e, 0xff, 0xfe, 0x77, 0xee, 0x02 };
++	struct in6_aliasreq_64 r;
++	socket_t so = NULL;
++	errno_t attach = -1, start = -1;
++
++	if (sock_socket(PF_INET6, SOCK_DGRAM, 0, NULL, NULL, &so) == 0) {
++		bzero(&r, sizeof(r));
++		strlcpy(r.ifra_name, "ue0", sizeof(r.ifra_name));
++		attach = sock_ioctl(so, SIOCPROTOATTACH_IN6_64, &r);
++		r.ifra_addr.sin6_len = sizeof(r.ifra_addr);
++		r.ifra_addr.sin6_family = AF_INET6;
++		memcpy(&r.ifra_addr.sin6_addr, ll, sizeof(ll));
++		r.ifra_prefixmask.sin6_len = sizeof(r.ifra_prefixmask);
++		r.ifra_prefixmask.sin6_family = AF_INET6;
++		memset(&r.ifra_prefixmask.sin6_addr, 0xff, 8);
++		start = sock_ioctl(so, SIOCLL_START_64, &r);
++		sock_close(so);
++	}
++	printf("SWEET USB: ue0 fe80::5eff:fe77:ee02 %s (attach %d, start %d)\n",
++	    start == 0 ? "up" : "NOT configured", (int)attach, (int)start);
++}
++
++static void
++ua_gadget(int arg)
++{
++	int level = arg & 0xf;
++	unsigned oas = 32;
++	thread_t thread;
++
++	ua.level = level;
++	printf("ASTEROIDS USB L%d: start (sweetusb=%d)%s\n", level, arg, (arg & UG_FLAG_HS) ? ", high speed forced" : "");
++	sweet_log_sync();
++	ud.dwc = ml_io_map(UA_DWC3_PA, UA_DWC3_SIZE);
++	ua.qs = ml_io_map(QSCRATCH_PA, 0x100);
++	if (ud.dwc == 0 || ua.qs == 0) {
++		printf("ASTEROIDS USB L%d: FAIL map\n", level);
++		return;
++	}
++
++	/* Gates before any write: a DWC_usb3 in device mode, and SID 0x40 passing straight through the SMMU. */
++	uint32_t id = dwc_rd(0xc120), gctl = dwc_rd(GCTL);
++	uint64_t abl = ((uint64_t)dwc_rd(GEVNTADRHI) << 32) | dwc_rd(GEVNTADRLO);
++	if ((id >> 16) != 0x5533 || ((gctl >> 12) & 3) != 2) {
++		printf("ASTEROIDS USB L%d: FAIL GSNPSID 0x%08x GCTL 0x%08x: not a DWC_usb3 in device mode; no writes\n", level, id, gctl);
++		return;
++	}
++	if (!ua_smmu_through(&oas)) {
++		printf("ASTEROIDS USB L%d: FAIL SID 0x40 route is not a single pass-through; no writes\n", level);
++		return;
++	}
++	printf("ASTEROIDS USB: ABL event buffer 0x%llx size 0x%08x count %u, %s kernel RAM 0x%lx+0x%lx\n", abl,
++	    dwc_rd(GEVNTSIZ), dwc_rd(GEVNTCOUNT) & 0xffff,
++	    (abl >= gPhysBase && abl < gPhysBase + gPhysSize) ? "INSIDE" : "outside", gPhysBase, gPhysSize);
++	printf("ASTEROIDS USB: QSCRATCH HS_PHY_CTRL 0x%08x SS_PHY_CTRL 0x%08x GENERAL_CFG 0x%08x; GUCTL1 0x%08x "
++	    "GTXFIFOSIZ 0x%08x 0x%08x 0x%08x 0x%08x GRXFIFOSIZ0 0x%08x\n", ua_rd(ua.qs, QSCRATCH_HS_PHY_CTRL),
++	    ua_rd(ua.qs, QSCRATCH_SS_PHY_CTRL), ua_rd(ua.qs, 0x08), dwc_rd(0xc11c), dwc_rd(0xc300), dwc_rd(0xc304),
++	    dwc_rd(0xc308), dwc_rd(0xc30c), dwc_rd(0xc380));
++	sweet_log_sync();
++
++	/* Halted before anything else changes, so no transfer of ABL's can run against a new setup. */
++	dwc_wr(DEVTEN, 0);
++	if (!ua_halt()) {
++		printf("ASTEROIDS USB L%d: FAIL core did not halt: DCTL 0x%08x DSTS 0x%08x\n", level, dwc_rd(DCTL), dwc_rd(DSTS));
++		return;
++	}
++
++	/* The DMA area: physically contiguous, under the SMMU's output size, permanent, a canary page each side. */
++	ua.area_size = 2 * PAGE_SIZE + round_page(UD_SIZE);
++	if (kmem_alloc_contig(kernel_map, &ua.area, ua.area_size, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("ASTEROIDS USB L%d: FAIL no DMA memory; ABL's buffer stays programmed, interrupt masked, core halted\n", level);
++		return;
++	}
++	ua.area_pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)ua.area));
++	for (vm_offset_t off = 0; off < ua.area_size; off += PAGE_SIZE) {
++		if (ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)(ua.area + off))) != ua.area_pa + off) {
++			ua.area_pa = 0;
++		}
++	}
++	if (ua.area_pa == 0 || ua.area_pa + ua.area_size > (1ull << oas) ||
++	    (abl + UD_EVT_SIZE > ua.area_pa && abl < ua.area_pa + ua.area_size)) {
++		printf("ASTEROIDS USB L%d: FAIL DMA area 0x%llx+0x%lx: not contiguous, above %u bits, or on ABL's buffer\n",
++		    level, ua.area_pa, (unsigned long)ua.area_size, oas);
++		return;
++	}
++	for (int i = 0; i < 2; i++) {
++		volatile uint32_t *w = (volatile uint32_t *)(ua.area + (i ? ua.area_size - PAGE_SIZE : 0));
++		for (uint32_t j = 0; j < PAGE_SIZE / 4; j++) {
++			w[j] = ug_canary(j);
++		}
++	}
++	sweet_dma_sync_va((const void *)ua.area, ua.area_size);
++	ud.dma = ua.area + PAGE_SIZE;
++	ud.dma_pa = ua.area_pa + PAGE_SIZE;
++	if (ud.lock == NULL) {
++		lck_grp_t *grp = lck_grp_alloc_init("sweet_usb", LCK_GRP_ATTR_NULL);
++		ud.lock = lck_mtx_alloc_init(grp, LCK_ATTR_NULL);
++	}
++	printf("ASTEROIDS USB: DMA area 0x%llx+0x%x, canaries at 0x%llx and 0x%llx\n", ud.dma_pa, UD_SIZE, ua.area_pa,
++	    ua.area_pa + ua.area_size - PAGE_SIZE);
++
++	/* Our event buffer replaces ABL's while the core is halted; interrupt masked, events polled. */
++	uint64_t evt = ud.dma_pa + UD_EVT;
++	if (!ug_pa_ok(ud.dma_pa, UD_SIZE, evt, UD_EVT_SIZE)) {
++		ua_stop("event buffer outside the DMA area");
++		return;
++	}
++	dwc_wr(GEVNTADRLO, (uint32_t)evt);
++	dwc_wr(GEVNTADRHI, (uint32_t)(evt >> 32));
++	dwc_wr(GEVNTSIZ, GEVNTSIZ_INTMASK | UD_EVT_SIZE);
++	dwc_wr(GEVNTCOUNT, dwc_rd(GEVNTCOUNT) & 0xffff);
++	uint64_t back = ((uint64_t)dwc_rd(GEVNTADRHI) << 32) | dwc_rd(GEVNTADRLO);
++	if (back != evt || dwc_rd(GEVNTSIZ) != (GEVNTSIZ_INTMASK | UD_EVT_SIZE) || (dwc_rd(GEVNTCOUNT) & 0xffff) != 0) {
++		printf("ASTEROIDS USB GATE: event buffer readback 0x%llx size 0x%08x count %u\n", back, dwc_rd(GEVNTSIZ),
++		    dwc_rd(GEVNTCOUNT) & 0xffff);
++		ua_stop("event buffer registers did not take");
++		return;
++	}
++	printf("ASTEROIDS USB: GEVNTADR 0x%llx (was ABL's 0x%llx), 4 KiB, interrupt masked\n", evt, abl);
++
++	/* ep0 OUT/IN, max packet 512 until connect done; the last command asks for a completion event. */
++	if (ud_epcmd(0, DEPCMD_DEPSTARTCFG, 0, 0, 0) ||
++	    ud_epcmd(0, DEPCMD_SETEPCONFIG, (0u << 1) | (512u << 3), (1u << 8) | (1u << 10) | (0u << 25), 0) ||
++	    ud_epcmd(0, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) ||
++	    ud_epcmd(1, DEPCMD_SETEPCONFIG, (0u << 1) | (512u << 3), (1u << 8) | (1u << 10) | (1u << 25), 0) ||
++	    ud_epcmd(1, DEPCMD_SETTRANSFRESOURCE | DEPCMD_CMDIOC, 1, 0, 0)) {
++		ua_stop("ep0 commands failed");
++		return;
++	}
++	uint32_t count = 0;
++	for (int i = 0; i < 100 && (count = dwc_rd(GEVNTCOUNT) & 0xffff) == 0; i++) {
++		delay(1000);
++	}
++	if (count != 0) {
++		long at = -1;
++		if (!ug_evt_count_ok(count)) {
++			ua_stop("bad event count after CmdIOC");
++			return;
++		}
++		ud_sync(UD_EVT, UD_EVT_SIZE);
++		for (uint32_t off = 0; off < UD_EVT_SIZE && at < 0; off += 4) {
++			if (*(volatile uint32_t *)(ud.dma + off) != 0) {
++				at = (long)off;
++			}
++		}
++		if (at < 0) {
++			printf("ASTEROIDS USB GATE: GEVNTCOUNT %u but our event buffer is all zero\n", count);
++			ua_stop("the controller wrote an event somewhere else");
++			return;
++		}
++		printf("ASTEROIDS USB: DMA write proven: event 0x%08x at our buffer +0x%lx, count %u\n",
++		    *(volatile uint32_t *)(ud.dma + at), at, count);
++		ud.evt_pos = (uint32_t)(at + count) % UD_EVT_SIZE;
++		ud.events += count / 4;
++		dwc_wr(GEVNTCOUNT, count);
++	} else {
++		printf("ASTEROIDS USB: no CmdIOC event in 100 ms; DMA write not proven at this level\n");
++	}
++	if (!ua_canaries_ok("after the event buffer test")) {
++		ua_stop("canary hit");
++		return;
++	}
++	dwc_wr(DALEPENA, 0x3);
++	if (level == UG_LEVEL_OWN) {
++		printf("ASTEROIDS USB L2: PASS owned: halted, GEVNTADR 0x%llx, ep0 commands done, %s, canaries intact\n",
++		    evt, count ? "event DMA proven" : "event DMA not proven");
++		sweet_log_sync();
++		return;
++	}
++
++	/* Level 3 and 4: speed, address 0, events, ep0 SETUP, VBUS session, run. */
++	if (arg & UG_FLAG_HS) {
++		dwc_wr(DCFG, dwc_rd(DCFG) & ~7u);
++	}
++	dwc_wr(DCFG, dwc_rd(DCFG) & ~(0x7fu << 3));
++	printf("ASTEROIDS USB: DCFG 0x%08x (DEVSPD %u)\n", dwc_rd(DCFG), dwc_rd(DCFG) & 7u);
++	if (level == UG_LEVEL_ECM) {
++		ud_if_create();
++		ud_net_start();
++	}
++	dwc_wr(DEVTEN, 0x7);            /* disconnect, USB reset, connect done */
++	ud_start_setup();
++	if (ud.gate != NULL) {
++		ua_stop(ud.gate);
++		return;
++	}
++	ua.qs_hs = ua_rd(ua.qs, QSCRATCH_HS_PHY_CTRL);
++	ua.qs_ss = ua_rd(ua.qs, QSCRATCH_SS_PHY_CTRL);
++	ua.qs_set = true;
++	ua_wr(ua.qs + QSCRATCH_HS_PHY_CTRL, ua.qs_hs | UTMI_OTG_VBUS_VALID | SW_SESSVLD_SEL);
++	ua_wr(ua.qs + QSCRATCH_SS_PHY_CTRL, ua.qs_ss | LANE0_PWR_PRESENT);
++	printf("ASTEROIDS USB: VBUS override: HS_PHY_CTRL 0x%08x -> 0x%08x, SS_PHY_CTRL 0x%08x -> 0x%08x\n", ua.qs_hs,
++	    ua_rd(ua.qs, QSCRATCH_HS_PHY_CTRL), ua.qs_ss, ua_rd(ua.qs, QSCRATCH_SS_PHY_CTRL));
++	dwc_wr(DCTL, dwc_rd(DCTL) | DCTL_RUN_STOP);
++	int i;
++	for (i = 0; i < 500 && (dwc_rd(DSTS) & DSTS_DEVCTRLHLT); i++) {
++		delay(1000);
++	}
++	ua.t_run = mach_absolute_time();
++	printf("ASTEROIDS USB L%d: running: DSTS 0x%08x after %d ms\n", level, dwc_rd(DSTS), i);
++	sweet_log_sync();
++	if (kernel_thread_start(ua_thread, NULL, &thread) != KERN_SUCCESS) {
++		ua_stop("no event thread");
++		return;
++	}
++	thread_deallocate(thread);
++	int livelog = 1;
++	PE_parse_boot_argn("sweetusblog", &livelog, sizeof(livelog));
++	if (level == UG_LEVEL_ECM && livelog && ud.ifp != NULL && kernel_thread_start(ud_log_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
