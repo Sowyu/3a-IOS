@@ -118,3 +118,32 @@ app status 2000ms: manager frame y 0 h <H>; scene raw top 68; overlap 68 -> 50
 ```
 
 If the `app status` lines show the overlap already at 50 while the root view still reads 68, a fourth source is involved. The timeline then shows the tick where it changes.
+
+## Round 5: hook the raw scene inset (after ast106)
+
+ast106 logged `app overlap failed ABI: absent`. The cause was my error. `_statusBarOverlapAndMarginInfoForView:inWindow:` is a class method of UIPresentationController, not UIViewController. The method dump lists it under `CLASS UIPresentationController` at 0x1892ca648, with encoding `{UIEdgeInsets=dddd}32@0:8@16@24`. I had read its class off the wrong header in a dump that mixed many classes. The selector, the class-method lookup and the encoding were right, and the cache on this Mac matches the phone for this purpose. The probe hit the same lookup, which is why it printed `overlap nan -> nan`. Its `manager frame y 0 h 48` and `scene raw top 68` show that the status bar height is already right and only the scene inset is tall.
+
+Fix: hook `-[UIWindowScene _safeAreaInsetsForInterfaceOrientation:]` (0x18918c360, `{UIEdgeInsets=dddd}24@0:8q16`). UIWindowScene is the only class in UIKitCore that implements it. All three readers that skip the window take their 68 from it: the window path (0x18918473c), the root view controller path in `_viewSafeAreaInsetsFromScene` (0x1892cbe9c), and the presentation overlap (0x1892ca798). The overlap hook is removed. The window hook stays, because it also covers the statusBarHeight merge.
+
+Rules for the new hook (appSceneRawInsets): apps only, so SpringBoard never installs it. Portrait only, both for the asked orientation and for the scene's own. `_referenceBounds` must be 0,0 420x930, the screen must be the canvas, and only top changes, through the same compactAppInsets cap: 50 < top <= 80, never increased, left and right zero. The guard is unchanged. One difference from the window hook: this works per scene, so overlay windows in that scene (UITextEffectsWindow, alerts) also get top 50. That only lowers a top inset and does not affect the bottom. If it fails its ABI check, the window hook still installs and the line says `scene route off`.
+
+The probe now prints `app status Nms: manager frame y .. h ..; scene top <original> -> <hooked>; presentation overlap <value>`, with the overlap read from UIPresentationController.
+
+Build: app-safearea/sweetsb-install.dylib, sha256 0bb2503554c9ed12bf2a1319a7a7c9fc635c6a7d1fa3ec17d20c3625ba02726a, no warnings. The ast106 build is kept in app-safearea/v4. safearea-check.sh passes, with mock scene cases for landscape asked, landscape current, short bounds, external screen, top 40, top 90, NaN and scope off. stui-check.sh passes. pacstrip finds no PAC code.
+
+Run, from plans/, with the same boot image:
+
+```sh
+python3 devloop/dev.py statusbar-real/boot/next-loop-sb-null-boot.img /usr/local/lib/sweetsb.dylib="$PWD/statusbar-real/app-safearea/sweetsb-install.dylib" --test ui --note app-safearea5 --key 'sweetsb-real'
+```
+
+Success, per app:
+
+```text
+app safe area installed; target=50pt; portrait full-screen only; scene route on
+app scene top 68 -> 50; target=50pt
+app layout 2000ms: window ... safe top 50; root ... safe top 50; navbar y 50 ...
+app status 2000ms: manager frame y 0 h 48; scene top 68 -> 50; presentation overlap 50
+```
+
+How to read a failure: `app scene skip: bounds ...` means `_referenceBounds` is not 420x930, and the line gives the real value. If the scene top shows 50 while a root view still reads 68, the 68 comes from a source other than the scene inset. The overlap value on the same line then shows whether the presentation path is still the one raising it.
