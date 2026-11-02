@@ -25,7 +25,7 @@ PUT = HERE / '06-hfs-put.py'
 HFS_PULL = REPO / 'tools/sweet-hfs-pull.py'
 PY = ['python3', '-I']
 LOG_PULL = REPO / 'tools/sweet-log-pull.sh'
-RECOVERY = ROOT / 'recovery/ramboot/orangefox-ram.img'
+RECOVERY = None   # never `fastboot boot` a recovery or stock kernel image: ABL makes that an Android boot (HANDOFF.md)
 HOOKED = '/usr/local/libexec/renegade-firstboot.sh'
 FRAMES = '/private/var/selftest/frames'
 PULLS = ['/private/var/tmp/bgl-backboardd.log', '/private/var/tmp/bgmtl.log', '/private/var/tmp/sweetrun.log',
@@ -256,13 +256,17 @@ class Cycle:
         """Ends with adbd as root. `adb root` restarts adbd, so the server is restarted as in /tmp/pull-log.sh."""
         if self.state == 'fastboot':
             self.say('booting recovery')
-            # recovery_a has no kernel: ABL takes boot_a's, which is ours now, so `reboot recovery` boots iOS.
-            # This is OrangeFox's ramdisk with the stock kernel, in RAM only, and `boot` of it writes nothing.
-            self.boot_until_left(self.a.recovery)
+            # boot_a's shim starts the stock kernel only in recovery mode, so this reaches OrangeFox (HANDOFF.md).
+            # Never `fastboot boot` a stock kernel: that is an Android boot.
+            self.r.sleep(4)
+            self.boot_until_left('recovery mode', ['fastboot', 'reboot', 'recovery'])
             self.state = 'unknown'
         def up():
             s = self.recovery()
-            if not s:
+            if not s and self.fastboot():       # the reboot is sometimes ignored: send it again, as /tmp/pull-log.sh did
+                self.r.run(['fastboot', 'reboot', 'recovery'], timeout=300)
+                self.r.sleep(12)
+            elif not s:
                 self.r.run(['adb', 'kill-server'])
                 self.r.run(['adb', 'start-server'], timeout=30)
             return s
@@ -431,7 +435,6 @@ def main(argv=None, runner=None, say=None):
     ap.add_argument('--key', action='append', default=[], metavar='REGEX', help='extra log lines for the summary')
     ap.add_argument('--ref', help='reference frames for framecmp')
     ap.add_argument('--logs', default=str(REPO / 'logs'))
-    ap.add_argument('--recovery', default=str(RECOVERY))
     ap.add_argument('--replay-image', help='image for a replay boot when the root is dirty (default: the test image)')
     ap.add_argument('--no-push', action='store_true')
     ap.add_argument('--find-wait', type=int, default=120)

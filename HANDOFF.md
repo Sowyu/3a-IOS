@@ -7,10 +7,11 @@ Updated 2026-11-02, about 19:00 AEDT. Update this file whenever the state change
 - iOS 26.6.2 cold boots from the power button, with no Mac.
 - `boot_a` holds the recovery-capable shim plus iOS, a full 100 MiB partition image with the signed vbmeta moved. It was built by `tools/ablfix/make_relocated.py` from `plans/recovery/out/recovery-boot.img`, the iOS image `next-flash-boot.img` with the recovery chain added.
 - `boot_b` holds the plain iOS image, without the recovery chain, as a fallback.
-- Retries: 6 left on `boot_a` in the GPT and 7 on `boot_b`, neither marked successful. `getvar` showed 7 for `a` while the table said 6, so trust the table.
+- `boot_a` is marked **successful** since 19:00 (both GPT copies, `tools/boot/phone_mark.py`, audited by Sol). A START boot left its count at 6, so the countdown is stopped. `boot_b`: retry 7, not successful. Any flash to `boot_a` clears the mark: rerun `phone_mark.py SERIAL NEWDIR` then `--write`, from OrangeFox, after updating its pinned `WANT_A`/`WANT_B` bytes to the reviewed live values.
 - `misc` was reset from `backup-asteroids/misc.img` at 18:39, because a stale `boot-recovery` command turned every boot into a recovery boot. It read empty at 18:44.
 - `recovery_a`, `init_boot_a` and `vendor_boot_a` are stock, byte for byte the backups.
-- **Pending**: the one-time `successful` write for `boot_a`, `tools/boot/phone_mark.sh`. A Sol audit was running at the time of writing; read `docs/gptwrite-audit.md` if it exists before running anything.
+- `fastboot reboot recovery` now reaches OrangeFox (sometimes needs resending), and `tools/devloop/dev.py` uses it. Hands-free runs work again (ast64).
+- Running on 2026-11-02 evening: a lag agent drives the phone through `dev.py` (`plans/lag/`, `analysis/lag.md`); a Freeform agent does desk work (`plans/freeform/`, `analysis/freeform.md`).
 
 ## What works
 
@@ -24,7 +25,7 @@ Updated 2026-11-02, about 19:00 AEDT. Update this file whenever the state change
 ## Open, most wanted first
 
 1. **Lag.** 25 to 35 frames/s while animating, and jittery. Frames run one at a time for an unknown reason. It is not `waitUntilScheduled`, the GPU clock, half-precision shaders, or the display copy. See `docs/speed2.md`.
-2. The boot slot `successful` write, then update the dev loop for the new recovery route.
+2. Freeform: compute on the A810, then Metal for one app (`docs/appmetal.md`).
 3. Wi-Fi, then a modem probe for mobile data. `docs/research-wifi.md`.
 4. Freeform and PencilKit need Metal in apps, and compute on the A810 is unproven. `docs/appmetal.md`.
 5. Sound and a real battery reading, which share the ADSP port. `docs/plan-power.md`.
@@ -66,7 +67,7 @@ Updated 2026-11-02, about 19:00 AEDT. Update this file whenever the state change
 - **Driver:** `patches/driver/` on top of the fetch-fix tree.
 - **Boot image:** args in `tools/boot/next-flash-args.txt`. The line is limited to 607 bytes, and `mkpayload.py` refuses more.
 - **Flashing a slot:** check the size first. Over 14118912 bytes, use `make_relocated.py`. Keep `boot_b` as a known-good fallback.
-- **Test cycle:** `tools/devloop/dev.py IMAGE [ROOTPATH=FILE ...] --test ui --note NAME`. Its recovery step still uses the old route and must be changed to the menu or `fastboot reboot recovery` with the new `boot_a`.
+- **Test cycle:** `tools/devloop/dev.py IMAGE [ROOTPATH=FILE ...] --test ui --note NAME`, one at a time (check `pgrep -f devloop/dev.py`). It reaches OrangeFox with `fastboot reboot recovery`.
 - **File pushes:** `tools/devloop/06-hfs-put.py` replaces existing root files from recovery, without a reflash. It cannot create new paths and refuses a dirty journal.
 - **Root build:** `tools/boot/build-root-example.sh`, 7 minutes to build, 3 for the journal, then about 9 to flash.
 

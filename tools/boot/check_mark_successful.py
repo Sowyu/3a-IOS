@@ -193,7 +193,7 @@ def test_refusals(stock, tmp):
 
 	# a valid table that differs from stock anywhere else
 	other = bytearray(primary[m.BLOCK:m.BLOCK + m.ARRAY_BYTES])
-	other[m.BOOT_B * m.ENTRY_SIZE + m.ATTR_TOP] = 0x73		# boot_b no longer unbootable
+	other[m.BOOT_B * m.ENTRY_SIZE + m.ATTR_TOP + 1] ^= 0x01		# a byte next to boot_b's attributes: not one the plan may differ in
 	other = bytes(other)
 	tail = primary[m.BLOCK + m.ARRAY_BYTES:]
 	ph = m.rewrite_header(primary[:m.BLOCK], other)
