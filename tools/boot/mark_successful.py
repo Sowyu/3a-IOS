@@ -111,8 +111,10 @@ def plan(primary_dump, backup_dump, stock_gpt):
 	if ph['guid'] != stock_h['guid']:
 		raise Refuse('disk GUID is not the stock LUN 4 GUID: wrong LUN or changed table')
 	diff = [i for i in range(ARRAY_BYTES) if parray[i] != stock_array[i]]
-	if diff not in ([], [ATTR_OFFSET]):
-		raise Refuse(f'entries differ from stock LUN 4 at {[hex(i) for i in diff[:8]]}; only {ATTR_OFFSET:#x} may')
+	# boot_b's attribute byte may differ too: iOS is flashed there as the fallback slot. It is checked, never written.
+	B_ATTR = BOOT_B * ENTRY_SIZE + ATTR_TOP
+	if not set(diff) <= {ATTR_OFFSET, B_ATTR}:
+		raise Refuse(f'entries differ from stock LUN 4 at {[hex(i) for i in diff[:8]]}; only {ATTR_OFFSET:#x} and {B_ATTR:#x} may')
 	if entry_name(parray, BOOT_A) != 'boot_a' or entry_name(parray, BOOT_B) != 'boot_b':
 		raise Refuse('boot_a or boot_b is not at the expected entry index')
 

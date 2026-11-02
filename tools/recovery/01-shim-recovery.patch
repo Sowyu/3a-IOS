@@ -1,0 +1,488 @@
+diff --git a/asteroids/shim/build.sh b/asteroids/shim/build.sh
+index 63b3a83..de27eaf 100755
+--- a/asteroids/shim/build.sh
++++ b/asteroids/shim/build.sh
+@@ -4,10 +4,20 @@
+ # Boot image header v4, os_version and patch level of the phone's own boot.img, kernel = Image.gz + live DTB (the
+ # DTB carries the splash_region ABL needs to keep the panel on). ASTEROIDS_DTB = the phone's /sys/firmware/fdt.
+ # ASTEROIDS_MEM = kernel RAM from tools/mkadt.py. The build stops if the phone's DTB disagrees with the shim's constants.
++# SHIM_RECOVERY_IMAGE = raw stock arm64 Image, with SHIM_RECOVERY_VENDOR_BOOT, SHIM_RECOVERY_RAMDISK and SHIM_RECOVERY_INIT_BOOT
++# = the phone's vendor_boot, recovery and init_boot images: carry the Image for recovery mode (recovery.c). Unset: as before.
+ set -euo pipefail
+ payload=$(python3 -I -c 'import os, sys; print(os.path.abspath(sys.argv[1]))' "${1:?usage: build.sh PAYLOAD OUT.img}")
+ output=$(python3 -I -c 'import os, sys; print(os.path.abspath(sys.argv[1]))' "${2:?usage: build.sh PAYLOAD OUT.img}")
+ dtb=$(python3 -I -c 'import os, sys; print(os.path.abspath(sys.argv[1]))' "${ASTEROIDS_DTB:?ASTEROIDS_DTB=the phone live.dtb}")
++rec_abs() { python3 -I -c 'import os, sys; print(os.path.abspath(sys.argv[1]))' "$1"; }
++rec_image=; rec_flags=
++if [ -n "${SHIM_RECOVERY_IMAGE:-}" ]; then
++	rec_image=$(rec_abs "$SHIM_RECOVERY_IMAGE")
++	rec_vendor=$(rec_abs "${SHIM_RECOVERY_VENDOR_BOOT:?SHIM_RECOVERY_VENDOR_BOOT=the phone vendor_boot image}")
++	rec_ramdisk=$(rec_abs "${SHIM_RECOVERY_RAMDISK:?SHIM_RECOVERY_RAMDISK=the phone recovery image}")
++	rec_init=$(rec_abs "${SHIM_RECOVERY_INIT_BOOT:?SHIM_RECOVERY_INIT_BOOT=the phone init_boot image}")
++fi
+ cd "$(dirname "$0")"
+ CROSS=${CROSS:-aarch64-elf-}
+ MKBOOTIMG=${MKBOOTIMG:?MKBOOTIMG=path to mkbootimg.py}
+@@ -17,27 +27,42 @@ CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align
+ # SHIM_USBPROBE=1: read-only register survey on screen instead of booting (usbprobe.c)
+ probe_src=; probe_obj=
+ if [ "${SHIM_USBPROBE:-0}" = 1 ]; then CFLAGS="$CFLAGS -DSHIM_USBPROBE"; probe_src=usbprobe.c; probe_obj=out/usbprobe.o; fi
++# SHIM_RECOVERYPROBE=1: show what the recovery checks found and stop, never start Linux or iOS
++rec_src=; rec_obj=
++if [ -n "$rec_image" ]; then
++	rec_flags=$(python3 -I recovery-defs.py "$rec_vendor" "$rec_ramdisk" "$rec_init")
++	CFLAGS="$CFLAGS $rec_flags"; rec_src=recovery.c; rec_obj=out/recovery.o
++	if [ "${SHIM_RECOVERYPROBE:-0}" = 1 ]; then CFLAGS="$CFLAGS -DSHIM_RECOVERYPROBE"; fi
++fi
+ mkdir -p out
+-for f in start.S loader.c console.c ufs.c $probe_src; do
++for f in start.S loader.c console.c ufs.c $probe_src $rec_src; do
+ 	${CROSS}gcc $CFLAGS -c $f -o out/${f%.*}.o
+ done
+ # The image runs wherever ABL puts it with no relocation pass: only the header's image_size may be absolute.
+-abs=$(${CROSS}readelf -r out/loader.o out/console.o out/ufs.o $probe_obj | grep -c ABS64 || true)
++abs=$(${CROSS}readelf -r out/loader.o out/console.o out/ufs.o $probe_obj $rec_obj | grep -c ABS64 || true)
+ [ "$abs" = 0 ] || { echo "error: $abs absolute relocations in C objects" >&2; exit 1; }
+ ${CROSS}gcc $CFLAGS -static -T shim.ld -Wl,--build-id=none -Wl,--no-warn-rwx-segments -Wl,-N \
+-	out/start.o out/loader.o out/console.o out/ufs.o $probe_obj -lgcc -o out/shim.elf
++	out/start.o out/loader.o out/console.o out/ufs.o $probe_obj $rec_obj -lgcc -o out/shim.elf
+ ${CROSS}objcopy -O binary out/shim.elf out/Image
+ end=$(${CROSS}nm out/shim.elf | awk '$3=="_end"{print $1}')
+ dtc -q -I dtb -O dts -o out/live.dts "$dtb"
+-python3 -I - "$end" "$payload" out/Image out/live.dts out/kernel-gz-dtb "$dtb" <<'PY'
++python3 -I - "$end" "$payload" out/Image out/live.dts out/kernel-gz-dtb "$dtb" "$rec_image" <<'PY'
+ import gzip, re, struct, sys
+-end, payload, image, dts, out, dtb = sys.argv[1:]
++end, payload, image, dts, out, dtb, rec_image = sys.argv[1:]
+ end = int(end, 16)
+ blob = open(image, 'rb').read().ljust(end, b'\0')
+ pl = open(payload, 'rb').read()
+ assert pl[:8] == b'SWEETXNU' and struct.unpack_from('<I', pl, 8)[0] == 1, 'payload is not mkpayload v1'
+ phys, size = struct.unpack_from('<2Q', pl, 0x38)
+ full = bytearray(blob + pl)
++if rec_image:
++	lx = open(rec_image, 'rb').read()
++	assert lx[56:60] == b'ARM\x64', 'SHIM_RECOVERY_IMAGE is not a raw arm64 Image'
++	lx_offset, lx_size, lx_flags = struct.unpack_from('<3Q', lx, 8)
++	assert lx_offset == 0 and lx_flags & 8 and lx_size >= len(lx), 'recovery Image must be place-anywhere'
++	full += bytes(-len(full) & 15)
++	struct.pack_into('<2Q', full, 0x20, len(full), len(lx))	# res2, res3: recovery.c
++	full += lx
+ struct.pack_into('<Q', full, 16, len(full))
+ open(image, 'wb').write(full)
+ text = open(dts).read()
+@@ -60,6 +85,10 @@ for a, b in sorted(banks):
+ 	else:
+ 		merged.append([a, a + b])
+ assert any(a <= phys and phys + size <= b for a, b in merged), f'kernel RAM {phys:#x}+{size:#x} is not inside contiguous memory'
++if rec_image:
++	assert any(a <= 0xa7000000 and 0xe0600000 <= b for a, b in merged), 'recovery.c RAM_LOW/RAM_HIGH bank is not in the DTB'
++	# ponytail: ABL's addresses from the live DTB, the phone's recovery probe confirms them at runtime
++	assert ((0xa8080000 + len(full) + 0x1fffff) & ~0x1fffff) + lx_size <= 0xb4539000, 'recovery Image overlaps the DTB'
+ open(out, 'wb').write(gzip.compress(bytes(full), mtime=0) + open(dtb, 'rb').read())
+ print(f'kernel RAM {phys:#x}+{size:#x}, framebuffer {fb:#x}+{fb_size:#x}, image {len(full)} bytes')
+ PY
+diff --git a/asteroids/shim/loader.c b/asteroids/shim/loader.c
+index b73b152..3a31c01 100644
+--- a/asteroids/shim/loader.c
++++ b/asteroids/shim/loader.c
+@@ -49,7 +49,7 @@ _Static_assert(__builtin_offsetof(struct boot_args, CommandLine) == 108, "boot_a
+ _Static_assert(sizeof(struct boot_args) == 736, "boot_args layout");
+ 
+ /* MMU off: everything is Device memory, so copy in aligned 8-byte words. */
+-static void copy64(uintptr_t dst, uintptr_t src, uint64_t n)
++void copy64(uintptr_t dst, uintptr_t src, uint64_t n)
+ {
+ 	volatile uint64_t *d = (volatile uint64_t *)dst;
+ 	volatile const uint64_t *s = (volatile const uint64_t *)src;
+@@ -159,11 +159,22 @@ static const char *boot_payload(uintptr_t start, uintptr_t end)
+ 
+ const char *ufs_prepare(void);
+ void usb_probe(void);
++const char *recovery_boot(uintptr_t head, uint64_t image_size, uint64_t linux_off, uint64_t linux_size, uint64_t dtb);
+ 
+-void shim_main(uintptr_t head, uintptr_t payload)
++void shim_main(uintptr_t head, uintptr_t payload, uint64_t dtb)
+ {
+ 	uint64_t image_size = ((const uint64_t *)head)[2];	/* patched by build.sh */
+-
++	uintptr_t payload_end = head + image_size;
++
++#ifdef SHIM_RECOVERY
++	/* Before any console or UFS work: recovery mode leaves the hardware as ABL did and does not return. */
++	uint64_t linux_off = ((const uint64_t *)head)[4], linux_size = ((const uint64_t *)head)[5];	/* res2, res3 */
++	const char *stay_ios = recovery_boot(head, image_size, linux_off, linux_size, dtb);
++	payload_end = head + linux_off;
++	con_str("RECOV", stay_ios);
++#else
++	(void)dtb;
++#endif
+ 	con_str("SHIM", "asteroids xnu loader");
+ 	con_skip();
+ 	const char *why = ufs_prepare();
+@@ -180,7 +191,7 @@ void shim_main(uintptr_t head, uintptr_t payload)
+ #endif
+ 	con_str("UFS", "ready");
+ 	con_skip();
+-	const char *failed = boot_payload(payload, head + image_size);
++	const char *failed = boot_payload(payload, payload_end);
+ 	con_show();
+ 	con_str("LOADER", failed);
+ }
+diff --git a/asteroids/shim/recovery-defs.py b/asteroids/shim/recovery-defs.py
+new file mode 100644
+index 0000000..7c8ff78
+--- /dev/null
++++ b/asteroids/shim/recovery-defs.py
+@@ -0,0 +1,27 @@
++#!/usr/bin/env python3
++"""Compiler flags naming the exact ramdisks recovery mode must find: recovery-defs.py VENDOR_BOOT RECOVERY INIT_BOOT."""
++import struct, sys
++vendor_img, recovery_img, init_boot_img = sys.argv[1:]
++
++def rd(path):
++	with open(path, 'rb') as f:
++		return f.read()
++
++v, r, i = rd(vendor_img), rd(recovery_img), rd(init_boot_img)
++assert v[:8] == b'VNDRBOOT' and struct.unpack_from('<I', v, 8)[0] == 4, 'vendor_boot is not v4'
++assert r[:8] == b'ANDROID!' and struct.unpack_from('<I', r, 40)[0] == 4, 'recovery is not v4'
++assert i[:8] == b'ANDROID!' and struct.unpack_from('<I', i, 40)[0] == 4, 'init_boot is not v4'
++page = struct.unpack_from('<I', v, 12)[0]
++v_size = struct.unpack_from('<I', v, 24)[0]
++r_kernel, r_size = struct.unpack_from('<2I', r, 8)
++i_size = struct.unpack_from('<I', i, 12)[0]
++assert r_kernel == 0, 'recovery has a kernel: ABL would not use this path'
++assert r_size and i_size and v_size
++blob = v[page:page + v_size] + r[page:page + r_size]
++assert len(blob) == v_size + r_size
++h = 0xcbf29ce484222325
++for (w,) in struct.iter_unpack('<Q', blob[:len(blob) & ~7]):
++	h = ((h ^ w) * 0x100000001b3) & 0xffffffffffffffff
++i_rounded = (i_size + page - 1) & ~(page - 1)	# stock ABL 0x72f0 rounds the init_boot ramdisk up to a page
++print(f'-DSHIM_RECOVERY -DRECOVERY_VENDOR_SIZE={v_size}UL -DRECOVERY_RAMDISK_SIZE={r_size}UL '
++      f'-DRECOVERY_INITBOOT_SIZE={i_rounded}UL -DRECOVERY_HASH=0x{h:016x}ULL')
+diff --git a/asteroids/shim/recovery.c b/asteroids/shim/recovery.c
+new file mode 100644
+index 0000000..1abfca7
+--- /dev/null
++++ b/asteroids/shim/recovery.c
+@@ -0,0 +1,294 @@
++/*
++ * Recovery mode: start the stock Linux Image behind the payload, so ABL's OrangeFox path works with the shim in boot_a.
++ *
++ * ABL loads boot_a's kernel in recovery mode too, then places vendor ramdisk + recovery ramdisk + init_boot ramdisk +
++ * bootconfig at linux,initrd-start (analysis/recovery.md). A stock kernel started on anything but that initrd can run
++ * Android, which formats userdata, so this only says yes when the exact recovery ramdisk is in memory. Any doubt: iOS.
++ * The checks read memory and write nothing. The one write is the Image copy, once every check has passed.
++ */
++#include <stdint.h>
++
++#ifndef PHYS
++#define PHYS(a)		((uintptr_t)(a))
++#endif
++
++/* Stock DTB memory bank a7000000+39600000: every address taken from the DTB must be in it. build.sh checks the bank. */
++#define RAM_LOW		0xa7000000UL
++#define RAM_HIGH	0xe0600000UL
++#define DTB_MAX		0x200000UL		/* arm64 booting.rst */
++#define BOOTCONFIG_MAX	0x4000UL
++#define BC_TRAILER	20
++#define SZ_2M		0x200000UL
++
++#define FDT_MAGIC	0xd00dfeedu
++#define FDT_BEGIN_NODE	1
++#define FDT_END_NODE	2
++#define FDT_PROP	3
++#define FDT_NOP		4
++#define FDT_END		9
++
++static inline uint8_t rd8(uint64_t a) { return *(const volatile uint8_t *)PHYS(a); }
++
++static uint32_t be32(uint64_t a)
++{
++	return (uint32_t)rd8(a) << 24 | (uint32_t)rd8(a + 1) << 16 | (uint32_t)rd8(a + 2) << 8 | rd8(a + 3);
++}
++
++static uint64_t be64(uint64_t a) { return (uint64_t)be32(a) << 32 | be32(a + 4); }
++
++static uint32_t le32(uint64_t a)
++{
++	return (uint32_t)rd8(a + 3) << 24 | (uint32_t)rd8(a + 2) << 16 | (uint32_t)rd8(a + 1) << 8 | rd8(a);
++}
++
++/* [a, a + n) is inside the RAM bank, without overflow */
++static int in_ram(uint64_t a, uint64_t n)
++{
++	return a >= RAM_LOW && a <= RAM_HIGH && n <= RAM_HIGH - a;
++}
++
++/* NUL-terminated s at a, inside limit */
++static int str_is(uint64_t a, uint64_t limit, const char *s)
++{
++	for (; *s; s++, a++)
++		if (a >= limit || rd8(a) != (uint8_t)*s)
++			return 0;
++	return a < limit && rd8(a) == 0;
++}
++
++/* needle anywhere in [a, a + n) */
++static int mem_has(uint64_t a, uint64_t n, const char *needle)
++{
++	uint64_t len = 0;
++	while (needle[len])
++		len++;
++	for (uint64_t i = 0; i + len <= n; i++) {
++		uint64_t j = 0;
++		while (j < len && rd8(a + i + j) == (uint8_t)needle[j])
++			j++;
++		if (j == len)
++			return 1;
++	}
++	return 0;
++}
++
++struct chosen {
++	uint64_t initrd_start, initrd_end, bootargs, bootargs_len;
++};
++
++/* Walk the FDT's structure block for /chosen. Every offset comes from the DTB, so each one is bounds checked first. */
++static const char *fdt_chosen(uint64_t dtb, struct chosen *c)
++{
++	if (!dtb || (dtb & 7) || !in_ram(dtb, 0x40))
++		return "bad DTB address";
++	if (be32(dtb) != FDT_MAGIC)
++		return "no FDT magic";
++	uint64_t total = be32(dtb + 4), off_struct = be32(dtb + 8), off_str = be32(dtb + 12);
++	uint64_t size_str = be32(dtb + 32), size_struct = be32(dtb + 36);
++	if (total < 0x40 || total > DTB_MAX || !in_ram(dtb, total) || be32(dtb + 20) < 17)
++		return "bad FDT header";
++	if (off_struct > total || size_struct > total - off_struct || off_str > total || size_str > total - off_str)
++		return "bad FDT offsets";
++
++	uint64_t p = dtb + off_struct, end = p + size_struct, strs = dtb + off_str, str_end = strs + size_str;
++	int depth = 0, in_chosen = 0, seen_chosen = 0, seen_end = 0;
++	while (p + 4 <= end) {
++		uint32_t tag = be32(p);
++		p += 4;
++		if (tag == FDT_NOP)
++			continue;
++		if (tag == FDT_END) {
++			seen_end = 1;
++			break;
++		}
++		if (tag == FDT_END_NODE) {
++			if (depth == 0)
++				return "bad FDT nesting";
++			if (depth == 2)
++				in_chosen = 0;
++			depth--;
++			continue;
++		}
++		if (tag == FDT_BEGIN_NODE) {
++			uint64_t name = p;
++			while (p < end && rd8(p))
++				p++;
++			if (p >= end)
++				return "bad FDT node";
++			p = dtb + ((p + 1 - dtb + 3) & ~3UL);
++			depth++;
++			if (depth == 2 && str_is(name, end, "chosen")) {
++				if (seen_chosen)
++					return "two /chosen nodes";
++				in_chosen = seen_chosen = 1;
++			}
++			continue;
++		}
++		if (tag != FDT_PROP || p + 8 > end)
++			return "bad FDT tag";
++		uint64_t len = be32(p), nameoff = be32(p + 4);
++		p += 8;
++		if (len > end - p || nameoff >= size_str)
++			return "bad FDT prop";
++		if (in_chosen && depth == 2) {
++			uint64_t name = strs + nameoff;
++			if (str_is(name, str_end, "linux,initrd-start")) {
++				if (len != 8)
++					return "initrd-start is not 64 bits";
++				c->initrd_start = be64(p);
++			} else if (str_is(name, str_end, "linux,initrd-end")) {
++				if (len != 8)
++					return "initrd-end is not 64 bits";
++				c->initrd_end = be64(p);
++			} else if (str_is(name, str_end, "bootargs")) {
++				c->bootargs = p;
++				c->bootargs_len = len;
++			}
++		}
++		p = dtb + ((p + len - dtb + 3) & ~3UL);
++	}
++	if (!seen_end || depth != 0)
++		return "truncated FDT";
++	if (!seen_chosen)
++		return "no /chosen";
++	if (!c->initrd_start || !c->initrd_end || !c->bootargs)
++		return "/chosen lacks initrd or bootargs";
++	return 0;
++}
++
++uint64_t recovery_got_hash;
++
++/* FNV-1a over 64-bit words. Identifies the ramdisks: nothing here defends against someone crafting a collision. */
++static uint64_t ramdisk_hash(uint64_t a, uint64_t n)
++{
++	uint64_t h = 0xcbf29ce484222325ULL;
++	for (uint64_t i = 0; i + 8 <= n; i += 8) {
++		h ^= *(const volatile uint64_t *)PHYS(a + i);
++		h *= 0x100000001b3ULL;
++	}
++	return h;
++}
++
++/* 0 only when this boot is provably ABL's recovery mode with the exact ramdisks this shim was built for. */
++const char *recovery_check(uint64_t dtb, uint64_t *initrd_start, uint64_t *initrd_end)
++{
++	struct chosen c = { 0, 0, 0, 0 };
++	const char *why = fdt_chosen(dtb, &c);
++	if (why)
++		return why;
++	*initrd_start = c.initrd_start;
++	*initrd_end = c.initrd_end;
++
++	if (mem_has(c.bootargs, c.bootargs_len, "androidboot.force_normal_boot") ||
++	    mem_has(c.bootargs, c.bootargs_len, "androidboot.mode") ||
++	    mem_has(c.bootargs, c.bootargs_len, "skip_initramfs"))
++		return "bootargs select normal boot";
++
++	/* The size alone rejects a normal boot: vendor + init_boot + bootconfig is about 45 MiB short of this. */
++	const uint64_t bc_start = c.initrd_start + RECOVERY_VENDOR_SIZE + RECOVERY_RAMDISK_SIZE + RECOVERY_INITBOOT_SIZE;
++	if ((c.initrd_start & 7) || c.initrd_end <= c.initrd_start || !in_ram(c.initrd_start, c.initrd_end - c.initrd_start))
++		return "initrd outside RAM";
++	if (c.initrd_end < bc_start + BC_TRAILER + 1 || c.initrd_end - bc_start > BOOTCONFIG_MAX)
++		return "initrd size is not recovery";
++
++	/* linux/bootconfig.h trailer: size, checksum, magic. The size includes ABL's padding. */
++	uint64_t trailer = c.initrd_end - BC_TRAILER;
++	static const char magic[] = "#BOOTCONFIG\n";
++	for (int i = 0; i < 12; i++)
++		if (rd8(trailer + 8 + i) != (uint8_t)magic[i])
++			return "no bootconfig trailer";
++	uint64_t bc_len = le32(trailer);
++	if (bc_len != trailer - bc_start)
++		return "bootconfig size mismatch";
++	uint32_t sum = 0;
++	for (uint64_t i = 0; i < bc_len; i++)
++		sum += rd8(bc_start + i);
++	if (sum != le32(trailer + 4))
++		return "bootconfig checksum";
++
++	/* Both are absent in recovery mode. first_stage_init only obeys force_normal_boot=1: refuse any value. */
++	if (mem_has(bc_start, bc_len, "androidboot.force_normal_boot"))
++		return "bootconfig has force_normal_boot";
++	if (mem_has(bc_start, bc_len, "androidboot.mode"))
++		return "bootconfig has androidboot.mode";
++	if (!mem_has(bc_start, bc_len, "androidboot.hardware=qcom"))
++		return "bootconfig lacks the vendor keys";
++
++	/* Last, because it reads 57 MiB with the caches off. A normal boot never reaches it. */
++	recovery_got_hash = ramdisk_hash(c.initrd_start, RECOVERY_VENDOR_SIZE + RECOVERY_RAMDISK_SIZE);
++	if (recovery_got_hash != RECOVERY_HASH)
++		return "ramdisk hash mismatch";
++	return 0;
++}
++
++/* Where the Image goes: first 2 MiB boundary behind the shim, below the DTB and initrd. 0 when it does not fit. */
++uint64_t recovery_target(uint64_t shim_end, uint64_t linux_src, uint64_t linux_size, uint64_t dtb, uint64_t initrd_start,
++			 const char **why)
++{
++	if ((linux_src & 7) || linux_size < 0x40 || le32(linux_src + 56) != 0x644d5241u) {
++		*why = "no arm64 Image behind the payload";
++		return 0;
++	}
++	uint64_t text_offset = le32(linux_src + 8) | (uint64_t)le32(linux_src + 12) << 32;
++	uint64_t image_size = le32(linux_src + 16) | (uint64_t)le32(linux_src + 20) << 32;
++	uint64_t flags = le32(linux_src + 24);
++	if (text_offset || !(flags & 8) || image_size < linux_size) {
++		*why = "Image header not place-anywhere";
++		return 0;
++	}
++	uint64_t target = (shim_end + SZ_2M - 1) & ~(SZ_2M - 1);
++	if (target + image_size > dtb || target + image_size > initrd_start || !in_ram(target, image_size)) {
++		*why = "no room for the Image";
++		return 0;
++	}
++	return target;
++}
++
++#ifndef RECOVERY_HOST_TEST
++#include "console.h"
++
++void copy64(uintptr_t dst, uintptr_t src, uint64_t n);
++typedef void (*linux_entry_t)(uint64_t dtb, uint64_t x1, uint64_t x2, uint64_t x3);
++
++/*
++ * Runs before anything else in the shim: UFS and the panel are as ABL left them, as they are when ABL jumps to a
++ * kernel itself. Returns the reason on a boot that stays iOS, and does not return on recovery mode.
++ */
++const char *recovery_boot(uintptr_t head, uint64_t image_size, uint64_t linux_off, uint64_t linux_size, uint64_t dtb)
++{
++	uint64_t initrd_start = 0, initrd_end = 0;
++	const char *why = recovery_check(dtb, &initrd_start, &initrd_end);
++#ifdef SHIM_RECOVERYPROBE
++	con_show();
++	con_str("PROBE", why ? "boots iOS" : "recovery mode: would start Linux");
++	con_str("WHY", why ? why : "all checks passed");
++	con_hex("DTB", dtb);
++	con_hex("INITRD", initrd_start);
++	con_hex("END", initrd_end);
++	con_hex("SIZE", initrd_end - initrd_start);
++	con_hex("WANT", RECOVERY_VENDOR_SIZE + RECOVERY_RAMDISK_SIZE + RECOVERY_INITBOOT_SIZE);
++	con_hex("HASH", recovery_got_hash);
++	con_hex("EXPECT", RECOVERY_HASH);
++	const char *fit = 0;
++	con_hex("TARGET", recovery_target(head + image_size, head + linux_off, linux_size, dtb, initrd_start, &fit));
++	con_str("FIT", fit ? fit : "ok");
++	con_str("HOLD", "power + vol down for fastboot");
++	for (;;)
++		__asm__ volatile("wfe");
++#endif
++	if (why)
++		return why;
++	uint64_t target = recovery_target(head + image_size, head + linux_off, linux_size, dtb, initrd_start, &why);
++	if (!target)
++		return why;
++
++	copy64(target, head + linux_off, linux_size);
++	if (le32(target + 56) != 0x644d5241u)
++		return "Image copy failed";
++
++	/* Everything was written with the MMU and caches off, as in boot_payload. Interrupts are masked in start.S. */
++	__asm__ volatile("dsb sy; ic iallu; dsb sy; isb" ::: "memory");
++	((linux_entry_t)target)(dtb, 0, 0, 0);
++	return "Linux returned";
++}
++#endif
+diff --git a/asteroids/shim/start.S b/asteroids/shim/start.S
+index 692f283..7a1fba8 100644
+--- a/asteroids/shim/start.S
++++ b/asteroids/shim/start.S
+@@ -1,7 +1,8 @@
+ /*
+  * asteroids boot shim entry: arm64 Linux Image header so Nothing's ABL treats
+  * us like a kernel. ABL enters at EL1, MMU/D-cache off, x0 = DTB pointer.
+- * image_size is patched by build.sh to cover the payload behind _end.
++ * image_size is patched by build.sh to cover the payload behind _end, res2 and
++ * res3 to locate a stock Linux Image behind that (recovery.c).
+  */
+ 	.section .text.head, "ax"
+ 	.globl _head
+@@ -34,7 +35,8 @@ _start:
+ 	b.hs	2f
+ 	str	xzr, [x1], #8
+ 	b	1b
+-2:	adr	x0, _head
++2:	mov	x2, x0			/* ABL's DTB */
++	adr	x0, _head
+ 	adr	x1, _end
+ 	bl	shim_main
+ 3:	wfe

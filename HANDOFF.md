@@ -1,87 +1,90 @@
 # Handoff: read this first
 
-Written 2026-11-02 for whoever picks this up next. The phone is a test device owned by the repo owner. Update this file when the state changes.
+Updated 2026-11-02, about 19:00 AEDT. Update this file whenever the state changes, and keep it the first thing a new agent reads.
 
-## Where things stand
+## Phone state right now
 
-iOS 26.6.2 (23G90, iPhone12,1 base) cold boots from internal storage on a Nothing Phone (3a) Pro, with no Mac and no cable. Android cannot start from either slot, because iOS is flashed to `boot_a` and `boot_b`.
+- iOS 26.6.2 cold boots from the power button, with no Mac.
+- `boot_a` holds the recovery-capable shim plus iOS, a full 100 MiB partition image with the signed vbmeta moved. It was built by `tools/ablfix/make_relocated.py` from `plans/recovery/out/recovery-boot.img`, the iOS image `next-flash-boot.img` with the recovery chain added.
+- `boot_b` holds the plain iOS image, without the recovery chain, as a fallback.
+- Retries: 6 left on `boot_a` in the GPT and 7 on `boot_b`, neither marked successful. `getvar` showed 7 for `a` while the table said 6, so trust the table.
+- `misc` was reset from `backup-asteroids/misc.img` at 18:39, because a stale `boot-recovery` command turned every boot into a recovery boot. It read empty at 18:44.
+- `recovery_a`, `init_boot_a` and `vendor_boot_a` are stock, byte for byte the backups.
+- **Pending**: the one-time `successful` write for `boot_a`, `tools/boot/phone_mark.sh`. A Sol audit was running at the time of writing; read `docs/gptwrite-audit.md` if it exists before running anything.
 
-The kernel is local XNU 12377 with this repo's patches, on top of `nothing-sm7635-devs/ios-asteroids` branch `asteroids-ios26`. Compositing runs Metal through Chlorophyll on Mesa Turnip on the Adreno 810. The canvas is 420x930 pt at 2x, 840x1860 px, scaled to the 1080x2392 panel.
+## What works
 
-Fixed and confirmed on the phone:
+- Cold boot, and OrangeFox from the fastboot menu's Recovery mode
+- Liquid Glass with no search band, black bars or zebra, and the icon tear fixed
+- GPU hang fix, 0 recoveries in 9 scripted runs
+- Real iPhone 11 status bar with even corners
+- Widgets that need no internet
+- The hands-free test loop, `tools/devloop/`
 
-- Icon tear, wallpaper corruption, UI restarts every 3 minutes, buffer leak
-- Search band and most glass glitches, black bars while animating, zebra on app launch
-- GPU hangs: 0 recoveries in 9 scripted runs, 7 back in the control run with the fix off
-- Real iPhone 11 status bar with even corners, and hidden wallpaper host apps
-- Widgets show real content where no internet is needed, such as Notes
+## Open, most wanted first
 
-Still open, most wanted first:
-
-1. **Lag.** Animations run at 25 to 35 frames/s and look jittery. Frames run one at a time for a reason nobody has found yet. It is not the `waitUntilScheduled` wait (about 10 calls a run), the GPU clock, half-precision shaders or the display copy. See `docs/speed2.md`.
-2. **Recovery access.** See below. It is the first thing to fix, since logs and file pushes depend on it.
-3. **Boot slot countdown.** See below.
-4. Wi-Fi, then a modem probe for mobile data. `docs/research-wifi.md`.
-5. Freeform and PencilKit need Metal in apps, and compute on the A810 is unproven. `docs/appmetal.md`.
-6. Sound and a real battery reading, which share the ADSP port. `docs/plan-power.md`.
-7. Small ones: glass flicks white in places and stayed white in Calculator, Calendar widget stays a skeleton, app top spacing could still be tighter, only 24 GB of storage is visible, Nothing logo and the fixed 10 s wait in boot.
+1. **Lag.** 25 to 35 frames/s while animating, and jittery. Frames run one at a time for an unknown reason. It is not `waitUntilScheduled`, the GPU clock, half-precision shaders, or the display copy. See `docs/speed2.md`.
+2. The boot slot `successful` write, then update the dev loop for the new recovery route.
+3. Wi-Fi, then a modem probe for mobile data. `docs/research-wifi.md`.
+4. Freeform and PencilKit need Metal in apps, and compute on the A810 is unproven. `docs/appmetal.md`.
+5. Sound and a real battery reading, which share the ADSP port. `docs/plan-power.md`.
+6. Small ones:
+   - Glass flicks white, and stayed white in Calculator
+   - Calendar widget stays a skeleton
+   - App top spacing could still be tighter
+   - Only 24 GB of storage is visible
+   - Nothing logo, and the fixed 10 s wait at boot
+   - Sol's two should-fixes for the recovery gate, in `docs/recovery-audit.md`
 
 ## Rules from the owner
 
 - Never reduce Liquid Glass or blur. No bars, zoom, crop or stretch.
-- A brick is acceptable to them as a last resort, but avoid it. They have explicitly asked to try the boot slot write below.
-- Use the hands-free loop rather than asking them to test what a script can.
+- They accept risk, including boot path experiments, but audit risky steps with Sol, `gpt-6.1-sol`, first. Skipping an audit cost an hour today.
+- Test with the hands-free loop rather than asking them, where a script can do it.
 - Use `say` when you need them, and also say it in chat.
-- No AI attribution in commits.
-- Never put device dumps, phone logs, serials, firmware or Apple files in this repo. It is public.
+- No AI attribution in commits. The repo is public, so never commit dumps, logs, serials, firmware or Apple files.
+
+## Hard lessons from today. Do not repeat them.
+
+1. **Boot slot images must end below 14118912 bytes.** The stock signed vbmeta lives inside `boot_a`/`boot_b` at that offset, and a footer in the last 64 bytes points to it. A longer image overwrites it. Flashing a smaller one later does not restore it, because fastboot writes only the image's length. Then every boot and every `fastboot boot` fails with `Load Error`, and ABL marks the slot unbootable. Repair with a full 100 MiB image: `plans/ablfix/boot_a-ios-fixed.img`, made by `tools/ablfix/make_fixed_boot.py`. For larger images, use `make_relocated.py`, which moves the vbmeta after the image and rewrites the footer. The unlocked ABL accepts that. `recovery_a`'s limit is 48357376. See `docs/ablfix.md`.
+2. **Never `fastboot boot` a stock Linux kernel.** ABL replaces the image's ramdisk with stock `init_boot`, so it is an Android boot, which can format `userdata`.
+3. **`misc` can hold a stale `boot-recovery`.** Then START and power-on go to recovery mode. If it ever holds `--wipe_data`, OrangeFox may wipe `userdata` by itself on start. Read `misc` from OrangeFox first: `dd if=/dev/block/by-name/misc bs=4096 count=1 | od -c`. Reset it with `fastboot flash misc backup-asteroids/misc.img`, which is 1 MiB and zero BCB.
+4. `recovery_a` has no kernel, so ABL borrows `boot_a`'s. Our shim detects recovery mode from the DTB and initrd size, bootconfig and a ramdisk hash, then jumps to the stock kernel it carries. Any doubt boots iOS. Proven on the phone in both directions with the probe image. See `docs/recovery.md` and `tools/recovery/`.
+5. **ABL takes one retry** per power-on, hard reset and menu START, and none for Power + Volume Down, `fastboot boot` or recovery. A flash resets to 7 and clears `successful`. Nothing in ABL ever sets `successful`. See `docs/bootslot.md`.
+6. `fastboot reboot recovery` is often ignored. Use the menu, or send it again.
 
 ## Danger
 
-- Android formats `userdata` when it boots, which destroys the iOS root. Stock boot images must stay off the phone's boot slots unless you mean that.
-- Never run `fastboot reboot` plain, `set_active`, or a lock state change.
-- `userdata` holds the root. A root flash erases iOS state.
-
-## Recovery access is broken, fix this first
-
-`recovery_a` has no kernel. ABL takes the kernel from `boot_a`, and since that is ours now, both `fastboot reboot recovery` and the menu's Recovery mode boot iOS. `fastboot boot` of OrangeFox's own image fails because its kernel field is empty.
-
-Tried: `recovery/ramboot/orangefox-ram.img`, the stock kernel plus OrangeFox's ramdisk, through `fastboot boot`. It loaded, showed nothing on USB, then the phone came back in iOS. Do not repeat it. A normal-mode boot of a recovery ramdisk probably gets `force_normal_boot` from ABL and then tries to start Android userspace, which is the path that can format `userdata`. That is inferred.
-
-Also tried: flashing that combined image to `recovery_a`, so the partition carries its own kernel. ABL drops straight back to fastboot, from the Mac's command and from the menu. Restored `recovery_a` from the backup afterwards.
-
-Next idea: since ABL loads `boot_a`'s kernel plus `recovery_a`'s ramdisk in recovery mode, make the shim detect recovery mode from the DTB and jump to a stock Linux kernel carried in the same boot image.
-
-Without recovery there are no kernel logs, no file pushes, and the `tools/devloop/dev.py` cycle stops.
-
-## Boot slot countdown
-
-A flash clears `slot-successful` and sets 7 retries. ABL takes one per normal boot: power-on, hard reset, menu START. `fastboot boot` and Power + Volume Down cost nothing. At 0 the slot goes unbootable and ABL falls back to the other slot, then fastboot. Reflashing resets it. Each kernel flash clears it anyway. Details in `docs/bootslot.md`.
-
-The owner has asked for the permanent fix: set `successful` with a one-byte write in both copies of the LUN 4 GPT from OrangeFox. Nothing has been written. Planned order:
-
-1. Restore recovery access.
-2. Save LUN 4 LBA 1..5 and 0xffffb..0xfffff. The backup GPT has never been read.
-3. Run the tool's `check` on the real bytes. `tools/boot/mark_successful.py` has no phone code, so a small wrapper is needed. It refuses unless every byte and checksum matches.
-4. Write the backup table first, then the primary, verifying each.
-5. Read `slot-successful:a` in fastboot, then cold boot and confirm the count holds.
-
-That table also lists `abl`, `xbl`, `tz` and `hyp`, and there is no EDL programmer, so a bad write could mean a repair service. Be careful, and read the whole of `docs/bootslot.md` first.
+- Android formats `userdata` when it boots, which destroys the iOS root. Keep stock boot images off both slots.
+- Never run plain `fastboot reboot`, `set_active`, erase, `-w`, or a lock state change.
+- The LUN 4 GPT also lists `xbl`, `abl`, `tz` and `hyp`. There is no EDL programmer, so a bad table write means a repair service.
+- A root flash erases iOS state.
 
 ## How to work
 
-- Boot-arg line limit is 607 bytes. `mkpayload.py` refuses more.
-- `tools/devloop/dev.py IMAGE [ROOTPATH=FILE ...] --test ui --note NAME` runs one unattended cycle in about 5 minutes, once recovery works. Variants differ by one boot arg. Compare whole sets of runs, since home swipes alone swing about 10 frames/s.
-- `tools/devloop/06-hfs-put.py` replaces existing root files from recovery, without a reflash. It cannot create new paths and refuses a dirty journal.
-- Patches: `patches/kernel/` in number order on top of upstream patch 2049. `patches/driver/` on top of the fetch-fix tree. Build with `USE_KDK=1 tools/xnu-local-build.sh --remake -j12 26.5`.
-- Current boot image args are in `tools/boot/next-flash-args.txt`.
-- Root build: `tools/boot/build-root-example.sh`, about 7 minutes, then 3 for the journal, then about 9 to flash.
+- **Kernel:** `patches/kernel/` in number order on top of upstream `nothing-sm7635-devs/ios-asteroids` branch `asteroids-ios26`, through 2049. Build with `USE_KDK=1 tools/xnu-local-build.sh --remake -j12 26.5`.
+- **Driver:** `patches/driver/` on top of the fetch-fix tree.
+- **Boot image:** args in `tools/boot/next-flash-args.txt`. The line is limited to 607 bytes, and `mkpayload.py` refuses more.
+- **Flashing a slot:** check the size first. Over 14118912 bytes, use `make_relocated.py`. Keep `boot_b` as a known-good fallback.
+- **Test cycle:** `tools/devloop/dev.py IMAGE [ROOTPATH=FILE ...] --test ui --note NAME`. Its recovery step still uses the old route and must be changed to the menu or `fastboot reboot recovery` with the new `boot_a`.
+- **File pushes:** `tools/devloop/06-hfs-put.py` replaces existing root files from recovery, without a reflash. It cannot create new paths and refuses a dirty journal.
+- **Root build:** `tools/boot/build-root-example.sh`, 7 minutes to build, 3 for the journal, then about 9 to flash.
 
 ## Reports
 
-Each one marks what is proven and what is inferred. Some earlier ones have been overtaken, so trust the newest and check code against claims. Some inferences were wrong today:
+Each one marks proven and inferred. Trust the newest and check code against claims. Several inferences were wrong today:
 
-- The widget failure was not entitlements.
-- Status bar work targeted UIKit's copy of the classes for a long time, while SpringBoard uses the `STUI` copy in SystemStatusUI.
+- Entitlements were not the cause of the widget failure.
+- SpringBoard uses the `STUI` status bar classes in SystemStatusUI, not UIKit's.
 - `waitUntilScheduled` was not the serial frame cause.
+- `init_boot` did not cause the `Load Error`.
 
-Start with `docs/roadmap.md`, `docs/speed2.md`, `docs/hangs.md`, `docs/blackbars2.md`, `docs/bootslot.md`.
+Start with:
+
+- `docs/roadmap.md`
+- `docs/speed2.md`
+- `docs/hangs.md`
+- `docs/blackbars2.md`
+- `docs/ablfix.md`
+- `docs/recovery.md`
+- `docs/bootslot.md`
