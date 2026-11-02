@@ -47,7 +47,9 @@ Still open, most wanted first:
 
 Tried: `recovery/ramboot/orangefox-ram.img`, the stock kernel plus OrangeFox's ramdisk, through `fastboot boot`. It loaded, showed nothing on USB, then the phone came back in iOS. Do not repeat it. A normal-mode boot of a recovery ramdisk probably gets `force_normal_boot` from ABL and then tries to start Android userspace, which is the path that can format `userdata`. That is inferred.
 
-Next idea, not yet tried: flash that same combined image to `recovery_a`, so the partition carries its own kernel and ABL boots it in recovery mode. The stock image is backed up. This should also restore OrangeFox from the phone's own menu.
+Also tried: flashing that combined image to `recovery_a`, so the partition carries its own kernel. ABL drops straight back to fastboot, from the Mac's command and from the menu. Restored `recovery_a` from the backup afterwards.
+
+Next idea: since ABL loads `boot_a`'s kernel plus `recovery_a`'s ramdisk in recovery mode, make the shim detect recovery mode from the DTB and jump to a stock Linux kernel carried in the same boot image.
 
 Without recovery there are no kernel logs, no file pushes, and the `tools/devloop/dev.py` cycle stops.
 
