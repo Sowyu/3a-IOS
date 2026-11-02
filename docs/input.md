@@ -63,45 +63,68 @@ PON interrupt: not cheap. No sweet driver takes a GIC SPI today, only IPIs and P
 
 ## Fixes prepared
 
-All of these are off by default, and each is a boot arg. They apply in order on the current tree. Each one passes a syntax check with the build's own flags and adds no new kind of warning.
+All of these are off by default, and each is a boot arg. Each one passes a syntax check with the build's own flags and adds no new kind of warning.
+
+Apply order:
+
+1. Upstream `asteroids-ios26`, which ends at 2042.
+2. The local patches 2043 to 2049 (`ios-asteroids/xnu/patches-12377/`, now also in `3a-IOS/patches/kernel/`). 2047 creates `SweetFbScale.h`.
+3. 2051 to 2120.
+4. Optionally the lag agent's 2140 to 2143.
+5. 2150, 2151, 2153, and 2152 last.
+
+Step 5 is checked on the 2120-series base and on the live tree. The corrected steps 1 to 3 have not been re-checked from a clean upstream.
 
 | Patch | Boot args | Does | Expected |
 |---|---|---|---|
 | 2150 | `sweetkeys_ms=N` (2 to 100, default 20) | Key poll period. Timing lines: `display off/on (power key down X ms, up Y ms ago)`, `first frame after display on: N ms`, `SWEET PANEL: display ... (rc, N ms)`, key edges with `t_us`, PON debounce at boot | Press seen 7.5 ms sooner at 5 ms; the iOS share of lock and wake becomes measurable |
 | 2151 | `sweettouchirq` bits: 1 read on the IRQ edge, 2 stamp at the read start (when the edge was noticed, not the controller's scan time), 4 one stats line per touch; `sweettouchirq_us` (500); `sweethid_touch_us` | Reads on the edge while touched, with a 12 ms fallback | Report to sent 2.3 to 1.1 ms, jitter 1 to 0.17 ms (Model). The stats line measures the report rate |
-| 2152 v2 | `sweetpwrfast` bits: 1 dark at a short solo release, 2 panel out of sleep at a press while off; `sweetpwrfast_ms` (300 to 3000, default 2000) | The screen follows the key at once, in parallel with iOS. iOS's request confirms the step. A touch, another key, or the window passing without iOS undoes it | Lock is dark about 10 to 30 ms after release, whatever iOS is doing. With `sweetpanel=1`, wake loses most of its 90 ms sleep-out |
+| 2152 v3 | `sweetpwrfast=1`, `sweetpwrfast_ms` (300 to 3000, default 2000). Only with `sweetpanel=0` | The screen goes black at a short power release, in parallel with iOS. iOS's display off confirms it. A touch, another key, or the window passing without iOS brings the kept image back | Lock is black about 10 to 30 ms after release, whatever iOS is doing |
 | 2153 | `sweetfb_lead=US` (1500 to 7000, suggest 3000) | Moves the vsync tick, at most 1 ms per frame, until its flip latches that long after the tick | Tick to latch 7.2 to 2.9 ms (Model). About 3 ms off every frame on average, and 4 on boots like ast66 |
 
-### 2152 v2, after Sol's audit (`analysis/input-ff-audit.md`)
+### 2152 v3, pixels only, after Sol's re-audit (`analysis/2152-reaudit.md`)
 
-Sol rated v1 NO-GO on findings 1 and 2, with 6 and 7 as should-fixes. v2 changes:
+Sol rated v2 NO-GO. Findings 1 to 3 were about the panel commands, 4 about pixel rollback when a flip fails, 5 about the apply order, and 6 about CoreAnimation holds. The owner decided to narrow 2152 to the pixel path, since the phone only runs `sweetpanel=0`.
 
-1. Undoing a dark step no longer needs a new frame or the GPU. With panel commands it is DCS 28 (display off, panel awake) and undoing it is one DCS 29. Without them it is a flip to black that keeps the shown buffer, and undoing it flips back to that buffer. Nothing writes the kept buffer while the screen is black: the tick, the early swap path and the HUD all skip it.
-2. The window ends on its own timer (a second thread call armed at the deadline), not only at a vsync tick. iOS's display change also triggers a run at once. The range is now 300 to 3000 ms.
-3. The panel thread counts a step done only when its command completed. It walks toward a target one command at a time, rereads the target between commands, and retries a timed-out command with backoff from 20 ms to 1.3 s. A rollback in the middle of a sleep sequence takes the short way, for example DCS 29 one frame after DCS 28.
-4. Events are queued in order, not OR'd. Each one carries iOS's display state and a generation number, read before the key or touch goes to iOS. A release darkens only if its press began with the display on and iOS has not changed state since. An early wake needs iOS still off in the press's generation. A full queue cancels both steps.
-5. A touch or another key cancels an early wake, and the panel is told to sleep right then.
-6. An early wake now leaves the panel's display off (DCS 11 only), so it never lights while iOS is off. When iOS turns the display on and finds the panel asleep, frames wait until sleep-out completes, for at most 500 ms, and display on follows the first frame. That keeps flips off a sleeping panel (finding 7). It applies whenever `sweetpanel` is 1 or 2, with or without `sweetpwrfast`, and so does item 3.
+1. **With `sweetpanel=1` or `2`, 2152 does nothing.** It logs `sweetpwrfast ignored` and stays off. The patch does not touch `sweet_dsi_asteroids.c`, and it adds no DCS command and no panel state. v2's retrying planner and its sleep-out readiness gate are gone. Panel modes behave exactly as on the 2120 base. Findings 1, 2 and 3 cannot arise, because no DCS command is ever part of a speculative step. `host-check/patch_scope_check.py` enforces this. 2152 also stays off without the asteroids flip and with zero-copy scanout.
+2. **Finding 4.** The kept image is a debt, `fFastKept`, from the black flip until either a flip back has latched or iOS has turned the display off. The pure function `sfs_fast_keep_next()` in `SweetFbScale.h` chooses the next step, and no step clears the debt on a failure. If any flip fails to latch, `astFallback` stops flipping and scans the boot buffer. That buffer is black, because it is seeded from the black front, or plainly black with hardware scale. So 2152 writes the kept image into it: a copy without hardware scale, a scale of the canvas with it (`fastShowInBoot`, the copy path's nearest-neighbour branch). If the black flip itself fails, the image goes back at once. The debt is retried on every vsync tick and on a 50 ms timer, 1 s once scanout is frozen.
+3. **Finding 6.** While the screen is black, the tick still takes each frame, copies it into the kept buffer without flipping, and releases its CoreAnimation holds at the 2120 point. So holds live as long as they do without 2152, and the kept buffer holds the newest frame when the screen comes back. Keeping the pixels needs no CA hold.
+4. **Finding 5.** The apply order is corrected above, and in `plans/input/README.md`.
 
-Bound, on every path: the screen is dark while iOS has it on for at most the window plus one work-loop wait (up to about 50 ms behind a present), plus one panel command or one latch. In the model that is 2000 to 2070 ms. Only a DCS link that keeps failing stretches it, and the thread keeps retrying. The one case outside this is a latch failure during the flip back, which makes the existing flip fallback take over as it would for any frame.
+Bound when flips fail: the window (2 s by default), plus a present already running on the work loop, plus 25 ms for the failed latch and 25 ms for the fallback's latch, plus one copy or scale into the boot buffer. If the fallback cannot put scanout back on the boot buffer (`ast.frozen`), the old driver has no display path for any frame. 2152 still writes the image there and keeps the debt until iOS turns the display off. Nothing is bounded in that state.
 
-Unchanged: only short solo presses (under 700 ms, no other key) darken, so Siri, screenshots and SOS keep iOS's timing. Wake never shows the last frame. The state machine is `sfs_fast_drain()` in `SweetFbScale.h`, and the panel planner is `panel_plan()` in `sweet_dsi_asteroids.c`.
+One known difference from a normal flip: if a GPU recovery lands during the copy of a frame into the kept buffer, the normal path would drop that frame. The kept buffer keeps it. The GPU gate already proved that frame's own work finished before the copy started.
 
-Checks, all on the Mac. `host-check/fast_power_model.c` replays each audit scenario on v1 and v2. The pure parts are real code: v1's `sfs_fast_step`, and v2's `sfs_fast_drain` and `panel_plan`. The glue, iOS, the GPU gate and the DCS link are modelled. Every scenario fails on v1 and passes on v2:
+Checks, all on the Mac. `host-check/fast_power_model.c` runs v2 (the audited code) against v3 on the pixel path. The pure parts are real code (v3's `sfs_fast_drain` and `sfs_fast_keep_next`). The glue is a line-by-line mirror, and the model covers:
 
-| Scenario | Measure | v1 | v2 |
+- flip failure, `ast.stopped` and `astFallback`, with and without hardware scale
+- frozen scanout
+- the GPU gate and epochs
+- CoreAnimation's two surfaces with hold-wait, with and without `sweetfb_keep`
+
+| Scenario | Measure | v2 | v3 |
 |---|---|---|---|
-| GPU recovery voids the frame during a panel dark step, iOS stays on | dark while iOS on | 7899 ms (never back) | 2000 ms |
-| Same with `sweetpanel=0` | dark while iOS on | 7899 ms | 2000 ms |
-| The undo command times out once (DCS 11 in v1) | dark while iOS on | 7899 ms | 2000 ms |
-| DCS 29 times out once | dark while iOS on | 7899 ms | 2070 ms |
-| Undoing an early wake times out once (DCS 10) | awake while iOS off | 7990 ms | 2065 ms |
-| Wake press drained after iOS turned on, release later | dark while iOS on | 2010 ms | 11 ms |
-| Lock press drained after iOS turned off | lit while iOS off | 1692 ms | 19 ms |
-| Touch after an early wake, iOS stays off | awake after the touch | 1853 ms | 9 ms |
-| iOS on while the panel sleeps | flips to a sleeping panel | 1 | 0 |
+| GPU recovery during the dark step (v1 finding) | dark while iOS on | 2000 ms | 2000 ms |
+| Wake press drained late (v1 finding) | dark while iOS on | 11 ms | 11 ms |
+| Black flip fails, hardware scale, no valid frame | dark while iOS on | 7899 ms (never back) | 0 ms |
+| Flip back fails, hardware scale, frame voided | dark while iOS on | 7899 ms | 2000 ms |
+| Flip back fails, no hardware scale | dark while iOS on | 7899 ms | 2000 ms |
+| Flip back fails and scanout freezes | debt dropped while unpaid | 1 | 0 (kept until iOS off) |
+| `sweetfb_keep`, iOS keeps drawing during the window | longest CA hold | 1994 ms | 16 ms |
+| Same without keep | longest CA hold | 33 ms | 16 ms |
 
-The v2 random walk ran 3000 runs over presses, touches, iOS latencies (including ignoring the press), GPU recoveries and 5% DCS failures. It found no violation: dark while iOS on at most 2070 ms, and the old image lit while iOS is off for at most 16 ms, which is the normal off path's one tick. `fast_power_check.c` covers each rule of `sfs_fast_drain` and a 2-million-step random walk. A `panel_plan` table checks every command, the state it reaches and its spacing. Mutation tests undo each fix in turn, and each one makes a check fail, with one exception. Reading iOS's state at drain time instead of from the snapshot changes nothing, because the generation check already blocks every case where the two differ.
+The 3000-run random walk is differential. Each run is repeated with `sweetpwrfast=0`, and v3 may add one window of darkness to that baseline and nothing else: no longer leak of an old image while iOS is off, no longer hold, no dropped debt. It found no violation. Its 8221 ms worst darkness is a run that is just as dark without 2152. Flip failures are injected into 2152's own flips only.
+
+Each fix has a mutation that takes it out again, and every one is caught:
+
+- a failed flip drops the debt
+- the canvas is not put in the boot buffer
+- a stop under a dark step does not pay at once
+- the tick returns while dark
+- in `sfs_fast_keep_next`, a stopped flip path counts as paid
+- in `sfs_fast_keep_next`, frozen scanout counts as paid
+
+The glue mutations are in the model's mirror; the two header mutations are in real code. `fast_power_check.c` covers each rule of `sfs_fast_drain`, an exhaustive table of `sfs_fast_keep_next`, and a 2-million-step walk. Its generation and touch-cancel mutations fail as they should. `patch_scope_check.py` passes and catches its own two mutations: the panel guard removed, and a panel call added.
 
 Not prepared:
 

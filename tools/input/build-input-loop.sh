@@ -22,7 +22,7 @@ base="${args/ sweetsyserr=backboardd,MobileSafari/} $loop $sb sweetfb_ast_hw=1"
 all='sweettouchirq=7 sweetkeys_ms=5 sweetpwrfast=1 sweetfb_lead=3000'
 mk in-stats "$base sweettouchirq=4"
 mk in-all "$base $all"
-mk in-panel "${base/sweetpanel=0/sweetpanel=1} ${all/sweetpwrfast=1/sweetpwrfast=3}"
+mk in-panel "${base/sweetpanel=0/sweetpanel=1} ${all/ sweetpwrfast=1/}"      # 2152 does nothing with panel commands
 mk in-div "${base/ sweetpanicfb=10/} $all sweettouchdiv=4"
 # optional, frame pacing (agree with the lag agent first): ticks at 120 Hz; then CoreAnimation told at 120 Hz too
 mk in-120 "${base/sweetfb_hz=60/sweetfb_hz=120} $all"

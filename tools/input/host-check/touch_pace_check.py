@@ -7,7 +7,7 @@ Run: python3 -I touch_pace_check.py [path to sweet_touch_asteroids.c]. Times are
 93-byte frame at about 1 MHz plus the 150 us CS delay; report rates 120 and 240 Hz are guesses, the stats line measures it."""
 import os, pathlib, re, subprocess, sys, tempfile
 here = pathlib.Path(__file__).resolve().parent
-src = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else here.parent / 'work/s2/bsd/dev/sweet_touch_asteroids.c'
+src = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else here.parent / 'work/p2/bsd/dev/sweet_touch_asteroids.c'
 text = src.read_text()
 m = re.search(r'\nstatic bool\nat_read_due\(.*?\n}\n', text, re.S)
 assert m, 'at_read_due not found'
@@ -97,8 +97,12 @@ int main(void)
 	return fails != 0;
 }
 '''
-with tempfile.TemporaryDirectory(dir=here) as d:
+d = tempfile.mkdtemp(prefix='tmp-touch-', dir=here.parent / 'work')     # moved to the Trash below, never deleted
+try:
     c, exe = os.path.join(d, 'sim.c'), os.path.join(d, 'sim')
     open(c, 'w').write(harness)
     subprocess.run(['cc', '-O1', '-Wall', '-o', exe, c, '-lm'], check=True)
-    sys.exit(subprocess.run([exe]).returncode)
+    rc = subprocess.run([exe]).returncode
+finally:
+    subprocess.run(['/usr/bin/trash', d], check=True)
+sys.exit(rc)
