@@ -1,6 +1,6 @@
 # Handoff: read this first
 
-Updated 2026-11-02, about 23:10 AEDT. Update this file whenever the state changes, and keep it the first thing a new agent reads.
+Updated 2026-11-02, about 22:20 AEDT. Update this file whenever the state changes, and keep it the first thing a new agent reads.
 
 ## Phone state right now
 
@@ -26,7 +26,7 @@ Updated 2026-11-02, about 23:10 AEDT. Update this file whenever the state change
 ## Open, most wanted first (updated 22:05)
 
 1. **Lag.** Found and partly fixed (`docs/lag.md`). Frames were serial because our driver made 4 kernel calls per texture upload. `patches/lag/chl-staging-pool.patch` pools those buffers, and `sweetfb_keep=1` (kernel 2082) shows a finished frame instead of dropping it. Together they took shown frames in animation bursts from a median of 39.8 to 47.1 per second over 2 runs each. **But keep brings back black bars**: the kernel holds both CoreAnimation surfaces and hold-wait times out after 50 ms. The owner saw them in ast84. The lag agent is now making CoreAnimation use a third surface the way real iPhones do, by making our display behave like Apple's, with the 2090 bar logger as proof. Do not make keep default until that run shows 0 bars. The root currently has the pool payload (`plans/lag/next-keep/out-metal`) pushed by ast84; `next-fix/out-metal` is the previous known-good.
-2. **Freeform.** Compute works on the A810: ast83 ran a trivial kernel and PencilKit's real `sdfPen_kernel`, all results correct, with no GPU recovery. Patch 2130 (inject into Freeform only) failed two Sol audits, `docs/input-ff-audit.md` and `docs/2130-reaudit.md`. The third version (23:15) refuses chroots on both sides, builds the path from the real root, is inert byte for byte with the arg off, and takes the MAC decision from `exec_handle_sugid` itself. Its host check, `tools/freeform/tests/`, passes 52 of 52. Sol's third audit is running. After a GO: build the kernel, then run phase 2b in `docs/freeform.md`.
+2. **Freeform.** Compute works on the A810: ast83 ran a trivial kernel and PencilKit's real `sdfPen_kernel`, all results correct, with no GPU recovery. Patch 2130 (inject into Freeform only) failed two Sol audits, `docs/input-ff-audit.md` and `docs/2130-reaudit.md`. The third version (22:15) refuses chroots on both sides, builds the path from the real root, is inert byte for byte with the arg off, and takes the MAC decision from `exec_handle_sugid` itself. Its host check, `tools/freeform/tests/`, passes 52 of 52. Sol's third audit is running. After a GO: build the kernel, then run phase 2b in `docs/freeform.md`.
 3. **Input** (`docs/input.md`, `patches/input/`). Sol: 2150, 2151 and 2153 GO. 2152, the instant power button, is NO-GO twice. The second audit (`docs/2152-reaudit.md`) found that a panel command that keeps failing, or a timed-out one, can leave the screen dark with no bound, and that a failed flip abandons the kept image. Decision: 2152 is narrowed to the pixel path (`sweetpanel=0`, the only mode the phone uses), does nothing in panel modes 1 and 2, keeps its rollback through flip failures, and stops holding CoreAnimation surfaces while dark. The input agent is rewriting it, then a fresh Sol audit. The combined kernel goes ahead without 2152.
 4. Wi-Fi, then a modem probe for mobile data. `docs/research-wifi.md`.
 5. Sound and a real battery reading. `docs/plan-power.md`.
