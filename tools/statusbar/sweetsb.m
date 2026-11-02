@@ -10,6 +10,9 @@
 #include <stdatomic.h>
 #include <limits.h>
 #include <dlfcn.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <sys/stat.h>
 #include "sweetsb_guard.h"
 
 #define FAMILIES 2
@@ -37,6 +40,16 @@ static NSString *statePath;
 static char boot[64];
 static BOOL save(int starts);
 
+/* App stderr may go nowhere. Kernel patch 0048 prints /dev/null writes of the processes named in boot-arg sweetnull
+   as "|name| text", so a process whose stderr is not /dev/null also writes there. */
+static int teeFd=-1;
+static void openTee(void) {
+    struct stat e,n;
+    int fd=open("/dev/null",O_WRONLY|O_CLOEXEC);
+    if(fd<0)return;
+    if(!fstat(STDERR_FILENO,&e) && !fstat(fd,&n) && S_ISCHR(e.st_mode) && e.st_rdev==n.st_rdev)close(fd);
+    else teeFd=fd;
+}
 /* Raw diagnostics avoid Objective-C messaging during installation. */
 static void note(const char *fmt, ...) {
     char line[512];
@@ -44,6 +57,7 @@ static void note(const char *fmt, ...) {
     va_list ap; va_start(ap,fmt); vsnprintf(line+n,sizeof(line)-n,fmt,ap); va_end(ap);
     size_t len=strnlen(line,sizeof(line)-2);line[len++]='\n';
     (void)write(STDERR_FILENO,line,len);
+    if(teeFd>=0)(void)write(teeFd,line,len);
 }
 static BOOL signature(Method m,const char *ret,unsigned n,const char *last) {
     if (!m || method_getNumberOfArguments(m)!=n) return NO;
@@ -216,20 +230,27 @@ static BOOL save(int starts) {
 #ifndef SWEETSB_HOST_TEST
 __attribute__((constructor)) static void start(void) {
     unsetenv("DYLD_INSERT_LIBRARIES");
+    openTee();
     @autoreleasepool { @try {
         NSString *exe=NSBundle.mainBundle.executablePath;
         BOOL spring=[exe isEqualToString:@"/System/Library/CoreServices/SpringBoard.app/SpringBoard"];
-        if (!spring && ![NSBundle.mainBundle.bundlePath hasSuffix:@".app"]) {note("scope rejected: not an app");return;}
         NSString *home=NSHomeDirectory();
+        note("loaded pid=%d exe=%s home=%s",getpid(),exe?exe.UTF8String:"nil",home?home.UTF8String:"nil");
+        if (!spring && ![NSBundle.mainBundle.bundlePath hasSuffix:@".app"]) {note("scope rejected: not an app");return;}
+        NSString *dir=spring ? @"/private/var/tmp" : [home stringByAppendingPathComponent:@"Library/Caches"];
+        if (!spring && access(dir.fileSystemRepresentation,W_OK)) {   // a missing or foreign container home: SpringBoard proves /private/var/tmp
+            note("guard state dir %s not writable (errno %d), using /private/var/tmp",dir.UTF8String,errno);
+            dir=@"/private/var/tmp";
+        }
         statePath=[(spring ? @"/private/var/tmp/sweetsb-real.state" :
-            [[home stringByAppendingPathComponent:@"Library/Caches"] stringByAppendingPathComponent:[NSString stringWithFormat:@"sweetsb-real-%@.state",exe.lastPathComponent]]) copy];
+            [dir stringByAppendingPathComponent:[NSString stringWithFormat:@"sweetsb-real-%@.state",exe.lastPathComponent]]) copy];
         size_t len=sizeof(boot)-1;
         if (sysctlbyname("kern.bootsessionuuid",boot,&len,NULL,0) || !boot[0]) {note("guard failed: boot UUID unavailable");return;}
         int starts=0; char was[64]="";
         NSString *old=[NSString stringWithContentsOfFile:statePath encoding:NSUTF8StringEncoding error:NULL];
         BOOL damaged=old && sscanf(old.UTF8String,"%d %63s",&starts,was)!=2;
         starts=damaged ? SWEETSB_MAX_STARTS+1 : sweetsb_guard_next(starts,was,boot);   // a damaged record never reads as a fresh start
-        if (!save(starts)) {note("guard failed: cannot write state");return;}
+        if (!save(starts)) {note("guard failed: cannot write state %s",statePath.UTF8String);return;}
         if (!sweetsb_guard_allows(starts)) {note("guard blocked start=%d",starts);return;}
         appSafeAreaScope=sweetAppExecutable(exe.UTF8String);
         note("guard armed start=%d; registering ObjC image callback",starts);

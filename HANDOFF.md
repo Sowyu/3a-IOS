@@ -33,7 +33,7 @@ Updated 2026-11-02, about 22:20 AEDT. Update this file whenever the state change
 6. Small ones:
    - Glass flicks white, and stayed white in Calculator
    - Calendar widget stays a skeleton
-   - App top spacing could still be tighter
+   - App top spacing: apps still reserve 68 pt. The fix in `tools/statusbar/sweetsb_safearea.h` (50 pt) installs in PosterBoard but showed no sign of running in real apps, whose stderr went nowhere. The new version (`docs/app-safearea2.md`) logs through `sweetnull`, falls back to `/private/var/tmp` for its guard file, and reports every early return. One hands-free run is staged: `plans/statusbar-real/boot/next-loop-sb-null-boot.img`, untested.
    - Only 24 GB of storage is visible
    - Apple logo early in boot (the bootloader's Nothing logo can't safely change: no logo partition, signed ABL)
    - The fixed 10 s wait in boot
