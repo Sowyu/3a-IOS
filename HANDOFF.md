@@ -74,6 +74,7 @@ Updated 2026-11-02, about 22:20 AEDT. Update this file whenever the state change
 - **Boot image:** args in `tools/boot/next-flash-args.txt`. The line is limited to 607 bytes, and `mkpayload.py` refuses more.
 - **Flashing a slot:** check the size first. Over 14118912 bytes, use `make_relocated.py`. Keep `boot_b` as a known-good fallback.
 - **Test cycle:** `tools/devloop/dev.py IMAGE [ROOTPATH=FILE ...] --test ui --note NAME`, one at a time (check `pgrep -f devloop/dev.py`). It reaches OrangeFox with `fastboot reboot recovery`.
+- **Never put the text `devloop/dev.py` in a long-running command line,** such as a waiter. `plans/lag/run-arms.sh` waits with `pgrep -f devloop/dev.py` before each run, so a waiter that names it blocks the queue forever. Wait on a pid instead. This cost 10 minutes on 2026-11-02.
 - **File pushes:** `tools/devloop/06-hfs-put.py` replaces existing root files from recovery, without a reflash. It cannot create new paths and refuses a dirty journal.
 - **Root build:** `tools/boot/build-root-example.sh`, 7 minutes to build, 3 for the journal, then about 9 to flash.
 
