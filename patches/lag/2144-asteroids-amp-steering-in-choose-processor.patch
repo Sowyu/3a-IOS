@@ -1,0 +1,83 @@
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -4692,11 +4692,23 @@
+ uint64_t sweet_amp_big_mask;
+ uint64_t sweet_amp_little_mask;
+ int sweet_amp_pri = BASEPRI_DEFAULT;
++/*
++ * 2144: the steering above was only in choose_processor_smt(), and this kernel builds without CONFIG_SCHED_SMT, so it never
++ * ran (sweetamp_prio changed nothing, analysis/lag.md). It is now also in choose_processor(). sweetamp_ui=N (0 = off):
++ * a thread with base_pri >= N that finds no idle big core preempts the big core running the lowest-priority thread, when
++ * that thread's priority is below its own, instead of taking an idle little core. backboardd's render thread is 54 and
++ * SpringBoard's main thread 47: their frames ran on the A520s more than half the time, at about twice the encode time.
++ */
++int sweet_amp_ui_pri;
+ 
+ void sweet_amp_enable(uint64_t big, uint64_t little, int pri);
+ void
+ sweet_amp_enable(uint64_t big, uint64_t little, int pri)
+ {
++	int ui = 0;
++	if (PE_parse_boot_argn("sweetamp_ui", &ui, sizeof(ui)) && ui > 0 && ui < BASEPRI_RTQUEUES) {
++		sweet_amp_ui_pri = ui;
++	}
+ 	sweet_amp_pri = pri;
+ 	os_atomic_store(&sweet_amp_little_mask, little, relaxed);
+ 	os_atomic_store(&sweet_amp_big_mask, big, release);
+@@ -5228,11 +5240,19 @@
+ 				if ((thread->sched_pri < BASEPRI_RTQUEUES) || processor_is_fast_track_candidate_for_realtime_thread(pset, processor)) {
+ 					uint64_t idle_map = (pset->cpu_state_map[PROCESSOR_IDLE] & pset->recommended_bitmask);
+ 					uint64_t non_avoided_idle_map = idle_map & ~pset->perfcontrol_cpu_migration_bitmask;
++					bool keep_hint = true;
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++					/* 2144: wrong core class for this thread and an idle core of the right class exists */
++					uint64_t amp_want = sweet_amp_wanted_map(thread);
++					if (amp_want != 0 && !bit_test(amp_want, processor->cpu_id) && (idle_map & amp_want) != 0) {
++						keep_hint = false;
++					}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+ 					/*
+ 					 * If the rotation bitmask to force a migration is set for this core and there's an idle core that
+ 					 * that needn't be avoided, don't continue running on the same core.
+ 					 */
+-					if (!(bit_test(processor->processor_set->perfcontrol_cpu_migration_bitmask, processor->cpu_id) && non_avoided_idle_map != 0)) {
++					if (keep_hint && !(bit_test(processor->processor_set->perfcontrol_cpu_migration_bitmask, processor->cpu_id) && non_avoided_idle_map != 0)) {
+ 						return processor;
+ 					}
+ 				}
+@@ -5305,6 +5325,35 @@
+ 		/* there shouldn't be a pending AST if the processor is idle */
+ 		assert((idle_map & pset->pending_AST_URGENT_cpu_mask) == 0);
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		{
++			/* 2144: an idle core of the thread's class first (big for user threads at or above sweetamp_prio) */
++			uint64_t amp_want = sweet_amp_wanted_map(thread);
++			int want = amp_want != 0 ? lsb_first(idle_map & amp_want) : -1;
++			if (want >= 0) {
++				return processor_array[want];
++			}
++			/* sweetamp_ui: no idle big core; preempt the big core running the lowest priority below this thread's */
++			uint64_t big = os_atomic_load(&sweet_amp_big_mask, relaxed);
++			if (sweet_amp_ui_pri != 0 && big != 0 && amp_want == big && thread->base_pri >= sweet_amp_ui_pri &&
++			    get_threadtask(thread) != kernel_task) {
++				uint64_t busy_big = (pset->cpu_state_map[PROCESSOR_RUNNING] | pset->cpu_state_map[PROCESSOR_DISPATCHING]) &
++				    pset->recommended_bitmask & ~pset->pending_AST_URGENT_cpu_mask & big;
++				processor_t lowest = PROCESSOR_NULL;
++				for (int c = lsb_first(busy_big); c >= 0; c = lsb_next(busy_big, c)) {
++					processor_t p = processor_array[c];
++					if (p != PROCESSOR_NULL && (lowest == PROCESSOR_NULL || p->current_pri < lowest->current_pri)) {
++						lowest = p;
++					}
++				}
++				if (lowest != PROCESSOR_NULL && thread->sched_pri > lowest->current_pri) {
++					pset->last_chosen = lowest->cpu_id;
++					return lowest;
++				}
++			}
++		}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++
+ 		/*
+ 		 * Look at the preferred cores first.
+ 		 */

@@ -14,9 +14,13 @@ Updated 2026-11-02, about 22:20 AEDT. Update this file whenever the state change
 - Input latency: four kernel patches prepared, off by default, not yet run (`patches/input/` 2150 to 2153, `docs/input.md`): key poll period, touch on interrupt with sample timestamps, instant screen blank on power, and latching frames closer to the tick. Test after the lag agent, with a Sol audit of 2152 first, since it changes panel power.
 - Running on 2026-11-02 evening: a lag agent drives the phone through `dev.py` (`plans/lag/`, `analysis/lag.md`); a Freeform agent does desk work (`plans/freeform/`, `analysis/freeform.md`).
 
-## Overnight 2026-11-03, 01:00 to 08:00
+## Overnight 2026-11-03 results (written 06:35)
 
-The owner asked for the lag to be worked on autonomously overnight. The lag agent owns the phone after `plans/night-queue.sh` finishes (about 01:20): it picks a lever, runs it hands-free with `dev.py`, measures the share of 1-vsync gaps at 60 Hz, and keeps or drops it. Rules: RAM boots only, no flashing or boot-path writes, no 30 Hz cap, no visual reductions, keep and astwait together, stop on any run that needs a button. It ends by pushing the best known-good driver to the root. The Freeform and USB agents work at the desk only. The USB patches get a Sol audit before any boot. After a GO, the main session runs the USB levels between lag runs, lowest risk first, stopping at the first failure. The owner stayed up to press buttons if needed, alerted with `say`. The Mac side must need no sudo or approval. The Mac is kept awake with `caffeinate`.
+- **Lag:** 37 hands-free runs (ast101 to ast137). Best arm: UBWC on (`sweettu=sysmem,nocb,nolrz`) with the texture pool kept (`patches/lag/bgmtl-texpool-with-ubwc.patch`, built as `plans/lag/next-luma-ub/out-metal`) plus kernel 2144 (big-core steering that actually compiles): 73.9% of frame gaps at one vsync against a 67.9% baseline median, flip rate 0.24 against 0.31, heavy frames late 28% against 40 to 45%, 0 GPU recoveries. Dropped with runs: GPU clock, GMEM, light fetch sync, overlap ordering, bind cache, CoreAnimation pacing variables. Heavy glass frames still take 16 to 17 ms, right at one vsync. Details in `docs/lag.md`. Next: the owner tries UBWC + pool on the daily image; 2144 is in a Sol audit before joining the combined kernel. The root has the known-good `plans/lag/next-luma` driver (restored in ast137).
+- **App spacing:** fixed (ast110), see Small ones.
+- **USB:** level 2 PASS (ast107). Levels 3 and 4 are blocked by macOS accessory security, which never asked for approval (ast108, ast112). Needs the owner: check System Settings > Privacy & Security > Allow accessories to connect, then rerun `plans/usb/gadget/attended-l34.sh` style levels 3 and 4 with the v4 images in `plans/usb/gadget/out-v4`.
+- **Freeform:** the compositor fix (2130 v4) works; ast111 with the owner drawing finished cleanly with 0 recoveries, but logged no GPU drawing jobs. The owner's report of what the stroke did is pending.
+- Overnight control: queues paused with SIGSTOP and resumed with SIGCONT, waiting on pids only. A 20-minute heartbeat found nothing stuck all night.
 
 ## What works
 

@@ -1,0 +1,14 @@
+--- ../next-luma/Chlorophyll/src/bgmtl.m	2026-11-02 23:41:04
++++ Chlorophyll/src/bgmtl.m	2026-11-03 05:16:44
+@@ -488,8 +488,9 @@
+ {
+    static long cap = -1;
+    if (cap < 0) cap = getenv("BGMTL_TEXPOOL_MB") ? atol(getenv("BGMTL_TEXPOOL_MB")) << 20 : 0;
+-   // Bergamota: a taken texture is zeroed like new memory (chl_texture_zero), which only reads as clear without UBWC
+-   if (cap > 0 && (!getenv("TU_DEBUG") || !strstr(getenv("TU_DEBUG"), "noubwc"))) cap = 0;
++   // Bergamota: a taken texture is zeroed like new memory (chl_texture_zero). lag: kept with UBWC too. The zero covers the whole
++   // allocation, metadata included, so a taken texture is byte for byte a new one, which is also what a new UBWC texture is; and most
++   // takes are cleared by their first pass on the GPU (zero_kept). analysis/lag.md, UBWC.
+    return cap;
+ }
+ 

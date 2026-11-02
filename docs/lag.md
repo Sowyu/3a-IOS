@@ -451,3 +451,43 @@ Same 2144 kernel in both arms. The payload is `lumatrace` with CPU numbers and t
 - 0 recoveries in all three runs.
 
 This is the first lever tonight that moves pacing beyond noise. The gain is modest, about 4 to 5 points of 1-vsync share.
+
+### UBWC + pool + 2144 steering: the best arm (ast133 to 136)
+
+| Run | Arm | Shown fps | 1 vsync | Flip rate | Steady | Heavy late | Heavy on A520 |
+|---|---|---:|---:|---:|---:|---:|---:|
+| ast133 | UBWC + pool, kernel 2144 (default idle steering) | 44.5 | **73.9%** | **0.24** | **51.8%** | 29% | 30% |
+| ast135 | same | 44.3 | **73.9%** | **0.25** | **50.9%** | 28% | |
+| ast134 | UBWC + pool, combined kernel | 42.8 | 70.0% | 0.32 | 40.5% | 36% | |
+| ast136 | A60 baseline, combined kernel | 41.9 | 67.9% | 0.30 | 44.2% | 40% | |
+
+**Proven:** with both changes, the 1-vsync share rose from a median of 67.9% (five baseline runs: ast101, 104, 123, 125, 136) to 73.9%. The flip rate fell from about 0.31 to 0.24 and 0.25, and steady time rose from about 42% to about 51%. 0 recoveries.
+
+The kernel is `kernel-2144.sweet`, built from `research/xnu-local`. It has 2140 to 2144 but not 2130 or 2150 to 2153. `sweetamp` defaults to 1, so its idle steering is on without any boot arg. The UI preemption (`sweetamp_ui`) did not fit in 607 bytes next to the UBWC flags and was not tested with UBWC.
+
+## Night summary and what to make default
+
+All tonight's runs are RAM boots through `dev.py`. The black-bar fix (keep + astwait) was on in every arm.
+
+1. **UBWC with the texture pool kept.** It adds `plans/lag/patches/bgmtl-texpool-with-ubwc.patch`; the clean, trace-free build is `plans/lag/next-luma-ub/out-metal`. UBWC itself comes from `sweettu=sysmem,nocb,nolrz` in the boot args, or `sysmem,nocb,nolrz` in the root's `/private/var/db/bgmtl/bgmtl-bb.tudebug`, which is `sysmem,noubwc,nocb,nolrz` today. It cuts heavy-frame GPU time by 35 to 45% and shows no visual change in readable frames. The clean build has not run on the phone. Its only difference from the daily `next-luma` is the pool rule, and the trace build with the same rule ran three times. Owner check: Control Center, app open and close, home swipes.
+2. **2144 into the combined kernel.** It fixes CPU placement, which never worked before. It is a scheduler change, so a Sol audit comes first. With UBWC it adds about 4 points of 1-vsync share and steadier pacing.
+3. **Not useful, dropped:** GPU clock, GMEM (allowed or forced), the light fetch sync, hardware overlap ordering (the tear returns), the bind cache, `CA_FORCE_TRIPLE_BUFFERED_LATENCY`, `CA_DISABLE_LOW_LATENCY`, `CA_DISABLE_SERVER_TIMER_EARLY_WAKEUP`, the Metal GPU timing properties, and 30 Hz (the owner rejected it).
+
+**What still limits pacing, Inferred:**
+
+- Heavy glass frames take 16 to 17 ms from start to GPU end even with UBWC. That is right at one vsync.
+- CoreAnimation's own pacing decides, at each vsync, whether to start a frame. It does not follow any event of ours.
+- About 12 to 14% of heavy-frame gaps are the idle kind, where CoreAnimation had nothing new to draw.
+
+The next steps are reading QuartzCore's pacing decision (the ipsw workaround is above) and tracing SpringBoard's transactions, which needs a channel out of its sandbox.
+
+**Left on the root:** the daily driver `plans/lag/next-luma/out-metal` (`bgmtl-inject.dylib`, `libchlorophyll.dylib`, `bgl-launch`), pushed by the last run. The root's `bgmtl-bb.tudebug` file was not touched.
+
+Files for the night:
+
+- `plans/lag/tools/pacing.py`, `miss.py`
+- Patches: `plans/lag/patches/2144-asteroids-amp-steering-in-choose-processor.patch` and `bgmtl-texpool-with-ubwc.patch`
+- Kernels: `plans/lag/kernel/kernel-2144.sweet`
+- Builds: `plans/lag/next-luma-trace*` (trace arms) and `plans/lag/next-luma-ub` (the clean candidate)
+- Images: `plans/lag/build-pace.sh`, which builds `plans/lag/out/pace-*`
+- Batches: `plans/lag/night*.sh`
