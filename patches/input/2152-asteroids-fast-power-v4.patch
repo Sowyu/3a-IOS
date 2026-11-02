@@ -1,0 +1,640 @@
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -18,6 +18,7 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void sweet_hid_key(int key, int down);
++extern void sweet_fb_input_event(uint32_t kind);  /* SweetFramebuffer.cpp, 2152: 1 short power release, 2 power down, 4 other key */
+ void sweet_keys_init(void);
+ 
+ /*
+@@ -50,6 +51,11 @@
+ static unsigned keys_poll_ms = 20;      /* 2150 sweetkeys_ms: poll period; a press waits half of it on average */
+ /* 2150: when the last power press and release were seen (mach absolute), for SweetFramebuffer's display on/off timing lines */
+ uint64_t sweet_keys_power_abs[2];
++/* 2152: a press counts as short below this, and only with no other key down during it (Siri is a long press, a screenshot
++ * or SOS has a volume key down too) */
++#define KEYS_SHORT_MS   700
++static uint64_t keys_short_abs;
++static bool keys_power_solo;
+ 
+ static uint32_t
+ keys_rd(vm_offset_t base, uint32_t off)
+@@ -142,6 +148,17 @@
+ 				state[k] = now[k];
+ 				if (k == 0) {
+ 					__atomic_store_n(&sweet_keys_power_abs[state[k] ? 0 : 1], t, __ATOMIC_RELEASE);
++				}
++				/* 2152: the fast path hears of it before iOS does, so it records the display state the press found */
++				if (k == 0 && state[k]) {
++					keys_power_solo = !state[1] && !state[2] && !state[3];
++					sweet_fb_input_event(2);
++				} else if (k == 0) {
++					uint64_t down = __atomic_load_n(&sweet_keys_power_abs[0], __ATOMIC_ACQUIRE);
++					sweet_fb_input_event(keys_power_solo && t - down < keys_short_abs ? 1 : 0);
++				} else if (state[k]) {
++					keys_power_solo = false;
++					sweet_fb_input_event(4);
+ 				}
+ 				sweet_hid_key(k, state[k]);
+ 				absolutetime_to_nanoseconds(t, &ns);
+@@ -167,6 +184,7 @@
+ 		printf("SWEET KEYS: disabled (sweetkeys=0)\n");
+ 		return;
+ 	}
++	nanoseconds_to_absolutetime((uint64_t)KEYS_SHORT_MS * NSEC_PER_MSEC, &keys_short_abs);
+ 	(void)PE_parse_boot_argn("sweetkeys_ms", &keys_poll_ms, sizeof(keys_poll_ms));
+ 	if (keys_poll_ms < 2 || keys_poll_ms > 100) {
+ 		keys_poll_ms = 20;
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -54,6 +54,7 @@
+ #include "IOHIDUsageTables.h"
+ 
+ extern "C" uint64_t mach_absolute_time(void);
++extern "C" void sweet_fb_input_event(uint32_t kind);    /* SweetFramebuffer.cpp, 2152: 4 = a touch began, sent before iOS gets it */
+ 
+ /* One open client: the user client and its event callback. */
+ class IOHIDEventServiceClient : public OSObject {
+@@ -634,6 +635,9 @@
+ 	collection->setIntegerValue(kIOHIDEventFieldDigitizerChildEventMask, cmask);
+ 	collection->setIntegerValue(kIOHIDEventFieldDigitizerButtonMask, any ? 1 : 0);
+ 	IOLockUnlock(fLock);
++	if (!was && down) {
++		sweet_fb_input_event(4);
++	}
+ 
+ 	/* Per-touch lines flood the screen console: boot-arg sweethidlog=1 */
+ 	static int touch_log = -1;
+--- a/iokit/Kernel/arm/SweetFbScale.h
++++ b/iokit/Kernel/arm/SweetFbScale.h
+@@ -49,6 +49,109 @@
+ }
+ 
+ /*
++ * 2152: the power key's fast path, pixels only (sweetpanel=0 with the asteroids flip; panel modes 1 and 2 never use it).
++ * dark: the screen was flipped to black ahead of iOS's display off, keeping the buffer that was shown. iOS's state always
++ * wins: its display off ends the step, and a step iOS has not confirmed within the window is undone.
++ *
++ * Events are queued in order. Each carries iOS's display state and its generation (bumped on every RequestPowerChange that
++ * changes it), read before the key or touch went to iOS, so a press is classified by the state it began in, never by what iOS
++ * did with it since. A release darkens only if its press began with the display on and iOS has not changed it since. A press,
++ * another key or a touch ends a dark step. A dropped event (full queue) ends it too.
++ *
++ * sfs_fast_drain returns BLANK when a dark step starts and RESTORE when one ends with iOS's display still on, from the state
++ * before and after the whole batch, so a step undone within one batch costs nothing and is not started again in it.
++ */
++#define SFS_FAST_SHORT  1u      /* the power key came up after a short press with no other key during it */
++#define SFS_FAST_PRESS  2u      /* the power key went down */
++#define SFS_FAST_OTHER  4u      /* another key or a touch went down */
++#define SFS_OP_BLANK    1u      /* black now: flip to a black buffer, keeping the shown one */
++#define SFS_OP_RESTORE  2u      /* the step ended with iOS's display on: show the kept image again (sfs_fast_keep_next) */
++struct sfs_fast_ev {
++	uint32_t kind;
++	bool ios_off;           /* iOS's display state when the event was taken, before iOS saw it */
++	uint32_t gen;           /* and its generation */
++};
++struct sfs_fast {
++	bool dark;
++	bool press_on;          /* the current press began with the display on */
++	uint32_t press_gen;     /* in this generation */
++	uint64_t until;
++};
++
++static inline void
++sfs_fast_one(struct sfs_fast *f, uint32_t mode, const struct sfs_fast_ev *e, bool ios_off, uint32_t gen, bool can_blank,
++    bool may_dark, uint64_t now, uint64_t window)
++{
++	if (e->kind & (SFS_FAST_PRESS | SFS_FAST_OTHER)) {
++		f->dark = false;
++	}
++	if (e->kind & SFS_FAST_OTHER) {
++		f->press_on = false;
++	}
++	if (e->kind & SFS_FAST_PRESS) {
++		f->press_on = !e->ios_off;
++		f->press_gen = e->gen;
++	}
++	if (e->kind & SFS_FAST_SHORT) {
++		if (f->press_on && f->press_gen == gen && !ios_off && (mode & 1u) && can_blank && may_dark && !f->dark) {
++			f->dark = true;
++			f->until = now + window;
++		}
++		f->press_on = false;
++	}
++}
++
++static inline uint32_t
++sfs_fast_drain(struct sfs_fast *f, uint32_t mode, const struct sfs_fast_ev *evs, unsigned n, bool lost, bool ios_off,
++    uint32_t gen, bool can_blank, uint64_t now, uint64_t window)
++{
++	bool dark0 = f->dark;
++	if (f->dark && (ios_off || now >= f->until)) {
++		f->dark = false;
++	}
++	for (unsigned i = 0; i < n; i++) {
++		sfs_fast_one(f, mode, &evs[i], ios_off, gen, can_blank, !dark0, now, window);
++	}
++	if (lost) {
++		f->dark = f->press_on = false;
++	}
++	uint32_t ops = 0;
++	ops |= !dark0 && f->dark ? SFS_OP_BLANK : 0u;
++	ops |= dark0 && !f->dark && !ios_off ? SFS_OP_RESTORE : 0u;
++	return ops;
++}
++
++/*
++ * 2152: the kept image is owed back to the screen from the moment the black flip is tried until it is shown again or iOS
++ * turns the display off. The kernel asks this for the next step, does it, and asks again (at most three steps per call):
++ *   KEEP_FLIP  flip back to the kept buffer (normal path).
++ *   KEEP_BOOT  the flip path has stopped (a flip did not latch and astFallback took over): it scans the boot buffer, which
++ *              astFallback seeded from the black front, or with hardware scale with plain black. Put the kept image there.
++ *   KEEP_DONE  the debt is paid: the flip back latched, the boot buffer holds the image and is scanned, or iOS is off.
++ *   KEEP_WAIT  the boot buffer holds the image but the fallback could not restore scanout to it (frozen): no display path is
++ *              left for any frame, so the debt stays and is asked about again later, until iOS turns the display off.
++ * No step clears the debt on a failure: a flip that does not latch leads to KEEP_BOOT, never to KEEP_DONE.
++ */
++#define SFS_KEEP_DONE   0
++#define SFS_KEEP_FLIP   1
++#define SFS_KEEP_BOOT   2
++#define SFS_KEEP_WAIT   3
++static inline int
++sfs_fast_keep_next(bool ios_off, bool stopped, bool frozen, bool kept_on_screen, bool boot_written)
++{
++	if (ios_off) {
++		return SFS_KEEP_DONE;
++	}
++	if (!stopped) {
++		return kept_on_screen ? SFS_KEEP_DONE : SFS_KEEP_FLIP;
++	}
++	if (!boot_written) {
++		return SFS_KEEP_BOOT;
++	}
++	return frozen ? SFS_KEEP_WAIT : SFS_KEEP_DONE;
++}
++
++/*
+  * 2053: QSEED3 values for a bilinear upscale, as Linux _dpu_plane_setup_scaler3 and dpu_hw_setup_scaler3 with version > 0x1002:
+  * enable, Y/RGB filter 3 = bilinear, non-DX, blend_cfg, and bilinear alpha when the format has alpha. No coefficient LUT is used.
+  * 2110: vertical preload 2 from scaler version 0x3000 on, as _dpu_plane_setup_scaler3 (DPU_QSEED4_DEFAULT_PRELOAD_V).
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -250,8 +250,16 @@
+   restored ? "copy boot buffer" : "scanout unknown; copies frozen");
+  sweet_log_sync();
+ }
++/*
++ * 2152: set around present() while the screen is black ahead of iOS: the frame goes into the stage, never a flip slot, and is
++ * not flipped. present reaches astFlip only for a frame copied whole that passed its epoch check: that is when the stage
++ * holds a complete frame (sweet_fb_stage_done). Any earlier return leaves it marked incomplete.
++ */
++static bool sweet_fb_noflip, sweet_fb_stage_done;
++static unsigned sweet_fb_fast_rejects;
+ static void astFlip(unsigned back)
+ {
++ if (sweet_fb_noflip) { sweet_fb_stage_done = true; return; }
+  if (ast.stopped) return;
+  if (ast.first) {
+   IOLog("SWEET FB AST: first flip ctl=ae16000 pipe=ae05000 intf=ae36000 mdp=ae01000 src=%x dst=%x bytes=9dad00 slot=9dc000 end=e6440000 size=%x out=%x xy=%x/%x stride=%x fmt=%x op=%x layer=%x top=%x dsc=%x active=%x fetch=%x iflush=%x flush=%x mask=1 enable=%x config=%x hsync=%x period=%x start=%x endv=%x count=%x frame=%u line=%u irq=%x timeout_us=25000\n",
+@@ -345,6 +353,13 @@
+ }
+ class AppleCLCD;
+ static AppleCLCD *sweet_fb_shot_fb;             /* the framebuffer kern.sweet_fb_shot reads (patch 0224) */
++/* 2152 sweetpwrfast: the framebuffer the keys and touch threads report to, and their events in order (sweet_fb_input_event) */
++#define SWEET_FB_FAST_RING 16
++static AppleCLCD *sweet_fb_fast_fb;
++static IOSimpleLock *sweet_fb_fast_lock;
++static struct sfs_fast_ev sweet_fb_fast_ring[SWEET_FB_FAST_RING];
++static uint32_t sweet_fb_fast_head, sweet_fb_fast_tail;
++static bool sweet_fb_fast_lost;
+ extern "C" unsigned char iso_font[256 * 16];    /* osfmk/console/iso_font.c: the 8x16 console font */
+ extern "C" void sweet_gpu_hud_state(unsigned *mhz, unsigned *level, unsigned *busy_pct, int *gov, int *state); /* bsd/dev/sweet_a630.c */
+ extern "C" void sweet_cpufreq_hud_mhz(unsigned *a55_mhz, unsigned *a75_mhz);    /* bsd/dev/sweet_cpufreq.c */
+@@ -379,6 +394,7 @@
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
+ #include <kern/thread.h>
++#include <kern/thread_call.h>
+ #include <sys/proc.h>
+ #include <sys/errno.h>
+ 
+@@ -764,6 +780,22 @@
+ 	bool          fEmptyBlackArmed;       /* 0233: the next layerless swap may blank (boot, and once after each power on) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
+ 	uint64_t      fOnAbs;         /* 2150: when iOS asked for display on, until the first frame after it is shown */
++	uint32_t      fPowerGen;      /* 2152: display power changes iOS made, so a queued event knows what iOS has done since */
++	uint32_t      fFastMode;      /* 2152 sweetpwrfast=1: black at a short power release; 0 with panel commands */
++	uint64_t      fFastWindow;    /* sweetpwrfast_ms: how long a dark step iOS has not confirmed stands (absolute time) */
++	struct sfs_fast fFast;        /* work loop only */
++	uint32_t      fFastKept;      /* the asteroids buffer owed back to the screen (sfs_fast_keep_next), 0 = nothing owed */
++	uintptr_t     fFastStage;     /* v4: frames taken while black are composed here, never in the kept slot */
++	bool          fFastStageValid;        /* the stage holds a complete frame newer than the kept slot */
++	bool          usesDefaultSurface(const uint8_t *rec, uint32_t mask);
++	bool          fFastBoot;      /* the kept image has been written into the boot buffer for the fallback scanout */
++	thread_call_t fFastCall;      /* runs fastRun on the work loop for queued events */
++	thread_call_t fFastTimeout;   /* and at the window's end, and to retry a debt, whatever the vsync tick is doing */
++	static void   fastCall(thread_call_param_t p0, thread_call_param_t p1);
++	static IOReturn fastAction(OSObject *owner, void *a0, void *a1, void *a2, void *a3);
++	void          fastRun(const char *why);
++	bool          fastRestore(void);
++	void          fastShowInBoot(uintptr_t src);
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+@@ -1194,6 +1226,55 @@
+ 		IOLog("SWEET FB: tick every %u us, CoreAnimation told every %u ticks\n", fTickUS, fNotifyDiv);
+ 	}
+ 	fVsync->setTimeoutUS(fTickUS);
++	{
++		/*
++		 * 2152 sweetpwrfast=1: the screen goes black at a short power release, in parallel with iOS; iOS's own display off
++		 * confirms it, or the kept image comes back. Pixels only: with panel commands (sweetpanel=1 or 2), with no asteroids
++		 * flip, or with zero-copy scanout it stays off and nothing here runs.
++		 */
++		uint32_t mode = 0, ms = 2000;
++		PE_parse_boot_argn("sweetpwrfast", &mode, sizeof(mode));
++		PE_parse_boot_argn("sweetpwrfast_ms", &ms, sizeof(ms));
++		if (ms < 300 || ms > 3000) {
++			ms = 2000;
++		}
++		nanoseconds_to_absolutetime((uint64_t)ms * NSEC_PER_MSEC, &fFastWindow);
++		mode &= 1u;
++		if (mode != 0 && (fPanel || !ast.enabled || fZc)) {
++			IOLog("SWEET FB: sweetpwrfast ignored: it needs sweetpanel=0, the asteroids flip and no zero-copy scanout\n");
++			mode = 0;
++		}
++		if (mode != 0) {
++			sweet_fb_fast_lock = IOSimpleLockAlloc();
++			fFastCall = thread_call_allocate_with_priority(&AppleCLCD::fastCall, this, THREAD_CALL_PRIORITY_KERNEL_HIGH);
++			fFastTimeout = thread_call_allocate_with_priority(&AppleCLCD::fastCall, this, THREAD_CALL_PRIORITY_KERNEL_HIGH);
++			fFastStage = (uintptr_t)IOMallocData(astBytes);
++		}
++		if (sweet_fb_fast_lock != NULL && fFastCall != NULL && fFastTimeout != NULL && fFastStage != 0) {
++			fFastMode = mode;
++			__atomic_store_n(&sweet_fb_fast_fb, this, __ATOMIC_RELEASE);
++			IOLog("SWEET FB: fast power on, iOS has %u ms to confirm\n", ms);
++		} else if (mode != 0) {
++			/* a piece failed: free the others, the feature stays off */
++			if (sweet_fb_fast_lock != NULL) {
++				IOSimpleLockFree(sweet_fb_fast_lock);
++				sweet_fb_fast_lock = NULL;
++			}
++			if (fFastCall != NULL) {
++				thread_call_free(fFastCall);
++				fFastCall = NULL;
++			}
++			if (fFastTimeout != NULL) {
++				thread_call_free(fFastTimeout);
++				fFastTimeout = NULL;
++			}
++			if (fFastStage != 0) {
++				IOFreeData((void *)fFastStage, astBytes);
++				fFastStage = 0;
++			}
++			IOLog("SWEET FB: sweetpwrfast off: no memory for it\n");
++		}
++	}
+ 	if (fEarly) {
+ 		fSwapTimer = IOTimerEventSource::timerEventSource(this, &AppleCLCD::swapFired);
+ 		if (fSwapTimer == NULL || fWorkLoop->addEventSource(fSwapTimer) != kIOReturnSuccess) {
+@@ -1277,6 +1358,9 @@
+ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
++	if (fb->fFastMode) {
++		fb->fastRun("tick");    /* 2152: queued events, the window and any debt, also when the timeout call is late */
++	}
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
+ 	fb->fSt.ticks++;
+@@ -1400,7 +1484,14 @@
+ 	if (ast.enabled && rec == NULL) ast.repeated++; // Software presentation ticks with no new frame.
+ 	if (rec != NULL) {
+ 		fb->fCopyHold = taken;
++		/* 2152: while black ahead of iOS the frame is still taken, copied and its holds let go (2120), into the stage */
++		sweet_fb_noflip = fb->fFast.dark;
++		sweet_fb_stage_done = false;
+ 		fb->present(rec, copyEpoch);
++		if (sweet_fb_noflip && sweet_fb_stage_done) {
++			fb->fFastStageValid = true;
++		}
++		sweet_fb_noflip = false;
+ 		fb->fCopyHold = NULL;
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 		uint64_t onAbs = __atomic_exchange_n(&fb->fOnAbs, 0, __ATOMIC_ACQ_REL);
+@@ -1448,7 +1539,9 @@
+ 	sweet_hold_release(taken);      /* copied: CA may render into them again */
+ 	sweet_hold_release(stale);
+ 	fb->statsTick(now);
+-	fb->hudTick(now);
++	if (!fb->fFast.dark) {
++		fb->hudTick(now);       /* 2152: the HUD draws on the shown buffer, which is black then */
++	}
+ 	if (fb->fLatchLeadUS != 0 && rec != NULL && fb->fTickDeadlineUS != 0 && ast.lastLatch > now) {
+ 		/* 2153: this tick's flip latched; nudge the schedule so the next one lands sweetfb_lead before the panel's vsync */
+ 		uint32_t wait = (uint32_t)sweet_abs_us(ast.lastLatch - now);
+@@ -1526,8 +1619,8 @@
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
+ 	SweetSurface *taken[4] = {};
+ 
+-	if (fb->fPowerOff) {
+-		return;         /* the vsync tick runs the backlight ramp and redraws on power on */
++	if (fb->fPowerOff || fb->fFast.dark) {
++		return;         /* the vsync tick runs the backlight ramp and redraws on power on; 2152: and while black ahead of iOS */
+ 	}
+ 	fb->zcPoll();           /* 0216: also kicked by SwapWait when it saw the latch, so the frame it waited for is released now */
+ 	fb->scanBlitPoll();     /* 0241: a GPU scan-out copy whose fence passed is scanned now */
+@@ -2384,7 +2477,158 @@
+ /*
+  * Screen black in one step (the pixel fallback of the power-off fade): ABL's
+  * framebuffer is cleared with one memset and shown 1:1.
++ */
++/* 2152: the power key's fast path, always on the work loop (serialised with the vsync tick, present and every flip) */
++void
++AppleCLCD::fastCall(thread_call_param_t p0, thread_call_param_t p1 __unused)
++{
++	AppleCLCD *fb = (AppleCLCD *)p0;
++	fb->fWorkLoop->runAction(&AppleCLCD::fastAction, fb);
++}
++
++IOReturn
++AppleCLCD::fastAction(OSObject *owner, void *a0 __unused, void *a1 __unused, void *a2 __unused, void *a3 __unused)
++{
++	((AppleCLCD *)owner)->fastRun("call");
++	return kIOReturnSuccess;
++}
++
++/*
++ * Drains the queued events in order and applies sfs_fast_drain's decision. A dark step keeps the shown buffer (fFastKept)
++ * and flips another one to black. From then until the kept image is back on the screen, or iOS has turned the display off,
++ * fFastKept stays set and fastRestore runs on every call: at the window's end, on input, on every tick and on a 50 ms retry
++ * call. While dark, frames go on being taken and copied into the kept buffer without a flip, so it holds the newest frame.
++ */
++void
++AppleCLCD::fastRun(const char *why)
++{
++	struct sfs_fast_ev evs[SWEET_FB_FAST_RING];
++	unsigned n = 0;
++	IOSimpleLockLock(sweet_fb_fast_lock);
++	while (sweet_fb_fast_tail != sweet_fb_fast_head && n < SWEET_FB_FAST_RING) {
++		evs[n++] = sweet_fb_fast_ring[sweet_fb_fast_tail++ % SWEET_FB_FAST_RING];
++	}
++	bool lost = sweet_fb_fast_lost;
++	sweet_fb_fast_lost = false;
++	IOSimpleLockUnlock(sweet_fb_fast_lock);
++
++	uint64_t now = mach_absolute_time();
++	uint32_t owed0 = fFastKept;
++	IOLockLock(fLock);
++	bool off = fPowerOff;
++	bool canBlank = fFastKept == 0 && ast.enabled && !ast.stopped && ast.front != 0;
++	uint32_t ops = sfs_fast_drain(&fFast, fFastMode, evs, n, lost, off, fPowerGen, canBlank, now, fFastWindow);
++	IOLockUnlock(fLock);
++
++	bool blankFailed = false;
++	if (fFast.dark && ast.stopped) {
++		fFast.dark = false;     /* the flip path stopped under a dark step (nothing here flips then, but be sure): pay now */
++	}
++	if (ops & SFS_OP_BLANK) {
++		fFastKept = ast.front;
++		fFastBoot = false;
++		fFastStageValid = false;
++		blackout();
++		if (ast.stopped) {
++			fFast.dark = false;     /* the black flip did not latch: the fallback scans the boot buffer; the image goes back now */
++			blankFailed = true;
++		}
++	}
++	bool paid = fFastKept != 0 && !fFast.dark && fastRestore();
++	if (fFast.dark && (ops & SFS_OP_BLANK)) {
++		(void)thread_call_enter_delayed(fFastTimeout, fFast.until + 1);
++	} else if (fFastKept != 0 && !fFast.dark && !thread_call_isactive(fFastTimeout)) {
++		uint64_t retry;         /* a retry the vsync tick does not push back: armed only when none is pending */
++		nanoseconds_to_absolutetime((ast.frozen ? 1000 : 50) * NSEC_PER_MSEC, &retry);
++		(void)thread_call_enter_delayed(fFastTimeout, mach_absolute_time() + retry);
++	} else if (owed0 != 0 && fFastKept == 0) {
++		(void)thread_call_cancel(fFastTimeout);
++	}
++	if (ops != 0 || paid || blankFailed) {
++		IOLog("SWEET FB: fast power (%s):%s%s%s%s, %u events%s, display %s, power key down %lld ms ago\n", why,
++		    (ops & SFS_OP_BLANK) ? " black (shown buffer kept)" : "", blankFailed ? ", the black flip failed" : "",
++		    (ops & SFS_OP_RESTORE) ? (now >= fFast.until ? " back: iOS did not confirm in time" : " back: input") : "",
++		    paid ? " (kept image shown again)" : (owed0 != 0 && fFastKept == 0 ? " (iOS turned the display off)" : ""), n,
++		    lost ? " (some lost)" : "", off ? "off" : "on", sweet_power_key_ms(0, mach_absolute_time()));
++		if (sweet_fb_fast_rejects != 0) {
++			IOLog("SWEET FB: fast power: %u frames with the default surface left out while black\n", sweet_fb_fast_rejects);
++		}
++	}
++}
++
++/*
++ * 2152: pays the debt as sfs_fast_keep_next directs. True once the kept image is on the screen again. False with the debt
++ * still owed (frozen scanout) or paid by iOS turning the display off. Bound when flips fail: the flip back waits at most 25 ms
++ * for its latch, astFallback at most 25 ms more to scan the boot buffer, then one copy or scale of the image into it.
+  */
++bool
++AppleCLCD::fastRestore(void)
++{
++	uint32_t kept = fFastKept;
++	for (int i = 0; i < 3; i++) {
++		bool off = __atomic_load_n(&fPowerOff, __ATOMIC_ACQUIRE);
++		int step = sfs_fast_keep_next(off, ast.stopped, ast.frozen, ast.front == kept, fFastBoot);
++		if (step == SFS_KEEP_DONE) {
++			fFastKept = 0;
++			fFastBoot = false;
++			fFastStageValid = false;
++			return !off;
++		}
++		if (step == SFS_KEEP_WAIT) {
++			/*
++			 * ponytail: frozen scanout after a failed flip back leaves the last confirmed front, black, on the panel, and
++			 * nothing here can move it. 91 phone runs never logged "SWEET FB AST: fallback"; add a recovery path the
++			 * first time any phone log shows that line.
++			 */
++			return false;
++		}
++		if (step == SFS_KEEP_FLIP) {
++			if (fFastStageValid) {
++				/* v4: the stage holds a complete newer frame: into the kept slot, which is not on the panel */
++				memcpy((void *)ast.va[kept], (const void *)fFastStage, ast.hw ? ast.hwCanvas : astBytes);
++				fFastStageValid = false;
++			}
++			astFlip(kept);          /* a flip that does not latch ends in astFallback: ast.stopped, next step KEEP_BOOT */
++		} else {
++			fastShowInBoot(fFastStageValid ? fFastStage : ast.va[kept]);
++			fFastBoot = true;
++			IOLog("SWEET FB: fast power: a flip did not latch; kept image written to the boot buffer (scanout %s)\n",
++			    ast.frozen ? "unknown" : "restored");
++		}
++	}
++	return false;
++}
++
++/*
++ * 2152: from the keys thread (power key, other keys) and the touch thread (a finger down), always before the event goes to
++ * iOS, so it records iOS's display state as the press found it. Nothing unless sweetpwrfast is on.
++ */
++extern "C" void sweet_fb_input_event(uint32_t kind);
++void
++sweet_fb_input_event(uint32_t kind)
++{
++	AppleCLCD *fb = __atomic_load_n(&sweet_fb_fast_fb, __ATOMIC_ACQUIRE);
++	if (fb == NULL || kind == 0) {
++		return;
++	}
++	/*
++	 * RequestPowerChange stores the state, then the generation. A read that catches it between the two pairs the new state
++	 * with the old generation; the generation then never matches again, so that event cannot darken.
++	 */
++	struct sfs_fast_ev e;
++	e.kind = kind;
++	e.gen = __atomic_load_n(&fb->fPowerGen, __ATOMIC_ACQUIRE);
++	e.ios_off = __atomic_load_n(&fb->fPowerOff, __ATOMIC_ACQUIRE);
++	IOSimpleLockLock(sweet_fb_fast_lock);
++	if (sweet_fb_fast_head - sweet_fb_fast_tail < SWEET_FB_FAST_RING) {
++		sweet_fb_fast_ring[sweet_fb_fast_head++ % SWEET_FB_FAST_RING] = e;
++	} else {
++		sweet_fb_fast_lost = true;
++	}
++	IOSimpleLockUnlock(sweet_fb_fast_lock);
++	(void)thread_call_enter(fb->fFastCall);
++}
++
+ void
+ AppleCLCD::blackout(void)
+ {
+@@ -4021,6 +4265,58 @@
+ 		.h = h, .px0 = px0, .n = px1 - px0,
+ 	};
+ 	sweet_rows_run(&job, py0, py1);
++}
++
++/*
++ * 2152: the image at src (the kept slot or the stage) into the boot buffer, which astFallback scans in the panel layout.
++ * Without hardware scale src has that layout too. With it, src is the canvas (fLogicalW x fLogicalH at ast.hwStride): scale it
++ * as the copy path's nearest-neighbour branch does (presentScaled). The boot buffer may already be on the panel, so only the
++ * bars around the image are cleared and the image is drawn over what is there, not after a full clear.
++ */
++void
++AppleCLCD::fastShowInBoot(uintptr_t src)
++{
++	if (src == 0) {
++		return;
++	}
++	if (!ast.hw) {
++		memcpy((void *)fPixels, (const void *)src, astBytes);
++	} else if (fScale != 0 && fXMap != NULL) {
++		int32_t px0 = fPadX, px1 = fPadX + (int32_t)((uint64_t)fLogicalW * fScaleXNum / fScaleXDen);
++		int32_t py0 = fPadY, py1 = fPadY + (int32_t)((uint64_t)fLogicalH * fScaleYNum / fScaleYDen);
++		px1 = px1 > (int32_t)fWidth ? (int32_t)fWidth : px1;
++		py1 = py1 > (int32_t)fHeight ? (int32_t)fHeight : py1;
++		for (uint32_t y = 0; y < fHeight; y++) {
++			uintptr_t row = fPixels + (uint64_t)y * fRowBytes;
++			if ((int32_t)y < py0 || (int32_t)y >= py1) {
++				bzero((void *)row, (size_t)fWidth * 4);
++			} else {
++				bzero((void *)row, (size_t)px0 * 4);
++				if (px1 < (int32_t)fWidth) {
++					bzero((void *)(row + (uint64_t)px1 * 4), (size_t)(fWidth - px1) * 4);
++				}
++			}
++		}
++		for (int32_t px = px0; px < px1; px++) {
++			int32_t lx = (int32_t)((uint64_t)(px - fPadX) * fScaleXDen / fScaleXNum);
++			fXMap[px - px0] = (uint32_t)(lx < 0 ? 0 : (lx >= (int32_t)fLogicalW ? (int32_t)fLogicalW - 1 : lx));
++		}
++		struct sweet_rows_job job = {
++			.base = (const uint8_t *)src, .draw = fPixels, .xmap = fXMap, .bpr = ast.hwStride, .rowBytes = fRowBytes,
++			.padY = fPadY, .scaleYNum = fScaleYNum, .scaleYDen = fScaleYDen, .sy = 0, .dy = 0, .h = (int32_t)fLogicalH,
++			.px0 = px0, .n = px1 - px0,
++		};
++		if (px1 > px0 && py1 > py0) {
++			sweet_rows_run(&job, py0, py1);
++		}
++		fBarsMask |= 1u;
++	} else {
++		uint32_t rows = fLogicalH < fHeight ? fLogicalH : fHeight, bytes = ast.hwStride < fRowBytes ? ast.hwStride : fRowBytes;
++		for (uint32_t y = 0; y < rows; y++) {
++			memcpy((void *)(fPixels + (uint64_t)y * fRowBytes), (const void *)(src + (uint64_t)y * ast.hwStride), bytes);
++		}
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
+ }
+ 
+ void
+@@ -4042,7 +4338,27 @@
+ 	}
+ }
+ 
++/* 2152 v4: whether an enabled layer of the record is the published default surface (fSurface), which present answers with
++ * astFallback in the middle of the layers */
+ bool
++AppleCLCD::usesDefaultSurface(const uint8_t *rec, uint32_t mask)
++{
++	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
++		uint32_t id = get32(rec, 0x54 + 4 * layer);
++		if (!(mask & (1u << layer)) || id == 0) {
++			continue;
++		}
++		SweetSurface *s = sweet_surface_copy(id);
++		bool found = s != NULL && s == fSurface;
++		OSSafeReleaseNULL(s);
++		if (found) {
++			return true;
++		}
++	}
++	return false;
++}
++
++bool
+ AppleCLCD::astCovered(const uint8_t *rec, uint32_t mask)
+ {
+ 	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
+@@ -4145,14 +4461,24 @@
+  if (ast.enabled && !ast.stopped) {
+   back = ast.front == 1 ? 2 : 1;
+   fDrawIdx = back;
+-  fDraw = ast.va[back];
++  if (sweet_fb_noflip && usesDefaultSurface(rec, mask)) {
++   sweet_fb_fast_rejects++;    // 2152 v4: it would end in astFallback partway through; nothing is written while black
++   return;
++  }
++  fDraw = sweet_fb_noflip ? fFastStage : ast.va[back];
+   if (ast.bar && (ast.pipe[5] == astPA[back] || (ast.ctl[6] & 1))) {
+    // 2090: never expected. The slot about to be written is on the panel, or the last flip has not latched.
+    if (ast.barScanned++ < 16) IOLog("SWEET FB BAR: writing a scanned slot %u src=%x flush=%x line=%u\n", back, ast.pipe[5], ast.ctl[6], ast.intf[0xb0/4]);
+   }
+   // Preserve partial damage outside this swap before the row workers start. A reading copy from
+   // write-combined memory is slow, so skip it when a layer that will draw covers the whole canvas.
+-  if (!astCovered(rec, mask)) {
++  if (sweet_fb_noflip) {
++   // 2152 v4: the frame before is the stage when it holds a complete one, else the kept slot. The stage is incomplete from
++   // here until present reaches astFlip with this frame whole and its epoch current.
++   bool fresh = !fFastStageValid;
++   fFastStageValid = false;
++   if (fresh && !astCovered(rec, mask)) memcpy((void *)fDraw, (const void *)ast.va[fFastKept], ast.hw ? ast.hwCanvas : astBytes);
++  } else if (!astCovered(rec, mask)) {
+    ast.preserves++;
+    // 2053: before the first canvas the front is in the boot layout, so a partial first frame starts from black.
+    if (ast.hw && !ast.hwOn) memset((void *)fDraw, 0, ast.hwCanvas);
+@@ -4533,7 +4859,8 @@
+ 			IOLockLock(fFB->fLock);
+ 			uint64_t t = mach_absolute_time();
+ 			if (off != fFB->fPowerOff) {
+-				fFB->fPowerOff = off;
++				__atomic_store_n(&fFB->fPowerOff, off, __ATOMIC_RELEASE);
++				__atomic_store_n(&fFB->fPowerGen, fFB->fPowerGen + 1, __ATOMIC_RELEASE);      /* 2152 */
+ 				__atomic_store_n(&fFB->fOnAbs, off ? 0 : t, __ATOMIC_RELEASE);
+ 				fFB->fEmptyBlackArmed = !off;   /* 0233: the first swap after the display comes on may be layerless: black */
+ 				fFB->fFadeStep = 0;
+@@ -4542,6 +4869,9 @@
+ 				fFB->fDirty = true;     /* on: redraw the latest frame */
+ 			}
+ 			IOLockUnlock(fFB->fLock);
++			if (fFB->fFastMode) {
++				(void)thread_call_enter(fFB->fFastCall);        /* 2152: iOS's answer ends a dark step now, not at the next tick */
++			}
+ 			IOLog("SWEET FB: display %s (power key down %lld ms, up %lld ms ago)\n", off ? "off" : "on",
+ 			    sweet_power_key_ms(0, t), sweet_power_key_ms(1, t));
+ 		}

@@ -126,6 +126,29 @@ Each fix has a mutation that takes it out again, and every one is caught:
 
 The glue mutations are in the model's mirror; the two header mutations are in real code. `fast_power_check.c` covers each rule of `sfs_fast_drain`, an exhaustive table of `sfs_fast_keep_next`, and a 2-million-step walk. Its generation and touch-cancel mutations fail as they should. `patch_scope_check.py` passes and catches its own two mutations: the panel guard removed, and a panel call added.
 
+### 2152 v4, after Sol's third audit (`analysis/2152-audit3.md`)
+
+Sol rated v3 NO-GO with `sweetpwrfast=1` and acceptable with it off. v3 goes into tonight's kernel off by default, unchanged. v4 is a separate file, `plans/input/patches/2152-asteroids-fast-power-v4.patch`, that applies in v3's place.
+
+1. **Finding 2 is fixed.** v3 composed frames taken while black straight into the kept slot. A record that stopped partway (a later layer being the default surface, which makes `present` call `astFallback` with hardware scale) or one refused by the epoch check left that slot incomplete, and v3 then restored it. In v4:
+   - Those frames go into a separate stage buffer (`fFastStage`, allocated only with `sweetpwrfast=1`), so the kept slot is never written while black.
+   - The stage is marked incomplete before its first write. It counts as complete only when `present` reaches `astFlip`, the single point after a whole copy and a passed epoch check (`sweet_fb_stage_done`).
+   - Rollback copies a complete stage into the kept slot, which is not on the panel, before flipping. With an incomplete stage it uses the untouched kept slot. The boot-buffer path picks its source the same way.
+   - A record with a default-surface layer is refused while black, before anything is written, so 2152 never triggers a fallback by presenting.
+2. **Finding 1 is a known limit, not fixed.** If the flip back fails and the fallback also fails to restore scanout, the panel can keep scanning black while iOS has the display on. 91 phone runs never logged `SWEET FB AST: fallback`, so the owner chose to record the limit rather than build a new recovery path. The code carries a `ponytail:` marker at `SFS_KEEP_WAIT` naming the trigger: the first phone log with that line.
+3. **Finding 3, small fix.** The boot-buffer recovery clears only the scaling bars and draws the image over what is there, instead of blanking the whole live buffer first. It still writes a buffer that may be on the panel, so a partial frame for one refresh remains possible.
+4. **Finding 4, documentation.** The bound is conditional on the work loop making progress: the window, timer and gate scheduling, any present already running, two 25 ms latch waits, the fallback's seeding and one copy or scale. It has not been timed.
+5. **Finding 5, small fix.** If setup fails partway, the pieces already allocated are freed. Teardown of a running provider is still not handled, because AppleCLCD is never stopped in this boot.
+
+Checks: `host-check/fast_power_model.c` now builds v2, v3 and v4. It models records that stop partway or fail the epoch check, and a stage for v4:
+
+| Scenario | Measure | v3 | v4 |
+|---|---|---|---|
+| Black, then a two-layer record whose second layer is the default surface | incomplete image shown | 4449 ms | 0 ms, and no fallback entered |
+| Black, then a frame refused by the epoch check | incomplete image shown | 2898 ms | 0 ms |
+
+Each earlier scenario gives the same result on v4 as on v3. The 3000-run differential random walk on v4 now also sends both kinds of record. It found no violation: no incomplete image shown, and no fallback started by a frame while black. Two new mutations, refusing nothing and counting the stage complete before `astFlip`, are caught by the two new scenarios. The six earlier mutations are caught on v4 too.
+
 Not prepared:
 
 - A GIC interrupt for touch or PON. It needs new GIC and PDC plumbing under Gunyah, and the poll fixes get most of the gain. Revisit if the 0.5 ms passes cost measurable power.
