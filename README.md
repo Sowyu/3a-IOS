@@ -8,17 +8,18 @@ Work in progress. iOS 26.6.2 runs on a Nothing Phone (3a) Pro (Asteroids, SM7635
 - Metal to Vulkan through Chlorophyll on Mesa Turnip
 - Native-shaped 840x1860 canvas, no bars or zoom
 - iPhone 11 status bar layout
-- Journaled root on internal storage, loaded by `fastboot boot` from a Mac
+- Journaled root on internal storage, cold boots from the power button
 
 **Does not work yet:**
 
 - Wi-Fi, mobile data, sound, a real battery reading
-- Cold boot without a Mac
 - Metal in apps, so PencilKit drawing crashes
 - Widgets, which stay on "Waiting..."
 - Smooth animation: about 25 to 35 frames/s while animating
 
 ## What is here
+
+- `HANDOFF.md` has the current state and what to do next. A new contributor or thread should read it first.
 
 - `docs/` holds the plans and bug reports. Start with `docs/roadmap.md`, though some of it has moved on. Each report separates proven from inferred.
 - `patches/kernel/` has the XNU patches, on top of `nothing-sm7635-devs/ios-asteroids` branch `asteroids-ios26` through its patch 2049.
@@ -31,7 +32,7 @@ No iOS images, firmware, shared cache, boot or partition dumps, or phone logs. T
 
 ## Warning
 
-Android boots after a normal reset on stock boot slots, and it formats `userdata`, which is where iOS lives. Read `docs/plan-boot.md` before flashing anything. Nothing here is tested beyond one phone.
+On stock boot slots, Android boots after a normal reset, and it formats `userdata`, which is where iOS lives. Read `docs/plan-boot.md` before flashing anything. Nothing here is tested beyond one phone.
 
 ## Credits
 

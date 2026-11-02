@@ -1,3 +1,42 @@
+# The colour band over the boot logo
+
+The band is the GPU bring-up test in stage 16, `a810_stage16` in `bsd/dev/sweet_a810.c`, from patch 2005. It has nothing to do with the hardware scaler. I can't prove it from the photos alone, but every fact I can check agrees and nothing else in the tree draws this.
+
+| Fact | Code | Owner's report and photo |
+|---|---|---|
+| Colours | Red, green and blue thirds across the width | Blue, green and red stripes |
+| White | 4 white rows at the top and bottom of the band | "With a white rectangle" |
+| Position | Rows 160..319 of 2392, full width | Top of the panel, not touching the top edge, about 200 to 370 rows in the photo |
+| Blue third | x 720..1079 | Photo's top third, which is the panel's right side once the mirroring and rotation are undone |
+| Timing | Drawn once, nothing clears it until the first flip at SpringBoard's first frame | Appears after the small rectangle, stays until the Apple logo |
+
+The photo overestimates the height because the band is overexposed: the code gives 6.7% of the panel, the owner's estimate was 12%. The first photo's white and cyan are that overexposure. The second photo, band absent, fits a moment before the band. The owner's order now puts it there, not after.
+
+The log confirms the draw. ast39 prints `stage 16 bar st 0 ... pixels 0xff0000 0xff00 0xff ok`, read back from the framebuffer itself.
+
+## Questions from the report
+
+- It occurs with CPU scaling too. ast38, a CPU boot, has the same log line, and so do 55 of the 61 logs. `sweeta810=16` is in every recent boot line. The owner most likely saw it first on this boot because of looking at the phone at that moment, which I can't verify.
+- It isn't stale memory. The GPU writes it on each boot and the kernel reads it back, so cold and warm boots behave alike.
+- It isn't a slot or stride fault. The logo stays correct around it, so slot 0 is still scanned at boot layout. 2053 only programs the scaler at the first flip, which is later, and it clears slot 0 after that flip.
+- 2111's chart is off without its boot-arg, and `next-flash` doesn't set it.
+- The shim only draws on failure: `con_clear(RED)` on an exception and `con_clear(BLUE)` on a loader error, both full screen. `plans/boot/01` draws nothing.
+- `sweet_early.c` draws only with `sweetearlyfb=1` or a panic, and it draws at the bottom of the screen.
+- The other patches you listed have no such pattern. Only 2002 has these colours in added lines, and that is this band's pixel helper.
+
+## Fix
+
+`plans/hwscale/patches/2112-asteroids-a810-no-boot-band.patch` removes the band from stage 16. The one-packet IB stays as the stage's gate, so the GPU is still proven before publication. The patch passes `git apply --check` and `-fsyntax-only` with the kernel's flags with 0 errors (`plans/hwscale/kernel-syntax-2112.log`). It has not been built or run.
+
+I didn't clear the slots or defer the scaler switch, because neither is the cause. Clearing slot 0 would also erase the logo.
+
+Two side effects:
+
+- The 10 s wait stays. `SweetAdrenoPublish` runs after it and backboardd opens that service, so removing it moves the boot order, and I'd test that on its own. It may save up to 10 s of boot.
+- Later GPU pool allocations move down by the band's IB, about 0.7 MB, because the pool hands out memory in order. I expect no effect.
+
+What the owner should see: the Nothing logo and the small rectangle stay clean until the Apple logo, with no band, and the GPU works as before. The log has `SWEET A810: the GPU is up (sweet_a810_ready), no band (2112)` and no `stage 16 bar` line.
+
 # Does the VIG0 hardware scaler crop or shift the picture?
 
 ## Result

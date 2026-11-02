@@ -1,0 +1,135 @@
+2112: stage 16 no longer has the GPU draw its red, green and blue band into the boot framebuffer. UNTESTED ON A PHONE, syntax-checked only.
+Why: sweeta810=16 draws rows 160..319 of 0xe3940000 on every boot, with or without sweetfb_ast_hw, and nothing clears them until the first flip, so the band sits over the boot logo. Stage 16's one-packet IB stays as the gate. The GPU also loses its write mapping of those framebuffer pages.
+Apply: git apply on the current tree, then rebuild the kernel. Check: "SWEET A810: the GPU is up (sweet_a810_ready), no band (2112)" in the log. Recovery: boot the previous image.
+
+diff --git a/bsd/dev/sweet_a810.c b/bsd/dev/sweet_a810.c
+--- a/bsd/dev/sweet_a810.c
++++ b/bsd/dev/sweet_a810.c
+@@ -30,8 +30,7 @@
+  *      the scratch page, the power-up list
+  *  15  14, and the zap shader (ADT "zap-mbn") through SCM PAS 13 into 0x9ea9a000, then CP_SET_SECURE_MODE 0 and a
+  *      CP_MEM_WRITE of 0x05ec0ff1
+- *  16  15, and a one-packet IB, then a red/green/blue band (white edges) the GPU writes into the framebuffer near the
+- *      top, drawn once and left for 10 s; then sweet_a810_ready() is true
++ *  16  15, and a one-packet IB, then a 10 s wait; then sweet_a810_ready() is true
+  * Each stage has rootstockos's gate; the first gate that fails stops the run and says why. After a failure once the GMU
+  * was started, the CP is stopped (CP_SQE_CNTL 0) if it was started, and the GMU is put back in reset (CM3_SYSRESET = 1,
+  * read back). sCR0 of the GPU SMMU is only ever read.
+@@ -41,8 +40,7 @@
+  * gmuPrerequisites, gmuClocksOn, gmuState, gmuColdStart, gpuGx; Copyright (c) 2026, UniXNU contributors / rootstockos
+  * contributors, BSD-2-Clause-Patent), ported to C for this kernel; its board facts are package/GpuPowerBoard.h
+  * (sweet_a810_board.h here, unchanged), the register map NativeAdrenoA810HwInit.h (MIT). Stages 12-16 are
+- * gpuSurvey, gpuHwInit, cpStart, zapStart and barStart of the same file (the bar near the top and drawn once, not two
+- * thirds down every 200 ms), with sweet_a810_cp.c (NativeAdreno's ring, CP init and power-up list, MIT) and
++ * gpuSurvey, gpuHwInit, cpStart, zapStart and barStart of the same file (without its bar), with sweet_a810_cp.c (NativeAdreno's ring, CP init and power-up list, MIT) and
+  * sweet_a810_smmu.c (the GPU's context). The SHA-256 below is
+  * NativeAdreno's NativeAdrenoSha256.cpp (MIT, Copyright (c) 2026 NativeAdreno contributors) in C.
+  * I/O on this kernel: plain 32-bit ldr/str with dsb sy (the phone runs under the Gunyah hypervisor, which aborts other
+@@ -1321,14 +1319,7 @@
+ 	return 1;
+ }
+ 
+-/* ---- Stage 16: a one-packet IB, then a band the GPU writes into the framebuffer (barStart) ---- */
+-#define A810_FB_PA              0xE3940000ULL   /* the 3a's UEFI framebuffer: 1080 x 2392, 4320 bytes a row, x8r8g8b8 */
+-#define A810_FB_WIDTH           1080u
+-#define A810_FB_HEIGHT          2392u
+-#define A810_FB_STRIDE          4320u
+-#define A810_BAR_Y0             160u            /* near the top, below the status area */
+-#define A810_BAR_ROWS           160u
+-
++/* ---- Stage 16: a one-packet IB (barStart without its band: 2112, the band showed over the boot logo until the first frame) ---- */
+ static int
+ a810_ib(uint64_t iova, uint32_t dwords, uint32_t *fence, uint32_t *seen, int *st, int *wait)
+ {
+@@ -1387,89 +1378,10 @@
+ 		return 0;
+ 	}
+ 
+-	/* The framebuffer: the console's, when it is the 3a's 32-bit panel framebuffer; else the board's own facts. */
+-	PE_Video video;
+-	uint64_t fb = A810_FB_PA;
+-	uint32_t width = A810_FB_WIDTH, height = A810_FB_HEIGHT, stride = A810_FB_STRIDE;
+-	if (PE_current_console(&video) == 0) {
+-		A810_LOG("SWEET A810: bar: console %#lx %lux%lu row %lu depth %lu\n", video.v_baseAddr, video.v_width,
+-		    video.v_height, video.v_rowBytes, video.v_depth);
+-		if (video.v_depth == 32 && video.v_baseAddr == A810_FB_PA && video.v_width >= 3 && video.v_width <= 16381 &&
+-		    video.v_height >= 3 * A810_BAR_ROWS && video.v_rowBytes >= video.v_width * 4) {
+-			width = (uint32_t)video.v_width;
+-			height = (uint32_t)video.v_height;
+-			stride = (uint32_t)video.v_rowBytes;
+-		}
+-	}
+-	struct gpb_bar b;
+-	b.y0 = A810_BAR_Y0;
+-	b.rows = A810_BAR_ROWS;
+-	b.width = width;
+-	b.row_bytes = stride;
+-	const uint64_t first = fb + (uint64_t)b.y0 * stride, end = first + (uint64_t)(b.rows - 1) * stride + width * 4u;
+-	b.page = first & ~0xfffULL;
+-	b.bytes = ((end + 0xfffULL) & ~0xfffULL) - b.page;
+-	b.offset = first - b.page;
+-	b.ib_dwords = b.rows * (3u + width);
+-	b.ib_bytes = (b.ib_dwords * 4u + 0xfffu) & ~0xfffu;
+-	A810_LOG("SWEET A810: bar: fb %#llx %ux%u row %u; rows %u-%u span %#llx+%#llx at %#llx, ib %u dwords\n", fb, width, height,
+-	    stride, b.y0, b.y0 + b.rows - 1, b.page, b.bytes, b.offset, b.ib_dwords);
+-	if (b.y0 + b.rows > height || b.bytes > GPB_FB_MAX || b.ib_bytes > GPB_BAR_IB_MAX) {
+-		a810_fail(16, "bar plan");
+-		return 0;
+-	}
+-	mst = a810_gpu_map(GPB_FB_IOVA, b.page, b.bytes, A810_GPU_PROT_READ | A810_GPU_PROT_WRITE);
+-	if (mst) {
+-		A810_LOG("SWEET A810: bar fb map %s\n", a810_smmu_status_text((uint32_t)mst));
+-		a810_fail(16, "framebuffer map");
+-		return 0;
+-	}
+-	volatile uint32_t *bar_ib = a810_gpool_take(b.ib_bytes, &pa);
+-	if (!bar_ib || a810_pm4_type7(GPB_CP_MEM_WRITE, b.width + 2, &header)) {
+-		a810_fail(16, "bar IB");
+-		return 0;
+-	}
+-	/* gpb_bar_fill, written straight into the write-combined IB with 32-bit stores */
+-	uint32_t k = 0;
+-	for (uint32_t row = 0; row < b.rows; ++row) {
+-		const uint64_t to = GPB_FB_IOVA + b.offset + (uint64_t)row * b.row_bytes;
+-		bar_ib[k++] = header;
+-		bar_ib[k++] = (uint32_t)to;
+-		bar_ib[k++] = (uint32_t)(to >> 32);
+-		for (uint32_t x = 0; x < b.width; ++x) {
+-			bar_ib[k++] = gpb_bar_pixel(&b, x, row);
+-		}
+-	}
+-	__asm__ volatile ("dsb sy" ::: "memory");
+-	mst = a810_gpu_map(GPB_BAR_IB_IOVA, pa, b.ib_bytes, A810_GPU_PROT_READ);
+-	if (mst) {
+-		A810_LOG("SWEET A810: bar ib map %s\n", a810_smmu_status_text((uint32_t)mst));
+-		a810_fail(16, "bar IB map");
+-		return 0;
+-	}
+-	A810_LOG("SWEET A810: next: bar: drawing once from the IB at %#llx\n", GPB_BAR_IB_IOVA);
+-	a810_ib(GPB_BAR_IB_IOVA, b.ib_dwords, &fence, &seen, &st, &wait);
+-	uint32_t px[3] = {0, 0, 0};
+-	vm_offset_t view = ml_io_map_wcomb(b.page, b.bytes);
+-	if (view) {
+-		const volatile uint32_t *mid = (const volatile uint32_t *)(view + b.offset + (size_t)(b.rows / 2) * b.row_bytes);
+-		px[0] = mid[b.width / 6];
+-		px[1] = mid[b.width / 2];
+-		px[2] = mid[b.width * 5 / 6];
+-	}
+-	ok = !st && !wait;
+-	const int same = px[0] == 0x00ff0000u && px[1] == 0x0000ff00u && px[2] == 0x000000ffu;
+-	A810_LOG("SWEET A810: stage 16 bar st %d fence %u %s seen %u pixels %#x %#x %#x %s\n", st, fence,
+-	    wait < 0 ? "-" : a810_fence_text[wait & 3], seen, px[0], px[1], px[2], ok && same ? "ok" : "miss");
+-	a810_cp_state("bar");
+-	if (!ok) {
+-		a810_fail(16, "bar IB fence");
+-		return 0;
+-	}
+ 	a810_ring_request_reset(&a810_ring);   /* the first user submission carries the context entry */
+ 	a810_ready = 1;
+-	A810_LOG("SWEET A810: the GPU is up (sweet_a810_ready); the band stays for 10 s unless the console scrolls over it\n");
+-	delay_for_interval(10, NSEC_PER_SEC);
++	A810_LOG("SWEET A810: the GPU is up (sweet_a810_ready), no band (2112)\n");
++	delay_for_interval(10, NSEC_PER_SEC);   /* 2112: only the wait the band had, so backboardd's start does not move. ponytail: remove once a boot shows nothing races */
+ 	return 1;
+ }
+ 

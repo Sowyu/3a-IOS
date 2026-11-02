@@ -25,7 +25,7 @@ PUT = HERE / '06-hfs-put.py'
 HFS_PULL = REPO / 'tools/sweet-hfs-pull.py'
 PY = ['python3', '-I']
 LOG_PULL = REPO / 'tools/sweet-log-pull.sh'
-RECOVERY = ROOT / 'recovery/OrangeFox-R12.0_6.1-Unofficial-Asteroids.img'
+RECOVERY = ROOT / 'recovery/ramboot/orangefox-ram.img'
 HOOKED = '/usr/local/libexec/renegade-firstboot.sh'
 FRAMES = '/private/var/selftest/frames'
 PULLS = ['/private/var/tmp/bgl-backboardd.log', '/private/var/tmp/bgmtl.log', '/private/var/tmp/sweetrun.log',
@@ -256,16 +256,13 @@ class Cycle:
         """Ends with adbd as root. `adb root` restarts adbd, so the server is restarted as in /tmp/pull-log.sh."""
         if self.state == 'fastboot':
             self.say('booting recovery')
-            self.r.sleep(4)
-            # the phone's recovery_a is OrangeFox; `fastboot boot` of its 100 MiB image fails with rc 1 (ast28)
-            self.boot_until_left('recovery slot', ['fastboot', 'reboot', 'recovery'])
+            # recovery_a has no kernel: ABL takes boot_a's, which is ours now, so `reboot recovery` boots iOS.
+            # This is OrangeFox's ramdisk with the stock kernel, in RAM only, and `boot` of it writes nothing.
+            self.boot_until_left(self.a.recovery)
             self.state = 'unknown'
         def up():
             s = self.recovery()
-            if not s and self.fastboot():       # the reboot can drop back to fastboot: /tmp/pull-log.sh retries it the same way
-                self.r.run(['fastboot', 'reboot', 'recovery'], timeout=300)
-                self.r.sleep(12)
-            elif not s:
+            if not s:
                 self.r.run(['adb', 'kill-server'])
                 self.r.run(['adb', 'start-server'], timeout=30)
             return s
