@@ -1,0 +1,32 @@
+--- a/Chlorophyll/src/bgmtl.m
++++ b/Chlorophyll/src/bgmtl.m
+@@ -792,7 +792,7 @@
+ // ponytail: the hold also covers the flip's latch wait. Release it right after the copy if wait_us shows up in the frame rate.
+ #define BG_HOLD_TARGETS 4
+ #define BG_HOLD_MAX_US 50000
+-static struct { uint64_t commits, busy, wait_us, max_us, timeouts, skipped, log_ns; unsigned stuck, rest; } g_hold;
++static struct { uint64_t commits, busy, wait_us, max_us, timeouts, skipped, log_ns, rest_until; unsigned stuck; } g_hold;
+ static void
+ bg_hold_gate(IOSurfaceRef *s, unsigned n)
+ {
+@@ -800,8 +800,9 @@
+    BOOL busy = NO, clear = NO;
+    uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC), us = 0;
+    for (unsigned i = 0; i < n; i++) busy = busy || IOSurfaceIsInUse(s[i]);
+-   if (busy && g_hold.rest) {          // a hold that never goes (display off, a frozen copy) must not cost every frame the limit
+-      g_hold.rest--;
++   // a hold that never goes (display off, a frozen copy) must not cost every frame the limit. lag: the rest lasts 2 s; counted
++   // in busy commits it outlived the stuck hold and let the next animation draw into held surfaces (black bars, ast84)
++   if (busy && t0 < g_hold.rest_until) {
+       g_hold.skipped++;
+       busy = NO;
+    }
+@@ -819,7 +820,7 @@
+          g_hold.stuck = 0;
+       } else {
+          g_hold.timeouts++;
+-         if (++g_hold.stuck >= 4) { g_hold.stuck = 0; g_hold.rest = 120; }
++         if (++g_hold.stuck >= 4) { g_hold.stuck = 0; g_hold.rest_until = clock_gettime_nsec_np(CLOCK_MONOTONIC) + 2000000000ull; }
+       }
+    } else {
+       g_hold.stuck = 0;

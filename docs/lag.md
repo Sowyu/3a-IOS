@@ -170,3 +170,67 @@ The ast66 to ast73 trace builds differ, so compare only within A and B. ast65 st
 - `plans/lag/kernel/kernel-2140.sweet`, `kernel-2141.sweet`, and images `plans/lag/out/lag-hw-boot.img`, `lag-hw2-boot.img`, `lag-hw2-keep-boot.img`.
 
 The phone root has `next-fix/out-metal`'s `bgmtl-inject.dylib` and `libchlorophyll.dylib` again (ast82). `bgl-launch` went back in ast69. The phone was left in OrangeFox.
+
+## Black bars with keep, and an honest SwapWait
+
+2026-11-02, late evening. Runs ast84 to ast96. ast84 is the owner's run. ast85 to ast96 used my trace build of the pool (`plans/lag/arms/fix2`) and kernels with 2140 to 2143. Labels as above.
+
+### The cause
+
+With `sweetfb_keep=1`, the kernel can hold both of CoreAnimation's surfaces: the kept frame and the pending one. In copy mode SwapWait answered "complete" at once (`swapWaitInner` returned early unless `fEarly`), so CoreAnimation started drawing into the kept surface. bgmtl's hold-wait then waited in `commit` and gave up after 50 ms.
+
+**Proven, ast84** (owner's run, pool + keep, no hw). There were 4 timeouts at boot. After them the gate skipped all of its next 120 busy commits, because the rest was counted in busy commits, not in time. With keep there are many busy commits, so those 120 unguarded commits landed in the first animations. Those 120 skips are the likely source of the bars the owner saw. In the steady state the gate waited successfully on 516 commits, 4.1 s in total.
+
+### What real iPhones do, and what changed
+
+On Apple hardware, CoreAnimation calls SwapWait(N) before each frame and draws into the older surface once it returns. The display answers only when the surface it is giving back is really free. Our copy-mode display did not.
+
+- **2142, `sweetfb_astwait=1`.** In copy mode, SwapWait(N) answers complete only once no older swap's surface is held: neither the kept frame nor one being copied. It waits up to 1.5 frames, then answers `kIOReturnBusy`, which CoreAnimation's poll treats as "pending" (0221). This is Apple's contract, so CoreAnimation's own loop does the waiting, before it draws. Off unless the boot arg is set.
+- **`bgmtl-hold-rest-2s.patch`.** The hold-wait rest after four misses now lasts 2 s, so it can no longer leak into later animations. `plans/lag/test/hold-check.py` covers it with a fake clock.
+- **2143.** The 2090 bar check now also runs with hardware scale, by scanning the canvas-sized slot and hashing the source around its 1:1 copy. Diagnostic only.
+
+A third surface is not on offer. **Proven:** CoreAnimation kept rotating two surfaces in every run, honest SwapWait included. In ast85 and ast87 it re-made one surface early, with ID 2 replaced by 75 or 129, but never added one. `CA_FORCE_TRIPLE_BUFFERED_LATENCY` changed nothing (ast68). In iOS 26 the "FlipBook" strings belong to the always-on display's frame store, not the swap chain. What makes CoreAnimation choose triple-buffered latency is still **Missing**. The ipsw workaround is above.
+
+### Measured
+
+SwapWait with 2142 answered after a real wait on 274 of 3149 swaps in ast85, median 3.8 ms, and on 296 of 3121 in ast87, median 5.4 ms. The shown-fps baseline with neither change is ast74 and ast76: 39.5 and 40.0.
+
+| Run | Config | hold-wait timeouts / skipped | `src_moved` | Shown fps in bursts |
+|---|---|---|---:|---:|
+| ast85, ast87, ast89 | pool + keep + astwait, hw | 0 / 0 each | n/a, ast87 had bar check off under hw | 48.2, 47.2, 46.5 |
+| ast92, ast94 | pool + keep + astwait, hw, bar check (2143) | 0 / 0 each | 3, 4 | 45.8, 47.9 |
+| ast90 | pool + keep + astwait, no hw, bar check | 0 / 0 | 1 | 40.2 |
+| ast86, ast91 | pool + keep, hw (control) | 6 / 0, 8 / 7 | ast91: 5 | 48.6, 47.5 |
+| ast95 | pool + keep, no hw, bar check: the owner's config | 7 / 2 | 8 | 41.5 |
+| ast88, ast93 | pool, keep off, hw | 0 / 0 each | ast93: 2 | 40.7, 37.6 |
+| ast96 | pool, keep off, no hw, bar check | 0 / 0 | 4 | 37.8 |
+
+With hardware scale, shown fps in bursts is a median of 47.2 over five fix runs, against a median of 38.6 for pool without keep (ast88 40.7, ast93 37.6, ast79 38.6) and 39.8 for neither. The fix keeps all of keep's gain. Without hw (CPU copy), the fix gives 40.2 and keep without astwait 41.5.
+
+**Bar check, Proven for what it can see.** Every arm, the controls included, has the same hits:
+
+- Boot and lock-screen black frames (swap 1, swap 17).
+- Calculator, which is black.
+- Dark-grey rows during home swipes, at full-scale rows 1376 to 1536 or canvas rows 1072 to 1200, with `px` `ff27…` to `ff40…`. They appear in pool-only runs with keep off (ast93, ast96) at the same rows and values. They are dark icons, not CoreAnimation's pure-black damage fill.
+
+No run had a pure-black hit during the script after boot. That includes ast95, the owner's failing config. **So the 2090 check does not see the owner's bars.** It misses bars under 48 rows or under 3 columns, and it samples only the frame copied at each tick. Zero bars is therefore **not proven** by the logger.
+
+The objective signs of the mechanism are hold-wait timeouts and skipped commits. They fell from 6 to 8 timeouts in the keep controls to 0 in all five fix runs, and to 0 skips. `src_moved` (a source changed during its copy) fell from 8 in the owner's config to 1 without hw. It is not zero in any arm, the pool-only ones included (2 and 4), so that write path predates keep and needs its own look.
+
+### Verdict and what to make default
+
+- Daily driver: `plans/lag/next-keep/out-metal/bgmtl-inject.dylib` and `libchlorophyll.dylib`, which are the staging pool plus the 2 s hold rest, with no trace.
+- Daily kernel: 2142 in the series, and `sweetfb_keep=1 sweetfb_astwait=1` together in the boot args. Never keep alone. If the owner sees any bar with that pair, drop both boot args. The pool alone is bar-safe (0 timeouts) but shows no frame-rate gain.
+- Still needed: one owner-watched run of pool + keep + astwait without hw, the configuration where the owner saw bars, before flashing.
+- 2140, 2141 and 2143 are diagnostics, off unless their boot args are set.
+
+Files for this part:
+
+- `plans/lag/patches/2142-asteroids-honest-swapwait-copy-mode.patch`
+- `plans/lag/patches/2143-asteroids-bar-check-hw-scale.patch`
+- `plans/lag/patches/bgmtl-hold-rest-2s.patch`
+- `plans/lag/test/hold-check.py`
+- Kernels `plans/lag/kernel/kernel-2142.sweet` and `kernel-2143.sweet`
+- Images `plans/lag/out/lag-{x,xbar,xbar3,kbar,kbar3,p,pbar3,xbar-nohw,kbar-nohw,pbar-nohw}-boot.img`
+
+The xnu tree in `research/xnu-local` has 2140 to 2143 applied. The root has the `fix2` trace build until it is replaced.

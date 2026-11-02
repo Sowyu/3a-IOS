@@ -1,0 +1,56 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -2208,7 +2208,7 @@
+  }
+  int barcheck = 0;
+  PE_parse_boot_argn("sweetfb_barcheck", &barcheck, sizeof(barcheck));
+- ast.bar = barcheck == 1 && !ast.hw;
++ ast.bar = barcheck == 1;   /* 2143: also with hardware scale, on the canvas-sized slot */
+  if (ast.bar) IOLog("SWEET FB BAR: armed, every %d rows, %d columns\n", SFS_BAR_STEP, SFS_BAR_COLS);
+  int hwtest = 0;
+  PE_parse_boot_argn("sweetfb_hwtest", &hwtest, sizeof(hwtest));
+@@ -4130,7 +4130,12 @@
+ {
+ 	struct sfs_bar bar;
+ 	uint64_t start = mach_absolute_time(), ns;
+-	sfs_bar_scan((const uint8_t *)ast.va[back], 4320, 1080, 2392, &bar);
++	const uint32_t slotH = ast.hwOn ? ast.hwH : 2392;     /* 2143: with hardware scale the slot holds the canvas */
++	if (ast.hwOn) {
++		sfs_bar_scan((const uint8_t *)ast.va[back], ast.hwStride, ast.hwW, ast.hwH, &bar);
++	} else {
++		sfs_bar_scan((const uint8_t *)ast.va[back], 4320, 1080, 2392, &bar);
++	}
+ 	ast.barChecks++;
+ 	bool changed = bar.sig != ast.barSig;
+ 	ast.barSig = bar.sig;
+@@ -4138,7 +4143,7 @@
+ 		uint32_t first = 0;
+ 		bool dark = false;
+ 		if (src != NULL) {
+-			uint32_t row = (uint32_t)(((uint64_t)bar.from[i] + bar.to[i]) / 2 * srcH / 2392);
++			uint32_t row = (uint32_t)(((uint64_t)bar.from[i] + bar.to[i]) / 2 * srcH / slotH);
+ 			dark = sfs_bar_row(src + (uint64_t)row * bpr, srcW, &first);
+ 		}
+ 		ast.barHits++;
+@@ -4312,7 +4317,21 @@
+ 			continue;
+ 		}
+ 		if (fHw) {
++			/* 2143: the 2090 check of the scaled copy, for the 1:1 canvas copy of hardware scale */
++			bool barWhole = ast.bar && src != 0 && s != fSurface && s->width >= fLogicalW && s->height >= fLogicalH && s->memory != NULL &&
++			    (uint64_t)s->offset + (uint64_t)(fLogicalH - 1) * s->bytesPerRow + (uint64_t)fLogicalW * 4 + s->wrapDelta <= s->memory->getLength();
++			uint32_t barHash = 0;
++			if (barWhole) {
++				barSrc = (const uint8_t *)(src + s->offset);
++				barBpr = s->bytesPerRow;
++				barW = fLogicalW;
++				barH = fLogicalH;
++				barHash = sfs_bar_hash(barSrc, barBpr, barW, barH);
++			}
+ 			presentCanvas(s, src, sx, sy, dx, dy, w, h);
++			if (barWhole && sfs_bar_hash(barSrc, barBpr, barW, barH) != barHash && ast.barMoved++ < 64) {
++				IOLog("SWEET FB BAR: source changed during its copy swap=%u surface=%u fence last=%u\n", fCurSwapID, id, sweet_gpu_fence_snapshot());
++			}
+ 			s->release();
+ 			continue;
+ 		}
