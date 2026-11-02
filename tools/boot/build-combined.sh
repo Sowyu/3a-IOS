@@ -1,0 +1,20 @@
+#!/bin/bash
+# Hands-on boot images for the combined kernel (2130, 2150 to 2153 with 2152 v4, lag 2140 to 2143, all off unless set).
+# next-fix's ADT and args without sweetsyserr, no self-test, plus the input args. Writes only next-combined/out. Touches no phone.
+set -euo pipefail
+here=$(cd "$(dirname "$0")" && pwd); root="$here/.."; repo="$root/ios-asteroids"; nf="$root/next-fix/boot"
+kernel="$here/kernel/kernel.development.sweet"
+out="$here/out"; mkdir -p "$out"
+args=$(sed -n "s/^args='\(.*\)'\$/\1/p" "$nf/build.sh")
+[ -n "$args" ] || { echo "cannot read the args from $nf/build.sh" >&2; exit 1; }
+shim="$out/shim"; [ ! -e "$shim" ] || /usr/bin/trash "$shim"; cp -R "$root/ios-sweet/asteroids/shim" "$shim"
+mk() {
+	python3 -I "$repo/tools/mkpayload.py" "$kernel" "$root/ux-fix/ux-420pt-2x-840x1860.adt" "$out/$1.payload" --cmdline "$2"
+	ASTEROIDS_DTB="$repo/research/asteroids-hw/live.dtb" MKBOOTIMG="$root/ref/tools/mkbootimg.py" bash "$shim/build.sh" "$out/$1.payload" "$out/$1-boot.img"
+	echo "$1: ${#2} of 607 bytes, $(wc -c < "$out/$1-boot.img") bytes image"
+}
+daily="${args/ sweetsyserr=backboardd,MobileSafari/} sweetthermal=3 sweetfetchsync=1 sweetsb=1 sweetfb_ast_hw=1"
+input='sweettouchirq=3 sweetkeys_ms=5 sweetfb_lead=3000'
+mk combo-daily "$daily $input"                       # power button: keys reach iOS faster, iOS blanks the screen itself
+mk combo-daily-pwr "$daily $input sweetpwrfast=1"     # plus the instant blank (2152 v4, Sol GO with the frozen-scanout limit accepted)
+mk combo-daily-ff "$daily $input sweetappmetal=Freeform"   # Freeform phase 2b, only with its libraries pushed
