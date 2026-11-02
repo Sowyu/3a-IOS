@@ -1,0 +1,141 @@
+--- a/launch/bgl-launch.c
++++ b/launch/bgl-launch.c
+@@ -41,8 +41,11 @@
+  * ran stock, its alive=0 switched Metal off at the next start and the rest of the boot had CoreAnimation's CPU renderer. A GPU that
+  * never appears writes bgmtl-bb.off (the next starts do not wait again) and this start runs plain.
+  * BGMTL_SKIP_COMPUTE (Chlorophyll drops those compute dispatches): the first line of bgmtl-bb.skipcompute (empty: none), default
+- * "compute_average_luma,compute_sum_luma": the GPU hung right after backboardd's first luma dispatches in ast9 and ast10, with
+- * sysmem and with sysmem,flushall (flushall did not help and is not the default any more).
++ * none. It was "compute_average_luma,compute_sum_luma" from ast10 to ast96, after hangs right after backboardd's first luma
++ * dispatches in ast9 and ast10, but ast10b hung with them skipped and no decoded hang dump since has a compute IB
++ * (3a-IOS/docs/freeform.md). Skipped, CoreAnimation reads luma results nothing wrote, and UIKit picks the light or dark glass
++ * and status bar style from them: dark glass and a white clock on white Notes, white glass on black Calculator
++ * (analysis/glass-flat.md). "compute_average_luma,compute_sum_luma" in that file brings the skip back.
+  * TU_DEBUG for Turnip: the first line of bgmtl-bb.tudebug (an empty file: none), default "noubwc,nocb,nolrz" since ast22
+  * (sysmem dropped: every pass in system memory made frames slow enough for the display to copy them half drawn, 250 x 50 ms
+  * waits a boot; UniXNU-asteroids runs the A810 with nocb alone). Before: "sysmem,noubwc" (noubwc since ast14:
+@@ -278,7 +281,7 @@
+ #define BB_SKIPCOMPUTE "bgmtl-bb.skipcompute"
+ #define BB_TEXPOOL "bgmtl-bb.texpool"
+ #define BB_TEXPOOL_DEFAULT "192"
+-#define BB_SKIPCOMPUTE_DEFAULT "compute_average_luma,compute_sum_luma"
++#define BB_SKIPCOMPUTE_DEFAULT ""
+ #define BB_GPU_WAIT 90
+ #define GPU_SERVICE "SweetAdreno630"   /* SWEET_GPU_SERVICE_NAME, xnu/gpu-abi/sweet_adreno_abi.h */
+ #define BB_MAX_RETRIES 3                /* restarts on Metal in BB_WINDOW_S ... */
+--- a/Chlorophyll/src/bgmtl.m
++++ b/Chlorophyll/src/bgmtl.m
+@@ -746,6 +746,7 @@
+ - (instancetype)initWithBGDevice:(BGMTLDevice *)device bytesNoCopy:(void *)p length:(NSUInteger)length deallocator:(void (^)(void *, NSUInteger))dealloc;
+ - (struct chl_buffer *)chlBuffer;
+ - (void)bgRefresh;   // a no-copy buffer: the caller's bytes into the GPU memory (at commit)
++- (void)bgWriteBack:(NSUInteger)off length:(NSUInteger)len;   // a no-copy buffer: those GPU-written bytes into the caller's
+ - (BOOL)bgIsNoCopy;
+ - (void *)contents;
+ @end
+@@ -776,6 +777,7 @@
+    struct chl_compute_pipeline *_p;
+    struct chl_pipeline_info _info;
+    int _skip;     // its dispatches are dropped (bg_compute_skipped)
++   int _luma;     // CoreAnimation's luma kernels: 1 compute_average_luma (a float4 per threadgroup), 2 compute_sum_luma (one float4)
+ }
+ @end
+ 
+@@ -922,6 +924,8 @@
+    uint64_t _t_first;                                      // the first encoder (encode time for bgmtl.perf)
+    int _epoch;                                             // bg_gpu_epoch before this command buffer was submitted, when it stages copies
+    BOOL _hasEpoch;
++   struct { BGMTLBuffer *b; NSUInteger off, len; int sum; } _luma[8];   // luma kernel outputs (bgLumaFinish), retained
++   unsigned _nLuma;
+ }
+ - (instancetype)initWithBGQueue:(BGMTLCommandQueue *)queue;
+ - (struct chl_cmdbuf *)bgChl;                         // the Vulkan command buffer, noting when encoding began
+@@ -936,6 +940,8 @@
+ - (void)bgSkip:(const char *)what why:(const char *)why;
+ - (void)bgFailWith:(NSString *)why code:(NSInteger)code;
+ - (void)bgCompleteFrom:(uint64_t)t_begin;
++- (void)bgLuma:(BGMTLBuffer *)b offset:(NSUInteger)off length:(NSUInteger)len sum:(int)sum;
++- (void)bgLumaFinish:(BOOL)good;
+ @end
+ 
+ @interface BGMTLComputeEncoder : _MTLCommandEncoder {
+@@ -1639,6 +1645,7 @@
+    p->_info = info;
+    bg_render_air_dump(air, [function name]);
+    p->_skip = bg_compute_skipped([[function name] UTF8String]);
++   p->_luma = [[function name] isEqualToString:@"compute_average_luma"] ? 1 : [[function name] isEqualToString:@"compute_sum_luma"] ? 2 : 0;
+    if (p->_skip) BG_LOG("pipeline %s: its dispatches are SKIPPED (BGMTL_SKIP_COMPUTE)\n", [[function name] UTF8String]);
+    BG_LOG("pipeline %s: buffers %#x textures %#x samplers %#x\n", [[function name] UTF8String], info.buffers_used[0], info.textures_used[0],
+           info.samplers_used[0]);
+@@ -1866,6 +1873,10 @@
+ - (struct chl_buffer *)chlBuffer { return _buf; }
+ - (BOOL)bgIsNoCopy { return _mapped != NULL; }
+ - (void)bgRefresh { if (_mapped && _contents) memcpy(_mapped, _contents, _length); }
++- (void)bgWriteBack:(NSUInteger)off length:(NSUInteger)len
++{
++   if (_mapped && _contents && off <= _length && len <= _length - off) memcpy((char *)_contents + off, (char *)_mapped + off, len);
++}
+ - (void *)contents { return _contents; }
+ - (NSUInteger)length { return _length; }
+ - (id)device { return _owner; }
+@@ -1984,6 +1995,7 @@
+    bg_return_slot(self, _queue);
+    [self bgCaptureFinish:NO];
+    [self bgWbFinish:NO];                 // never committed: nothing to publish
++   [self bgLumaFinish:NO];
+    if (_ccb) chl_cmdbuf_release(_ccb);   // never committed: discarded; committed: complete by now (the completion holds a reference)
+    [_queue release]; [_error release]; [_completed release]; [_scheduled release]; [_presents release];
+    [_linWritten release]; [_written release]; [_noCopy release];
+@@ -2053,6 +2065,34 @@
+    if (![b bgIsNoCopy]) return;
+    if (!_noCopy) _noCopy = [[NSMutableSet alloc] init];
+    [_noCopy addObject:b];
++}
++// CoreAnimation reads its luma kernels' float4 results on the CPU, and UIKit picks light or dark glass and status bar text
++// from them. In a no-copy buffer the GPU wrote its own copy, so those bytes go back into the caller's memory (unified memory
++// does that on an iPhone). Only the bytes the kernel writes: the rest of the buffer may already hold newer CPU data.
++// ponytail: luma kernels only (sizes from their AIR); a general no-copy write-back needs each kernel's write ranges.
++- (void)bgLuma:(BGMTLBuffer *)b offset:(NSUInteger)off length:(NSUInteger)len sum:(int)sum
++{
++   if (_nLuma >= sizeof _luma / sizeof _luma[0]) { BG_LOG("luma: more than 8 luma dispatches in one command buffer\n"); return; }
++   _luma[_nLuma].b = [b retain]; _luma[_nLuma].off = off; _luma[_nLuma].len = len; _luma[_nLuma].sum = sum;
++   _nLuma++;
++}
++- (void)bgLumaFinish:(BOOL)good
++{
++   static unsigned said;
++   static uint64_t last_ns;
++   for (unsigned i = 0; i < _nLuma; i++) {
++      BGMTLBuffer *b = _luma[i].b;
++      if (good && [b bgIsNoCopy]) [b bgWriteBack:_luma[i].off length:_luma[i].len];
++      uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC);
++      if (_luma[i].sum && _luma[i].off + 16 <= [b length] && (said < 64 || now - last_ns > 2000000000ull)) {
++         said++; last_ns = now;
++         const float *r = (const float *)((const char *)[b contents] + _luma[i].off);
++         BG_LOG("luma: result %g %g %g %g at %lu, %s buffer, %s\n", r[0], r[1], r[2], r[3], (unsigned long)_luma[i].off,
++                [b bgIsNoCopy] ? "no-copy" : "own", good ? "completed" : "NOT completed");
++      }
++      [b release];
++   }
++   _nLuma = 0;
+ }
+ 
+ // Per-second timing of commits (the compositor): how a frame's time splits into CoreAnimation's own work, encoding (from the
+@@ -2464,6 +2504,7 @@
+    }
+    [self bgCaptureFinish:good];
+    [self bgWbFinish:good];                                      // before anything that can swap or present these surfaces
++   [self bgLumaFinish:good];                                    // before any handler reads the luma results
+    for (void (^h)(id) in bg_take(self, _scheduled)) h(self);    // left here by the compositor's deferral (see commit)
+    // buffer-backed textures: the GPU's result goes back into their buffers before any completed handler reads them
+    for (BGMTLTexture *t in _linWritten) {
+@@ -2702,6 +2743,9 @@
+    unsigned t[3] = { (unsigned)size.width, (unsigned)size.height, (unsigned)size.depth };
+    char why[512] = { 0 };
+    if (chl_dispatch(_cb->_ccb, g, t, why, sizeof(why)) != 0) [_cb bgSkip:"dispatch" why:why];
++   else if (_pipeline->_luma && _buf[2])   // [[buffer(2)]] destination: a float4 per threadgroup, or the one total
++      [_cb bgLuma:(BGMTLBuffer *)_buf[2] offset:_off[2] length:16 * (_pipeline->_luma == 1 ? g[0] * g[1] * g[2] : 1)
++              sum:_pipeline->_luma == 2];
+ }
+ - (void)dispatchThreads:(MTLSize)threads threadsPerThreadgroup:(MTLSize)size
+ {
