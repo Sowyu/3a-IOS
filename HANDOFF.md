@@ -32,13 +32,15 @@ Updated 2026-11-02, about 22:20 AEDT. Update this file whenever the state change
 5. Wi-Fi, then a modem probe for mobile data. `docs/research-wifi.md`.
 6. Sound and a real battery reading. `docs/plan-power.md`.
 7. Small ones:
-   - Glass buttons render flat: grey in Notes, white in Calculator, and the Notes clock white on white. Cause found (`docs/glass-flat.md`): the launcher has skipped CoreAnimation's luma compute kernels since ast9, so UIKit reads unwritten bytes when it picks light or dark glass and the status bar style. Fix: `patches/glass/luma-compute.patch` (skip off by default, `bgmtl-bb.skipcompute` brings it back, no-copy result buffers copied back). Being built as `plans/glass/next-luma`, then one nohw hands-free run checked with `tools/glass/luma-frames.py`.
+   - Glass light or dark picked at random, fixed on 2026-11-02. Cause (`docs/glass-flat.md`): the launcher had skipped CoreAnimation's luma compute kernels since ast9, so UIKit read unwritten bytes when it picked light or dark glass and the status bar style. `patches/glass/luma-compute.patch`, built as `plans/lag/next-luma` (the daily `next-keep` driver plus the patch), ran in ast98: 101 luma results, 0 GPU recoveries, and `tools/glass/luma-frames.py` reads dark Calculator glass, light Notes glass and a dark clock, all wrong in ast96. The checker needs numpy and a run name with `nohw`. `bgmtl-bb.skipcompute` brings the old skip back without a rebuild.
    - Calendar widget stays a skeleton
    - App top spacing: apps still lay out at 68 pt. ast97 proved the new `sweetsb` (`docs/app-safearea2.md`) loads in every app, logs through `sweetnull`, and lowers the window's safe top from 68 to 50. But each root view controller still reports 68 and nav bars sit at y 68, so view controllers take the inset from another route. The agent is finding it.
    - Only 24 GB of storage is visible
    - Apple logo early in boot (the bootloader's Nothing logo can't safely change: no logo partition, signed ABL)
    - The fixed 10 s wait in boot
    - A `com.apple.mobile...` service crashed 4 times in ast84, not seen before
+
+**ast98 (23:43), combined kernel plus the luma driver, nohw, keep and astwait on:** all 22 self-test frames, 0 GPU recoveries, 0 backboardd restarts, then a `reset-unknown` after the last frame, which 17 of the previous 45 runs also had. SpringBoard took 20 s to come up instead of about 5.
 
 **Combined kernel, built 23:08:** `next-combined/kernel/kernel.development.sweet` (SHA256 10f64275...), from the live tree with the lag patches 2140 to 2143 (all off unless their boot args are set), plus 2130, 2150, 2151, 2153 and 2152 v4. Built in a separate copy, `ios-asteroids/research/xnu-combined/dxb`, with `XNU_LOCAL_DIR=$PWD/research/xnu-combined USE_KDK=1 tools/xnu-local-build.sh --remake -j12 26.5` from `ios-asteroids`. A full build took 22 minutes. Hands-on images come from `tools/boot/build-combined.sh`: `combo-daily`, `combo-daily-pwr` (plus `sweetpwrfast=1`) and `combo-daily-ff` (plus `sweetappmetal=Freeform`, needs its libraries pushed). Loop images for hands-free runs come from `tools/input/build-input-loop.sh KERNEL`. Next: one hands-free run of `in-all`, then a RAM boot for the owner, and a flash to `boot_a` only if they like it, with `boot_b` kept as today's fallback.
 

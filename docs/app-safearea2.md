@@ -63,3 +63,29 @@ How to read a failure:
 - `top 68 -> 50` with a layout line still at 68 means layout reads another route. The next target is `_safeAreaInsetsConsultingAlternativeTopInsetIfApplicable`.
 
 Rollback: put app-safearea/v1/sweetsb-install.dylib or the ordinary sweetsb-install.dylib back at the same root path.
+
+## Round 3: the root view controller route (after ast97)
+
+ast97 (logs/ast97-app-safearea2.txt) proves the dylib loads in all five apps (lines 10171, 11208, 11335, 11442, 11722) and the window hook changes `top 68 -> 50` with statusbar=0. The probes show every main window at safe top 50, but every root view controller's view at 68, with the nav bar at y 68. The guard did not need the fallback: every app reported home=/var/mobile, and no `not writable` line appears. The `skip: scene nil; top=0` lines come from windows before they join a scene. The `skip: window level 10; top=68` lines come from UITextEffectsWindow. Both are expected.
+
+Proven from UIKitCore disassembly, not yet by a run: `-[UIViewController _viewSafeAreaInsetsFromScene]` at 0x1892cbb9c starts from `-[UIWindow _managedSafeAreaInsets]`, which only tail-calls `safeAreaInsets` (0x1891d7858) and gives 50. When the view controller's ivar flag bit 6 is set (`ldrh` then `tbnz w8, #6` at 0x1892cbc00), it branches to 0x1892cbe68. There it reads `-[UIWindowScene _safeAreaInsetsForInterfaceOrientation:]` with `_lastKnownInterfaceOrientation` directly, and the window hook never sees that value. The caller list for the method's stub 0x18b52f020 is `_setContentOverlayInsets:andLeftMargin:rightMargin:` (0x1891a6b4c, 0x1891a6b84), plus code at 0x18917ce5c and 0x1892cc07c that is not an ObjC method. The bit 6 flag is my inference for "root view controller", from the ast97 pattern.
+
+Fix: sweetsb_safearea.h now also hooks `-[UIViewController _viewSafeAreaInsetsFromScene]` (appVCInsets). It takes the view's window from `viewIfLoaded.window` and applies the same checks as the window hook (appWindowFits): not hosted, level 0, frame 0,0 420x930, UIWindowScene in portrait, canvas screen. Then it applies the same compactAppInsets cap: top only, only when 50 < top <= 80, never increases. The hook is optional. On an ABI mismatch, the window hook still installs, and the install line says `vc route off`. SpringBoard is still out of scope. The guard is unchanged. A ponytail comment records one limit: a root view placed below the window top gets the cap, not the exact delta.
+
+Build: app-safearea/sweetsb-install.dylib, sha256 3b87a987ac5731ee882a900033ac251916ea9d0f8e3b486b9246777cd2366b6a, no warnings. The ast97 diagnostic build is kept as app-safearea/v2 (sha256 08f86f90..., 72576 bytes). safearea-check.sh passes, with new mock view controller cases for an unloaded view, no window, level 10, landscape, top 40, top 90 and scope off. stui-check.sh passes. pacstrip finds no PAC code.
+
+Run, from plans/, with the same boot image:
+
+```sh
+python3 devloop/dev.py statusbar-real/boot/next-loop-sb-null-boot.img /usr/local/lib/sweetsb.dylib="$PWD/statusbar-real/app-safearea/sweetsb-install.dylib" --test ui --note app-safearea3 --key 'sweetsb-real'
+```
+
+Success, per app:
+
+```text
+|Preferences| sweetsb-real: app safe area installed; target=50pt; portrait full-screen only; vc route on
+|Preferences| sweetsb-real: app vc safe area top 68 -> 50; <root VC class> target=50pt
+|Preferences| sweetsb-real: app layout 2s: window UIWindow safe top 50; root ... safe top 50; navbar y 50 h ...
+```
+
+If the root view still reads 68 with the `vc ... -> 50` line present, a later stage raises it again. The next candidate is `_statusBarOverlapAndMarginInfoForView:inWindow:` in the function at 0x1892cc07c, which takes the max of that value and `_viewSafeAreaInsetsFromScene` (fmaxnm at 0x1892cc12c).
