@@ -78,6 +78,44 @@ Depends on nothing. Risk: low, the worst case is a screen or hang needing Power 
 
 Verify on the phone: no red exception screen, SMMU IDs and SMR 0-6 printed, then either "not clocked" or the DWC3 registers. A red screen with a plain `ldr` at the ELR disproves finding 1 for that address.
 
+### Phase 0 result, 2026-11-02 23:31
+
+The owner booted `plans/devloop/out/usbprobe-boot.img` (plain-ldr patch, no writeback loads in `usbprobe.o`) with `fastboot boot` from the fastboot menu. Blue screen, no exception, `USBPROBEdone`. Photo: `ios-asteroids/research/cam/usbprobe-asteroids-20261102.jpg`, not in this repo.
+
+Read from the photo:
+
+| Register | Value |
+|---|---|
+| SMMU idr0, idr1 | 4C017E72, 60000048 |
+| SMMU idr2, scr0 | 00005111, 002A0406 |
+| SMR0 to SMR6 / S2CR | 80000060/0, 80000540/1, 80021C00/2, 80000040/3 (USB SID matched), 80000480/4, 0/00020000, 0/00020000 |
+| Context bank 3 SCTLR, CBAR, CBA2R | 000000E0, 0001F000, 1 |
+| USB GDSC | gdscr=F822F800, master=1 |
+| CFGNOC | 1 |
+| GSNPSID | 5533330A |
+| GCTL | 00102001 |
+| GSTS | 7E800000 |
+| GHWPARAMS0, 1, 3 | 4020400A, 0162493B, 10420085 |
+| GUSB2PHYCFG | 00002400 |
+| GUSB3PIPECTL | 0B080402 |
+| DCFG | 0048080C |
+| DCTL | 10F00000 |
+| DEVTEN | 00001277 |
+| DSTS | 00D212E4 |
+| DALEPENA | 0000000F |
+| GEVNTADRLO, HI | D017B000, 0 |
+| GEVNTSIZ | 80001000 |
+| GEVNTCOUNT | 0 |
+
+What it means. Proven by the reads succeeding: the USB GDSC is on and the DWC3 core is clocked after ABL, so no power-up through the PMIC is needed to talk to it. The rest is my reading of the register fields against the DWC3 and SMMUv2 layouts, not yet checked against the source:
+
+- The core is DWC_usb3 3.30a (`GSNPSID`), in device mode (`GCTL` PRTCAPDIR = 2).
+- ABL stopped it cleanly: `DCTL` RUN_STOP is 0 and `DSTS` DEVCTRLHLT is set. `DCFG` still has ABL's SuperSpeed setting and USB address 1 from fastboot.
+- ABL's event buffer is still programmed at 0xD017B000, 4 KiB, interrupt masked. That is ABL memory. Reprogram `GEVNTADR` and `GEVNTSIZ` to our own buffer before setting RUN_STOP, or the controller writes events into memory we don't own.
+- The USB stream 0x40 maps through SMR3 to context bank 3. Its SCTLR M bit is 0, so stage 1 translation is off and DMA addresses pass through. Whatever bounds them is Gunyah's stage 2, as this plan assumed. Keep the Phase 3 DMA gates.
+
+Next is Phase 3, the gadget stages on top of these values. The Poco F1 CDC-ECM code is the starting point.
+
 ### Phase 1: fail-safe kernel. 1 hour agent, 1 CI run, 3 owner boots
 
 Depends on nothing. Patches 2060, 2062. Hold 2061 for Phase 1b.
