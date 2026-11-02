@@ -264,3 +264,42 @@ dyld accepts the spelling. Proven from Apple's dyld-1378 source: `Loader::getLoa
 - With the trial off, v4 equals base in all 23,040 execs of the original matrix, and in 384 more that inherit v4's own spellings.
 
 The compile check passes with 0 new diagnostics, and `git apply --check` passes on the tree.
+
+## ast102: black board and hard reset (2026-11-03)
+
+With v4, backboardd ran on Chlorophyll (glass, 0 restarts, 0 recoveries), and Freeform got its device.
+
+### The black board: two translator gaps, both fixed in `plans/lag/next-ff3`
+
+- **Proven** from `bgmtl-app.log`: `sixChannelBlend_fragment` was refused ("function constant 11 has no value"), and the draws that needed it ran with no pipeline. `uber_fragment` was built but its draw was refused, because it fetched `[[color(4)]]` and the pass has no attachment 4.
+- **Proven** on the host with PencilKit's exact constants:
+  1. PencilKit leaves `MULTIPLY_COLOR_ATTACHMENT_INDEX` (11) unset, and the module's static initializer reads it unconditionally. In Metal that value is just undefined; the translator refused it.
+  2. `secondary_paint_framebuffer [[color(4)]]` exists only when `SECONDARY_PAINT` (17) is set, and PencilKit did not set it. The translator fetched it anyway.
+- **Inferred:** these were the board's composite draws, so the canvas stayed black.
+- Fix 1: an unset constant reads as 0, which is what the module defaults gave before.
+- Fix 2: a `[[color(n)]]` input whose predicate the pipeline's constants make false becomes undefined. Fix 2 applies only to specialised pipelines, through the new `air_to_nir_options.specialized` field, appended last.
+- On the host, every specialisation PencilKit requested in ast102 now translates: 12 functions. With default constants, the NIR of the 58 compositor modules and the 34 PencilKit functions is unchanged.
+
+### Did the drawing kernels run?
+
+- **Proven:** PencilKit built `paint_kernel` (3 specialisations) and `particle_kernel` (4 specialisations). It never built `sdfPen_kernel`.
+- **Unknown:** whether any dispatch ran. next-ff2 did not log dispatches. next-ff3 logs each dispatch and commit in the trial app and fsyncs every line.
+
+### The reset: not established
+
+- **Proven:** the last synced kernel lines are a 2-IB submission (fence 1041) and one stalled-fence kick with RBBM `0xec3425`. Then there are no more synced A810 lines: no further kick, no RECOVERY, no SMMU fault, no panic, and a dirty root.
+- **Proven:** just before that, Freeform's in-process CoreAnimation started rendering through Chlorophyll. It loaded QuartzCore's metallib, built Vfx pipelines, and copied a 250x376 IOSurface. Its framebuffer calls, selectors 74 and 88, are no-ops that backboardd also makes.
+- **Inferred:** a stuck GPU would have produced more kicks or a recovery, so the whole system stopped within about a second.
+- ast100 also hard-reset about 10 s after Freeform registered a device, with zero GPU submissions all boot. So the trigger may not be drawing at all.
+
+### Next retry
+
+1. Run hands-free first: `selftest/freeform-idle.sh` opens Freeform and a board and never draws. It needs no owner, so it fits a lag-queue slot.
+2. Only if that survives, run the owner: `freeform-owner.sh` with one stroke of the default pen, then wait.
+
+Both runs use `plans/lag/next-ff3`'s two dylibs and `plans/freeform/out/ff-owner-boot.img`, which is built on kernel-ff4.
+
+### Containment, proposed and not built
+
+- Kernel: give non-compositor submissions a time budget and attribute a stall to its client. Then a timed-out client is killed and refused further submissions, instead of every client's fences being voided. This helps only if the kernel keeps running, which in ast102 it did not.
+- Userspace: hand the device only to PencilKit, not to Freeform's in-process CoreAnimation, which ran on the CPU in the builds where drawing only crashed Freeform. That needs `MTLCreateSystemDefaultDevice` to answer per caller, and is a design to check first.
