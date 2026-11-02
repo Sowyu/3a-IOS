@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """The combined verdict of one level run: the phone's kernel log (pulled by dev.py) and, for levels 3 and 4, the
-Mac's usb-check.py result. PASS needs both halves; any failure line on either side is a FAIL.
+Mac's usb-check.py result. PASS needs both halves; any failure line on either side is a FAIL. Only the phone log from
+the last "ASTEROIDS USB L<n>: start" on counts, so lines from an earlier boot in the same pulled log cannot vouch for
+this one. Use the usb-check file written for this same run.
 
   python3 -I host/usb-verdict.py LEVEL PHONE_LOG [USBCHECK_FILE]
 
@@ -20,6 +22,10 @@ BAD = ['ASTEROIDS USB GATE:', 'ASTEROIDS USB L%d: FAIL', 'stop NOT verified', 'd
 
 
 def verdict(level, log, check):
+    start = log.rfind('ASTEROIDS USB L%d: start (sweetusb=' % level)
+    if start < 0:
+        return False, 'phone: no "ASTEROIDS USB L%d: start" in the log' % level
+    log = log[log.rfind('\n', 0, start) + 1:]
     for want in NEED[level]:
         if want not in log:
             return False, 'phone: missing "%s"' % want

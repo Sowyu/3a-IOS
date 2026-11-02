@@ -1,10 +1,150 @@
-# USB gadget for SSH from the Mac: patches 2160 and 2161, v2
+# USB gadget for SSH from the Mac: patches 2160 and 2161, v4
 
-2026-11-03. Desk work only. I ran no adb, fastboot or dev.py, built no kernel, wrote nothing in either live kernel tree, and committed nothing. Nothing here has run on a phone.
+2026-11-03. Desk work only, no phone. v3, under Sol's level 4 re-audit, is unchanged:
 
-v2 answers Sol's audit, `analysis/usb-gadget-audit.md`, which found levels 2, 3 and 4 NO-GO. The audited v1 patches stay here unchanged for diffing.
+- The `-v3.patch` files match `SHA256SUMS-v3`.
+- The v3 host tools, self-test, builder and README are copied unchanged in `v3/`.
+- v4's hashes are in `SHA256SUMS-v4`.
 
-Labels: **proven** means read in code, a log or a file, with the place named, or established by a desk run that is named. **Inferred** means reasoning with no run behind it. Line numbers in `sweet_usb.c`, `sweet_ufs.c`, `sweet_reboot.c` and `sweet_usb_gadget.h` refer to `work/b2/bsd/dev/`, the files after both v2 patches.
+## What ast107 and ast108 showed
+
+Level 2 passed on the phone (`ios-asteroids/logs/ast107-usb-l2.txt`).
+
+Level 3 failed (`ast108-usb-l3.txt`): `FAIL no SET_CONFIGURATION in 120 s: 1 connects, 1 resets, 10 setups`, followed by a verified stop. The cause is the Mac's accessory security, not the gadget and not its descriptors. This Mac's kernel log for that run (`log show`, no sudo) says so (proven):
+
+```
+01:48:18.250 (IOUSBHostFamily) usb-drd2-port-hs@02100000: AppleUSBHostPort::enumerateDeviceComplete_block_invoke: enumerated 0x1209/0001/0103 (iOS 26 asteroids (USB level 3) / 1) at 480 Mbps
+01:48:18.250 (AppleCredentialManager) ACMTRM: _onEnterRestrictedMode: [CACHE MISS] (reason=4).
+01:48:18.250 (AppleCredentialManager) ACMTRM: _onEnterRestrictedMode: rejecting cache miss (trigger not allowed).
+01:48:18.250 (IOUSBHostFamily) usb-drd2-port-hs@02100000: AppleUSBHostPort::enumerateDeviceComplete_block_invoke: device functionality blocked by transport restrictions
+01:48:18.250 (IOUSBHostFamily) iOS 26 asteroids (USB level 3)@02100000: IOUSBHostDevice::start_block_invoke: device will not be registered for matching
+```
+
+macOS enumerated the device, then refused to match any driver to it, because the device was not in its cache of approved accessories and it was not allowed to ask. Nothing ever sends SET_CONFIGURATION to a device no driver matched. The phone's other USB identities pass the same port with no restriction over the last two days: fastboot `0x18d1/d00d "Android"` 131 times, and OrangeFox `0x18d1/4e11 "A059"` 54 times. They were approved before. This was the only restricted-mode event in three days.
+
+The guess about class 0 was reasonable, but the level 3 descriptor already had bDeviceClass 0 and bDeviceSubClass 0. That is exactly what `AppleUSBHostCompositeDevice` matches (its Info.plist on this Mac: `IOProviderClass IOUSBHostDevice, bDeviceClass 0, bDeviceSubClass 0`). The driver never got the chance.
+
+### (a) What the hardware path proved
+
+Proven by both logs:
+
+- The link came up at high speed: the phone's `connect done #1, speed 0 (high)` and the Mac's `at 480 Mbps`.
+- One bus reset was handled.
+- SET_ADDRESS worked.
+- Nine IN control transfers completed with data and status stages. They were the device descriptor, strings 5, 1 and 3 (each at length 2 and then in full), and the configuration descriptor at 9 and at 18 bytes.
+- The bytes arrived intact: the Mac logged the product string `iOS 26 asteroids (USB level 3)` exactly as our pool held it. That is controller DMA out of our pool, read correctly by a host.
+- The stop was verified: halted, transfers ended, event buffer ours, canaries intact, sGFSR 0.
+
+Not proven:
+
+- SET_CONFIGURATION handling.
+- Any OUT data stage. The Mac sent none.
+- The timed stop after configuration. The stop ran on the 120 s no-configuration path.
+
+So the level 3 criterion is right as a USB criterion. The Mac blocked it before the gadget could meet it, and it cannot pass on this Mac until the accessory is approved.
+
+### (b) The smallest change, and level 4
+
+No descriptor change gets a SET_CONFIGURATION from this Mac without an approval. Any identity macOS has not approved before is blocked in the same way. That includes level 4, which would have failed the same way tonight.
+
+Once approved, both levels have a matching driver (proven from the drivers' Info.plists on this Mac):
+
+- Level 3 and v4's level 4, with device class 0: `AppleUSBHostCompositeDevice` sets the configuration.
+- v3's level 4, with device class 2: `AppleUSBCDC.kext`'s `CDCCompositeDevice` (bDeviceClass 2) would have set it.
+- Then `AppleUserECM.dext` matches the interfaces `2/6/*` and `10/0/0`, which are exactly the ECM interfaces we describe.
+
+That these drivers work end to end with this gadget is inferred.
+
+## v4 changes
+
+1. One device identity at levels 3 and 4, so a single approval should cover both, `sweet_usb_gadget.h` (2160 v4). Both levels now have bDeviceClass 0/0/0, bcdDevice 1.01, product string 2 "Sweet iOS (USB Ethernet)", manufacturer "ios-sweet" and serial "0001". Only the configuration differs. The level-3-only string is gone. Level 4 moves from device class 2 to class 0, which `AppleUSBHostCompositeDevice` configures. Which fields macOS's approval cache is keyed on is unknown. If it covers the configuration descriptor, level 4 needs its own approval, and nothing is lost. `sweet_usb.c`, `sweet_ufs.c` and `sweet_reboot.c` are byte-identical to v3, and 2161 v4 differs from 2161 v3 only in its Subject line.
+2. `host/usb-check.py` recognises the block. It scans the kernel log with `log show` (no sudo) for `blocked by transport restrictions` since the run started, and ends with `USBCHECK L<n> FAIL BLOCKED by macOS accessory security ...` instead of a generic configuration failure. Run against this Mac's real log, it finds the ast108 line in 2 s and nothing after it. It accepts the v4 identity (bcdDevice 0x0101) as well as the v2 and v3 per-level values. At level 3 it requires the configured interface to be the vendor class 255.
+
+## v4 tests
+
+All ran on 2026-11-03.
+
+1. `cc -std=c11 -Wall -Wextra -Werror -I work/b4/bsd/dev host/test_gadget.c -o /tmp/tg && /tmp/tg`: 13741 checks, 0 failed. New: the same device descriptor and the same strings at levels 3 and 4 at every speed, class 0/0, AppleUserECM's interface classes present, level 3's vendor interface. Against v3's header, the three "same device descriptor" checks fail.
+2. `python3 -I host/test_usb_check.py`: 13 checker scenarios and 8 verdict cases pass. New: v4 identity at levels 3 and 4, and BLOCKED at levels 3 and 4. All four fail with `--checker v3/host/usb-check.py`.
+3. `python3 -I host/kernel-harness.py b4`: 31 of 31. The kernel code is v3's.
+4. `syntax-check.py b4` for the three files and `m4`: exit 0, with the same 6, 77 and 9 inherited diagnostics.
+5. `git apply` of both v4 patches onto the combined tree's three files reproduces `work/b4` byte for byte.
+
+## What this means for the runs
+
+Hands-free levels 3 and 4 need this Mac to accept the gadget's identity. Either of these needs the owner and is outside my rules:
+
+1. One attended run. Have the Mac unlocked and someone at it when a level 3 boot with the v4 identity (or v2's, for level 3 only) enumerates, and allow the accessory when asked. macOS then caches it, as it did for fastboot and adb. Whether it prompts at all depends on the "Allow accessories to connect" setting, which I did not read. "Trigger not allowed" at 01:48 fits a locked Mac.
+2. Or set System Settings > Privacy & Security > Allow accessories to connect to "Always". That needs an admin password, and it weakens a security control, so it is the owner's decision.
+
+After either one, rerun level 3 with `usb-check.py` and `usb-verdict.py` as before. If it passes, level 4 (after Sol's GO on v3, with v4's identity) should need no further click, unless the cache is keyed on the configuration.
+
+---
+
+The rest of this file is the v3 description.
+
+## v3
+
+2026-11-03. Desk work only. I ran no adb, fastboot or dev.py, built no kernel, wrote nothing in either live kernel tree, and committed nothing.
+
+v3 answers Sol's re-audit, `analysis/usb-gadget-audit2.md`. That audit gave level 2 GO, level 3 GO after level 2 passes, and level 4 NO-GO. v2 is what runs on the phone tonight, and it is unchanged:
+
+- The `-v2.patch` files still match `SHA256SUMS`.
+- The v2 host tools, self-test, builder and README are copied unchanged in `v2/`, and still match their hashes in `v2/SHA256SUMS`.
+- v3's hashes are in `SHA256SUMS-v3`.
+
+Line numbers below refer to `work/b3/bsd/dev/`, the files after both v3 patches. The v2 description further down still holds except where this section says otherwise.
+
+## v3, finding by finding
+
+| # | Re-audit finding | v3 change | Where | Test, failing on v2 and passing on v3 |
+|---|---|---|---|---|
+| 1 | Alt 0 does not exclude TX: output starts TX in alt 0, and teardown can let a packet be copied into a TX buffer the controller owns | A data output admission gate, `ud.tx_closed`, guarded by `ud.lock` (see the list below) | `sweet_usb.c:441`, `:804`, `:833`, `:1849`, `:1981`, `:1781`, `:2315` | "R1 alt 0", "R1 configured but alt 0", "R1 output interleaved with alt-0 teardown", "R1 alt 1 again" (liveness) |
+| 2 | The readiness refusal came after the read-only probe | Levels 2 to 4 also refuse before the probe's first access when recovery is not armed. The check inside `ua_gadget` stays | `sweet_usb.c:209` | "R2 recovery not armed: the probe makes no access either" |
+| 3 | Request validation incomplete | The class branch accepts only SET_ETHERNET_PACKET_FILTER (0x21, 0x43) to interface 0, with no data, when configured. Standard requests are checked for wValue, wIndex and wLength as chapter 9 defines them, and for the Address and Configured states. The kernel tracks the Address state | `sweet_usb_gadget.h:332`, `:343`, `sweet_usb.c:1940`, `:1881` | 21 new header checks, 15 of which fail on v2's header. Harness: "R3 malformed SET_CONFIGURATION configures nothing" |
+| GUCTL2 note | ENDTRANSFER on a pending SETUP may not complete (Linux) | `ua_stop` leaves a SETUP TRB waiting for the host to the halt, as `dwc3_gadget_soft_disconnect` does. It still ends an ep0 data or status stage and every data endpoint | `sweet_usb.c:1788` | "R4 stop with a pending SETUP: halt covers it, stop verified". The old F3 stop-failure test now fails an ep1 data stage's end instead |
+| F7 note | The verdict matched substrings across boots | `usb-verdict.py` judges only the log after the last `ASTEROIDS USB L<n>: start`. On v2's script, "an old passing boot, then one that went quiet" gives a false PASS | `host/usb-verdict.py` | 3 new verdict cases |
+
+How the gate in finding 1 works:
+
+- Every teardown closes it under `ud.lock` before it ends any transfer: alternate 0, `SET_CONFIGURATION(0)`, bus reset or disconnect, and `ua_stop`. It stays closed through alt 0.
+- `ud_if_output` drops a packet while the gate is closed.
+- Before copying a byte, `ud_tx_kick_locked` checks the gate, `ud.gate`, `ud.stopped` and that the TX slot is not owned by the controller.
+- `tx_busy` is cleared only after the TX end succeeded with the gate closed.
+- The gate reopens under the same lock only in alternate 1, configured, with no gate failure, and then sends what is queued.
+- All command cleanup stays outside the lock.
+- The gadget starts with the gate closed. On the Poco F1 it is never closed, so that path keeps its behaviour.
+
+Finding 1's tests run the real `ud_if_output` and `ud_tx_kick_locked`, which the harness now extracts too, along with the real probe entry. A lock hook runs one network output just before each lock acquisition during the host's SET_INTERFACE(1, 0), 12 positions in all. Lock 2 is Sol's case. The mock flags any packet copy into `UD_TX` while the controller owns ep3. On v2, TX ends up active after the teardown at all 12 positions, and position 2 shows the copy into a live TX.
+
+### v3 desk checks
+
+All ran on 2026-11-03.
+
+1. `python3 -I host/kernel-harness.py b3`: 31 of 31 pass, plus the boot-order check.
+2. `python3 -I host/kernel-harness.py b2`: the same 25 earlier tests pass, and all 6 new tests fail.
+3. `python3 -I host/kernel-harness.py b`, v1: only the 3 baselines and one other test pass.
+4. `cc -std=c11 -Wall -Wextra -Werror -I work/b3/bsd/dev host/test_gadget.c -o /tmp/tg && /tmp/tg`: 13916 checks, 0 failed. With `-I work/b2/bsd/dev`, 15 fail.
+5. `python3 -I host/test_usb_check.py`: 9 checker scenarios and 8 verdict cases, all pass.
+6. `python3 -I host/syntax-check.py b3 FILE` for `sweet_usb.c`, `sweet_ufs.c` and `sweet_reboot.c`, and `m3 sweet_usb.c`: all exit 0, with 6, 77 and 9 inherited diagnostics as before.
+7. `git apply` of both v3 patches onto copies of the combined tree's three files reproduces `work/b3` byte for byte. `sweet_reboot.c` and `sweet_ufs.c` are the same as v2's.
+
+The mock's locks still do not block. The interleaving tests stand in for another thread with one call at a chosen point, so they cover ordering, not real concurrency.
+
+### Left for later
+
+- No watchdog for a bus stall that freezes every CPU. That is unchanged and shared by every level.
+- The Mac's IOUSBHostInterface key names are still my assumption. They only matter for level 3's host half. Level 4's checker uses ifconfig, ping6 and ssh.
+- The daily image is not approved for level 4, and its missing deadman still refuses level 4.
+- `CLEAR_FEATURE(ENDPOINT_HALT)` with no `CLEARSTALL`, and no reconnect after a stop, as in v2.
+
+### For tonight's v2 runs
+
+Use v3's `host/usb-verdict.py` for the level 2 and 3 verdicts too. It is host-only, needs no kernel change, and only judges the last run of the level in the pulled log. With v2's script, an earlier passing boot in the same log can vouch for a later quiet one.
+
+---
+
+The rest of this file is the v2 description.
 
 ## Files
 
