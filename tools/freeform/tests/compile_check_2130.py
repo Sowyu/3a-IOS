@@ -5,7 +5,7 @@ import collections, json, os, re, shutil, subprocess, sys, tempfile
 HERE = os.path.dirname(os.path.abspath(__file__)); ROOT = os.path.abspath(os.path.join(HERE, '../../..'))
 K = os.path.join(ROOT, 'ios-asteroids/research/xnu-local/dxb/xnu')
 OBJ = os.path.join(ROOT, 'ios-asteroids/research/xnu-local/dxb/build/xnu.obj/DEVELOPMENT_ARM64_SWEET/bsd/DEVELOPMENT')
-P = os.path.join(HERE, '../2130-asteroids-app-metal-exec.patch')
+P = os.path.abspath(sys.argv[1]) if len(sys.argv) > 1 else os.path.join(HERE, '../2130-asteroids-app-metal-exec-v4.patch')
 env = dict(os.environ, DEVELOPER_DIR='/Applications/Xcode.app/Contents/Developer')
 r = subprocess.run(['git', 'apply', '--check', P], cwd=K, capture_output=True, text=True)
 print(('ok   ' if r.returncode == 0 else 'FAIL ') + 'git apply --check in the kernel tree ' + r.stderr.strip()[:200])

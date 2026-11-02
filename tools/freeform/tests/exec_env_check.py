@@ -5,7 +5,8 @@ cut from temp copies of the kernel tree's kern_exec.c, four ways:
   base       the tree as it is: 2058 without 2130
   audited    tests/old/2130-audited.patch, the first audit's version
   reaudited  tests/old/2130-reaudited.patch, the second audit's version
-  current    plans/freeform/2130-asteroids-app-metal-exec.patch
+  v3         tests/old/2130-audit3.patch, the version Sol's third audit passed (plans/freeform/2130-asteroids-app-metal-exec.patch)
+  current    plans/freeform/2130-asteroids-app-metal-exec-v4.patch: v3 with an insert spelling only 2130 produces (ast100)
 and runs them against kernel stubs: user memory addressed by offset (so 4-byte pointers work), exec_add_user_string with the
 kernel's own accounting, a path builder relative to the caller's chroot as vn_getpath's is, and an exec_handle_sugid stub that
 makes its changes during the call. Every finding must reproduce on the version it was found in and be fixed in current. With
@@ -17,7 +18,8 @@ HERE = os.path.dirname(os.path.abspath(__file__)); ROOT = os.path.abspath(os.pat
 K = os.path.join(ROOT, 'ios-asteroids/research/xnu-local/dxb/xnu')
 PATCHES = {'base': None, 'audited': os.path.join(HERE, 'old/2130-audited.patch'),
            'reaudited': os.path.join(HERE, 'old/2130-reaudited.patch'),
-           'current': os.path.join(HERE, '../2130-asteroids-app-metal-exec.patch')}
+           'v3': os.path.join(HERE, 'old/2130-audit3.patch'),
+           'current': os.path.join(HERE, '../2130-asteroids-app-metal-exec-v4.patch')}
 
 STUBS = r'''
 #include <errno.h>
@@ -265,6 +267,10 @@ X = '/usr/libexec/x'
 APP = 'DYLD_INSERT_LIBRARIES=/usr/local/lib/bgmtl/bgmtl-inject.dylib'
 SB = 'DYLD_INSERT_LIBRARIES=/usr/local/lib/sweetsb.dylib'
 BOTH = 'DYLD_INSERT_LIBRARIES=/usr/local/lib/sweetsb.dylib:/usr/local/lib/bgmtl/bgmtl-inject.dylib'
+# APP is also bgl-launch's own variable for backboardd. v4 inserts and strips only its doubled-slash spelling.
+APP4 = 'DYLD_INSERT_LIBRARIES=/usr/local/lib/bgmtl//bgmtl-inject.dylib'
+BOTH4 = 'DYLD_INSERT_LIBRARIES=/usr/local/lib/sweetsb.dylib:/usr/local/lib/bgmtl//bgmtl-inject.dylib'
+LAUNCHER = (APP, 'BGMTL_BB=1', 'BGMTL_BB_RETRY=1')   # bgl-launch.c:585-587, what backboardd inherits
 DENIED = 'SWEET_APPMETAL_DENIED='
 TRIAL = '/private/var/trial'
 
@@ -335,7 +341,7 @@ with tempfile.TemporaryDirectory() as t:
         ('should-fix 3', 'the MAC decision inside exec_handle_sugid is a transition, the earlier query said none',
          dict(app='Freeform', qmac=0, smac=1), lambda o: inserts(o) == []),
         ('should-fix 3', 'the earlier query said transition, the decision inside exec_handle_sugid did not',
-         dict(app='Freeform', qmac=1, smac=0), lambda o: inserts(o) == [APP]),
+         dict(app='Freeform', qmac=1, smac=0), lambda o: inserts(o) in ([APP], [APP4])),
         ('review note', 'sweetexecenv gives Notes the exact inject value; a restricted Notes exec must keep it as sweetexecenv set it',
          dict(app='Freeform', path=NOTES, env='Notes:' + APP, cs=0x800), lambda o: inserts(o) == [APP]),
     ]
@@ -343,6 +349,23 @@ with tempfile.TemporaryDirectory() as t:
         o_old, o_new = run(exe['reaudited'], **kw), run(exe['current'], **kw)
         report(not ok(o_old) and ok(o_new), 're-audit %s: %s: reaudited %s, current %s' % (
             f, what, 'reproduces' if not ok(o_old) else 'DOES NOT REPRODUCE', 'fixed' if ok(o_new) else 'STILL WRONG %r' % envs(o_new)))
+    # ast100: bgl-launch execs backboardd with APP. With the trial on, v3 stripped it and backboardd ran CoreAnimation's
+    # stock renderer. Reproduce on v3, fixed in current, and current must equal base for that exec.
+    for sb in ('', '1'):
+        kw = dict(sb=sb, app='Freeform', path='/usr/libexec/backboardd')
+        o_b, o_old, o_new = run(exe['base'], LAUNCHER, **kw), run(exe['v3'], LAUNCHER, **kw), run(exe['current'], LAUNCHER, **kw)
+        ok = lambda o: inserts(o) == [APP] and envs(o) == list(LAUNCHER)
+        report(not ok(o_old) and ok(o_new) and o_new == o_b,
+               'ast100: sweetsb=%s, sweetappmetal=Freeform, bgl-launch to backboardd keeps %s: v3 %s, current %s%s' % (
+                   sb or '(absent)', APP[22:], 'reproduces (drops it)' if not ok(o_old) else 'DOES NOT REPRODUCE',
+                   'fixed' if ok(o_new) else 'STILL WRONG %r' % envs(o_new), ', equal to base' if o_new == o_b else ', DIFFERS FROM BASE'))
+    # a child of Freeform still drops 2130's own spelling, and any other process keeps the launcher's
+    for path in ('/usr/libexec/backboardd', X, NOTES):
+        kw = dict(app='Freeform', path=path)
+        o = run(exe['current'], (APP4, APP, 'A=1'), **kw)
+        report(envs(o) == [APP, 'A=1'], 'current, trial on, %s inherits both spellings: keeps the launcher\'s, drops 2130\'s%s' % (
+            path, '' if envs(o) == [APP, 'A=1'] else ' %r' % envs(o)))
+
     # blocker 2 is "differs from base with the trial off": reaudited must differ from base, current must not
     for app in ('', 'Notes', '0', 'freeform'):
         kw = dict(sb=1, app=app, env='Freeform:DYLD_INSERT_LIBRARIES=/x.dylib')
@@ -372,6 +395,14 @@ with tempfile.TemporaryDirectory() as t:
     if first_diff:
         print('     first difference: %r inherit %r' % first_diff)
 
+    n = same = 0
+    for sb, app, (path, vnode), inh, ptr in itertools.product(['', '1'], APPS, [(FF, FF), (NOTES, NOTES), (X, X), (FF, TRIAL + FF)],
+                                                           [(APP4,), (BOTH4,), (DENIED + APP4[22:],), (DENIED + BOTH4[22:], 'A=1')], [8, 4]):
+        kw = dict(sb=sb, app=app, path=path, vnode=vnode, ptr=ptr)
+        n += 1
+        same += run(exe['base'], inh, **kw) == run(exe['current'], inh, **kw)
+    report(same == n, "trial off or refused, inheriting v4's own spellings: current equals base in %d of %d execs" % (same, n))
+
     # Capacity: off, the append threshold is base's to the byte; on, it is where the arithmetic says, and one byte less fails open
     for ptr in (8, 4):
         for kw in (dict(sb=1, path=NOTES), dict(sb=1, path=FF)):
@@ -386,7 +417,7 @@ with tempfile.TemporaryDirectory() as t:
         def low(exe_, var_kw, key):
             return next(v for v in range(40, 600) if inserts(run(exe_, inh, ptr=ptr, **{key: v}, **var_kw)))
         ref = low(exe['base'], dict(sb=1), 'argspace')
-        for kw, var in ((dict(app='Freeform'), APP), (dict(sb=1, app='Freeform'), BOTH)):
+        for kw, var in ((dict(app='Freeform'), APP4), (dict(sb=1, app='Freeform'), BOTH4)):
             got = low(exe['current'], kw, 'argspace')
             below = run(exe['current'], inh, ptr=ptr, argspace=got - 1, **kw)
             report(got - ref == len(var) - len(SB) and inserts(below) == [] and field(below, 'RC') == 'RC 0',
@@ -395,7 +426,7 @@ with tempfile.TemporaryDirectory() as t:
         # strspace steps with the initial alignment padding, so check the append's condition itself on every value: the space
         # left before it (final count, plus the variable if appended, plus the tail padding) is at least length + one pointer
         # exactly when it appended. 2058's own append in base passes the same test.
-        for name_, kw, var in (('base', dict(sb=1), SB), ('current', dict(app='Freeform'), APP), ('current', dict(sb=1, app='Freeform'), BOTH)):
+        for name_, kw, var in (('base', dict(sb=1), SB), ('current', dict(app='Freeform'), APP4), ('current', dict(sb=1, app='Freeform'), BOTH4)):
             wrong = []
             for sv in range(120, 260):
                 o = run(exe[name_], inh, ptr=ptr, strspace=sv, **kw)
@@ -412,7 +443,7 @@ with tempfile.TemporaryDirectory() as t:
     # A refusal renames 22 bytes and nothing else: neighbours, counters and pointers as accepted, both pointer widths
     for ptr in (8, 4):
         for kw, inh, what in ((dict(sb=1, app='Freeform'), ('A=1', 'BB=22'), 'appended variable after A=1 and BB=22'),
-                              (dict(app='Freeform', env='Freeform:' + APP + ',Z=9'), ('A=1',), 'sweetexecenv value between A=1 and Z=9')):
+                              (dict(app='Freeform', env='Freeform:Y=8,Z=9'), ('A=1',), 'inject variable after A=1 and sweetexecenv\'s Y=8, Z=9')):
             ok_o = run(exe['current'], inh, ptr=ptr, **kw)
             no_o = run(exe['current'], inh, ptr=ptr, cs=0x800, **kw)
             a, b = bytes.fromhex(field(ok_o, 'AREA')[5:]), bytes.fromhex(field(no_o, 'AREA')[5:])
@@ -425,18 +456,20 @@ with tempfile.TemporaryDirectory() as t:
 
     # Behaviour current keeps: the trial itself, children, and the sugid stub's changes made during the call
     KEEP = [
-        ('Freeform gets the inject', dict(app='Freeform'), (), lambda o: inserts(o) == [APP]),
-        ('Freeform gets both, sweetsb first, in one variable', dict(sb=1, app='Freeform'), (), lambda o: inserts(o) == [BOTH]),
+        ('Freeform gets the inject', dict(app='Freeform'), (), lambda o: inserts(o) == [APP4]),
+        ('Freeform gets both, sweetsb first, in one variable', dict(sb=1, app='Freeform'), (), lambda o: inserts(o) == [BOTH4]),
         ('with the trial on, other apps get nothing new', dict(app='Freeform', path=NOTES), (), lambda o: inserts(o) == []),
-        ('a child of Freeform drops the inject', dict(app='Freeform', path=X), (APP,), lambda o: inserts(o) == []),
-        ('a child drops the renamed form', dict(app='Freeform', path=X), (DENIED + APP[22:],), lambda o: envs(o) == []),
+        ('a child of Freeform drops the inject', dict(app='Freeform', path=X), (APP4,), lambda o: inserts(o) == []),
+        ('a child drops the renamed form', dict(app='Freeform', path=X), (DENIED + APP4[22:],), lambda o: envs(o) == []),
+        ('the sweetexecenv value of the launcher\'s spelling for a restricted Freeform is left as set',
+         dict(app='Freeform', env='Freeform:' + APP, cs=0x800), (), lambda o: inserts(o) == [APP]),
         ('a launcher\'s own insert is kept and suppresses ours', dict(app='Freeform'), ('DYLD_INSERT_LIBRARIES=/mine.dylib',),
          lambda o: inserts(o) == ['DYLD_INSERT_LIBRARIES=/mine.dylib']),
         ('posix_spawn into a chroot (the new process rooted, the caller not) is refused',
          dict(app='Freeform', rdir_target=TRIAL), (), lambda o: inserts(o) == []),
         ('hardened runtime set inside exec_handle_sugid is refused', dict(app='Freeform', scs=0x10000), (), lambda o: inserts(o) == []),
         ('set-id credentials made inside exec_handle_sugid are refused', dict(sb=1, app='Freeform', ssugid=1), (),
-         lambda o: envs(o) == [DENIED + BOTH[22:]]),
+         lambda o: envs(o) == [DENIED + BOTH4[22:]]),
         ('a refusal says why on the console', dict(app='Freeform', cs=0x800), (),
          lambda o: 'SWEET EXEC: appmetal inject refused for /Applications/Freeform.app/Freeform: a restricted signature' in o),
         ('a chroot refusal says so', chroot, (), lambda o: 'refused for /Applications/Freeform.app/Freeform: a chroot' in o),

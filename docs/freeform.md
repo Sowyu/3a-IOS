@@ -250,3 +250,17 @@ With `sweetappmetal` off, backboardd differs from next-luma only in the translat
 ### Fix
 
 The kernel fix, which needs Sol's audit and a kernel build: 2130 inserts and strips a spelling only it produces, `/usr/local/lib/bgmtl//bgmtl-inject.dylib`. That is the same file, and the doubled slash makes the string 2130's alone. The combined form becomes `...sweetsb.dylib:/usr/local/lib/bgmtl//bgmtl-inject.dylib`, and `exec_env_check.py` gets a case where bgl-launch to backboardd with the trial on keeps its variable, which fails on the current code. Inferred: dyld opens the doubled-slash path normally; check that the first time on the phone. The stop-gap with the existing kernel is to change bgl-launch's spelling instead. That is one line and pushable, but it touches the daily launcher.
+
+### 2130 v4 (2026-11-03, overnight)
+
+`plans/freeform/2130-asteroids-app-metal-exec-v4.patch` is v3 with one change. 2130 inserts and strips `/usr/local/lib/bgmtl//bgmtl-inject.dylib`, a spelling only it produces, and its combined form ends in the same doubled-slash path. bgl-launch's `DYLD_INSERT_LIBRARIES=/usr/local/lib/bgmtl/bgmtl-inject.dylib` for backboardd is never 2130's any more, so the launcher stays as it is. v3 is unchanged and saved as `tests/old/2130-audit3.patch`. `2130-v3-to-v4.patch` is the increment for a tree that already carries v3.
+
+dyld accepts the spelling. Proven from Apple's dyld-1378 source: `Loader::getLoader` opens an insert path as given, and falls back to `realpath()` only if that fails, with a comment that names paths containing `//`. The only `//` rule in dyld is the cache builder's install-name check, which does not apply here. The phone's dyld is dyld-1387 (`/usr/lib/dyld` on the root) and has the same insert-loop and realpath strings. `@loader_path` for libchlorophyll and libdrm becomes `/usr/local/lib/bgmtl//...`, which the kernel opens as the same file. Inferred: no behaviour difference on the phone. Confirm it on the first boot.
+
+`tests/exec_env_check.py` (59 of 59, saved in `work/exec-env-check-v4.txt`):
+
+- bgl-launch to backboardd with the trial on keeps its variable. This drops it on v3 and is fixed in v4, equal to base, with and without sweetsb.
+- With the trial on, a process inheriting both spellings keeps the launcher's and drops 2130's.
+- With the trial off, v4 equals base in all 23,040 execs of the original matrix, and in 384 more that inherit v4's own spellings.
+
+The compile check passes with 0 new diagnostics, and `git apply --check` passes on the tree.
