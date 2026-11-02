@@ -205,3 +205,19 @@ Still open:
 - A library that dyld accepts and that then fails in a dependency or constructor still kills Freeform at load. The watchdog cannot cover that.
 - The near-capacity E2BIG predates 2058 (audit, capacity section).
 - Nothing here ran on a phone. Sol should re-audit before the kernel is built.
+
+## 2130 after the re-audit
+
+Sol's second NO-GO (`analysis/2130-reaudit.md`) had two blockers. Both are fixed, and so are both should-fixes.
+
+| Item | Change |
+|---|---|
+| Blocker 1: chroot-relative path | Injection is refused if the calling process or the new process has a chroot (`fd_rdir`), and the vnode's path is built from the machine's root (`VN_GETPATH_NO_PROCROOT`). The console says `refused ...: a chroot` |
+| Blocker 2: behaviour change when off | Every 2130 line is a no-op unless `sweetappmetal=Freeform`, the `sweetexecenv` bookkeeping included. The log line for a refused value is gone too |
+| Should-fix 3: MAC decision asked twice | `exec_handle_sugid` hands back its own `mac_transition` through a new argument, written only with the feature on. The second query is gone |
+| Should-fix 4: tests | `tests/exec_env_check.py` now covers 32-bit and 64-bit pointers, append thresholds, neighbouring bytes on a refusal, the derived pointer vector, chroots, and changes made inside `exec_handle_sugid` |
+| Note on value search | The late scan only runs for the exact Freeform exec, so the same value that `sweetexecenv` sets for another app is left alone |
+
+The check builds four versions from the tree: base (2058 alone), the first audited version, the re-audited version and the current one. Each finding reproduces on the version where it was found and passes on current. With the trial off or refused, current equals base in all 23,040 executions of the matrix, compared on string bytes, counters, the pointer vector and console lines. `tests/old/2130-reaudited.patch` is the re-audited version, byte for byte.
+
+Still open: the items listed under "2130 after the audit". Nothing has run on a phone. Sol should audit this version before the kernel is built.

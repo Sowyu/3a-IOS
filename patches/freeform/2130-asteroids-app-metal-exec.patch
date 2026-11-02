@@ -1,42 +1,42 @@
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -416,6 +416,8 @@ static int execargs_alloc(struct image_params *imgp);
+@@ -416,8 +416,10 @@ static int execargs_alloc(struct image_params *imgp);
  static int execargs_free(struct image_params *imgp);
  static int exec_check_permissions(struct image_params *imgp);
  static int exec_extract_strings(struct image_params *imgp);
 +static char *sweet_appmetal_inserted(struct image_params *imgp);
 +static void sweet_appmetal_check(struct image_params *imgp, proc_t p, char *s, int mac_transition);
  static int exec_add_apple_strings(struct image_params *imgp, const load_result_t *load_result, task_t task);
- static int exec_handle_sugid(struct image_params *imgp);
+-static int exec_handle_sugid(struct image_params *imgp);
++static int exec_handle_sugid(struct image_params *imgp, int *sweet_mac);
  static int sugid_scripts = 0;
-@@ -2400,7 +2402,18 @@ grade:
+ SYSCTL_INT(_kern, OID_AUTO, sugid_scripts, CTLFLAG_RW | CTLFLAG_LOCKED, &sugid_scripts, 0, "");
+ static kern_return_t create_unix_stack(vm_map_t map, load_result_t* load_result, proc_t p);
+@@ -2400,7 +2402,12 @@ grade:
  	/*
  	 * deal with set[ug]id.
  	 */
+-	error = exec_handle_sugid(imgp);
 +	char *sweet_am = sweet_appmetal_inserted(imgp);
-+#if CONFIG_MACF
-+	/* 2130: the query exec_handle_sugid makes first; it does not keep the answer */
-+	int sweet_am_mac = sweet_am != NULL && mac_cred_check_label_update_execve(imgp->ip_vfs_context, imgp->ip_vp,
-+	    imgp->ip_arch_offset, imgp->ip_scriptvp, imgp->ip_scriptlabelp, imgp->ip_execlabelp, p, &imgp->ip_px_smpx);
-+#else
-+	int sweet_am_mac = 0;
-+#endif
- 	error = exec_handle_sugid(imgp);
++	int sweet_am_mac = 0;   /* 2130: exec_handle_sugid's own MAC transition decision */
++	error = exec_handle_sugid(imgp, &sweet_am_mac);
 +	if (sweet_am != NULL && !error) {
 +		sweet_appmetal_check(imgp, p, sweet_am, sweet_am_mac);
 +	}
  	if (error) {
  		KERNEL_DEBUG_CONSTANT(BSDDBG_CODE(DBG_BSD_PROC, BSD_PROC_EXITREASON_CREATE) | DBG_FUNC_NONE,
  		    proc_getpid(p), OS_REASON_EXEC, EXEC_EXIT_REASON_SUGID_FAILURE, 0, 0);
-@@ -6796,6 +6809,102 @@ sweet_ui_exec_path(const char *p)
+@@ -6796,6 +6803,125 @@ sweet_ui_exec_path(const char *p)
      return *p && !strchr(p,'/') && strcmp(p,".") && strcmp(p,"..");
  }
  
 +/*
 + * 2130: sweetappmetal=Freeform inserts the Chlorophyll inject into exactly /Applications/Freeform.app/Freeform, the trial of
-+ * plans/freeform. Off without the boot-arg, and every other value is refused. With 2058's sweetsb=1 as well, Freeform gets one
-+ * variable listing both, sweetsb first. The match is the exec path string and the vnode's own path, so another bundle, a
-+ * helper of the same name or a symlink to another file does not match.
++ * plans/freeform. Every 2130 line is a no-op unless that boot-arg is set and accepted (sweet_appmetal_enabled): without it,
++ * or with any other value, exec behaves exactly as with 2058 alone. With sweetsb=1 as well, Freeform gets one variable listing
++ * both, sweetsb first. The match is the exec path string and the vnode's path from the machine's root, and a chroot of the
++ * caller or of the new process refuses, so another bundle, a helper of the same name, a symlink to another file or a
++ * Freeform-shaped path inside a chroot does not match.
 + */
 +#define SWEET_APPMETAL_PATH "/Applications/Freeform.app/Freeform"
 +static const char sweet_insert_app[] = "DYLD_INSERT_LIBRARIES=/usr/local/lib/bgmtl/bgmtl-inject.dylib";
@@ -51,10 +51,8 @@
 +	static int state = -1;
 +	if (state < 0) {
 +		char name[16] = "";
++		/* any other value is off, silently: off must be 2058 alone, console included */
 +		state = PE_parse_boot_argn("sweetappmetal", name, sizeof(name)) && !strcmp(name, "Freeform");
-+		if (!state && name[0] != '\0') {
-+			printf("SWEET EXEC: appmetal: sweetappmetal=%s refused, only Freeform is supported\n", name);
-+		}
 +	}
 +	return state;
 +}
@@ -77,22 +75,45 @@
 +}
 +
 +static int
++sweet_appmetal_chrooted(proc_t p)
++{
++	int rooted;
++	if (p == PROC_NULL) {
++		return 1;
++	}
++	proc_fdlock(p);
++	rooted = p->p_fd.fd_rdir != NULLVP;
++	proc_fdunlock(p);
++	return rooted;
++}
++
++static int
 +sweet_appmetal_match(struct image_params *imgp)
 +{
 +	char real[64];
-+	int len = sizeof(real);
++	size_t len = sizeof(real);
 +	if (!sweet_appmetal_enabled() || strcmp(imgp->ip_strings + strlen(EXECUTABLE_KEY), SWEET_APPMETAL_PATH)) {
 +		return 0;
 +	}
-+	/* the file actually being executed: ENOSPC for a longer path, which is not ours either */
-+	return imgp->ip_vp != NULLVP && vn_getpath(imgp->ip_vp, real, &len) == 0 && !strcmp(real, SWEET_APPMETAL_PATH);
++	/* the caller's root, or with posix_spawn the new process's: both name files relative to themselves */
++	if (sweet_appmetal_chrooted(current_proc()) || sweet_appmetal_chrooted(vfs_context_proc(imgp->ip_vfs_context))) {
++		printf("SWEET EXEC: appmetal inject refused for %s: a chroot\n", SWEET_APPMETAL_PATH);
++		return 0;
++	}
++	/* the file actually being executed, named from the machine's root: ENOSPC for a longer path, which is not ours either */
++	return imgp->ip_vp != NULLVP && vn_getpath_ext(imgp->ip_vp, NULLVP, real, &len, VN_GETPATH_NO_PROCROOT) == 0 &&
++	       !strcmp(real, SWEET_APPMETAL_PATH);
 +}
 +
-+/* Our insertion among the extracted environment strings, or NULL. With the feature on an inherited copy was stripped. */
++/*
++ * Our insertion among the extracted environment strings, or NULL. Only for the exec of the exact path, so an identical value
++ * that sweetexecenv appends for another executable is left alone. With the feature on an inherited copy was stripped.
++ */
 +static char *
 +sweet_appmetal_inserted(struct image_params *imgp)
 +{
-+	if (!sweet_appmetal_enabled() || imgp->ip_endargv == NULL || imgp->ip_endenvv == NULL) {
++	if (!sweet_appmetal_enabled() || imgp->ip_endargv == NULL || imgp->ip_endenvv == NULL ||
++	    strcmp(imgp->ip_strings + strlen(EXECUTABLE_KEY), SWEET_APPMETAL_PATH)) {
 +		return NULL;
 +	}
 +	for (char *s = imgp->ip_endargv; s < imgp->ip_endenvv; s += strlen(s) + 1) {
@@ -131,7 +152,7 @@
  __attribute__((noinline))
  static int
  exec_extract_strings(struct image_params *imgp)
-@@ -6972,7 +7081,7 @@ exec_extract_strings(struct image_params *imgp)
+@@ -6972,7 +7098,7 @@ exec_extract_strings(struct image_params *imgp)
  			goto bad;
  		}
  		/* Never propagate our own variable to children, including when dyld skipped it. */
@@ -140,17 +161,18 @@
  			size_t n = (size_t)(imgp->ip_strendp - sweet_begin);
  			imgp->ip_strendp = sweet_begin;
  			imgp->ip_strspace += n;
-@@ -7027,6 +7136,9 @@ exec_extract_strings(struct image_params *imgp)
+@@ -7027,6 +7153,10 @@ exec_extract_strings(struct image_params *imgp)
  						}
  						imgp->ip_argspace -= new_ptr_size;
  						imgp->ip_envc++;
-+						if (!strncmp(one, "DYLD_INSERT_LIBRARIES=", 22)) {
++						/* 2130 only: with it off, 2058 keeps its own behaviour beside sweetexecenv */
++						if (sweet_appmetal_enabled() && !strncmp(one, "DYLD_INSERT_LIBRARIES=", 22)) {
 +							sweet_existing = TRUE;
 +						}
  						printf("SWEET EXEC: env %s += %s\n", base, one);
  					}
  					c = e < end ? e + 1 : e;
-@@ -7036,17 +7148,20 @@ exec_extract_strings(struct image_params *imgp)
+@@ -7036,17 +7166,20 @@ exec_extract_strings(struct image_params *imgp)
  		}
  	}
  
@@ -179,3 +201,25 @@
  		imgp->ip_envc++;
  	}
  
+@@ -7702,7 +7835,7 @@ exec_check_permissions(struct image_params *imgp)
+  */
+ __attribute__((noinline))
+ static int
+-exec_handle_sugid(struct image_params *imgp)
++exec_handle_sugid(struct image_params *imgp, int *sweet_mac)
+ {
+ 	proc_t                  p = vfs_context_proc(imgp->ip_vfs_context);
+ 	kauth_cred_t            cred = vfs_context_ucred(imgp->ip_vfs_context);
+@@ -7732,6 +7865,12 @@ exec_handle_sugid(struct image_params *imgp)
+ 		imgp->ip_execlabelp,
+ 		p,
+ 		&imgp->ip_px_smpx);
++	/* 2130: the decision that controls this exec, for the inject's check after it */
++	if (sweet_appmetal_enabled()) {
++		*sweet_mac = mac_transition;
++	}
++#else
++	(void)sweet_mac;
+ #endif
+ 
+ 	OSBitAndAtomic(~((uint32_t)P_SUGID), &p->p_flag);
