@@ -1,0 +1,668 @@
+From: asteroids USB gadget, part 1 of 2
+Subject: [PATCH 2160 v3] asteroids: USB gadget shared plumbing (no behaviour change on asteroids)
+
+New bsd/dev/sweet_usb_gadget.h: the hardware-free gadget logic (DMA area layout, address gates, descriptors per level
+and speed, the ep0 request table, frame and event arithmetic), host-tested by plans/usb/gadget/host/test_gadget.c.
+sweet_usb.c: the DMA layout moves there and gives every TRB and small buffer its own 64-byte cache line; DWC3 register
+accesses become one plain ldr/str each; ud_start_trb refuses a TRB or buffer outside the DMA area; RX length and TX
+padding go through the tested helpers; the TX pad uses the bulk max packet. v2: ud_start_trb returns its result, and
+in strict mode (set only by 2161's asteroids levels) refuses a slot that is not the endpoint's own or still active,
+and turns a failed STARTTRANSFER into a stop. v3: a data output admission gate, ud.tx_closed, checked under ud.lock
+by ud_if_output and by ud_tx_kick_locked before any packet byte is copied, with the TX slot's ownership; false and
+so inert on the Poco F1. The ep0 request parser checks the whole request shape and the Address state. On asteroids none of this runs until 2161 and sweetusb>=2. The Poco F1 and sweet paths keep their behaviour apart from the new layout and the gate.
+
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -23,6 +23,7 @@
+ #include <vm/vm_kern_xnu.h>
+ #include <pexpert/pexpert.h>
+ #include "sweet_board.h"
++#include "sweet_usb_gadget.h"
+ #include <kern/locks.h>
+ #include <sys/kpi_mbuf.h>
+ #include <sys/kpi_socket.h>
+@@ -388,21 +389,7 @@
+ #define TRBCTL_STATUS3  (4u << 4)
+ #define TRBCTL_DATA     (5u << 4)
+ 
+-/* DMA area layout */
+-#define UD_EVT          0x0000          /* event buffer, 4 KiB */
+-#define UD_EVT_SIZE     0x1000
+-#define UD_TRB_OUT      0x1000          /* ep0 OUT TRB */
+-#define UD_TRB_IN       0x1010          /* ep0 IN TRB */
+-#define UD_TRB_RX       0x1020          /* ep1 OUT (bulk, host -> phone) */
+-#define UD_TRB_TX       0x1030          /* ep1 IN (bulk, phone -> host) */
+-#define UD_TRB_INT      0x1050          /* ep2 IN (interrupt, notifications) */
+-#define UD_SETUP        0x1040          /* 8-byte setup packet */
+-#define UD_DATA         0x1100          /* ep0 data stage, 512 bytes */
+-#define UD_NOTIFY       0x1300          /* 16-byte notification */
+-#define UD_RX           0x2000          /* one received frame */
+-#define UD_TX           0x2800          /* one frame to send */
+-#define UD_FRAME_MAX    0x800
+-#define UD_SIZE         0x4000
++/* DMA area layout: sweet_usb_gadget.h */
+ 
+ /* Physical endpoints: 2n = OUT, 2n+1 = IN */
+ #define EP_RX           2               /* 0x01 bulk OUT */
+@@ -436,19 +423,25 @@
+ 	uint8_t     notify_stage;   /* 1 NETWORK_CONNECTION sent, 2 SPEED_CHANGE sent */
+ 	int         net_route;      /* sweetnetroute=1: add the default route via the host at link-up */
+ 	volatile UInt32 route_thread; /* a route thread is running */
+-} ud;
++	uint32_t    bulk_mps;       /* 512, or 1024 at SuperSpeed (asteroids) */
++	volatile bool stopped;      /* asteroids teardown done: no transfer may start again */
++	const char *volatile gate;  /* asteroids: why a DMA gate refused, for the event thread to stop on */
++	bool        strict;         /* asteroids: one transfer per slot, and a failed start stops the gadget */
++	bool        tx_closed;      /* asteroids: data output admission, under lock; closed except in alt 1 (Poco F1: false) */
++} ud = { .bulk_mps = 512 };
+ 
++/* One plain str / ldr each: Gunyah cannot emulate an access with writeback (see ua_rd). */
+ static inline void
+ dwc_wr(uint32_t off, uint32_t v)
+ {
+-	*(volatile uint32_t *)(ud.dwc + off) = v;
++	__asm__ volatile ("str %w0, [%1]" :: "r"(v), "r"(ud.dwc + off) : "memory");
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ }
+ 
+ static inline uint32_t
+ dwc_rd(uint32_t off)
+ {
+-	return usb_rd(ud.dwc, off);
++	return ua_rd(ud.dwc, off);
+ }
+ 
+ static void
+@@ -492,16 +485,35 @@
+ }
+ 
+ /* One TRB (at DMA offset trb) on physical endpoint ep. */
+-static void
++static int
+ ud_start_trb(unsigned ep, uint32_t trb, uint32_t buf, uint32_t len, uint32_t ctl)
+ {
+ 	volatile uint32_t *t = (volatile uint32_t *)(ud.dma + trb);
+ 	uint64_t bpa = ud.dma_pa + buf;
++	uint32_t w[4];
+ 
+-	t[0] = (uint32_t)bpa;
+-	t[1] = (uint32_t)(bpa >> 32);
+-	t[2] = len;
+-	t[3] = ctl | TRB_HWO | TRB_LST | TRB_ISP_IMI | TRB_IOC;
++	/* DMA gate: the TRB is one of the TRB slots, its buffer lies inside one buffer region of our own area. */
++	if (ud.stopped || !ug_trb_off_ok(trb) || !ug_buf_off_ok(buf, len) ||
++	    !ug_pa_ok(ud.dma_pa + UD_TRB_OUT, UD_SETUP - UD_TRB_OUT, ud.dma_pa + trb, 16) ||
++	    !ug_pa_ok(ud.dma_pa + UD_SETUP, UD_SIZE - UD_SETUP, bpa, len)) {
++		if (!ud.stopped) {
++			printf("ASTEROIDS USB GATE: refused TRB 0x%x buffer 0x%x+%u on ep%u\n", trb, buf, len, ep);
++			ud.gate = "TRB or buffer outside the DMA area";
++		}
++		return -1;
++	}
++	/* Asteroids: each endpoint has its own slot, and a slot the controller may still own is never rewritten. */
++	if (ud.strict && (ug_trb_slot(ep) != trb || ud.xfer_active[ep])) {
++		printf("ASTEROIDS USB GATE: ep%u TRB 0x%x refused: %s\n", ep, trb,
++		    ug_trb_slot(ep) != trb ? "not its slot" : "a transfer is still active");
++		ud.gate = "start on an active or foreign slot";
++		return -1;
++	}
++	ug_trb_fill(w, bpa, len, ctl | TRB_HWO | TRB_LST | TRB_ISP_IMI | TRB_IOC);
++	t[0] = w[0];
++	t[1] = w[1];
++	t[2] = w[2];
++	t[3] = w[3];
+ 	ud_sync(trb, 16);
+ 	if (len) {
+ 		ud_sync(buf, len);
+@@ -510,7 +522,15 @@
+ 	if (ud_epcmd(ep, DEPCMD_STARTTRANSFER, (uint32_t)(tpa >> 32), (uint32_t)tpa, 0) == 0 && ep < 6) {
+ 		ud.xfer_res[ep] = (uint8_t)((dwc_rd(DEPCMD(ep)) >> 16) & 0x7f);
+ 		ud.xfer_active[ep] = true;
++		return 0;
+ 	}
++	if (ud.strict) {                /* a timeout may still start it later: never treat the slot as free */
++		if (ep < 6) {
++			ud.xfer_active[ep] = true;
++		}
++		ud.gate = "STARTTRANSFER failed";
++	}
++	return -1;
+ }
+ 
+ static void
+@@ -730,7 +750,7 @@
+ {
+ 	volatile uint32_t *t = (volatile uint32_t *)(ud.dma + UD_TRB_RX);
+ 	ud_sync(UD_TRB_RX, 16);
+-	uint32_t len = UD_FRAME_MAX - (t[2] & 0xffffff);
++	uint32_t len = ug_rx_len(t[2], UD_FRAME_MAX);
+ 	ud_sync(UD_RX, UD_FRAME_MAX);
+ 	if (ud.ifp != NULL && len >= ETHER_HDR_LEN && len <= ETHER_MAX_LEN) {
+ 		/*
+@@ -769,6 +789,10 @@
+ ud_tx_kick_locked(void)
+ {
+ 	while (!ud.tx_busy && ud.txq_count > 0 && ud.configured) {
++		/* Asteroids: no packet byte is copied unless output is admitted and the TX slot is free. ud.lock held. */
++		if (ud.tx_closed || ud.gate != NULL || ud.stopped || (ud.strict && ud.xfer_active[EP_TX])) {
++			break;
++		}
+ 		mbuf_t m = ud.txq[ud.txq_head];
+ 		ud.txq_head = (ud.txq_head + 1) % UD_TXQ;
+ 		ud.txq_count--;
+@@ -779,9 +803,9 @@
+ 		}
+ 		mbuf_copydata(m, 0, len, (void *)(ud.dma + UD_TX));
+ 		mbuf_freem(m);
+-		/* A frame of a multiple of 512 bytes would need a zero-length
++		/* A frame of a multiple of the max packet would need a zero-length
+ 		 * packet to end it; one pad byte does the same (IP ignores it). */
+-		if ((len % 512) == 0) {
++		if (ug_tx_len((uint32_t)len, ud.bulk_mps) != len) {
+ 			((uint8_t *)(ud.dma + UD_TX))[len++] = 0;
+ 		}
+ 		ud.tx_busy = true;
+@@ -794,7 +818,7 @@
+ ud_if_output(ifnet_t ifp, mbuf_t m)
+ {
+ 	lck_mtx_lock(ud.lock);
+-	if (ud.txq_count == UD_TXQ || !ud.configured) {
++	if (ud.txq_count == UD_TXQ || !ud.configured || ud.tx_closed) {
+ 		lck_mtx_unlock(ud.lock);
+ 		mbuf_freem(m);
+ 		ifnet_stat_increment_out(ifp, 0, 0, 1);
+@@ -963,8 +987,10 @@
+ 	struct ifnet_init_eparams init;
+ 	static lck_grp_t *grp;
+ 
+-	grp = lck_grp_alloc_init("sweet_usb", LCK_GRP_ATTR_NULL);
+-	ud.lock = lck_mtx_alloc_init(grp, LCK_ATTR_NULL);
++	if (ud.lock == NULL) {          /* asteroids allocates it before the controller starts */
++		grp = lck_grp_alloc_init("sweet_usb", LCK_GRP_ATTR_NULL);
++		ud.lock = lck_mtx_alloc_init(grp, LCK_ATTR_NULL);
++	}
+ 
+ 	bzero(&init, sizeof(init));
+ 	init.ver = IFNET_INIT_CURRENT_VERSION;
+@@ -1193,7 +1219,7 @@
+ 		if ((++ticks % 30000) == 0) {
+ 			volatile uint32_t *rx = (volatile uint32_t *)(ud.dma + UD_TRB_RX);
+ 			volatile uint32_t *tx = (volatile uint32_t *)(ud.dma + UD_TRB_TX);
+-			ud_sync(UD_TRB_RX, 0x20);
++			ud_sync(UD_TRB_RX, UD_TRB_INT - UD_TRB_RX);
+ 			printf("SWEET USB: ue0 rx %llu tx %llu frames; cfg %d alt %u txbusy %d txq %u; "
+ 			    "rx trb %08x/%08x act %d, tx trb %08x/%08x act %d; DSTS 0x%08x\n",
+ 			    ud.rx_frames, ud.tx_frames, ud.configured, ud.data_alt, ud.tx_busy, ud.txq_count,
+@@ -1529,4 +1555,5 @@
+ 		thread_deallocate(thread);
+ 	}
+ }
++
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_usb_gadget.h b/bsd/dev/sweet_usb_gadget.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_usb_gadget.h
+@@ -0,0 +1,461 @@
++/*
++ * SWEET USB gadget: the parts with no hardware access, shared by sweet_usb.c and the Mac host test
++ * (plans/usb/gadget/host/test_gadget.c). DMA area layout and address gates, descriptors per level and speed, the
++ * ep0 request table, event-count and frame-length arithmetic. Nothing here touches a register.
++ */
++#ifndef _SWEET_USB_GADGET_H_
++#define _SWEET_USB_GADGET_H_
++
++#include <stdbool.h>
++#include <stdint.h>
++#include <stddef.h>
++
++/*
++ * DMA area layout, 16 KiB. Every TRB and every small buffer has its own 64-byte line: the cache maintenance is by
++ * line, so a clean of one TRB the CPU just wrote must never write back a stale copy of a neighbour the controller
++ * updated (the old layout had four TRBs and the setup packet sharing lines).
++ */
++#define UD_EVT          0x0000          /* event buffer, 4 KiB */
++#define UD_EVT_SIZE     0x1000
++#define UD_TRB_OUT      0x1000          /* ep0 OUT TRB */
++#define UD_TRB_IN       0x1040          /* ep0 IN TRB */
++#define UD_TRB_RX       0x1080          /* ep1 OUT (bulk, host -> phone) */
++#define UD_TRB_TX       0x10c0          /* ep1 IN (bulk, phone -> host) */
++#define UD_TRB_INT      0x1100          /* ep2 IN (interrupt, notifications) */
++#define UD_SETUP        0x1140          /* 8-byte setup packet */
++#define UD_NOTIFY       0x1180          /* 16-byte notification */
++#define UD_DATA         0x1200          /* ep0 data stage, 512 bytes (one SuperSpeed ep0 packet) */
++#define UD_DATA_SIZE    0x200
++#define UD_RX           0x2000          /* one received frame */
++#define UD_TX           0x2800          /* one frame to send */
++#define UD_FRAME_MAX    0x800
++#define UD_SIZE         0x4000
++
++/* DSTS.CONNECTSPD */
++#define UG_SPEED_HS     0
++#define UG_SPEED_FS     1
++#define UG_SPEED_SS     4
++
++/* sweetusb=N: the low nibble is the level, 0x10 forces high speed (DCFG.DEVSPD = 0 before RUN_STOP). */
++#define UG_LEVEL_PROBE  1               /* read-only probe (2043, 2062) */
++#define UG_LEVEL_OWN    2               /* own the controller: our event buffer, ep0 commands, no RUN_STOP */
++#define UG_LEVEL_ENUM   3               /* soft-connect, enumerate with ep0 only, then soft-disconnect */
++#define UG_LEVEL_ECM    4               /* CDC-ECM, ue0, stays up */
++#define UG_FLAG_HS      0x10
++
++/* Is [off, off + len) inside one DMA buffer region? TRBs must be exactly one of the TRB slots. */
++static inline bool
++ug_trb_off_ok(uint32_t off)
++{
++	return off == UD_TRB_OUT || off == UD_TRB_IN || off == UD_TRB_RX || off == UD_TRB_TX || off == UD_TRB_INT;
++}
++
++/* The one TRB slot of each physical endpoint the gadget uses (0 = none): a slot belongs to exactly one endpoint. */
++static inline uint32_t
++ug_trb_slot(unsigned ep)
++{
++	switch (ep) {
++	case 0: return UD_TRB_OUT;
++	case 1: return UD_TRB_IN;
++	case 2: return UD_TRB_RX;
++	case 3: return UD_TRB_TX;
++	case 5: return UD_TRB_INT;
++	default: return 0;
++	}
++}
++
++static inline bool
++ug_buf_off_ok(uint32_t off, uint32_t len)
++{
++	static const struct {
++		uint32_t off, size;
++	} region[] = {
++		{ UD_SETUP, 8 }, { UD_NOTIFY, 16 }, { UD_DATA, UD_DATA_SIZE }, { UD_RX, UD_FRAME_MAX }, { UD_TX, UD_FRAME_MAX },
++	};
++	for (unsigned i = 0; i < sizeof(region) / sizeof(region[0]); i++) {
++		if (off >= region[i].off && len <= region[i].size && off - region[i].off <= region[i].size - len) {
++			return true;
++		}
++	}
++	return false;
++}
++
++/* A physical range inside [base, base + size), with no wrap. */
++static inline bool
++ug_pa_ok(uint64_t base, uint64_t size, uint64_t pa, uint64_t len)
++{
++	return pa >= base && len <= size && pa - base <= size - len;
++}
++
++static inline void
++ug_trb_fill(uint32_t t[4], uint64_t pa, uint32_t len, uint32_t ctl)
++{
++	t[0] = (uint32_t)pa;
++	t[1] = (uint32_t)(pa >> 32);
++	t[2] = len & 0xffffffu;
++	t[3] = ctl;
++}
++
++/* GEVNTCOUNT: whole 4-byte events, never more than the buffer holds. */
++static inline bool
++ug_evt_count_ok(uint32_t count)
++{
++	return (count & 3u) == 0 && count <= UD_EVT_SIZE;
++}
++
++/*
++ * The level 2 DMA proof. After SETTRANSFRESOURCE on ep1 with CmdIOC into a zeroed buffer, the controller must have
++ * counted exactly one event, written at offset 0, of the form "endpoint 1, EPCMDCMPLT (7), status 0, command type 2"
++ * (Linux core.h struct dwc3_event_depevt and DEPEVT_PARAMETER_CMD: bits 5:1 endpoint, 9:6 event, 15:12 status,
++ * 27:24 command), with every other word still zero. Bits 23:16 and 31:28 are not checked. 0 means proven.
++ */
++#define UG_CMDIOC_EVENT         0x020001c2u
++#define UG_CMDIOC_MASK          0x0f00ffffu
++enum { UG_PROOF_OK = 0, UG_PROOF_COUNT = -1, UG_PROOF_FORM = -2, UG_PROOF_STRAY = -3 };
++
++static inline int
++ug_cmdioc_proof(const volatile uint32_t *evt, uint32_t count)
++{
++	if (count != 4) {
++		return UG_PROOF_COUNT;
++	}
++	if ((evt[0] & UG_CMDIOC_MASK) != UG_CMDIOC_EVENT) {
++		return UG_PROOF_FORM;
++	}
++	for (uint32_t i = 1; i < UD_EVT_SIZE / 4; i++) {
++		if (evt[i] != 0) {
++			return UG_PROOF_STRAY;
++		}
++	}
++	return UG_PROOF_OK;
++}
++
++static inline uint32_t
++ug_evt_next(uint32_t pos)
++{
++	return (pos + 4) % UD_EVT_SIZE;
++}
++
++/* A completed OUT TRB of buf_size bytes: the frame length, or 0 if the size word is impossible. */
++static inline uint32_t
++ug_rx_len(uint32_t trb_size_word, uint32_t buf_size)
++{
++	uint32_t left = trb_size_word & 0xffffffu;
++	return left > buf_size ? 0 : buf_size - left;
++}
++
++/*
++ * An IN frame of len bytes on a bulk endpoint of max packet mps: a multiple of mps would need a zero-length packet
++ * to end it, and one pad byte does the same (IP ignores it). Returns the length to send.
++ */
++static inline uint32_t
++ug_tx_len(uint32_t len, uint32_t mps)
++{
++	return (len % mps) == 0 ? len + 1 : len;
++}
++
++static inline uint32_t
++ug_mps0(int speed)
++{
++	return speed == UG_SPEED_SS ? 512 : 64;
++}
++
++static inline uint32_t
++ug_bulk_mps(int speed)
++{
++	return speed == UG_SPEED_SS ? 1024 : 512;
++}
++
++/*
++ * Descriptors. VID 0x1209 / PID 0x0001 is the pid.codes test ID (as on the Poco F1). bcdDevice 0x0103 or 0x0104 names
++ * the level, so the Mac can tell which one enumerated. High speed keeps bcdUSB 2.00 and no BOS, as on the Poco F1.
++ */
++static const uint8_t ug_cfg_ecm_hs[80] = {
++	9, 2, 80, 0, 2, 1, 0, 0x80, 250,                /* config: 2 interfaces, 500 mA */
++	9, 4, 0, 0, 1, 0x02, 0x06, 0x00, 0,             /* comm interface 0: CDC ECM, 1 endpoint */
++	5, 0x24, 0x00, 0x10, 0x01,                      /* header, CDC 1.10 */
++	5, 0x24, 0x06, 0, 1,                            /* union: control 0, data 1 */
++	13, 0x24, 0x0f, 4, 0, 0, 0, 0, 0xea, 0x05, 0, 0, 0, /* ethernet: MAC string 4, max segment 1514 */
++	7, 5, 0x82, 0x03, 16, 0, 9,                     /* ep 0x82 interrupt IN, 16 bytes, 2^(9-1) uframes */
++	9, 4, 1, 0, 0, 0x0a, 0x00, 0x00, 0,             /* data interface 1 alt 0: no endpoints */
++	9, 4, 1, 1, 2, 0x0a, 0x00, 0x00, 0,             /* data interface 1 alt 1: two bulk endpoints */
++	7, 5, 0x81, 0x02, 0x00, 0x02, 0,                /* ep 0x81 bulk IN, 512 */
++	7, 5, 0x01, 0x02, 0x00, 0x02, 0,                /* ep 0x01 bulk OUT, 512 */
++};
++static const uint8_t ug_cfg_ecm_ss[98] = {
++	9, 2, 98, 0, 2, 1, 0, 0x80, 63,                 /* config: 2 interfaces, 504 mA (8 mA units) */
++	9, 4, 0, 0, 1, 0x02, 0x06, 0x00, 0,
++	5, 0x24, 0x00, 0x10, 0x01,
++	5, 0x24, 0x06, 0, 1,
++	13, 0x24, 0x0f, 4, 0, 0, 0, 0, 0xea, 0x05, 0, 0, 0,
++	7, 5, 0x82, 0x03, 16, 0, 9,
++	6, 0x30, 0, 0, 16, 0,                           /* companion: no burst, 16 bytes per interval */
++	9, 4, 1, 0, 0, 0x0a, 0x00, 0x00, 0,
++	9, 4, 1, 1, 2, 0x0a, 0x00, 0x00, 0,
++	7, 5, 0x81, 0x02, 0x00, 0x04, 0,                /* ep 0x81 bulk IN, 1024 */
++	6, 0x30, 0, 0, 0, 0,
++	7, 5, 0x01, 0x02, 0x00, 0x04, 0,                /* ep 0x01 bulk OUT, 1024 */
++	6, 0x30, 0, 0, 0, 0,
++};
++/* Level 3: one vendor interface with no endpoints, so nothing but ep0 ever moves data. */
++static const uint8_t ug_cfg_vendor_hs[18] = {
++	9, 2, 18, 0, 1, 1, 0, 0x80, 250,
++	9, 4, 0, 0, 0, 0xff, 0x00, 0x00, 0,
++};
++static const uint8_t ug_cfg_vendor_ss[18] = {
++	9, 2, 18, 0, 1, 1, 0, 0x80, 63,
++	9, 4, 0, 0, 0, 0xff, 0x00, 0x00, 0,
++};
++/* SuperSpeed only: USB 2.0 extension without LPM, SuperSpeed capability with U1/U2 latencies 0 (dis-u1/u2 quirks). */
++static const uint8_t ug_bos_ss[22] = {
++	5, 0x0f, 22, 0, 2,
++	7, 0x10, 2, 0, 0, 0, 0,
++	10, 0x10, 3, 0, 0x0e, 0, 1, 0, 0, 0,
++};
++/* The host side's MAC is string 4 (ECM iMACAddress); the phone's own is ..:02 */
++static const char *const ug_strings[] = {
++	NULL, "ios-sweet", "Sweet iOS (USB Ethernet)", "0001", "02005E77EE01", "iOS 26 asteroids (USB level 3)",
++};
++
++static inline uint32_t
++ug_device_desc(int level, int speed, uint8_t *out)
++{
++	const uint8_t d[18] = {
++		18, 1, 0x00, (uint8_t)(speed == UG_SPEED_SS ? 0x03 : 0x02),
++		(uint8_t)(level == UG_LEVEL_ECM ? 0x02 : 0x00), 0x00, 0x00,
++		(uint8_t)(speed == UG_SPEED_SS ? 9 : 64),
++		0x09, 0x12, 0x01, 0x00, (uint8_t)level, 0x01,
++		1, (uint8_t)(level == UG_LEVEL_ECM ? 2 : 5), 3, 1,
++	};
++	for (int i = 0; i < 18; i++) {
++		out[i] = d[i];
++	}
++	return 18;
++}
++
++static inline uint32_t
++ug_string(unsigned idx, uint8_t *out)
++{
++	if (idx == 0) {
++		out[0] = 4; out[1] = 3; out[2] = 0x09; out[3] = 0x04;   /* en-US */
++		return 4;
++	}
++	if (idx >= sizeof(ug_strings) / sizeof(ug_strings[0])) {
++		return 0;
++	}
++	const char *str = ug_strings[idx];
++	uint32_t n = 2;
++	for (; *str && n < 126; str++) {
++		out[n++] = (uint8_t)*str;
++		out[n++] = 0;
++	}
++	out[0] = (uint8_t)n;
++	out[1] = 3;
++	return n;
++}
++
++/* GET_DESCRIPTOR: the length written to out (at most UD_DATA_SIZE), or 0 to stall. */
++static inline uint32_t
++ug_descriptor(int level, int speed, uint16_t value, uint8_t *out)
++{
++	const uint8_t *src = NULL;
++	uint32_t n = 0;
++	bool ss = speed == UG_SPEED_SS;
++
++	switch (value >> 8) {
++	case 1:
++		return ug_device_desc(level, speed, out);
++	case 2:
++		if ((value & 0xff) != 0) {
++			return 0;
++		}
++		if (level == UG_LEVEL_ECM) {
++			if (speed == UG_SPEED_FS) {
++				return 0;               /* no full-speed ECM configuration */
++			}
++			src = ss ? ug_cfg_ecm_ss : ug_cfg_ecm_hs;
++			n = ss ? sizeof(ug_cfg_ecm_ss) : sizeof(ug_cfg_ecm_hs);
++		} else {
++			src = ss ? ug_cfg_vendor_ss : ug_cfg_vendor_hs;
++			n = sizeof(ug_cfg_vendor_hs);
++		}
++		break;
++	case 3:
++		return ug_string(value & 0xff, out);
++	case 15:
++		if (!ss) {
++			return 0;
++		}
++		src = ug_bos_ss;
++		n = sizeof(ug_bos_ss);
++		break;
++	default:
++		return 0;                       /* device qualifier, other speed: stall */
++	}
++	for (uint32_t i = 0; i < n; i++) {
++		out[i] = src[i];
++	}
++	return n;
++}
++
++/* What ep0 does with one SETUP packet. The kernel carries out the action; this decides it. */
++enum { UG_STALL, UG_IN, UG_OUT, UG_NODATA };
++enum { UG_ACT_NONE, UG_ACT_ADDRESS, UG_ACT_CONFIG, UG_ACT_ALT };
++
++struct ug_ctx {
++	int     level;
++	int     speed;
++	bool    configured;
++	uint8_t data_alt;
++	bool    addressed;      /* a non-zero SET_ADDRESS since the last reset (the Address state) */
++};
++#define UG_CTX_ADDRESSED 1      /* struct ug_ctx has addressed (v3) */
++
++struct ug_plan {
++	int      stage;         /* UG_STALL, UG_IN (len bytes in data), UG_OUT (len = buffer size), UG_NODATA */
++	uint32_t len;
++	int      action;
++	uint16_t arg;
++};
++
++static inline struct ug_plan
++ug_setup_plan(const uint8_t st[8], const struct ug_ctx *c, uint8_t *data)
++{
++	struct ug_plan p = { UG_NODATA, 0, UG_ACT_NONE, 0 };
++	uint8_t type = st[0], req = st[1];
++	uint16_t value = (uint16_t)(st[2] | st[3] << 8);
++	uint16_t index = (uint16_t)(st[4] | st[5] << 8);
++	uint16_t length = (uint16_t)(st[6] | st[7] << 8);
++	bool in = (type & 0x80) != 0, ok;
++	uint32_t n = 0;
++
++	if ((type & 0x60) == 0x20) {    /* class: only SET_ETHERNET_PACKET_FILTER to the ECM comm interface, configured */
++		if (c->level != UG_LEVEL_ECM || type != 0x21 || req != 0x43 || index != 0 || length != 0 || !c->configured) {
++			p.stage = UG_STALL;
++		}
++		return p;
++	}
++	if ((type & 0x60) != 0) {
++		p.stage = UG_STALL;
++		return p;
++	}
++	/*
++	 * Standard requests only in their full USB 2.0 chapter 9 shape: direction, recipient, wValue, wIndex and wLength,
++	 * and only in a device state where they are defined (Default, Address, Configured).
++	 */
++	uint16_t ifs = c->level == UG_LEVEL_ECM ? 2 : 1;            /* interfaces in configuration 1 */
++	switch (req) {
++	case 0:  ok = in && (type & 0x1f) <= 2 && value == 0 && length == 2; break;                 /* GET_STATUS */
++	case 1:
++	case 3:  ok = !in && (type & 0x1f) <= 2 && length == 0; break;                              /* CLEAR/SET_FEATURE */
++	case 5:  ok = type == 0x00 && !c->configured && index == 0 && length == 0; break;           /* SET_ADDRESS */
++	case 6:  ok = type == 0x80; break;                                                          /* GET_DESCRIPTOR */
++	case 8:  ok = type == 0x80 && c->addressed && value == 0 && index == 0 && length == 1; break; /* GET_CONFIGURATION */
++	case 9:  ok = type == 0x00 && c->addressed && index == 0 && length == 0; break;             /* SET_CONFIGURATION */
++	case 10: ok = type == 0x81 && c->configured && value == 0 && index < ifs && length == 1; break; /* GET_INTERFACE */
++	case 11: ok = type == 0x01 && c->configured && index < ifs && length == 0; break;           /* SET_INTERFACE */
++	case 48: ok = type == 0x00 && value == 0 && index == 0; break;                              /* SET_SEL */
++	case 49: ok = type == 0x00 && index == 0 && length == 0; break;                             /* SET_ISOCH_DELAY */
++	default: ok = false; break;
++	}
++	if (!ok) {
++		p.stage = UG_STALL;
++		return p;
++	}
++	switch (req) {
++	case 0:                         /* GET_STATUS */
++		data[0] = 0; data[1] = 0; n = 2;
++		break;
++	case 1:                         /* CLEAR_FEATURE, SET_FEATURE (halt, remote wakeup, U1/U2): accepted, no effect */
++	case 3:
++		break;
++	case 5:                         /* SET_ADDRESS */
++		if (value > 127) {
++			p.stage = UG_STALL;
++			return p;
++		}
++		p.action = UG_ACT_ADDRESS;
++		p.arg = value;
++		break;
++	case 6:                         /* GET_DESCRIPTOR */
++		n = ug_descriptor(c->level, c->speed, value, data);
++		if (n == 0) {
++			p.stage = UG_STALL;
++			return p;
++		}
++		break;
++	case 8:                         /* GET_CONFIGURATION */
++		data[0] = c->configured ? 1 : 0; n = 1;
++		break;
++	case 9:                         /* SET_CONFIGURATION */
++		if (value > 1 || (value == 1 && c->level == UG_LEVEL_ECM && c->speed == UG_SPEED_FS)) {
++			p.stage = UG_STALL;
++			return p;
++		}
++		p.action = UG_ACT_CONFIG;
++		p.arg = value;
++		break;
++	case 10:                        /* GET_INTERFACE */
++		data[0] = index == 1 ? c->data_alt : 0; n = 1;
++		break;
++	case 11:                        /* SET_INTERFACE: ECM data interface 1 alt 0/1, anything else only alt 0 */
++		if (c->level == UG_LEVEL_ECM && index == 1 && value <= 1) {
++			p.action = UG_ACT_ALT;
++			p.arg = value;
++		} else if (value != 0 || index > (c->level == UG_LEVEL_ECM ? 1 : 0)) {
++			p.stage = UG_STALL;
++			return p;
++		}
++		break;
++	case 48:                        /* SET_SEL: 6 bytes OUT, read and ignored (U1/U2 stay off) */
++		if (length != 6) {
++			p.stage = UG_STALL;
++			return p;
++		}
++		break;
++	case 49:                        /* SET_ISOCH_DELAY */
++		break;
++	default:
++		p.stage = UG_STALL;
++		return p;
++	}
++	if (length == 0) {
++		p.stage = UG_NODATA;
++		return p;
++	}
++	if (in) {
++		p.stage = UG_IN;
++		p.len = n < length ? n : length;
++		return p;
++	}
++	/* OUT data: the TRB must be a whole number of max packets, and the request must fit one buffer. */
++	if (length > ug_mps0(c->speed) || ug_mps0(c->speed) > UD_DATA_SIZE) {
++		p.stage = UG_STALL;
++		p.action = UG_ACT_NONE;
++		return p;
++	}
++	p.stage = UG_OUT;
++	p.len = ug_mps0(c->speed);
++	return p;
++}
++
++/* Canary pages around the DMA area: a fixed pattern, so any stray device write shows. */
++static inline uint32_t
++ug_canary(uint32_t i)
++{
++	return 0xc0de0000u ^ (i * 0x9e3779b1u);
++}
++
++/* Index of the first word that differs, or -1. */
++static inline long
++ug_canary_check(const volatile uint32_t *w, uint32_t words)
++{
++	for (uint32_t i = 0; i < words; i++) {
++		if (w[i] != ug_canary(i)) {
++			return (long)i;
++		}
++	}
++	return -1;
++}
++
++#endif /* _SWEET_USB_GADGET_H_ */
