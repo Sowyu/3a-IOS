@@ -229,3 +229,24 @@ Still open: the items listed under "2130 after the audit". Nothing has run on a 
 `combo-daily-ff-boot.img` has no `sweetdeadman` or `sweetselftest`, so `dev.py` refuses it, and adding them would take it to 610 of 607 bytes. `plans/freeform/build-images.sh` builds `out/ff-owner-boot.img` from the same combined kernel with the same args, without `sweetkeys_ms=5` and with `sweetdeadman=900 sweetselftest=1`, at 594 bytes. Its test body, `selftest/freeform-owner.sh`, opens Freeform and leaves the owner 6 minutes, taking a frame every 30 s.
 
 With `sweetappmetal` off, backboardd differs from next-luma only in the translator's function-constant `[[color(n)]]`. No compositor shader we have uses it: 58 modules give identical NIR. The specialisation code waits for `BGMTL_SPECIALIZE`, which only the trial app sets, and the inject's app mode waits for Freeform's bundle id. 2130 is byte-for-byte 2058 when off (`tests/exec_env_check.py`).
+
+## ast100: why phase 2b failed (2026-11-03)
+
+### backboardd ran without Chlorophyll: 2130 stripped the launcher's variable
+
+- **Proven, code:** `bgl-launch.c:585` sets `DYLD_INSERT_LIBRARIES=/usr/local/lib/bgmtl/bgmtl-inject.dylib`. That is byte for byte 2130's app-only string. With `sweetappmetal=Freeform` accepted, `sweet_appmetal_own` strips that exact inherited string on every exec, as the first audit asked, and backboardd is an exec of bgl-launch.
+- **Proven, host:** `exec_env_check.py`'s build of the real kernel code, run on backboardd's exec with the launcher's environment, gives `BGMTL_BB=1 BGMTL_BB_RETRY=1` and no insert variable when the trial is on. When it is off, the variable stays. Base keeps it either way.
+- **Proven, root:** the root's backboardd has no load command for the inject (`otool -L`), so the launcher's variable is the only way the inject reaches it.
+- **Proven, logs:** every earlier boot in `bgl-backboardd.log` prints `bgmtl[64]: GPU ready` right after the injection line. This boot prints nothing from the inject, and `bgmtl.log` has no line for it. The assertion that follows is CoreAnimation's OpenGL/CPU renderer, which NOTES records failing the same way whenever backboardd runs stock (ast4, ast5, ast7p, ast8). The retry, pid 366, went the same way, which matches the owner seeing no glass, a respring, then black.
+- So it was not next-ff2, not the luma fix, and not chance. backboardd never ran next-ff2's code at all.
+
+### The freeze: most likely the stock renderer, not Freeform's GPU work
+
+- **Proven:** the kernel never logged `A810 1 submissions`, which prints on a boot's first successful submit (`sweet_a810_msm.c:367`). No process submitted GPU work this boot. `bgmtl-app.log` shows Freeform opened a device and registered it, but has no library, `specialize:` or pipeline line: no PencilKit code ran, and the owner could not draw on a black screen.
+- **Proven:** the 10-second stats stop after uptime 97 s, and the log ends without a panic, a RECOVERY or a hang report. The root was left unclean.
+- **Inferred:** the stock renderer crashed again or hung, and launchd rebooted, as in ast4 and ast7p. The persistent log is not synced on every line, so the last seconds are likely lost. Freeform's device open is the only GPU-side event and cannot be excluded, but ast83 showed a second client opening a device works.
+- **Unknown:** what exactly reset the phone.
+
+### Fix
+
+The kernel fix, which needs Sol's audit and a kernel build: 2130 inserts and strips a spelling only it produces, `/usr/local/lib/bgmtl//bgmtl-inject.dylib`. That is the same file, and the doubled slash makes the string 2130's alone. The combined form becomes `...sweetsb.dylib:/usr/local/lib/bgmtl//bgmtl-inject.dylib`, and `exec_env_check.py` gets a case where bgl-launch to backboardd with the trial on keeps its variable, which fails on the current code. Inferred: dyld opens the doubled-slash path normally; check that the first time on the phone. The stop-gap with the existing kernel is to change bgl-launch's spelling instead. That is one line and pushable, but it touches the daily launcher.
