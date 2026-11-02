@@ -427,3 +427,27 @@ Same 2144 kernel in both arms. The payload is `lumatrace` with CPU numbers and t
 ### CoreAnimation pacing switches (batch 8)
 
 `bgl-launch` (`plans/lag/arms/calat`) sets `CA_DISABLE_LOW_LATENCY=1` (`sweetcalat=1`) or `CA_DISABLE_SERVER_TIMER_EARLY_WAKEUP=1` (`sweetcalat=2`) for backboardd, one per boot. It is built from next-luma's launcher, which is the one on the root; without the boot arg it behaves the same.
+
+**CoreAnimation pacing switches, no effect (ast128, 129).** `CA_DISABLE_LOW_LATENCY` gave 66.6% one vsync with flip rate 0.31; `CA_DISABLE_SERVER_TIMER_EARLY_WAKEUP` gave 66.2% with 0.32. 41 and 43% of heavy frames were late. The launcher does not log the variables it sets, so whether CoreAnimation read them is **Missing**. Dropped.
+
+### UBWC with the texture pool kept: the best arm tonight (ast130 to 132)
+
+`lumaub` is `lumatrace` with the pool kept under UBWC (`plans/lag/patches/bgmtl-texpool-with-ubwc.patch`), with `sweettu=sysmem,nocb,nolrz` on the combined kernel. **Proven:**
+
+| Run | Arm | Shown fps | 1 vsync | Flip rate | Steady | Heavy late | GPU 100-140 / 140+ draws |
+|---|---|---:|---:|---:|---:|---:|---|
+| ast101 | A60 | 41.0 | 65.3% | 0.36 | 35.8% | 45% | 11.6 / 18.5 ms |
+| ast104 | A60 | 42.2 | 67.9% | 0.31 | 42.0% | 43% | 11.4 / 18.2 ms |
+| ast123 | S0 (2144 kernel, stock placement) | 43.1 | 70.3% | 0.31 | 42.8% | 41% | |
+| ast125 | S0 | 41.0 | 64.9% | 0.31 | 41.1% | | |
+| ast127 | UBWC, pool off | 40.7 | 64.2% | 0.30 | 42.8% | 47% | 7.4 / 10.2 ms |
+| **ast130** | **UBWC + pool** | 42.3 | 69.5% | 0.34 | 35.3% | 35% | 7.4 / 10.8 ms |
+| **ast132** | **UBWC + pool** | 43.5 | 72.4% | 0.27 | 49.6% | 32% | 7.8 / 10.9 ms |
+
+- The pool works: 16935 hits against 6913 misses in ast130.
+- Late heavy frames took 16.8 ms from start to GPU end, against about 22 ms before.
+- The 1-vsync share has a median of 71.0% against 66.6% for the four baselines. Late heavy frames fell from 41 to 45% to 32 to 35%.
+- ast131 (no hw) frames show the home pages, Settings, Control Center glass and blur, and the app switcher looking as before, with no icon or label tear.
+- 0 recoveries in all three runs.
+
+This is the first lever tonight that moves pacing beyond noise. The gain is modest, about 4 to 5 points of 1-vsync share.
