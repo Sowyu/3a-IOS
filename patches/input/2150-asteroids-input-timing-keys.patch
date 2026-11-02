@@ -80,7 +80,7 @@
  	    mode & 3u : (mode >> 4) & 7u;
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -375,6 +375,19 @@
+@@ -352,6 +352,19 @@
  static uint32_t get32(const uint8_t *p, uint32_t off);
  static uint64_t sweet_abs_us(uint64_t abs);
  
@@ -100,7 +100,7 @@
  #if defined(SWEET)
  #include <IOKit/IOService.h>
  #include <IOKit/IOUserClient.h>
-@@ -769,6 +782,7 @@
+@@ -746,6 +759,7 @@
  	bool          fPanelOff;      /* asteroids: "display off" was posted for the current power-off */
  	bool          fEmptyBlackArmed;       /* 0233: the next layerless swap may blank (boot, and once after each power on) */
  	uint32_t      fFadeStep;      /* fade-out steps done while off */
@@ -108,7 +108,7 @@
  
  	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
  	void addClient(IOMobileFramebufferUserClient *client);
-@@ -1411,6 +1425,12 @@
+@@ -1379,6 +1393,12 @@
  		fb->present(rec, copyEpoch);
  		fb->fCopyHold = NULL;
  		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
@@ -121,7 +121,7 @@
  		if (ast.enabled) {
  			uint64_t handlerNS;
  			absolutetime_to_nanoseconds(mach_absolute_time() - now, &handlerNS);
-@@ -4533,8 +4553,10 @@
+@@ -4492,8 +4512,10 @@
  		if (args->scalarInputCount >= 1) {
  			bool off = args->scalarInput[0] == 0;
  			IOLockLock(fFB->fLock);
@@ -132,7 +132,7 @@
  				fFB->fEmptyBlackArmed = !off;   /* 0233: the first swap after the display comes on may be layerless: black */
  				fFB->fFadeStep = 0;
  				fFB->fBlackDone = false;
-@@ -4542,7 +4564,8 @@
+@@ -4501,7 +4523,8 @@
  				fFB->fDirty = true;     /* on: redraw the latest frame */
  			}
  			IOLockUnlock(fFB->fLock);

@@ -29,15 +29,15 @@
  /*
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -97,6 +97,7 @@
+@@ -98,6 +98,7 @@
+  uint64_t done, latched, latchNS, latchMinNS, latchMaxNS, repeated, epochDrops;
+  bool bar; uint64_t barChecks, barHits, barSrcDark, barSlotOnly, barMoved, barScanned, barMaxNS; uint32_t barSig, barLines; /* 2090 sweetfb_barcheck */
+  uint64_t copyNS, copyMaxNS, copies, logTime;
++ uint64_t lastLatch, leadMoves; /* 2153: when the newest flip latched; schedule moves made */
+  bool hw, hwOn; uint32_t hwStride, hwCanvas, hwSaved[6], hwSavedPe[9], hwSavedOp, hwW, hwH, hwVer; /* 2053 */
   uint64_t swapFlipNS, swapFlips, swapFlipMaxNS, handlerMaxNS, tickGapMaxNS, lastTick, preserves; /* 2052; maxima per log line */
   uint64_t logFlipNS, logFlips, dropDone, dropHeld; /* 2080: the window mean, and whether a replaced swap had finished on the GPU */
-  uint64_t keptShown; /* 2082 */
-+ uint64_t lastLatch, leadMoves; /* 2153: when the newest flip latched; schedule moves made */
-  uint32_t testSecs; uint64_t testEnd; bool testRegs; volatile uint32_t *lm; /* 2111 sweetfb_hwtest */
- } ast;
- static const uint32_t astPA[3] = {0xe3940000, 0xe431c000, 0xe4cf8000};
-@@ -277,6 +278,7 @@
+@@ -282,6 +283,7 @@
   ast.latchNS += latchNS;
   if (ast.latched == 1 || latchNS < ast.latchMinNS) ast.latchMinNS = latchNS;
   if (latchNS > ast.latchMaxNS) ast.latchMaxNS = latchNS;
@@ -45,7 +45,7 @@
   __atomic_store_n(&ast.front, back, __ATOMIC_RELEASE);
   if (ast.first) {
    IOLog("SWEET FB AST: first latch ok src=%x frame=%u->%u line=%u->%u irq=%x\n",
-@@ -425,6 +427,7 @@
+@@ -411,6 +413,7 @@
  #define SWEET_FB_NOTIFY_TYPES           8
  #define SWEET_FB_NOTIFY_VSYNC           5
  #define SWEET_FB_VSYNC_US               16667
@@ -53,7 +53,7 @@
  #define SWEET_FB_DOT_PITCH              458     /* ppi, as the iPhone X panel */
  #define SWEET_FB_BL_STEPS               12      /* vsyncs of backlight ramp */
  #define SWEET_FB_STATS_MAX              1024    /* kern.sweet_fb line (bsd/dev/sweet_fb.c) */
-@@ -656,6 +659,7 @@
+@@ -642,6 +645,7 @@
  	uint32_t      fTickUS;          /* 2081 sweetfb_hz=120: how often the tick looks for a frame. fVsyncUS stays what CoreAnimation is told */
  	uint32_t      fNotifyDiv;       /* 2081 ticks per vsync notification; sweetfb_ca120=1 tells CoreAnimation every tick */
  	uint64_t      fTickDeadlineUS;
@@ -61,41 +61,32 @@
  	uint64_t      fPhaseAbs;        /* a latch (vsync) as observed by SwapWait, abs time; 0 = none yet */
  	uint64_t      fPeriodAbs;       /* vsync period, abs units */
  	IOReturn      swapWait(uint32_t id);
-@@ -1208,6 +1212,12 @@
- 		PE_parse_boot_argn("sweetfb_keep", &keep, sizeof(keep));
- 		fKeepPrev = keep != 0 && !fEarly;
+@@ -1201,6 +1205,12 @@
  	}
+ 	fTickUS = fVsyncUS;
+ 	fNotifyDiv = 1;
 +	PE_parse_boot_argn("sweetfb_lead", &fLatchLeadUS, sizeof(fLatchLeadUS));
 +	if (fLatchLeadUS != 0 && (fLatchLeadUS < 1500 || fLatchLeadUS > 7000 || !fTickFix || fVsyncAlign || !ast.enabled)) {
 +		IOLog("SWEET FB: sweetfb_lead=%u ignored: needs 1500..7000, the tick fix, no vsyncalign, the asteroids flip\n",
 +		    fLatchLeadUS);
 +		fLatchLeadUS = 0;
 +	}
- 	fTickUS = fVsyncUS;
- 	fNotifyDiv = 1;
  	if (hz >= 120 && fTickFix && !fVsyncAlign) {
-@@ -1520,6 +1530,12 @@
+ 		int ca120 = 0;
+ 		PE_parse_boot_argn("sweetfb_ca120", &ca120, sizeof(ca120));
+@@ -1515,6 +1525,15 @@
  	sweet_hold_release(stale);
  	fb->statsTick(now);
  	fb->hudTick(now);
 +	if (fb->fLatchLeadUS != 0 && rec != NULL && fb->fTickDeadlineUS != 0 && ast.lastLatch > now) {
 +		/* 2153: this tick's flip latched; nudge the schedule so the next one lands sweetfb_lead before the panel's vsync */
-+		int32_t move = sfs_latch_lead((uint32_t)sweet_abs_us(ast.lastLatch - now), fb->fLatchLeadUS, SWEET_FB_PANEL_US, 1000);
++		uint32_t wait = (uint32_t)sweet_abs_us(ast.lastLatch - now);
++		int32_t move = sfs_latch_lead(wait, fb->fLatchLeadUS, SWEET_FB_PANEL_US, 1000);
 +		fb->fTickDeadlineUS += (uint64_t)(int64_t)move;
-+		ast.leadMoves += move != 0;
++		if (move != 0 && ast.leadMoves++ % 64 == 0) {
++			IOLog("SWEET FB AST: lead: tick to latch %u us, tick moved %d us (%llu moves)\n", wait, move, ast.leadMoves);
++		}
 +	}
  	if (fb->fTickFix && !fb->fVsyncAlign) {
  		fb->fTickDeadlineUS = sfs_tick_next(fb->fTickDeadlineUS ? fb->fTickDeadlineUS : sweet_abs_us(now), fb->fTickUS,
  		    sweet_abs_us(mach_absolute_time()), 250, &nextUS);
-@@ -1724,9 +1740,9 @@
-             ast.latchMinNS/1000, ast.latched ? ast.latchNS/ast.latched/1000 : 0, ast.latchMaxNS/1000);
-         IOLog("SWEET FB AST: copy_us avg=%llu max=%llu copies=%llu gpu_hold_ticks=%llu\n",
-             ast.copies ? ast.copyNS/ast.copies/1000 : 0, ast.copyMaxNS/1000, ast.copies, c.gpuHolds);
--        IOLog("SWEET FB AST: timing swap_to_flip_us avg=%llu max=%llu handler_us max=%llu tick_gap_us max=%llu preserves=%llu win_avg=%llu drop_done=%llu drop_held=%llu kept=%llu\n",
-+        IOLog("SWEET FB AST: timing swap_to_flip_us avg=%llu max=%llu handler_us max=%llu tick_gap_us max=%llu preserves=%llu win_avg=%llu drop_done=%llu drop_held=%llu kept=%llu lead_moves=%llu\n",
-             ast.swapFlips ? ast.swapFlipNS/ast.swapFlips/1000 : 0, ast.swapFlipMaxNS/1000, ast.handlerMaxNS/1000, ast.tickGapMaxNS/1000, ast.preserves,
--            ast.swapFlips > ast.logFlips ? (ast.swapFlipNS - ast.logFlipNS)/(ast.swapFlips - ast.logFlips)/1000 : 0, ast.dropDone, ast.dropHeld, ast.keptShown);
-+            ast.swapFlips > ast.logFlips ? (ast.swapFlipNS - ast.logFlipNS)/(ast.swapFlips - ast.logFlips)/1000 : 0, ast.dropDone, ast.dropHeld, ast.keptShown, ast.leadMoves);
-         ast.logFlipNS = ast.swapFlipNS;
-         ast.logFlips = ast.swapFlips;
-         ast.swapFlipMaxNS = ast.handlerMaxNS = ast.tickGapMaxNS = 0;

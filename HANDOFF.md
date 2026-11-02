@@ -1,6 +1,6 @@
 # Handoff: read this first
 
-Updated 2026-11-02, about 19:00 AEDT. Update this file whenever the state changes, and keep it the first thing a new agent reads.
+Updated 2026-11-02, about 22:45 AEDT. Update this file whenever the state changes, and keep it the first thing a new agent reads.
 
 ## Phone state right now
 
@@ -27,7 +27,7 @@ Updated 2026-11-02, about 19:00 AEDT. Update this file whenever the state change
 
 1. **Lag.** Found and partly fixed (`docs/lag.md`). Frames were serial because our driver made 4 kernel calls per texture upload. `patches/lag/chl-staging-pool.patch` pools those buffers, and `sweetfb_keep=1` (kernel 2082) shows a finished frame instead of dropping it. Together they took shown frames in animation bursts from a median of 39.8 to 47.1 per second over 2 runs each. **But keep brings back black bars**: the kernel holds both CoreAnimation surfaces and hold-wait times out after 50 ms. The owner saw them in ast84. The lag agent is now making CoreAnimation use a third surface the way real iPhones do, by making our display behave like Apple's, with the 2090 bar logger as proof. Do not make keep default until that run shows 0 bars. The root currently has the pool payload (`plans/lag/next-keep/out-metal`) pushed by ast84; `next-fix/out-metal` is the previous known-good.
 2. **Freeform.** Compute works on the A810: ast83 ran a trivial kernel and PencilKit's real `sdfPen_kernel`, all results correct, with no GPU recovery. Patch 2130 (inject into Freeform only) failed two Sol audits, `docs/input-ff-audit.md` and `docs/2130-reaudit.md`. A chroot-relative path match and bookkeeping with the arg off are being fixed. After a GO: build the kernel, then run phase 2b in `docs/freeform.md`.
-3. **Input** (`docs/input.md`, `patches/input/`). Sol: 2150, 2151 and 2153 GO; 2152, the instant power button, NO-GO because the panel could stay dark. Being fixed.
+3. **Input** (`docs/input.md`, `patches/input/`). Sol: 2150, 2151 and 2153 GO. 2152, the instant power button, was NO-GO because the panel could stay dark. v2 (22:40) fixes findings 1, 2, 6 and 7: undo is a panel command or a flip back to the kept buffer, the window ends on its own timer, panel commands retry until confirmed, and presses are judged by the display state when they began. Host checks in `tools/input/host-check/` replay all 9 audit scenarios, which fail on v1 and pass on v2. Sol is re-auditing it, along with 2153, whose placements moved so it applies over the lag patches 2140 to 2142. Apply order: 2051 to 2120, optionally 2140 to 2142, then 2150 to 2153.
 4. Wi-Fi, then a modem probe for mobile data. `docs/research-wifi.md`.
 5. Sound and a real battery reading. `docs/plan-power.md`.
 6. Small ones:

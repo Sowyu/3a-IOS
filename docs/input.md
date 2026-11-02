@@ -68,11 +68,40 @@ All of these are off by default, and each is a boot arg. They apply in order on 
 | Patch | Boot args | Does | Expected |
 |---|---|---|---|
 | 2150 | `sweetkeys_ms=N` (2 to 100, default 20) | Key poll period. Timing lines: `display off/on (power key down X ms, up Y ms ago)`, `first frame after display on: N ms`, `SWEET PANEL: display ... (rc, N ms)`, key edges with `t_us`, PON debounce at boot | Press seen 7.5 ms sooner at 5 ms; the iOS share of lock and wake becomes measurable |
-| 2151 | `sweettouchirq` bits: 1 read on the IRQ edge, 2 stamp at the sample time, 4 one stats line per touch; `sweettouchirq_us` (500); `sweethid_touch_us` | Reads on the edge while touched, with a 12 ms fallback | Report to sent 2.3 to 1.1 ms, jitter 1 to 0.17 ms (Model). The stats line measures the report rate |
-| 2152 | `sweetpwrfast` bits: 1 dark at a short solo release, 2 panel woken at a press while off; `sweetpwrfast_ms` (2000) | The screen follows the key at once, in parallel with iOS. iOS's request confirms the step. A touch, another key, or the window passing without iOS undoes it | Lock is dark about 10 to 30 ms after release, whatever iOS is doing. With `sweetpanel=1`, wake loses its 90 ms sleep-out |
+| 2151 | `sweettouchirq` bits: 1 read on the IRQ edge, 2 stamp at the read start (when the edge was noticed, not the controller's scan time), 4 one stats line per touch; `sweettouchirq_us` (500); `sweethid_touch_us` | Reads on the edge while touched, with a 12 ms fallback | Report to sent 2.3 to 1.1 ms, jitter 1 to 0.17 ms (Model). The stats line measures the report rate |
+| 2152 v2 | `sweetpwrfast` bits: 1 dark at a short solo release, 2 panel out of sleep at a press while off; `sweetpwrfast_ms` (300 to 3000, default 2000) | The screen follows the key at once, in parallel with iOS. iOS's request confirms the step. A touch, another key, or the window passing without iOS undoes it | Lock is dark about 10 to 30 ms after release, whatever iOS is doing. With `sweetpanel=1`, wake loses most of its 90 ms sleep-out |
 | 2153 | `sweetfb_lead=US` (1500 to 7000, suggest 3000) | Moves the vsync tick, at most 1 ms per frame, until its flip latches that long after the tick | Tick to latch 7.2 to 2.9 ms (Model). About 3 ms off every frame on average, and 4 on boots like ast66 |
 
-Rules that keep iOS in charge in 2152: only the release of a press that started with the display on can darken, and only if it was under 700 ms with no volume or home key during it. Siri, screenshots and SOS keep iOS's timing. Wake shows black only, never the last frame, because the last frame is what was on screen before the lock. Without panel commands (`sweetpanel=0`) the panel is already lit, so bit 2 does nothing. The state machine is `sfs_fast_step()` in `SweetFbScale.h`, and the host check fuzzes it with 2 million random steps.
+### 2152 v2, after Sol's audit (`analysis/input-ff-audit.md`)
+
+Sol rated v1 NO-GO on findings 1 and 2, with 6 and 7 as should-fixes. v2 changes:
+
+1. Undoing a dark step no longer needs a new frame or the GPU. With panel commands it is DCS 28 (display off, panel awake) and undoing it is one DCS 29. Without them it is a flip to black that keeps the shown buffer, and undoing it flips back to that buffer. Nothing writes the kept buffer while the screen is black: the tick, the early swap path and the HUD all skip it.
+2. The window ends on its own timer (a second thread call armed at the deadline), not only at a vsync tick. iOS's display change also triggers a run at once. The range is now 300 to 3000 ms.
+3. The panel thread counts a step done only when its command completed. It walks toward a target one command at a time, rereads the target between commands, and retries a timed-out command with backoff from 20 ms to 1.3 s. A rollback in the middle of a sleep sequence takes the short way, for example DCS 29 one frame after DCS 28.
+4. Events are queued in order, not OR'd. Each one carries iOS's display state and a generation number, read before the key or touch goes to iOS. A release darkens only if its press began with the display on and iOS has not changed state since. An early wake needs iOS still off in the press's generation. A full queue cancels both steps.
+5. A touch or another key cancels an early wake, and the panel is told to sleep right then.
+6. An early wake now leaves the panel's display off (DCS 11 only), so it never lights while iOS is off. When iOS turns the display on and finds the panel asleep, frames wait until sleep-out completes, for at most 500 ms, and display on follows the first frame. That keeps flips off a sleeping panel (finding 7). It applies whenever `sweetpanel` is 1 or 2, with or without `sweetpwrfast`, and so does item 3.
+
+Bound, on every path: the screen is dark while iOS has it on for at most the window plus one work-loop wait (up to about 50 ms behind a present), plus one panel command or one latch. In the model that is 2000 to 2070 ms. Only a DCS link that keeps failing stretches it, and the thread keeps retrying. The one case outside this is a latch failure during the flip back, which makes the existing flip fallback take over as it would for any frame.
+
+Unchanged: only short solo presses (under 700 ms, no other key) darken, so Siri, screenshots and SOS keep iOS's timing. Wake never shows the last frame. The state machine is `sfs_fast_drain()` in `SweetFbScale.h`, and the panel planner is `panel_plan()` in `sweet_dsi_asteroids.c`.
+
+Checks, all on the Mac. `host-check/fast_power_model.c` replays each audit scenario on v1 and v2. The pure parts are real code: v1's `sfs_fast_step`, and v2's `sfs_fast_drain` and `panel_plan`. The glue, iOS, the GPU gate and the DCS link are modelled. Every scenario fails on v1 and passes on v2:
+
+| Scenario | Measure | v1 | v2 |
+|---|---|---|---|
+| GPU recovery voids the frame during a panel dark step, iOS stays on | dark while iOS on | 7899 ms (never back) | 2000 ms |
+| Same with `sweetpanel=0` | dark while iOS on | 7899 ms | 2000 ms |
+| The undo command times out once (DCS 11 in v1) | dark while iOS on | 7899 ms | 2000 ms |
+| DCS 29 times out once | dark while iOS on | 7899 ms | 2070 ms |
+| Undoing an early wake times out once (DCS 10) | awake while iOS off | 7990 ms | 2065 ms |
+| Wake press drained after iOS turned on, release later | dark while iOS on | 2010 ms | 11 ms |
+| Lock press drained after iOS turned off | lit while iOS off | 1692 ms | 19 ms |
+| Touch after an early wake, iOS stays off | awake after the touch | 1853 ms | 9 ms |
+| iOS on while the panel sleeps | flips to a sleeping panel | 1 | 0 |
+
+The v2 random walk ran 3000 runs over presses, touches, iOS latencies (including ignoring the press), GPU recoveries and 5% DCS failures. It found no violation: dark while iOS on at most 2070 ms, and the old image lit while iOS is off for at most 16 ms, which is the normal off path's one tick. `fast_power_check.c` covers each rule of `sfs_fast_drain` and a 2-million-step random walk. A `panel_plan` table checks every command, the state it reaches and its spacing. Mutation tests undo each fix in turn, and each one makes a check fail, with one exception. Reading iOS's state at drain time instead of from the snapshot changes nothing, because the generation check already blocks every case where the two differ.
 
 Not prepared:
 

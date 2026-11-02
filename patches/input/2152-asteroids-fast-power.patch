@@ -1,10 +1,240 @@
+--- a/bsd/dev/sweet_dsi_asteroids.c
++++ b/bsd/dev/sweet_dsi_asteroids.c
+@@ -10,7 +10,8 @@
+  *   - in video mode it is scheduled for the first vertical front-porch line, started by the software trigger and
+  *     ended by INT_CTRL bit 0 (DMA done); then the FIFO and the trigger setup are reset;
+  *   - brightness is DCS 0x51 with two bytes, high byte first (bl-inverted-dbv), 10..4095;
+- *   - off: 28 then 120 ms, 10 then 100 ms; on: 11 then 80 ms, 29 then 10 ms.
++ *   - off: 28 then 120 ms, 10 then 100 ms; on: 11 then 80 ms, 29 then 10 ms. 2152 sends them one at a time toward a target and
++ *     counts a step done only when its command completed (panel_plan, panel_thread).
+  *
+  * SweetFramebuffer.cpp (AppleCLCD) posts what iOS asked for (sweet_panel_post_level / sweet_panel_post_power); one
+  * kernel thread applies it, so the panel's sleeps never land on the framebuffer's vsync timer. Boot-arg sweetpanel=N
+@@ -36,6 +37,8 @@
+ bool sweet_panel_display_on(void);
+ void sweet_panel_post_level(uint32_t level);
+ void sweet_panel_post_power(bool on);
++void sweet_panel_post_target(int target);
++int sweet_panel_state(void);
+ 
+ #define DSI0_PA                 0x0ae94000u
+ #define DSI0_SIZE               0x1000u
+@@ -64,12 +67,55 @@
+ static volatile uint32_t *panel_dsi;
+ static int panel_mode = -1;
+ static uint32_t panel_req_level;        /* REQ_PENDING | level, the newest from iOS */
+-static uint32_t panel_req_power;        /* REQ_PENDING | on */
+ static int panel_event;
+-static bool panel_on = true, panel_level_known;
++static bool panel_level_known;
+ static uint32_t panel_level;
+ static unsigned panel_sent, panel_timeouts;
+ 
++/*
++ * 2152: the panel's state is what its commands confirmed, not what was asked. DARK is awake with the display off (DCS 28,
++ * or 11 without 29 yet): it shows nothing and lights with one 29. Callers post a target; the panel thread walks toward it one
++ * command at a time, rereads the target between commands, and retries a command that timed out instead of assuming it took.
++ */
++#define PANEL_ON        0
++#define PANEL_DARK      1
++#define PANEL_ASLEEP    2
++static int panel_target = PANEL_ON;     /* the boot loader left it scanning out */
++static int panel_phys = PANEL_ON;
++static uint8_t panel_last;              /* the last command that completed */
++static uint64_t panel_last_abs, panel_post_abs;
++
++/*
++ * 2152: the next command from the confirmed state toward the target, the state it reaches once it completes, and how long
++ * after the last completed command it may go: 80 ms after sleep out, 100 after sleep in, 120 from display off to sleep in,
++ * 10 after display on, one frame from display off to on. 0 when the panel is there already. No hardware access: host-tested.
++ */
++static uint8_t
++panel_plan(int phys, int target, uint8_t last, int *next, unsigned *gap_ms)
++{
++	uint8_t cmd;
++	*next = phys;
++	*gap_ms = 0;
++	if (phys == target) {
++		return 0;
++	}
++	if (phys == PANEL_ON) {
++		cmd = 0x28;
++		*next = PANEL_DARK;
++	} else if (phys == PANEL_ASLEEP) {
++		cmd = 0x11;
++		*next = PANEL_DARK;
++	} else if (target == PANEL_ON) {
++		cmd = 0x29;
++		*next = PANEL_ON;
++	} else {
++		cmd = 0x10;
++		*next = PANEL_ASLEEP;
++	}
++	*gap_ms = last == 0x11 ? 80 : last == 0x10 ? 100 : last == 0x29 ? 10 : last == 0x28 ? (cmd == 0x10 ? 120 : 17) : 0;
++	return cmd;
++}
++
+ static inline uint32_t
+ dsi_rd(uint32_t reg)
+ {
+@@ -154,53 +200,70 @@
+ 	return dsi_send(words, 2, false);
+ }
+ 
+-static void
+-panel_sleep_ms(unsigned ms)
++static const char *
++panel_name(int state)
+ {
+-	delay_for_interval(ms, NSEC_PER_MSEC);
++	return state == PANEL_ON ? "on" : state == PANEL_DARK ? "dark" : "asleep";
+ }
+ 
+-static int
+-panel_set_power(bool on)
+-{
+-	int rc = dcs_short(on ? 0x11 : 0x28);   /* sleep out / display off */
+-	panel_sleep_ms(on ? 80 : 120);
+-	rc |= dcs_short(on ? 0x29 : 0x10);      /* display on / sleep in */
+-	panel_sleep_ms(on ? 10 : 100);
+-	return rc;
+-}
+-
+ static void
+ panel_thread(void *arg, wait_result_t wr)
+ {
++	unsigned fails = 0;
++	bool level_due = false;
+ 	(void)arg;
+ 	(void)wr;
+ 	for (;;) {
+-		uint32_t p = __atomic_exchange_n(&panel_req_power, 0, __ATOMIC_ACQ_REL);
++		int target = __atomic_load_n(&panel_target, __ATOMIC_ACQUIRE), next;
+ 		uint32_t l = __atomic_exchange_n(&panel_req_level, 0, __ATOMIC_ACQ_REL);
+-		if ((p & REQ_PENDING) && ((p & 1u) != 0) != panel_on) {
+-			bool on = (p & 1u) != 0;
+-			uint64_t t0 = mach_absolute_time(), ns;
+-			int rc = panel_set_power(on);
+-			panel_on = on;
+-			absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+-			printf("SWEET PANEL: display %s (rc %d, %llu ms)\n", on ? "on" : "off", rc, ns / NSEC_PER_MSEC);
+-			if (on && panel_level_known) {
+-				(void)panel_set_level(panel_level);     /* back at the level iOS last set */
+-			}
+-		}
++		uint64_t now = mach_absolute_time(), wait_abs = 0, gap_abs, ns;
++		unsigned gap;
+ 		if (l & REQ_PENDING) {
+ 			panel_level = l & 0xfffu;
+ 			panel_level_known = true;
+-			if (panel_on) {
+-				int rc = panel_set_level(panel_level);
+-				if (rc) {
+-					printf("SWEET PANEL: brightness %u timed out\n", panel_level);
+-				}
++			level_due = true;
++		}
++		uint8_t cmd = panel_plan(panel_phys, target, panel_last, &next, &gap);
++		nanoseconds_to_absolutetime((uint64_t)gap * NSEC_PER_MSEC, &gap_abs);
++		if (cmd != 0 && now < panel_last_abs + gap_abs) {
++			wait_abs = panel_last_abs + gap_abs - now;      /* the panel's own spacing; a new target is replanned at the wake */
++		} else if (cmd != 0) {
++			int rc = dcs_short(cmd);
++			if (rc == 0) {
++				panel_last = cmd;
++				panel_last_abs = mach_absolute_time();
++				__atomic_store_n(&panel_phys, next, __ATOMIC_RELEASE);
++				fails = 0;
++				level_due |= next == PANEL_ON && panel_level_known;     /* back at the level iOS last set */
++				absolutetime_to_nanoseconds(panel_last_abs - __atomic_load_n(&panel_post_abs, __ATOMIC_ACQUIRE), &ns);
++				printf("SWEET PANEL: %02x done, %s (target %s, %llu ms after it was asked)\n", cmd, panel_name(next),
++				    panel_name(target), ns / NSEC_PER_MSEC);
++				continue;
+ 			}
++			unsigned back = 20u << (fails < 6 ? fails : 6);
++			++fails;
++			if (fails <= 5 || fails % 20 == 0) {
++				printf("SWEET PANEL: %02x timed out (%u in a row), still %s, retry in %u ms\n", cmd, fails,
++				    panel_name(panel_phys), back);
++			}
++			nanoseconds_to_absolutetime((uint64_t)back * NSEC_PER_MSEC, &wait_abs);
++		} else if (level_due && panel_phys == PANEL_ON) {
++			level_due = panel_set_level(panel_level) != 0;
++			if (level_due) {
++				printf("SWEET PANEL: brightness %u timed out, retry in 200 ms\n", panel_level);
++				nanoseconds_to_absolutetime(200 * NSEC_PER_MSEC, &wait_abs);
++			}
+ 		}
+-		/* a request posted between the exchanges above and this wait is picked up 100 ms later at the latest */
+-		assert_wait_timeout(&panel_event, THREAD_UNINT, 100, NSEC_PER_MSEC);
++		if (wait_abs == 0) {
++			nanoseconds_to_absolutetime(100 * NSEC_PER_MSEC, &wait_abs);
++		}
++		assert_wait_deadline(&panel_event, THREAD_UNINT, mach_absolute_time() + wait_abs);
++		/* a post between the reads above and assert_wait would wait out the whole timeout: look once more */
++		if (__atomic_load_n(&panel_target, __ATOMIC_ACQUIRE) != target ||
++		    (__atomic_load_n(&panel_req_level, __ATOMIC_ACQUIRE) & REQ_PENDING)) {
++			clear_wait(current_thread(), THREAD_AWAKENED);
++			continue;
++		}
+ 		thread_block(THREAD_CONTINUE_NULL);
+ 	}
+ }
+@@ -251,26 +314,41 @@
+ bool
+ sweet_panel_display_on(void)
+ {
+-	return panel_on;
++	return __atomic_load_n(&panel_phys, __ATOMIC_ACQUIRE) != PANEL_ASLEEP;
+ }
+ 
++/* 2152: the state the panel's commands confirmed: PANEL_ON 0, PANEL_DARK 1, PANEL_ASLEEP 2. Always on with sweetpanel=0. */
++int
++sweet_panel_state(void)
++{
++	return __atomic_load_n(&panel_phys, __ATOMIC_ACQUIRE);
++}
++
+ void
+-sweet_panel_post_level(uint32_t level)
++sweet_panel_post_target(int target)
+ {
+-	if (panel_mode <= 0) {
++	if (panel_mode <= 0 || target < PANEL_ON || target > PANEL_ASLEEP) {
+ 		return;
+ 	}
+-	__atomic_store_n(&panel_req_level, REQ_PENDING | (level & 0xfffu), __ATOMIC_RELEASE);
++	if (__atomic_exchange_n(&panel_target, target, __ATOMIC_ACQ_REL) != target) {
++		__atomic_store_n(&panel_post_abs, mach_absolute_time(), __ATOMIC_RELEASE);
++	}
+ 	thread_wakeup(&panel_event);
+ }
+ 
+ void
+-sweet_panel_post_power(bool on)
++sweet_panel_post_level(uint32_t level)
+ {
+ 	if (panel_mode <= 0) {
+ 		return;
+ 	}
+-	__atomic_store_n(&panel_req_power, REQ_PENDING | (on ? 1u : 0u), __ATOMIC_RELEASE);
++	__atomic_store_n(&panel_req_level, REQ_PENDING | (level & 0xfffu), __ATOMIC_RELEASE);
+ 	thread_wakeup(&panel_event);
+ }
++
++void
++sweet_panel_post_power(bool on)
++{
++	sweet_panel_post_target(on ? PANEL_ON : PANEL_ASLEEP);
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
 --- a/bsd/dev/sweet_keys.c
 +++ b/bsd/dev/sweet_keys.c
 @@ -18,6 +18,7 @@
  
  extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
  extern void sweet_hid_key(int key, int down);
-+extern void sweet_fb_input_event(uint32_t ev);   /* SweetFramebuffer.cpp, 2152: 1 short power press, 2 power down, 4 other key */
++extern void sweet_fb_input_event(uint32_t kind);  /* SweetFramebuffer.cpp, 2152: 1 short power release, 2 power down, 4 other key */
  void sweet_keys_init(void);
  
  /*
@@ -20,10 +250,12 @@
  
  static uint32_t
  keys_rd(vm_offset_t base, uint32_t off)
-@@ -144,6 +150,16 @@
+@@ -142,6 +148,17 @@
+ 				state[k] = now[k];
+ 				if (k == 0) {
  					__atomic_store_n(&sweet_keys_power_abs[state[k] ? 0 : 1], t, __ATOMIC_RELEASE);
- 				}
- 				sweet_hid_key(k, state[k]);
++				}
++				/* 2152: the fast path hears of it before iOS does, so it records the display state the press found */
 +				if (k == 0 && state[k]) {
 +					keys_power_solo = !state[1] && !state[2] && !state[3];
 +					sweet_fb_input_event(2);
@@ -33,11 +265,10 @@
 +				} else if (state[k]) {
 +					keys_power_solo = false;
 +					sweet_fb_input_event(4);
-+				}
+ 				}
+ 				sweet_hid_key(k, state[k]);
  				absolutetime_to_nanoseconds(t, &ns);
- 				printf("SWEET KEYS: key=%d down=%d pon=%#x gpio=%#x t_us=%llu\n",
- 				    k, state[k], pon, gpio, ns / NSEC_PER_USEC);
-@@ -167,6 +183,7 @@
+@@ -167,6 +184,7 @@
  		printf("SWEET KEYS: disabled (sweetkeys=0)\n");
  		return;
  	}
@@ -51,7 +282,7 @@
  #include "IOHIDUsageTables.h"
  
  extern "C" uint64_t mach_absolute_time(void);
-+extern "C" void sweet_fb_input_event(uint32_t ev);      /* SweetFramebuffer.cpp, 2152: 4 = a touch began */
++extern "C" void sweet_fb_input_event(uint32_t kind);    /* SweetFramebuffer.cpp, 2152: 4 = a touch began, sent before iOS gets it */
  
  /* One open client: the user client and its event callback. */
  class IOHIDEventServiceClient : public OSObject {
@@ -67,77 +298,128 @@
  	static int touch_log = -1;
 --- a/iokit/Kernel/arm/SweetFbScale.h
 +++ b/iokit/Kernel/arm/SweetFbScale.h
-@@ -29,6 +29,57 @@
- }
- 
- /*
-+ * 2152: the power key's fast path. dark: the kernel blacked the screen out ahead of iOS's display off; awake: it woke the
-+ * panel ahead of iOS's display on (showing black). iOS's state (ios_off, from RequestPowerChange) always wins: its request
-+ * ends either step, and a step iOS has not confirmed within the window is undone. Mode bit 1 allows dark, bit 2 awake.
-+ * Returns what the caller does now. Events come in batches; a press in the same batch as a short release cancels it. Only
-+ * the release of a press that began with the display on darkens it, so the release of a wake press never does.
+@@ -26,6 +26,92 @@
+ 	}
+ 	*wait = (uint32_t)(deadline - now);
+ 	return deadline;
++}
++
++/*
++ * 2152: the power key's fast path. dark: the screen went dark ahead of iOS's display off. awake: the panel left sleep ahead of
++ * iOS's display on, with its display still off, so nothing shows. iOS's state always wins: its own change ends either step,
++ * and a step iOS has not confirmed within the window is undone.
++ *
++ * Events are queued in order. Each carries iOS's display state and its generation (bumped on every RequestPowerChange that
++ * changes it) read before the key or touch went to iOS, so a press is classified by the state it began in, never by what iOS
++ * did with it since. A release darkens only if its press began with the display on and iOS has not changed it since. A wake
++ * press is only woken early if iOS is still off in the generation the press saw. A press, another key or a touch cancels a
++ * dark step; another key or a touch cancels an early wake. A dropped event (full queue) cancels both.
++ *
++ * sfs_fast_drain returns the physical work from the state before and after the whole batch, so a step undone within one batch
++ * costs nothing, and a step undone in this batch is not started again in it (each window has one start).
 + */
 +#define SFS_FAST_SHORT  1u      /* the power key came up after a short press with no other key during it */
 +#define SFS_FAST_PRESS  2u      /* the power key went down */
 +#define SFS_FAST_OTHER  4u      /* another key or a touch went down */
-+#define SFS_DO_DARK     1u      /* black out now, and the panel off if the panel driver runs */
-+#define SFS_DO_WAKE     2u      /* the panel on now; it shows the black frame left by the off */
-+#define SFS_DO_SHOW     4u      /* undone while iOS has the display on: present the latest frame again */
-+#define SFS_DO_SLEEP    8u      /* undone while iOS has it off: the normal off path puts the panel back to sleep */
++#define SFS_OP_BLANK    1u      /* dark now: panel display off (DCS 28), or with no panel commands a flip to black keeping the shown buffer */
++#define SFS_OP_RESTORE  2u      /* undo it: panel display on (DCS 29), or a flip back to the kept buffer. Never waits for the GPU */
++#define SFS_OP_WAKE     4u      /* the panel out of sleep with its display still off (DCS 11) */
++#define SFS_OP_SLEEP    8u      /* undo it: the panel back to sleep (DCS 10) */
++struct sfs_fast_ev {
++	uint32_t kind;
++	bool ios_off;           /* iOS's display state when the event was taken, before iOS saw it */
++	uint32_t gen;           /* and its generation */
++};
 +struct sfs_fast {
 +	bool dark, awake;
-+	bool press_on;          /* the last power press came while iOS had the display on: only its release may darken */
++	bool press_on;          /* the current press began with the display on */
++	uint32_t press_gen;     /* in this generation */
 +	uint64_t until;
 +};
 +
-+static inline uint32_t
-+sfs_fast_step(struct sfs_fast *f, uint32_t mode, uint32_t ev, bool ios_off, bool panel_cmds, bool panel_off, uint64_t now,
-+    uint64_t window)
++static inline void
++sfs_fast_one(struct sfs_fast *f, uint32_t mode, const struct sfs_fast_ev *e, bool ios_off, uint32_t gen, bool can_wake,
++    bool can_blank, bool may_dark, bool may_wake, uint64_t now, uint64_t window)
 +{
-+	uint32_t act = 0;
-+	bool input = (ev & (SFS_FAST_PRESS | SFS_FAST_OTHER)) != 0;
-+	if (f->dark && (ios_off || now >= f->until || input)) {
++	if (e->kind & (SFS_FAST_PRESS | SFS_FAST_OTHER)) {
 +		f->dark = false;
-+		act |= ios_off ? 0u : SFS_DO_SHOW;
++	}
++	if (e->kind & SFS_FAST_OTHER) {
++		f->awake = false;
++		f->press_on = false;
++	}
++	if (e->kind & SFS_FAST_PRESS) {
++		f->press_on = !e->ios_off;
++		f->press_gen = e->gen;
++		if (e->ios_off && ios_off && gen == e->gen && (mode & 2u) && can_wake && may_wake && !f->awake) {
++			f->awake = true;
++			f->until = now + window;
++		}
++	}
++	if (e->kind & SFS_FAST_SHORT) {
++		if (f->press_on && f->press_gen == gen && !ios_off && (mode & 1u) && can_blank && may_dark && !f->dark) {
++			f->dark = true;
++			f->until = now + window;
++		}
++		f->press_on = false;
++	}
++}
++
++static inline uint32_t
++sfs_fast_drain(struct sfs_fast *f, uint32_t mode, const struct sfs_fast_ev *evs, unsigned n, bool lost, bool ios_off,
++    uint32_t gen, bool can_wake, bool can_blank, uint64_t now, uint64_t window)
++{
++	bool dark0 = f->dark, awake0 = f->awake;
++	if (f->dark && (ios_off || now >= f->until)) {
++		f->dark = false;
 +	}
 +	if (f->awake && (!ios_off || now >= f->until)) {
 +		f->awake = false;
-+		act |= ios_off ? SFS_DO_SLEEP : 0u;
 +	}
-+	if (ev & SFS_FAST_PRESS) {
-+		f->press_on = !ios_off;
++	for (unsigned i = 0; i < n; i++) {
++		sfs_fast_one(f, mode, &evs[i], ios_off, gen, can_wake, can_blank, !dark0, !awake0, now, window);
 +	}
-+	if ((ev & SFS_FAST_PRESS) && ios_off && (mode & 2u) && panel_cmds && panel_off && !f->awake) {
-+		f->awake = true;
-+		f->until = now + window;
-+		act |= SFS_DO_WAKE;
++	if (lost) {
++		f->dark = f->awake = f->press_on = false;
 +	}
-+	if ((ev & SFS_FAST_SHORT) && f->press_on && !input && !ios_off && (mode & 1u) && !f->dark && !(act & SFS_DO_SHOW)) {
-+		f->press_on = false;
-+		f->dark = true;
-+		f->until = now + window;
-+		act |= SFS_DO_DARK;
-+	}
-+	return act;
-+}
-+
-+/*
-  * 2053: QSEED3 values for a bilinear upscale, as Linux _dpu_plane_setup_scaler3 and dpu_hw_setup_scaler3 with version > 0x1002:
-  * enable, Y/RGB filter 3 = bilinear, non-DX, blend_cfg, and bilinear alpha when the format has alpha. No coefficient LUT is used.
-  * 2110: vertical preload 2 from scaler version 0x3000 on, as _dpu_plane_setup_scaler3 (DPU_QSEED4_DEFAULT_PRELOAD_V).
++	uint32_t ops = 0;
++	ops |= !dark0 && f->dark ? SFS_OP_BLANK : 0u;
++	ops |= dark0 && !f->dark && !ios_off ? SFS_OP_RESTORE : 0u;
++	ops |= !awake0 && f->awake ? SFS_OP_WAKE : 0u;
++	ops |= awake0 && !f->awake && ios_off ? SFS_OP_SLEEP : 0u;
++	return ops;
+ }
+ 
+ /*
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -366,6 +366,9 @@
+@@ -67,6 +67,11 @@
+ extern "C" int sweet_panel_mode(void);
+ extern "C" void sweet_panel_post_level(uint32_t level);
+ extern "C" void sweet_panel_post_power(bool on);
++extern "C" void sweet_panel_post_target(int target);    /* 2152: SWEET_PANEL_* below */
++extern "C" int sweet_panel_state(void);                 /* 2152: what the panel's commands confirmed */
++#define SWEET_PANEL_ON          0
++#define SWEET_PANEL_DARK        1       /* awake, display off: shows nothing, lights with one DCS 29 */
++#define SWEET_PANEL_ASLEEP      2
+ static void sweet_backlight_calibration(IOService *bl, uint32_t peak);  /* below: what CoreBrightness needs */
+ extern "C" void sweet_amp_mark_big(struct thread *thread);    /* osfmk/kern/sched_prim.c: prefer the big cores */
+ static void sweet_rows_start(void);     /* below: the scaled copy's helper threads */
+@@ -343,6 +348,13 @@
  }
  class AppleCLCD;
  static AppleCLCD *sweet_fb_shot_fb;             /* the framebuffer kern.sweet_fb_shot reads (patch 0224) */
-+/* 2152 sweetpwrfast: the framebuffer the keys and touch threads report to (sweet_fb_input_event), and their pending events */
++/* 2152 sweetpwrfast: the framebuffer the keys and touch threads report to, and their events in order (sweet_fb_input_event) */
++#define SWEET_FB_FAST_RING 16
 +static AppleCLCD *sweet_fb_fast_fb;
-+static uint32_t sweet_fb_fast_ev;
++static IOSimpleLock *sweet_fb_fast_lock;
++static struct sfs_fast_ev sweet_fb_fast_ring[SWEET_FB_FAST_RING];
++static uint32_t sweet_fb_fast_head, sweet_fb_fast_tail;
++static bool sweet_fb_fast_lost;
  extern "C" unsigned char iso_font[256 * 16];    /* osfmk/console/iso_font.c: the 8x16 console font */
  extern "C" void sweet_gpu_hud_state(unsigned *mhz, unsigned *level, unsigned *busy_pct, int *gov, int *state); /* bsd/dev/sweet_a630.c */
  extern "C" void sweet_cpufreq_hud_mhz(unsigned *a55_mhz, unsigned *a75_mhz);    /* bsd/dev/sweet_cpufreq.c */
-@@ -400,6 +403,7 @@
+@@ -377,6 +389,7 @@
  #include <pexpert/pexpert.h>
  #include <kern/clock.h>
  #include <kern/thread.h>
@@ -145,21 +427,26 @@
  #include <sys/proc.h>
  #include <sys/errno.h>
  
-@@ -783,6 +787,13 @@
+@@ -760,6 +773,18 @@
  	bool          fEmptyBlackArmed;       /* 0233: the next layerless swap may blank (boot, and once after each power on) */
  	uint32_t      fFadeStep;      /* fade-out steps done while off */
  	uint64_t      fOnAbs;         /* 2150: when iOS asked for display on, until the first frame after it is shown */
-+	uint32_t      fFastMode;      /* 2152 sweetpwrfast: bit 1 dark on a short power press, bit 2 the panel woken on a press */
++	uint32_t      fPowerGen;      /* 2152: display power changes iOS made, so a queued event knows what iOS has done since */
++	uint32_t      fFastMode;      /* 2152 sweetpwrfast: bit 1 dark at a short power release, bit 2 the panel out of sleep at a press */
 +	uint64_t      fFastWindow;    /* sweetpwrfast_ms: how long a step iOS has not confirmed stands (absolute time) */
 +	struct sfs_fast fFast;        /* work loop only */
-+	thread_call_t fFastCall;      /* runs fastAction on the work loop for the keys and touch threads */
++	bool          fFastPanel;     /* the dark step is the panel's display off; else a flip to black with fFastKept kept */
++	uint32_t      fFastKept;      /* the asteroids buffer on screen before a pixel dark step: restored by flipping back to it */
++	uint64_t      fWakeAbs;       /* panel commands: iOS turned the display on while the panel slept; frames wait for sleep out */
++	thread_call_t fFastCall;      /* runs fastRun on the work loop for queued events */
++	thread_call_t fFastTimeout;   /* and at the window's end, whatever the vsync tick is doing */
 +	static void   fastCall(thread_call_param_t p0, thread_call_param_t p1);
 +	static IOReturn fastAction(OSObject *owner, void *a0, void *a1, void *a2, void *a3);
-+	void          fastApply(uint32_t act, const char *why);
++	void          fastRun(const char *why);
  
  	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
  	void addClient(IOMobileFramebufferUserClient *client);
-@@ -1207,6 +1218,27 @@
+@@ -1184,6 +1209,28 @@
  		IOLog("SWEET FB: tick every %u us, CoreAnimation told every %u ticks\n", fTickUS, fNotifyDiv);
  	}
  	fVsync->setTimeoutUS(fTickUS);
@@ -168,70 +455,101 @@
 +		uint32_t mode = 0, ms = 2000;
 +		PE_parse_boot_argn("sweetpwrfast", &mode, sizeof(mode));
 +		PE_parse_boot_argn("sweetpwrfast_ms", &ms, sizeof(ms));
-+		if (ms < 300 || ms > 10000) {
++		if (ms < 300 || ms > 3000) {
 +			ms = 2000;
 +		}
-+		fFastMode = mode & 3u;
 +		nanoseconds_to_absolutetime((uint64_t)ms * NSEC_PER_MSEC, &fFastWindow);
-+		if (fFastMode != 0) {
++		mode &= 3u;
++		if (mode != 0) {
++			sweet_fb_fast_lock = IOSimpleLockAlloc();
 +			fFastCall = thread_call_allocate_with_priority(&AppleCLCD::fastCall, this, THREAD_CALL_PRIORITY_KERNEL_HIGH);
++			fFastTimeout = thread_call_allocate_with_priority(&AppleCLCD::fastCall, this, THREAD_CALL_PRIORITY_KERNEL_HIGH);
 +		}
-+		if (fFastCall != NULL) {
++		if (sweet_fb_fast_lock != NULL && fFastCall != NULL && fFastTimeout != NULL) {
++			fFastMode = mode;
 +			__atomic_store_n(&sweet_fb_fast_fb, this, __ATOMIC_RELEASE);
 +			IOLog("SWEET FB: fast power mode %u, iOS has %u ms to confirm, panel commands %s\n", fFastMode, ms,
 +			    fPanel ? "on" : "off");
-+		} else {
-+			fFastMode = 0;
 +		}
 +	}
  	if (fEarly) {
  		fSwapTimer = IOTimerEventSource::timerEventSource(this, &AppleCLCD::swapFired);
  		if (fSwapTimer == NULL || fWorkLoop->addEventSource(fSwapTimer) != kIOReturnSuccess) {
-@@ -1346,6 +1378,17 @@
- 		IOMobileFramebufferUserClient *client =
- 		    (IOMobileFramebufferUserClient *)fb->fClients->getObject(i);
- 		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
+@@ -1267,6 +1314,9 @@
+ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
++	if (fb->fFastMode) {
++		fb->fastRun("tick");    /* 2152: queued events and the window, also when the timeout call is late */
 +	}
-+	/* 2152: a fast step iOS answered, or whose window passed, ends here */
-+	uint32_t fastAct = fb->fFastMode ? sfs_fast_step(&fb->fFast, fb->fFastMode, 0, fb->fPowerOff, fb->fPanel, fb->fPanelOff, now,
-+	    fb->fFastWindow) : 0;
-+	if (fastAct != 0) {
-+		if (fastAct & SFS_DO_SHOW) {
-+			fb->fDirty = true;
-+		}
-+		IOLockUnlock(fb->fLock);
-+		fb->fastApply(fastAct, "vsync tick");
-+		IOLockLock(fb->fLock);
- 	}
- 	if (fb->fPowerOff) {
- 		/*
-@@ -1362,7 +1405,7 @@
- 		IOLockUnlock(fb->fLock);
- 		if (fb->fPanel) {
- 			/* asteroids: the panel itself goes dark (display off, sleep in) on the panel thread */
--			if (!fb->fPanelOff) {
-+			if (!fb->fPanelOff && !fb->fFast.awake) {     /* 2152: not while woken ahead of iOS's display on */
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
+ 	fb->fSt.ticks++;
+@@ -1343,7 +1393,10 @@
  				if (ast.enabled && !ast.stopped) fb->blackout();
  				fb->fPanelOff = true;
  				sweet_panel_post_power(false);
-@@ -1377,6 +1420,12 @@
- 			fb->fBlackDone = true;
- 			fb->blackout();
++			} else if (!fb->fFast.awake && sweet_panel_state() != SWEET_PANEL_ASLEEP) {
++				sweet_panel_post_power(false);  /* 2152: a wake iOS took back before its first frame, or an early wake ended */
+ 			}
++			fb->fWakeAbs = 0;
+ 			sender->setTimeoutUS(nextUS);
+ 			return;
  		}
-+		sender->setTimeoutUS(nextUS);
-+		return;
-+	}
-+	if (fb->fFast.dark) {
-+		/* 2152: dark ahead of iOS's display off: nothing new is shown until iOS answers or the window passes */
-+		IOLockUnlock(fb->fLock);
+@@ -1357,6 +1410,28 @@
  		sender->setTimeoutUS(nextUS);
  		return;
  	}
-@@ -2402,7 +2451,64 @@
++	if (fb->fFast.dark && !fb->fFastPanel) {
++		/* 2152: black ahead of iOS's display off: nothing new is shown until iOS answers or the window passes */
++		IOLockUnlock(fb->fLock);
++		sender->setTimeoutUS(nextUS);
++		return;
++	}
++	if (fb->fPanel && fb->fPanelOff) {
++		/*
++		 * 2152: iOS turned the display on while the panel slept. It leaves sleep now with its display still off, and no frame
++		 * is flipped until it has: the frame counters may stop while it sleeps, and a flip would then wait out its latch. If
++		 * sleep out has not completed in 500 ms, frames go on anyway and the panel thread keeps retrying.
++		 */
++		if (fb->fWakeAbs == 0) {
++			fb->fWakeAbs = now;
++			sweet_panel_post_target(SWEET_PANEL_DARK);
++		}
++		if (sweet_panel_state() == SWEET_PANEL_ASLEEP && sweet_abs_us(now - fb->fWakeAbs) < 500000) {
++			IOLockUnlock(fb->fLock);
++			sender->setTimeoutUS(nextUS);
++			return;
++		}
++	}
+ 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0 && fb->gpuGateOpen(mach_absolute_time());
+ 	uint8_t *rec = NULL;
+ 	uint32_t copyEpoch = 0;
+@@ -1415,6 +1490,7 @@
+ 	}
+ 	if (fb->fPanel && fb->fPanelOff && !dirty) {
+ 		fb->fPanelOff = false;          /* asteroids: the latest frame is up: sleep out, display on, iOS's level */
++		fb->fWakeAbs = 0;
+ 		sweet_panel_post_power(true);
+ 	}
+ 	uint32_t req = __atomic_load_n(&fb->fBlReq, __ATOMIC_ACQUIRE);
+@@ -1507,8 +1583,8 @@
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
+ 	SweetSurface *taken[4] = {};
+ 
+-	if (fb->fPowerOff) {
+-		return;         /* the vsync tick runs the backlight ramp and redraws on power on */
++	if (fb->fPowerOff || (fb->fFast.dark && !fb->fFastPanel)) {
++		return;         /* the vsync tick runs the backlight ramp and redraws on power on; 2152: nor while black ahead of iOS */
+ 	}
+ 	fb->zcPoll();           /* 0216: also kicked by SwapWait when it saw the latch, so the frame it waited for is released now */
+ 	fb->scanBlitPoll();     /* 0241: a GPU scan-out copy whose fence passed is scanned now */
+@@ -2365,8 +2441,124 @@
+ /*
   * Screen black in one step (the pixel fallback of the power-off fade): ABL's
   * framebuffer is cleared with one memset and shown 1:1.
-  */
-+/* 2152: the power key fast path, run on the work loop (serialised with the vsync tick and present) */
++ */
++/* 2152: the power key's fast path, always on the work loop (serialised with the vsync tick, present and flips) */
 +void
 +AppleCLCD::fastCall(thread_call_param_t p0, thread_call_param_t p1 __unused)
 +{
@@ -242,53 +560,132 @@
 +IOReturn
 +AppleCLCD::fastAction(OSObject *owner, void *a0 __unused, void *a1 __unused, void *a2 __unused, void *a3 __unused)
 +{
-+	AppleCLCD *fb = (AppleCLCD *)owner;
-+	uint32_t ev = __atomic_exchange_n(&sweet_fb_fast_ev, 0, __ATOMIC_ACQ_REL);
-+	IOLockLock(fb->fLock);
-+	uint32_t act = sfs_fast_step(&fb->fFast, fb->fFastMode, ev, fb->fPowerOff, fb->fPanel, fb->fPanelOff, mach_absolute_time(),
-+	    fb->fFastWindow);
-+	if (act & SFS_DO_SHOW) {
-+		fb->fDirty = true;      /* the latest frame again on the next tick */
-+	}
-+	IOLockUnlock(fb->fLock);
-+	fb->fastApply(act, ev & SFS_FAST_OTHER ? "input" : "power key");
++	((AppleCLCD *)owner)->fastRun("call");
 +	return kIOReturnSuccess;
 +}
 +
- void
-+AppleCLCD::fastApply(uint32_t act, const char *why)
++/*
++ * Drains the queued events in order and applies what sfs_fast_drain decides. Undoing never depends on a new frame or the
++ * GPU: the panel's dark step is undone with DCS 29 (the panel thread retries until it completes), the pixel one by flipping
++ * back to the buffer that was on screen, which nothing writes while the screen is black. Panel targets are posted under fLock,
++ * so they are ordered against RequestPowerChange; a pixel restore checks iOS's state again just before it flips.
++ */
++void
++AppleCLCD::fastRun(const char *why)
 +{
-+	if (act & SFS_DO_DARK) {
++	struct sfs_fast_ev evs[SWEET_FB_FAST_RING];
++	unsigned n = 0;
++	IOSimpleLockLock(sweet_fb_fast_lock);
++	while (sweet_fb_fast_tail != sweet_fb_fast_head && n < SWEET_FB_FAST_RING) {
++		evs[n++] = sweet_fb_fast_ring[sweet_fb_fast_tail++ % SWEET_FB_FAST_RING];
++	}
++	bool lost = sweet_fb_fast_lost;
++	sweet_fb_fast_lost = false;
++	IOSimpleLockUnlock(sweet_fb_fast_lock);
++
++	uint64_t now = mach_absolute_time();
++	int panel = sweet_panel_state();
++	IOLockLock(fLock);
++	bool off = fPowerOff, dark0 = fFast.dark, active0 = fFast.dark || fFast.awake;
++	bool canBlank = fPanel ? panel == SWEET_PANEL_ON : (ast.enabled && !ast.stopped && ast.front != 0);
++	bool canWake = fPanel && fPanelOff && panel == SWEET_PANEL_ASLEEP;
++	uint32_t ops = sfs_fast_drain(&fFast, fFastMode, evs, n, lost, off, fPowerGen, canWake, canBlank, now, fFastWindow);
++	if (ops & SFS_OP_BLANK) {
++		fFastPanel = fPanel;
++	}
++	if (fFastPanel && (ops & (SFS_OP_BLANK | SFS_OP_RESTORE))) {
++		sweet_panel_post_target((ops & SFS_OP_RESTORE) ? SWEET_PANEL_ON : SWEET_PANEL_DARK);
++	}
++	if (ops & (SFS_OP_WAKE | SFS_OP_SLEEP)) {
++		sweet_panel_post_target((ops & SFS_OP_WAKE) ? SWEET_PANEL_DARK : SWEET_PANEL_ASLEEP);
++	}
++	if (ops & SFS_OP_RESTORE) {
++		fDirty = true;          /* the newest frame follows once its GPU work is done; the screen does not wait for it */
++	}
++	bool active = fFast.dark || fFast.awake;
++	uint64_t until = fFast.until;
++	IOLockUnlock(fLock);
++
++	if ((ops & SFS_OP_BLANK) && !fFastPanel) {
++		fFastKept = ast.front;
 +		blackout();
-+		if (fPanel && !fPanelOff) {
-+			fPanelOff = true;
-+			sweet_panel_post_power(false);
++	}
++	if ((ops & SFS_OP_RESTORE) && !fFastPanel) {
++		if (fFastKept != 0 && !__atomic_load_n(&fPowerOff, __ATOMIC_ACQUIRE) && ast.enabled && !ast.stopped) {
++			astFlip(fFastKept);
 +		}
 +	}
-+	if (act & SFS_DO_WAKE) {
-+		fPanelOff = false;      /* sleep out and display on, showing the black frame the off left */
-+		sweet_panel_post_power(true);
++	if (!fFast.dark) {
++		fFastKept = 0;
 +	}
-+	if (act != 0) {
-+		IOLog("SWEET FB: fast power (%s):%s%s%s%s, power key down %lld ms ago\n", why, (act & SFS_DO_DARK) ? " dark" : "",
-+		    (act & SFS_DO_WAKE) ? " panel woken" : "", (act & SFS_DO_SHOW) ? " shown again, iOS kept the display on" : "",
-+		    (act & SFS_DO_SLEEP) ? " panel back to sleep, iOS kept the display off" : "", sweet_power_key_ms(0, mach_absolute_time()));
++	if (ops & (SFS_OP_BLANK | SFS_OP_WAKE)) {
++		(void)thread_call_enter_delayed(fFastTimeout, until + 1);
++	} else if (active0 && !active) {
++		(void)thread_call_cancel(fFastTimeout);
++	}
++	if (ops != 0 || (dark0 && !fFast.dark)) {
++		IOLog("SWEET FB: fast power (%s):%s%s%s%s%s%s, %u events%s, display %s, power key down %lld ms ago\n", why,
++		    (ops & SFS_OP_BLANK) ? (fFastPanel ? " dark (panel display off)" : " black (shown buffer kept)") : "",
++		    (ops & SFS_OP_RESTORE) ? (fFastPanel ? " shown again (panel display on)" : " shown again (flipped back)") : "",
++		    (ops & SFS_OP_WAKE) ? " panel out of sleep, display off" : "",
++		    (ops & SFS_OP_SLEEP) ? " panel back to sleep" : "",
++		    dark0 && !fFast.dark && off ? " confirmed by iOS" : "",
++		    (ops & SFS_OP_RESTORE) && now >= until ? ", iOS did not confirm in time" : "", n, lost ? " (some lost)" : "",
++		    off ? "off" : "on", sweet_power_key_ms(0, mach_absolute_time()));
 +	}
 +}
 +
-+/* 2152: from the keys thread (power key, other keys) and the touch thread (a finger down); nothing unless sweetpwrfast is set */
-+extern "C" void sweet_fb_input_event(uint32_t ev);
-+void
-+sweet_fb_input_event(uint32_t ev)
++/*
++ * 2152: from the keys thread (power key, other keys) and the touch thread (a finger down), always before the event goes to
++ * iOS, so it records iOS's display state as the press found it. Nothing unless sweetpwrfast is set.
+  */
++extern "C" void sweet_fb_input_event(uint32_t kind);
+ void
++sweet_fb_input_event(uint32_t kind)
 +{
 +	AppleCLCD *fb = __atomic_load_n(&sweet_fb_fast_fb, __ATOMIC_ACQUIRE);
-+	if (fb != NULL && ev != 0) {
-+		__atomic_fetch_or(&sweet_fb_fast_ev, ev, __ATOMIC_ACQ_REL);
-+		(void)thread_call_enter(fb->fFastCall);
++	if (fb == NULL || kind == 0) {
++		return;
 +	}
++	/*
++	 * RequestPowerChange stores the state, then the generation. A read that catches it between the two pairs the new state
++	 * with the old generation; the generation then never matches again, so that event can neither darken nor wake early.
++	 */
++	struct sfs_fast_ev e;
++	e.kind = kind;
++	e.gen = __atomic_load_n(&fb->fPowerGen, __ATOMIC_ACQUIRE);
++	e.ios_off = __atomic_load_n(&fb->fPowerOff, __ATOMIC_ACQUIRE);
++	IOSimpleLockLock(sweet_fb_fast_lock);
++	if (sweet_fb_fast_head - sweet_fb_fast_tail < SWEET_FB_FAST_RING) {
++		sweet_fb_fast_ring[sweet_fb_fast_head++ % SWEET_FB_FAST_RING] = e;
++	} else {
++		sweet_fb_fast_lost = true;
++	}
++	IOSimpleLockUnlock(sweet_fb_fast_lock);
++	(void)thread_call_enter(fb->fFastCall);
 +}
 +
 +void
  AppleCLCD::blackout(void)
  {
  	if (ast.enabled && !ast.stopped) {
+@@ -4514,7 +4706,8 @@
+ 			IOLockLock(fFB->fLock);
+ 			uint64_t t = mach_absolute_time();
+ 			if (off != fFB->fPowerOff) {
+-				fFB->fPowerOff = off;
++				__atomic_store_n(&fFB->fPowerOff, off, __ATOMIC_RELEASE);
++				__atomic_store_n(&fFB->fPowerGen, fFB->fPowerGen + 1, __ATOMIC_RELEASE);      /* 2152 */
+ 				__atomic_store_n(&fFB->fOnAbs, off ? 0 : t, __ATOMIC_RELEASE);
+ 				fFB->fEmptyBlackArmed = !off;   /* 0233: the first swap after the display comes on may be layerless: black */
+ 				fFB->fFadeStep = 0;
+@@ -4523,6 +4716,9 @@
+ 				fFB->fDirty = true;     /* on: redraw the latest frame */
+ 			}
+ 			IOLockUnlock(fFB->fLock);
++			if (fFB->fFastMode) {
++				(void)thread_call_enter(fFB->fFastCall);        /* 2152: iOS's answer ends a fast step now, not at the next tick */
++			}
+ 			IOLog("SWEET FB: display %s (power key down %lld ms, up %lld ms ago)\n", off ? "off" : "on",
+ 			    sweet_power_key_ms(0, t), sweet_power_key_ms(1, t));
+ 		}
