@@ -11,6 +11,7 @@ Updated 2026-11-02, about 19:00 AEDT. Update this file whenever the state change
 - `misc` was reset from `backup-asteroids/misc.img` at 18:39, because a stale `boot-recovery` command turned every boot into a recovery boot. It read empty at 18:44.
 - `recovery_a`, `init_boot_a` and `vendor_boot_a` are stock, byte for byte the backups.
 - `fastboot reboot recovery` now reaches OrangeFox (sometimes needs resending), and `tools/devloop/dev.py` uses it. Hands-free runs work again (ast64).
+- Input latency: four kernel patches prepared, off by default, not yet run (`patches/input/` 2150 to 2153, `docs/input.md`): key poll period, touch on interrupt with sample timestamps, instant screen blank on power, and latching frames closer to the tick. Test after the lag agent, with a Sol audit of 2152 first, since it changes panel power.
 - Running on 2026-11-02 evening: a lag agent drives the phone through `dev.py` (`plans/lag/`, `analysis/lag.md`); a Freeform agent does desk work (`plans/freeform/`, `analysis/freeform.md`).
 
 ## What works

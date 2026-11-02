@@ -1,0 +1,144 @@
+--- a/bsd/dev/sweet_dsi_asteroids.c
++++ b/bsd/dev/sweet_dsi_asteroids.c
+@@ -180,9 +180,11 @@
+ 		uint32_t l = __atomic_exchange_n(&panel_req_level, 0, __ATOMIC_ACQ_REL);
+ 		if ((p & REQ_PENDING) && ((p & 1u) != 0) != panel_on) {
+ 			bool on = (p & 1u) != 0;
++			uint64_t t0 = mach_absolute_time(), ns;
+ 			int rc = panel_set_power(on);
+ 			panel_on = on;
+-			printf("SWEET PANEL: display %s (rc %d)\n", on ? "on" : "off", rc);
++			absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++			printf("SWEET PANEL: display %s (rc %d, %llu ms)\n", on ? "on" : "off", rc, ns / NSEC_PER_MSEC);
+ 			if (on && panel_level_known) {
+ 				(void)panel_set_level(panel_level);     /* back at the level iOS last set */
+ 			}
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -47,6 +47,9 @@
+ static uint32_t keys_version, keys_last_status;
+ static bool keys_started;
+ static int keys_sleep_chan;
++static unsigned keys_poll_ms = 20;      /* 2150 sweetkeys_ms: poll period; a press waits half of it on average */
++/* 2150: when the last power press and release were seen (mach absolute), for SweetFramebuffer's display on/off timing lines */
++uint64_t sweet_keys_power_abs[2];
+ 
+ static uint32_t
+ keys_rd(vm_offset_t base, uint32_t off)
+@@ -106,7 +109,7 @@
+ keys_wait(void)
+ {
+ 	uint64_t deadline;
+-	clock_interval_to_deadline(20, NSEC_PER_MSEC, &deadline);
++	clock_interval_to_deadline(keys_poll_ms, NSEC_PER_MSEC, &deadline);
+ 	(void)assert_wait_deadline(&keys_sleep_chan, THREAD_UNINT, deadline);
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+@@ -135,10 +138,15 @@
+ 		for (int k = 0; k < 4; ++k) {
+ 			bool ok = k == 3 ? keys_home != 0 : (k == 1 ? gok : pok);
+ 			if (ok && now[k] != state[k]) {
++				uint64_t t = mach_absolute_time(), ns;
+ 				state[k] = now[k];
+-				printf("SWEET KEYS: key=%d down=%d pon=%#x gpio=%#x\n",
+-				    k, state[k], pon, gpio);
++				if (k == 0) {
++					__atomic_store_n(&sweet_keys_power_abs[state[k] ? 0 : 1], t, __ATOMIC_RELEASE);
++				}
+ 				sweet_hid_key(k, state[k]);
++				absolutetime_to_nanoseconds(t, &ns);
++				printf("SWEET KEYS: key=%d down=%d pon=%#x gpio=%#x t_us=%llu\n",
++				    k, state[k], pon, gpio, ns / NSEC_PER_USEC);
+ 			}
+ 		}
+ 		keys_wait();
+@@ -159,6 +167,10 @@
+ 		printf("SWEET KEYS: disabled (sweetkeys=0)\n");
+ 		return;
+ 	}
++	(void)PE_parse_boot_argn("sweetkeys_ms", &keys_poll_ms, sizeof(keys_poll_ms));
++	if (keys_poll_ms < 2 || keys_poll_ms > 100) {
++		keys_poll_ms = 20;
++	}
+ 	if (sweet_board_beryllium()) {
+ 		keys_gpio_base = 0xc500u;
+ 		keys_gpio_ppid = 0x0c5u;
+@@ -212,9 +224,12 @@
+ 	bool mok = keys_read(keys_gpio_apid, KEYS_GPIO_BASE + 0x40u, &mode);
+ 	bool eok = keys_read(keys_gpio_apid, KEYS_GPIO_BASE + 0x46u, &en);
+ 	bool sok = keys_read(keys_gpio_apid, KEYS_GPIO_BASE + 0x05u, &subtype);
+-	printf("SWEET KEYS: arb=%#x apids=%u pon-apid=%u gpio-ppid=%#x gpio-apid=%u pon=%#x/%d gpio=%#x/%d mode=%#x/%d en=%#x/%d subtype=%#x/%d\n",
++	/* 2150: the PMIC's own press debounce (PON_DBC_CTL, base + 0x71, as Linux pm8941-pwrkey), read only: RT_STS changes only after it */
++	uint8_t dbc = 0;
++	bool dok = keys_read(keys_pon_apid, (uint16_t)(KEYS_PON_RT - 0x10u + 0x71u), &dbc);
++	printf("SWEET KEYS: arb=%#x apids=%u pon-apid=%u gpio-ppid=%#x gpio-apid=%u pon=%#x/%d gpio=%#x/%d mode=%#x/%d en=%#x/%d subtype=%#x/%d dbc=%#x/%d poll=%u ms\n",
+ 	    keys_version, count, keys_pon_apid, keys_gpio_ppid, keys_gpio_apid,
+-	    pon, pok, gpio, gok, mode, mok, en, eok, subtype, sok);
++	    pon, pok, gpio, gok, mode, mok, en, eok, subtype, sok, dbc, dok, keys_poll_ms);
+ 	/* GPIO configuration belongs to firmware. Diagnose, never repair it here. */
+ 	unsigned dir = subtype >= 0x10u && subtype <= 0x13u ?
+ 	    mode & 3u : (mode >> 4) & 7u;
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -375,6 +375,19 @@
+ static uint32_t get32(const uint8_t *p, uint32_t off);
+ static uint64_t sweet_abs_us(uint64_t abs);
+ 
++/* 2150: the power key's last press [0] and release [1] (bsd/dev/sweet_keys.c), as milliseconds before now; -1 if none in 10 s */
++extern "C" uint64_t sweet_keys_power_abs[2];
++static long long
++sweet_power_key_ms(int which, uint64_t now)
++{
++	uint64_t t = __atomic_load_n(&sweet_keys_power_abs[which], __ATOMIC_ACQUIRE);
++	if (t == 0 || t > now) {
++		return -1;
++	}
++	uint64_t us = sweet_abs_us(now - t);
++	return us > 10000000 ? -1 : (long long)(us / 1000);
++}
++
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOUserClient.h>
+@@ -769,6 +782,7 @@
+ 	bool          fPanelOff;      /* asteroids: "display off" was posted for the current power-off */
+ 	bool          fEmptyBlackArmed;       /* 0233: the next layerless swap may blank (boot, and once after each power on) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
++	uint64_t      fOnAbs;         /* 2150: when iOS asked for display on, until the first frame after it is shown */
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+@@ -1411,6 +1425,12 @@
+ 		fb->present(rec, copyEpoch);
+ 		fb->fCopyHold = NULL;
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
++		uint64_t onAbs = __atomic_exchange_n(&fb->fOnAbs, 0, __ATOMIC_ACQ_REL);
++		if (onAbs != 0) {
++			uint64_t t = mach_absolute_time();
++			IOLog("SWEET FB: first frame after display on: %llu ms after iOS asked, power key down %lld ms ago\n",
++			    sweet_abs_us(t - onAbs) / 1000, sweet_power_key_ms(0, t));
++		}
+ 		if (ast.enabled) {
+ 			uint64_t handlerNS;
+ 			absolutetime_to_nanoseconds(mach_absolute_time() - now, &handlerNS);
+@@ -4533,8 +4553,10 @@
+ 		if (args->scalarInputCount >= 1) {
+ 			bool off = args->scalarInput[0] == 0;
+ 			IOLockLock(fFB->fLock);
++			uint64_t t = mach_absolute_time();
+ 			if (off != fFB->fPowerOff) {
+ 				fFB->fPowerOff = off;
++				__atomic_store_n(&fFB->fOnAbs, off ? 0 : t, __ATOMIC_RELEASE);
+ 				fFB->fEmptyBlackArmed = !off;   /* 0233: the first swap after the display comes on may be layerless: black */
+ 				fFB->fFadeStep = 0;
+ 				fFB->fBlackDone = false;
+@@ -4542,7 +4564,8 @@
+ 				fFB->fDirty = true;     /* on: redraw the latest frame */
+ 			}
+ 			IOLockUnlock(fFB->fLock);
+-			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
++			IOLog("SWEET FB: display %s (power key down %lld ms, up %lld ms ago)\n", off ? "off" : "on",
++			    sweet_power_key_ms(0, t), sweet_power_key_ms(1, t));
+ 		}
+ 		break;
+ 	case kSweetFBSwapWait:

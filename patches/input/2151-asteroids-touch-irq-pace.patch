@@ -1,0 +1,230 @@
+--- a/bsd/dev/sweet_touch_asteroids.c
++++ b/bsd/dev/sweet_touch_asteroids.c
+@@ -44,6 +44,7 @@
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ extern kern_return_t thread_terminate(thread_t);
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
++extern void sweet_hid_touch_at(int finger, int down, int x, int y, uint64_t stamp);
+ void sweet_touch_asteroids_init(void);
+ 
+ #define AT_TLMM_PA      0x0f100000u     /* TLMM + REG_BASE 0x100000 */
+@@ -226,6 +227,10 @@
+ 	uint64_t hold_abs, bad_abs;
+ 	uint32_t reads, torn, held, resumed, log;
+ 	char why;                       /* sweettouchlog: 'e' edge, 'l' IRQ low, 'a' while touched, 'p' periodic */
++	uint64_t stamp;                 /* 2151: sample time handed to the HID events of this read, 0 = dispatch time */
++	uint64_t read_abs, fallback_abs;        /* 2151: start of the last read; pace mode reads at least this often */
++	uint64_t s_t0, s_read;          /* 2151 stats: touch start, summed time from noticing to the events being sent */
++	uint32_t s_reads, s_fallback, s_edges, s_events, sessions;
+ } at;
+ static int at_sleep_chan;
+ 
+@@ -271,6 +276,28 @@
+ static unsigned at_idle_ms = 4;         /* IRQ check while idle (sweettouchidle_ms) */
+ static unsigned at_hold_ms = 30;        /* a contact missing with no UP record is kept this long (sweettouchhold, 0 = off) */
+ static unsigned at_bad_ms = 150;        /* unreadable reports in a row before a forced release */
++/* 2151 sweettouchirq bits: 1 read on the IRQ edge while touched, 2 events carry the sample time, 4 one stats line per touch */
++#define AT_IRQ_PACE     1u
++#define AT_IRQ_STAMP    2u
++#define AT_IRQ_STATS    4u
++static unsigned at_irq_mode;            /* 0 = as before */
++static unsigned at_irq_us = 500;        /* sweettouchirq_us: latch check period while touched, pace mode */
++static unsigned at_irq_fallback_ms = 12;        /* pace mode still reads this often while touched: a lost edge, a still finger */
++
++/*
++ * 2151: whether this pass reads a report. Default: on IRQ low, a latched edge, every pass while touched, and every 100 ms
++ * (ticks counts idle passes, as before). Pace mode while touched: on a latched edge only, as Linux reads on the IRQ, so the
++ * report is whole, or once nothing was read for the fallback time. A pass is at_irq_us there, so a report waits about
++ * 0.25 ms for its read instead of about half the 3 ms read-and-wait cycle, and the reads land on the report's own rhythm.
++ */
++static bool
++at_read_due(bool pace, bool active, bool low, bool edge, uint64_t since_read, uint64_t fallback, unsigned *ticks, unsigned period)
++{
++	if (pace && active) {
++		return edge || since_read >= fallback;
++	}
++	return low || edge || active || (++*ticks % period) == 0;
++}
+ 
+ static bool
+ at_wait_bits(vm_offset_t base, int32_t off, uint32_t mask, uint32_t want, unsigned us)
+@@ -772,12 +799,14 @@
+ 		uint32_t bit = 1u << id;
+ 		if (mask & bit) {
+ 			if (!(at.active & bit) || x[id] != at.x[id] || y[id] != at.y[id]) {
+-				sweet_hid_touch((int)id, 1, x[id], y[id]);
++				sweet_hid_touch_at((int)id, 1, x[id], y[id], at.stamp);
++				++at.s_events;
+ 			}
+ 			at.x[id] = x[id];
+ 			at.y[id] = y[id];
+ 		} else if (at.active & bit) {
+-			sweet_hid_touch((int)id, 0, at.x[id], at.y[id]);
++			sweet_hid_touch_at((int)id, 0, at.x[id], at.y[id], at.stamp);
++			++at.s_events;
+ 		}
+ 	}
+ 	at.active = mask;
+@@ -913,8 +942,8 @@
+ 	at_wr(at.tlmm, (int32_t)GPIO_INTR_CFG(PIN_IRQ), cfg);
+ 	at_wr(at.tlmm, (int32_t)GPIO_INTR_STATUS(PIN_IRQ), 0);
+ 	at.latch = (at_rd(at.tlmm, (int32_t)GPIO_INTR_CFG(PIN_IRQ)) & INTR_CFG_MASK) == INTR_CFG_FALLING;
+-	printf("SWEET TOUCH: IRQ edge latch %s, cfg=%#x, idle %u ms, active %u us, hold %u ms\n", at.latch ? "on" : "off", cfg,
+-	    at_idle_ms, at_active_us, at_hold_ms);
++	printf("SWEET TOUCH: IRQ edge latch %s, cfg=%#x, idle %u ms, active %u us, hold %u ms, irq mode %u every %u us\n",
++	    at.latch ? "on" : "off", cfg, at_idle_ms, at_active_us, at_hold_ms, at_irq_mode, at_irq_us);
+ }
+ 
+ static int
+@@ -1025,7 +1054,43 @@
+ 	return 0;
+ }
+ 
++/* 2151 sweettouchirq bit 4: one line per touch, from the first contact to the last lift (the first 40, then every 25th) */
+ static void
++at_touch_stats(uint32_t was, bool edge, uint64_t seen)
++{
++	uint64_t now = mach_absolute_time();
++	if (!(at_irq_mode & AT_IRQ_STATS)) {
++		return;
++	}
++	if (!was && at.active) {
++		at.s_t0 = seen;
++		at.s_read = 0;
++		at.s_reads = at.s_fallback = at.s_edges = 0;
++		at.s_events = (uint32_t)__builtin_popcount(at.active);        /* the downs that started it, already sent */
++	}
++	if (!was && !at.active) {
++		return;
++	}
++	++at.s_reads;
++	at.s_read += now - seen;
++	if (!edge && was && (at_irq_mode & AT_IRQ_PACE)) {
++		++at.s_fallback;
++	}
++	if (was && !at.active) {
++		uint64_t ms, read_ns;
++		++at.sessions;
++		absolutetime_to_nanoseconds(now - at.s_t0, &ms);
++		absolutetime_to_nanoseconds(at.s_read / at.s_reads, &read_ns);
++		ms /= NSEC_PER_MSEC;
++		if (at.sessions <= 40 || at.sessions % 25 == 0) {
++			printf("SWEET TOUCH: touch %u: %llu ms, %u reads (%u fallback), %u IRQ edges (%llu per s), %u events, "
++			    "noticed to sent %llu us (mode %u)\n", at.sessions, ms, at.s_reads, at.s_fallback, at.s_edges,
++			    ms ? (uint64_t)at.s_edges * 1000 / ms : 0, at.s_events, read_ns / NSEC_PER_USEC, at_irq_mode);
++		}
++	}
++}
++
++static void
+ at_thread(void *arg, wait_result_t result)
+ {
+ 	unsigned delay_s = 45;
+@@ -1076,19 +1141,27 @@
+ 	at_irq_latch();
+ 	unsigned errors = 0, ticks = 0, edge_only = 0, period = 100u / at_idle_ms;
+ 	uint64_t bad_since = 0;
++	bool pace = (at_irq_mode & AT_IRQ_PACE) && at.latch;
+ 	while (!at.dead) {
+ 		/* Read on IRQ low or a latched edge (falling in DT), while touched, every 100 ms. */
++		uint64_t seen = mach_absolute_time();
+ 		bool low = !(at_rd(at.tlmm, (int32_t)GPIO_IO(PIN_IRQ)) & 1u), edge = false;
+ 		if (at.latch && (at_rd(at.tlmm, (int32_t)GPIO_INTR_STATUS(PIN_IRQ)) & 1u)) {
+ 			at_wr(at.tlmm, (int32_t)GPIO_INTR_STATUS(PIN_IRQ), 0);
+ 			edge = true;
++			at.s_edges += at.active ? 1u : 0u;
+ 		}
+ 		if (edge && !low && !at.active && edge_only++ < 20u) {
+ 			printf("SWEET TOUCH: IRQ pulse seen only by the latch (%u)\n", edge_only);
+ 		}
+-		if (low || edge || at.active || (++ticks % period) == 0) {
++		if (at_read_due(pace, at.active != 0, low, edge, seen - at.read_abs, at.fallback_abs, &ticks, period)) {
++			uint32_t was = at.active;
+ 			at.why = at.active ? 'a' : edge ? 'e' : low ? 'l' : 'p';
++			at.stamp = (at_irq_mode & AT_IRQ_STAMP) ? seen : 0;
++			at.read_abs = seen;
+ 			err = fts_poll();
++			at.stamp = 0;
++			at_touch_stats(was, edge, seen);
+ 			if (err) {
+ 				uint64_t now = mach_absolute_time();
+ 				if (!bad_since) {
+@@ -1107,7 +1180,9 @@
+ 			}
+ 		}
+ 		/* HackiOS 8c6ea92: polling every 10 ms while touched added up to 10 ms to every move; 2 ms by default now */
+-		if (at.active || !(at_rd(at.tlmm, (int32_t)GPIO_IO(PIN_IRQ)) & 1u)) {
++		if (pace && at.active) {
++			at_wait_us(at_irq_us);
++		} else if (at.active || !(at_rd(at.tlmm, (int32_t)GPIO_IO(PIN_IRQ)) & 1u)) {
+ 			at_wait_us(at_active_us);
+ 		} else {
+ 			at_wait(at_idle_ms);
+@@ -1156,6 +1231,12 @@
+ 		at_hold_ms = 30;
+ 	}
+ 	(void)PE_parse_boot_argn("sweettouchlog", &at.log, sizeof(at.log));
++	(void)PE_parse_boot_argn("sweettouchirq", &at_irq_mode, sizeof(at_irq_mode));
++	(void)PE_parse_boot_argn("sweettouchirq_us", &at_irq_us, sizeof(at_irq_us));
++	if (at_irq_us < 200 || at_irq_us > 2000) {
++		at_irq_us = 500;
++	}
++	nanoseconds_to_absolutetime((uint64_t)at_irq_fallback_ms * NSEC_PER_MSEC, &at.fallback_abs);
+ 	nanoseconds_to_absolutetime((uint64_t)at_hold_ms * NSEC_PER_MSEC, &at.hold_abs);
+ 	nanoseconds_to_absolutetime((uint64_t)at_bad_ms * NSEC_PER_MSEC, &at.bad_abs);
+ 	kern_return_t kr = kernel_thread_start(at_thread, NULL, &thread);
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -393,11 +393,12 @@
+ 	OSDeclareDefaultStructors(SweetHIDTouch);
+ public:
+ 	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+-	void touch(int finger, bool down, int x, int y);
++	void touch(int finger, bool down, int x, int y, uint64_t stamp);
+ protected:
+ 	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return kHIDPage_Digitizer; }
+ 	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return kHIDUsage_Dig_TouchScreen; }
+ 	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 2; }
++	virtual UInt32 getReportInterval() APPLE_KEXT_OVERRIDE;
+ private:
+ 	IOLock *fLock;
+ 	int fLogicalW, fLogicalH, fOffX, fOffY;
+@@ -517,10 +518,20 @@
+ 	return true;
+ }
+ 
++/* 2151: sweethid_touch_us=N publishes the digitizer's real report period (1000..20000 us) instead of the base class's 10 ms */
++UInt32
++SweetHIDTouch::getReportInterval()
++{
++	UInt32 us = 0;
++	PE_parse_boot_argn("sweethid_touch_us", &us, sizeof(us));
++	return us >= 1000 && us <= 20000 ? us : IOHIDEventService::getReportInterval();
++}
++
++/* stamp: when the panel sampled this report (mach absolute, 2151 sweettouchirq bit 2), 0 = now */
+ void
+-SweetHIDTouch::touch(int finger, bool down, int x, int y)
++SweetHIDTouch::touch(int finger, bool down, int x, int y, uint64_t stamp)
+ {
+-	uint64_t now = mach_absolute_time();
++	uint64_t now = stamp ? stamp : mach_absolute_time();
+ 	IOHIDEvent *collection;
+ 	bool any = false;
+ 
+@@ -677,6 +688,14 @@
+ sweet_hid_touch(int finger, int down, int x, int y)
+ {
+ 	if (gSweetTouch) {
+-		gSweetTouch->touch(finger, down != 0, x, y);
++		gSweetTouch->touch(finger, down != 0, x, y, 0);
+ 	}
+ }
++
++extern "C" void
++sweet_hid_touch_at(int finger, int down, int x, int y, uint64_t stamp)
++{
++	if (gSweetTouch) {
++		gSweetTouch->touch(finger, down != 0, x, y, stamp);
++	}
++}
