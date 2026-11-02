@@ -6,7 +6,7 @@ cd "$(dirname "$0")/../../.." || exit 1
 G=plans/usb/gadget
 [ -n "${1:-}" ] && while kill -0 "$1" 2>/dev/null; do sleep 5; done
 last_log() { ls -t ios-asteroids/logs/ast*-usb-l"$1".txt 2>/dev/null | head -1; }
-for lvl in 2 3 4; do
+for lvl in ${USB_LEVELS:-2 3 4}; do
 	echo "== $(date +%T) level $lvl"
 	chk=
 	if [ "$lvl" != 2 ]; then
@@ -25,5 +25,5 @@ for lvl in 2 3 4; do
 	echo "$v"
 	case "$v" in *"USBVERDICT L$lvl PASS"*) ;; *) echo "== stopping at level $lvl"; say "USB level $lvl did not pass. Details are in the log."; exit 1 ;; esac
 done
-say "USB level 4 passed. SSH over the cable works."
+[ "$lvl" = 4 ] && say "USB level 4 passed. SSH over the cable works." || say "USB level $lvl passed."
 echo "== all levels passed $(date +%T)"
