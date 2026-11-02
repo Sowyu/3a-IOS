@@ -19,3 +19,6 @@ mk combo-daily "$daily $input"                       # power button: keys reach 
 mk combo-daily-pwr "$daily $input sweetpwrfast=1"     # plus the instant blank (2152 v4, Sol GO with the frozen-scanout limit accepted)
 mk combo-all "$daily $input sweetpwrfast=1 sweetfb_keep=1 sweetfb_astwait=1"   # plus keep-frames with honest SwapWait (2142), the lag fix: never keep without astwait
 mk combo-daily-ff "$daily $input sweetappmetal=Freeform"   # Freeform phase 2b, only with its libraries pushed
+# hands-free test of the kernel without hw scale, so the self-test's frames are readable
+loop='sweetthermal=0 sweetfetchsync=1 sweetdeadman=600 sweetselftest=1'
+mk combo-loop-nohw "${args/ sweetsyserr=backboardd,MobileSafari/} $loop sweetsb=1 $input sweetfb_keep=1 sweetfb_astwait=1"

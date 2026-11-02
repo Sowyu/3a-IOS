@@ -34,7 +34,7 @@ Updated 2026-11-02, about 22:20 AEDT. Update this file whenever the state change
 7. Small ones:
    - Glass buttons render flat: grey in Notes, white in Calculator, and the Notes clock white on white. Cause found (`docs/glass-flat.md`): the launcher has skipped CoreAnimation's luma compute kernels since ast9, so UIKit reads unwritten bytes when it picks light or dark glass and the status bar style. Fix: `patches/glass/luma-compute.patch` (skip off by default, `bgmtl-bb.skipcompute` brings it back, no-copy result buffers copied back). Being built as `plans/glass/next-luma`, then one nohw hands-free run checked with `tools/glass/luma-frames.py`.
    - Calendar widget stays a skeleton
-   - App top spacing: apps still reserve 68 pt. The fix in `tools/statusbar/sweetsb_safearea.h` (50 pt) installs in PosterBoard but showed no sign of running in real apps, whose stderr went nowhere. The new version (`docs/app-safearea2.md`) logs through `sweetnull`, falls back to `/private/var/tmp` for its guard file, and reports every early return. One hands-free run is staged: `plans/statusbar-real/boot/next-loop-sb-null-boot.img`, untested.
+   - App top spacing: apps still lay out at 68 pt. ast97 proved the new `sweetsb` (`docs/app-safearea2.md`) loads in every app, logs through `sweetnull`, and lowers the window's safe top from 68 to 50. But each root view controller still reports 68 and nav bars sit at y 68, so view controllers take the inset from another route. The agent is finding it.
    - Only 24 GB of storage is visible
    - Apple logo early in boot (the bootloader's Nothing logo can't safely change: no logo partition, signed ABL)
    - The fixed 10 s wait in boot
