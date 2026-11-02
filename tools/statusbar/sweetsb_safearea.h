@@ -7,7 +7,7 @@
 static const double APP_TOP_SAFE_AREA_PT = SWEETSB_APP_SAFEAREA ? 48 + VERTICAL_SHIFT_PT : 0;
 typedef struct UIEdgeInsets { double top,left,bottom,right; } SweetInsets;
 static BOOL appSafeAreaScope, appSafeAreaInstalled, appSafeAreaRejected;
-static IMP appSafeAreaOriginal, appVCSafeAreaOriginal;
+static IMP appSafeAreaOriginal, appOverlapOriginal;
 static atomic_bool appSafeAreaReported;
 
 static BOOL sweetAppExecutable(const char *p) {
@@ -52,8 +52,10 @@ static id findNavigationBar(id view,int depth) {
     for(id sub in (NSArray *)sweetSend(view,"subviews")) { id f=findNavigationBar(sub,depth+1); if(f)return f; }
     return nil;
 }
-/* What layout actually used: window and root view safe area, and the first navigation bar's top edge. */
+/* What layout actually used, as a timeline from the first change: window and root view safe area, the first navigation
+   bar's top edge, the status bar manager's frame, the raw scene top, and the status bar overlap before and after the hook. */
 static void probeAppLayout(void *tag) {
+    unsigned long ms=(unsigned long)(uintptr_t)tag;
     id app=sweetSend((id)objc_getClass("UIApplication"),"sharedApplication");
     int n=0;
     for(id w in (NSArray *)sweetSend(app,"windows")) {
@@ -62,11 +64,24 @@ static void probeAppLayout(void *tag) {
         id root=sweetSend(w,"rootViewController"),view=sweetSend(root,"view"),bar=findNavigationBar(w,0);
         CGRect b=bar ? ((CGRect(*)(id,SEL,CGRect,id))objc_msgSend)(bar,sel_registerName("convertRect:toView:"),
             ((CGRect(*)(id,SEL))objc_msgSend)(bar,sel_registerName("bounds")),nil) : CGRectNull;
-        note("app layout %lus: window %s safe top %g; root %s safe top %g; navbar y %g h %g",(unsigned long)(uintptr_t)tag,
+        note("app layout %lums: window %s safe top %g; root %s safe top %g; navbar y %g h %g",ms,
             object_getClassName(w),safeTop(w),root?object_getClassName(root):"nil",safeTop(view),
             bar?b.origin.y:NAN,bar?b.size.height:NAN);
+        id scene=sweetSend(w,"windowScene"),manager=sweetSend(scene,"statusBarManager");
+        SEL frameSel=sel_registerName("statusBarFrame"),rawSel=sel_registerName("_safeAreaInsetsForInterfaceOrientation:");
+        CGRect sb=manager && [manager respondsToSelector:frameSel] ? ((CGRect(*)(id,SEL))objc_msgSend)(manager,frameSel) : CGRectNull;
+        double raw=scene && [scene respondsToSelector:rawSel] ? ((SweetInsets(*)(id,SEL,NSInteger))objc_msgSend)(scene,rawSel,1).top : NAN;
+        double overlapIn=NAN,overlapOut=NAN;
+        if(appOverlapOriginal && view) {
+            Class vc=objc_getClass("UIViewController");
+            SEL o=sel_registerName("_statusBarOverlapAndMarginInfoForView:inWindow:");
+            overlapIn=((SweetInsets(*)(id,SEL,id,id))appOverlapOriginal)(vc,o,view,w).top;
+            overlapOut=((SweetInsets(*)(id,SEL,id,id))objc_msgSend)(vc,o,view,w).top;
+        }
+        note("app status %lums: manager frame y %g h %g; scene raw top %g; overlap %g -> %g",ms,
+            CGRectIsNull(sb)?NAN:sb.origin.y,CGRectIsNull(sb)?NAN:sb.size.height,raw,overlapIn,overlapOut);
     }
-    if(!n)note("app layout %lus: no full-screen window",(unsigned long)(uintptr_t)tag);
+    if(!n)note("app layout %lums: no full-screen window",ms);
 }
 /* Portrait full-screen app window on the canvas. who/base: one report per check per caller (window bits 0-5, VC 16-21). */
 static BOOL appWindowFits(id window,SweetInsets original,const char *who,unsigned base) {
@@ -88,8 +103,9 @@ static BOOL appWindowFits(id window,SweetInsets original,const char *who,unsigne
 }
 static void appSafeAreaChanged(void) {
     if(!atomic_exchange(&appSafeAreaReported,true)) {
-        dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW,2*NSEC_PER_SEC),dispatch_get_main_queue(),(void *)2,probeAppLayout);
-        dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW,10*NSEC_PER_SEC),dispatch_get_main_queue(),(void *)10,probeAppLayout);
+        static const unsigned ms[]={0,250,500,1000,2000,4000,10000};   // 0: the next main-queue turn, before the first frame
+        for(unsigned i=0;i<sizeof(ms)/sizeof(*ms);i++)
+            dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW,(int64_t)ms[i]*NSEC_PER_MSEC),dispatch_get_main_queue(),(void *)(uintptr_t)ms[i],probeAppLayout);
     }
     scheduleHealthy();
 }
@@ -107,22 +123,23 @@ static SweetInsets appSceneInsets(id window,SEL cmd,BOOL includeStatusBar) {
     appSafeAreaChanged();
     return adjusted;
 }
-/* -[UIViewController _viewSafeAreaInsetsFromScene] (UIKitCore 0x1892cbb9c) feeds _setContentOverlayInsets:andLeftMargin:rightMargin:.
-   For root view controllers (ivar flag bit 6) it reads -[UIWindowScene _safeAreaInsetsForInterfaceOrientation:] directly, not the
-   window, so ast97 showed window 50 but root view 68. Same checks on the view's window, then the same top-only cap.
-   ponytail: a view that starts below the window top gets the cap (target), not top minus the delta; fine while every root view is at y 0. */
-static SweetInsets appVCInsets(id vc,SEL cmd) {
-    SweetInsets original=((SweetInsets(*)(id,SEL))appVCSafeAreaOriginal)(vc,cmd);
+/* +[UIViewController _statusBarOverlapAndMarginInfoForView:inWindow:] (UIKitCore 0x1892ca648) returns the status bar overlap
+   in top and the horizontal margins in left/right. It reads -[UIWindowScene _safeAreaInsetsForInterfaceOrientation:] or the status
+   bar height, not the window, and __UIPresentationControllerBaseContentInsetsForControllersAndViewInWindow (0x1892cc07c) takes
+   max(overlap, _viewSafeAreaInsetsFromScene) for _setContentOverlayInsets:. ast99: the second was 50, the root views still 68.
+   Same window checks on the inWindow argument; only top changes, only downward.
+   ponytail: a view below the window top gets the cap, not top minus the delta; fine while every root view starts at y 0. */
+static SweetInsets appOverlapInsets(id cls,SEL cmd,id view,id window) {
+    SweetInsets original=((SweetInsets(*)(id,SEL,id,id))appOverlapOriginal)(cls,cmd,view,window);
     if(!appSafeAreaScope || APP_TOP_SAFE_AREA_PT<=0)return original;
-    id window=sweetSend(sweetSend(vc,"viewIfLoaded"),"window");
-    if(!window) { if(APP_ONCE(24))note("app vc safe area skip: no window; top=%g",original.top); return original; }
-    if(!appWindowFits(window,original,"app vc safe area",16))return original;
-    SweetInsets adjusted=compactAppInsets(original,APP_TOP_SAFE_AREA_PT);
-    if(adjusted.top==original.top) {
-        if(APP_ONCE(22))note("app vc safe area unchanged: %s insets %g,%g,%g,%g",object_getClassName(vc),original.top,original.left,original.bottom,original.right);
+    if(!window) { if(APP_ONCE(24))note("app overlap skip: no window; top=%g",original.top); return original; }
+    if(!appWindowFits(window,original,"app overlap",16))return original;
+    if(!(isfinite(original.top) && original.top>APP_TOP_SAFE_AREA_PT && original.top<=80)) {
+        if(APP_ONCE(22))note("app overlap unchanged: top %g left %g right %g",original.top,original.left,original.right);
         return original;
     }
-    if(APP_ONCE(23))note("app vc safe area top %g -> %g; %s target=%gpt",original.top,adjusted.top,object_getClassName(vc),APP_TOP_SAFE_AREA_PT);
+    SweetInsets adjusted=original;adjusted.top=APP_TOP_SAFE_AREA_PT;
+    if(APP_ONCE(23))note("app overlap top %g -> %g; view %s target=%gpt",original.top,adjusted.top,object_getClassName(view),APP_TOP_SAFE_AREA_PT);
     appSafeAreaChanged();
     return adjusted;
 }
@@ -149,16 +166,15 @@ static void installAppSafeArea(void) {
         if(i==0)hook=m;
     }
     // Optional second route: without it the window hook still installs.
-    Method vcHook=class_getInstanceMethod(objc_lookUpClass("UIViewController"),sel_registerName("_viewSafeAreaInsetsFromScene"));
-    Method loaded=class_getInstanceMethod(objc_lookUpClass("UIViewController"),sel_registerName("viewIfLoaded"));
-    BOOL vcOK=signature(vcHook,@encode(SweetInsets),2,NULL) && signature(loaded,"@",2,NULL);
-    if(!vcOK)note("app vc safe area failed ABI: %s",vcHook?method_getTypeEncoding(vcHook):"absent");
+    Method overlap=class_getClassMethod(objc_lookUpClass("UIViewController"),sel_registerName("_statusBarOverlapAndMarginInfoForView:inWindow:"));
+    BOOL overlapOK=signature(overlap,@encode(SweetInsets),4,NULL);
+    if(!overlapOK)note("app overlap failed ABI: %s",overlap?method_getTypeEncoding(overlap):"absent");
     appSafeAreaOriginal=method_getImplementation(hook);
     method_setImplementation(hook,(IMP)appSceneInsets);
-    if(vcOK) {
-        appVCSafeAreaOriginal=method_getImplementation(vcHook);
-        method_setImplementation(vcHook,(IMP)appVCInsets);
+    if(overlapOK) {
+        appOverlapOriginal=method_getImplementation(overlap);
+        method_setImplementation(overlap,(IMP)appOverlapInsets);
     }
     appSafeAreaInstalled=YES;
-    note("app safe area installed; target=%gpt; portrait full-screen only; vc route %s",APP_TOP_SAFE_AREA_PT,vcOK?"on":"off");
+    note("app safe area installed; target=%gpt; portrait full-screen only; overlap route %s",APP_TOP_SAFE_AREA_PT,overlapOK?"on":"off");
 }

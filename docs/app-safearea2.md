@@ -89,3 +89,32 @@ Success, per app:
 ```
 
 If the root view still reads 68 with the `vc ... -> 50` line present, a later stage raises it again. The next candidate is `_statusBarOverlapAndMarginInfoForView:inWindow:` in the function at 0x1892cc07c, which takes the max of that value and `_viewSafeAreaInsetsFromScene` (fmaxnm at 0x1892cc12c).
+
+## Round 4: the status bar overlap (after ast99)
+
+ast99 (logs/ast99-app-safearea3.txt) shows `vc route on` and `app vc safe area unchanged: <root VC> insets 50,0,34,0` in all five apps (lines 9192, 10204, 10340, 10462, 10731), with no `vc ... ->` line. So `_viewSafeAreaInsetsFromScene` was already 50, but the root views read 68 at 2 s and 10 s.
+
+Proven from disassembly: `__UIPresentationControllerBaseContentInsetsForControllersAndViewInWindow` (UIKitCore 0x1892cc07c) calls `+[UIViewController _statusBarOverlapAndMarginInfoForView:inWindow:]` (0x1892ca648). That returns the overlap in top and the horizontal margins in left and right, which go out through pointers at 0x1892cc0ec and 0x1892cc0f4. The function then takes `fmaxnm` of that top and `_viewSafeAreaInsetsFromScene` top (0x1892cc12c). The overlap method reads `-[UIWindowScene _safeAreaInsetsForInterfaceOrientation:]` directly (0x1892ca798). When `_UIViewControllerModernContentOverlayInsetsPropagation` (0x1892ca7a4) is false, it uses `statusBarHeight` instead (0x1892ca7c4), minus the view's minY. Neither branch goes through the window. Inferred, not proven: one of those two gives 68, and the later pass the owner saw is the overlap's first use once scene or status bar info arrives.
+
+Fix: the hook on `_viewSafeAreaInsetsFromScene` is removed, because it never fired. sweetsb_safearea.h now hooks the overlap class method (appOverlapInsets). It applies the window checks to the `inWindow:` argument: not hosted, level 0, 420x930 at 0,0, portrait UIWindowScene, canvas screen. Then it lowers only top, and only when 50 < top <= 80. Margins stay as they are, and nothing is ever increased. It covers both branches. The hook is optional, and the install line says `overlap route on` or `off`. The window hook, the guard and the SpringBoard exclusion are unchanged.
+
+Timeline probe: from the first window change, the probe runs at 0, 250, 500, 1000, 2000, 4000 and 10000 ms. Each tick logs two lines per full-screen window. `app layout Nms` has the window and root view safe tops and the nav bar y. `app status Nms` has the status bar manager's frame, the raw scene top (`_safeAreaInsetsForInterfaceOrientation:1`), and the overlap before and after the hook.
+
+Build: app-safearea/sweetsb-install.dylib, sha256 3049c912d307066f2542d34bf20f3fd4a0889d58092b3ecf3dea65e49227ef01, no warnings. The ast99 build is kept in app-safearea/v3. safearea-check.sh passes, with mock overlap cases for margins kept, nil window, level 10, landscape, a short frame, top 40, top 90, NaN and scope off. stui-check.sh passes. pacstrip finds no PAC code.
+
+Run, from plans/, with the same boot image:
+
+```sh
+python3 devloop/dev.py statusbar-real/boot/next-loop-sb-null-boot.img /usr/local/lib/sweetsb.dylib="$PWD/statusbar-real/app-safearea/sweetsb-install.dylib" --test ui --note app-safearea4 --key 'sweetsb-real'
+```
+
+Success, per app:
+
+```text
+app safe area installed; target=50pt; portrait full-screen only; overlap route on
+app overlap top 68 -> 50; view <root view class> target=50pt
+app layout 2000ms: window ... safe top 50; root ... safe top 50; navbar y 50 ...
+app status 2000ms: manager frame y 0 h <H>; scene raw top 68; overlap 68 -> 50
+```
+
+If the `app status` lines show the overlap already at 50 while the root view still reads 68, a fourth source is involved. The timeline then shows the tick where it changes.
