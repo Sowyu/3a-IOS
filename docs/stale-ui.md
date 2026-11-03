@@ -1,6 +1,6 @@
 # Stale UI after transitions
 
-2026-11-03, desk work only. No phone run of mine yet. Labels: **Measured** means a run's own log or frame shows it, **Code** means I read it in the source, **Inferred** means my reading, **Missing** means no data yet.
+2026-11-03. One phone run so far, ast154 (`stale-UB`), run by the owner's queue; I did not use the phone. Labels: **Measured** means a run's own log or frame shows it, **Code** means I read it in the source, **Inferred** means my reading, **Missing** means no data yet.
 
 ## The reports
 
@@ -46,6 +46,40 @@ The test that splits them: after the stale frame, go home and reopen the app. Co
 - Stale pixels gone after the reopen: the surface held pixels CoreAnimation did not expect, so hypothesis 1 (render side) or 4.
 - Stale pixels still there: a layer's source is stale, so hypothesis 2 or 5. The buttons are glass, so 2 first.
 
+## ast154: repro and the reopen split
+
+`stale-UB` (combo-ub without hw scale, root driver `next-luma-ub`), `--test staleui`. Self-test done in 364 s, root clean, 0 recoveries, 0 backboardd restarts, `preserves=0` all boot.
+
+**Measured, Notes: repro.** Frame 01, Notes' list on a fresh launch, has the "..." glyph in its top-right glass button. Frame 02, the note open, has a blank glass circle there instead of the note's buttons. Frames 03 and 04, back on the list 2 s and 7 s later, have a blank circle where the "..." was, slightly larger than before. Notes 2 and 3 repeat it exactly (frames 05 to 10). The new-note frames at 4 s and 12 s (12, 13) show the same blank circle.
+
+**Measured, the split.** Frame 11 goes home, reopens Notes and shoots 4 s later: the circle is still blank. The reopen animates the whole app from the home screen, so CoreAnimation redraws every pixel of the app. A buffer-age or partial-redraw fault would be gone after a full redraw. So hypotheses 1 (render side) and 4 are out for this case, and the fault is in what CoreAnimation draws on every frame. Frame 14 (new note, reopen) shows the home screen: Notes did not come forward within 4 s, so it says nothing.
+
+**Measured, Calendar: no repro.** The list menu (a pull-down: Single Day, Multi Day, List), search, and "+" all opened and closed, and the nav bar is sharp in every closed and reopened frame (16 to 26, zoomed). The calendars button did nothing (27). The inbox sheet opened and my swipe did not close it (31 to 34). None of these is a full-screen blur, so the owner's button is still unknown. Side note for the "+" report: "+" opened the New event sheet here (frame 23).
+
+**Not seen:** Notes' three buttons staying after leaving the note. In this run the note's buttons never drew in the first place (frame 02), which is the same family seen from the other side: the glass buttons are there, their glyphs are not, and the state does not recover.
+
+**Inferred.** Because the blank survives a full redraw, either a layer's source is wrong (hypotheses 2 and 5), or the draw that puts the glyph on the glass produces nothing in this state on every frame (new hypothesis 6 below). The first frame has the glyph with the same driver, so the glyph pipeline works at least in the list's first state.
+
+| # | After ast154 |
+|---|---|
+| 1 | Out for the Notes case: the blank survives a full redraw. The kernel half was already out |
+| 1b | Keep and astwait: out for the blank button (ast81, ast96). `stale-0` tests the rest |
+| 2 | Open, now a lead: the glyph sits on glass, and the button changes shape across the transition |
+| 3 | Open |
+| 4 | Out for the Notes case, same reason as 1 |
+| 5 | Open. **Measured, ast154:** the only copied, not imported surfaces this boot are 240x240 RG8 (ids 167, 173, 176, 188). `write-back 0`, `stale refreshes stopped 0`, `load forced to clear 0`. Nothing in this boot's `bgmtl.log` names a refused draw, pass or dispatch |
+| 6 | New: the glyph draw fails on every frame in the post-transition state, through a translation or ordering bug in its pipeline. Vibrant glyphs on glass use the `Bvcm` shaders, which read the destination (fetch), and `sweetfetchsync` changes how those reads are ordered |
+| 7 | New: UIKit's own state never finishes the transition (an animation completion that never arrives), so the glyph is really hidden. It would look exactly like this. Nothing on the driver side tests it directly |
+
+## Next runs
+
+`plans/stale/build-stale.sh` now also builds two arms on `stale-UB`, and `ONLY="name ..."` builds only those:
+
+- `stale-P0` adds `sweetpool=0`, which bgl-launch already reads: Chlorophyll's texture pool off, nothing pushed. Pooled textures come back zeroed and are cleared by their first pass, and an offscreen glyph cache would live in one.
+- `stale-F0` sets `sweetfetchsync=0`. Labels may tear in it (`lag.md`), so judge only the glyph.
+
+How to read them: the glyph back in `stale-P0` frames 03, 04 and 11 points at the pool. Back in `stale-F0` points at fetch ordering (hypothesis 6). Still blank in both, with `stale-0` also blank, leaves hypotheses 2, 3, 5 and 7. The next step then is a capture of the frame after the round trip, which needs a `shatter.capture` file on the root (a flash, since dev.py cannot create files), or a capture trigger in the driver.
+
 ## Repro
 
 `plans/devloop/selftest/scripts/staleui.sh` (copy in `tools/devloop/selftest/scripts/`):
@@ -66,7 +100,7 @@ Images, `plans/stale/build-stale.sh` (copy in `tools/stale/`), all on `next-comb
 
 ## Missing
 
-- Any run of `staleui`. No frame yet shows the three Notes buttons or the blurred Calendar buttons.
+- A frame of the three Notes buttons staying, or of the blurred Calendar buttons.
 - Whether no-hw reproduces what the owner saw on hw-scale images.
 - The owner session log (log-before.txt of the first dev.py run after 14:43).
 - Which Calendar button the owner meant.

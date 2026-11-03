@@ -9,6 +9,7 @@ args=$(sed -n "s/^args='\(.*\)'\$/\1/p" "$nf/build.sh")
 [ -n "$args" ] || { echo "cannot read the args from $nf/build.sh" >&2; exit 1; }
 shim="$out/shim"; [ ! -e "$shim" ] || /usr/bin/trash "$shim"; cp -R "$root/ios-sweet/asteroids/shim" "$shim"
 mk() {
+	case " ${ONLY:-$1} " in *" $1 "*) ;; *) return 0 ;; esac   # ONLY="stale-P0 stale-F0": leave queued images alone
 	[ ${#2} -le 607 ] || { echo "$1: ${#2} bytes, over 607" >&2; exit 1; }
 	python3 -I "$repo/tools/mkpayload.py" "$kernel" "$root/ux-fix/ux-420pt-2x-840x1860.adt" "$out/$1.payload" --cmdline "$2"
 	ASTEROIDS_DTB="$repo/research/asteroids-hw/live.dtb" MKBOOTIMG="$root/ref/tools/mkbootimg.py" bash "$shim/build.sh" "$out/$1.payload" "$out/$1-boot.img"
@@ -19,3 +20,7 @@ loop='sweetdeadman=900 sweetselftest=1'
 mk stale-UB "$base $loop sweetfb_keep=1 sweetfb_astwait=1 sweettu=sysmem,nocb,nolrz"   # combo-ub without hw scale (next-luma-ub driver)
 mk stale-K "$base $loop sweetfb_lead=3000 sweetfb_keep=1 sweetfb_astwait=1"             # combo-keep without hw scale
 mk stale-0 "$base $loop"                                                               # neither keep nor astwait: judge stale buttons only
+# ast154 bisect arms on stale-UB: Chlorophyll's texture pool off (the launcher's sweetpool=0), and the fetch sync off (labels may tear)
+ub="$base $loop sweetfb_keep=1 sweetfb_astwait=1 sweettu=sysmem,nocb,nolrz"
+mk stale-P0 "$ub sweetpool=0"
+mk stale-F0 "${ub/sweetfetchsync=1/sweetfetchsync=0}"
