@@ -426,3 +426,6 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 **Measured, host.** The corrected combined build passed. Kernel SHA256 is1dcd7de654ed7b81ed721cf95a2cfa4f5cc07a8893fea87d2d7616216e21d869. The data image SHA256 isb141136242ee89934c78e29e78dc881d1800c499fa5a16153af7cd34a478dd8a, with all10 packed kernel segments verified. Independent ordered reconstruction and isolated lifecycle/datapath suites pass, including shared-TLB isolation and the maintained2221 regression cases. The unapproved manifest is refused before any phone claim or mutation.
 
 **Missing.** Fresh source and exact-image review, followed by successful PAS15-only preparation and offline IPA handshake evidence before ONLINE. The modem hold is released while those prerequisites are pending.
+
+
+**Code, reviewed.** Sol gave conditional GO for the exact2208 ONLINE image and runner in `modem-2208-data-image-audit.md`. No integration fix is required. The fresh IPA source review closes the TLB isolation finding, but launch still requires successful separately reviewed PAS15-only and offline IPA/GSI/QMI handshake trials. The manifest remains unapproved until those hardware prerequisites pass.
