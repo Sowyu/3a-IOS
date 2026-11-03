@@ -537,3 +537,6 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 **Inferred.** The offline retain path supports a bounded ONLINE teardown only if WDS cleanup is attempted and AP DMA is quiesced before detach. An unresolved WDS start or handle remains a cleanup failure. Unverified PAS4 must prevent final GSI deallocation, PAS15 shutdown, SMMU parking and backing reuse until guarded reset. This does not complete M2.
 
 **Missing.** The combined ONLINE image still needs Sol's GO. NAS registration, a WDS call and data packets remain unmeasured. Command completion type0x23 is measured; data completion stays strict0x22. No data profile or packet-proof helper has been installed.
+
+
+**Code, review correction.** The first final2218 review accepted the offline I3 evidence and retained DMA lifecycle but rejected profile restoration that could overwrite an unrecognized change. The runner now restores only an exact match of the pinned temporary profile. It leaves the original alone and retains ownership without writing on any third state. Host tests cover conflicts and failed readback. The source and image are unchanged; a new exact-artifact review is required before launch.

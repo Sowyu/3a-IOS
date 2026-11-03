@@ -79,11 +79,14 @@ def pull_profile(serial, out, hook=False):
     return out / 'preferences.plist'
 
 
-def restore(serial, out, original):
+def restore(serial, out, original, trial):
     if busy() or recovery() != serial or not clean(serial):
         raise RuntimeError('restoration requires the same phone in clean recovery')
     before = pull_profile(serial, out / 'before-restore')
-    if before.read_bytes() != original.read_bytes():
+    current = before.read_bytes()
+    if current != original.read_bytes():
+        if current != trial.read_bytes():
+            raise RuntimeError('unrecognized live profile; retained without writing')
         result = run([sys.executable, '-I', str(PUT), '--adb', serial,
                       '--undo-dir', str(out), PREF + '=' + str(original)])
         (out / 'restore.log').write_bytes(result.stdout + result.stderr)
@@ -161,7 +164,7 @@ def main():
     finally:
         if launched:
             try:
-                restore(serial, out, local(m['original']))
+                restore(serial, out, local(m['original']), local(m['profile']))
             except BaseException:
                 print('Ownership retained pending recovery and profile restoration', flush=True)
                 raise
