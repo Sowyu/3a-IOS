@@ -22,7 +22,7 @@ s=(out/'ModemRuntime.inc').read_text()
 def function(start,end): return s[s.index(start):s.index(end)]
 (out/'lifecycle.c').write_text((root/'tests/lifecycle-prefix.c').read_text()+function('static int m_scm(','static int m_assign(')+function('static bool m_cleanup(','static int m_power_inspect(')+(root/'tests/lifecycle-tail.c').read_text())
 (out/'power.c').write_text((root/'tests/power-prefix.c').read_text()+function('static int m_power_inspect(', '#include "ModemGate.h"')+(root/'tests/power-tail.c').read_text())
-(out/'shutdown.c').write_text((root/'tests/shutdown-prefix.c').read_text()+function('static void m_shutdown_receive(', '/* Insert before m_greceive')+function('static bool m_shutdown_request(', 'static int m_shadow_prepare(')+(root/'tests/shutdown-tail.c').read_text())
+(out/'shutdown.c').write_text((root/'tests/shutdown-prefix.c').read_text()+function('static void m_shutdown_receive(', 'static void m_uim_readiness(')+function('static bool m_shutdown_request(', 'static int m_shadow_prepare(')+(root/'tests/shutdown-tail.c').read_text())
 (out/'vote.c').write_text((root/'tests/vote-prefix.c').read_text()+function('static int m_vote(', 'static int m_qwait(')+(root/'tests/vote-tail.c').read_text())
 PY
 cc -save-temps=obj -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -I"$out" "$out/lifecycle.c" -o "$out/check-lifecycle"

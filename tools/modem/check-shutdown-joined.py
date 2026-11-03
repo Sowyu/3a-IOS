@@ -14,7 +14,7 @@ s=(out/'ModemRuntime.inc').read_text()
 def f(start,end):return s[s.index(start):s.index(end)]
 # Hardware barriers have no meaning in this single-threaded host transport.
 rmt=f('static void m_rmtfs_receive(', 'static void m_pd_receive(').replace('__asm__ volatile("dmb sy":::"memory");','').replace('__asm__ volatile("dsb sy":::"memory");','')
-code=prefix+f('static int m_scm(', 'static int m_assign(')+rmt+f('static void m_shutdown_receive(', '/* Insert before m_greceive')+f('static bool m_shutdown_request(', 'static int m_shadow_prepare(')+f('static bool m_cleanup(', 'static int m_power_inspect(')+(here/'tests/lifecycle-tail.c').read_text().split('int main(void)')[0]+(here/'tests/shutdown-joined-tail.c').read_text()
+code=prefix+f('static int m_scm(', 'static int m_assign(')+rmt+f('static void m_shutdown_receive(', 'static void m_uim_readiness(')+f('static bool m_shutdown_request(', 'static int m_shadow_prepare(')+f('static bool m_cleanup(', 'static int m_power_inspect(')+(here/'tests/lifecycle-tail.c').read_text().split('int main(void)')[0]+(here/'tests/shutdown-joined-tail.c').read_text()
 (out/'shutdown-joined.c').write_text(code)
 env=dict(os.environ,TMPDIR=str(out/'tmp'))
 subprocess.run(['cc','-save-temps=obj','-std=c11','-Wall','-Wextra','-Werror','-DMODEM_PROTOCOL_HOST_TEST','-fsanitize=address,undefined','-I'+str(out),str(out/'shutdown-joined.c'),str(out/'QcomQrtr.c'),str(out/'ModemRmtfs.c'),'-o',str(out/'check-shutdown-joined')],env=env,check=True)
@@ -48,7 +48,7 @@ int main(void){
  puts("PASS: joined actual handover/RSC/SSCTL/RAM-rmtfs/PAS cleanup, timeout retention and ENODEV failure");
 }
 """
-code=joined_prefix+vote+f('static int m_vote(', 'static int m_qwait(')+f('static int m_scm(', 'static int m_assign(')+rmt+f('static void m_shutdown_receive(', '/* Insert before m_greceive')+f('static bool m_shutdown_request(', 'static int m_shadow_prepare(')+f('static bool m_cleanup(', 'static int m_power_inspect(')+(here/'tests/lifecycle-tail.c').read_text().split('int main(void)')[0]+joined_tail+handover_tests
+code=joined_prefix+vote+f('static int m_vote(', 'static int m_qwait(')+f('static int m_scm(', 'static int m_assign(')+rmt+f('static void m_shutdown_receive(', 'static void m_uim_readiness(')+f('static bool m_shutdown_request(', 'static int m_shadow_prepare(')+f('static bool m_cleanup(', 'static int m_power_inspect(')+(here/'tests/lifecycle-tail.c').read_text().split('int main(void)')[0]+joined_tail+handover_tests
 (out/'handover-joined.c').write_text(code)
 subprocess.run(['cc','-save-temps=obj','-std=c11','-Wall','-Wextra','-Werror','-DMODEM_PROTOCOL_HOST_TEST','-fsanitize=address,undefined','-I'+str(out),str(out/'handover-joined.c'),str(out/'QcomQrtr.c'),str(out/'ModemRmtfs.c'),'-o',str(out/'check-handover-joined')],env=env,check=True)
 subprocess.run([str(out/'check-handover-joined')],env=env,check=True)
