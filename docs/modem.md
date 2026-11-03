@@ -197,3 +197,10 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 **Measured, host.** The actual extracted sender and response handler pass sanitizer tests for endpoint binding, truncation, wrong transaction/opcode, duplicate result TLVs, stale acknowledgment, timeout and transport failure. Existing lifecycle tests cover the graceful path skipping the stop bit while still requiring PAS success. `plans/modem/logs/start-check-2179.txt` and `uim-check-2179.txt` pass. The full Trash-safe --remake completed with exit 0 in `build-2179.txt`.
 
 **Inferred.** Missing sysmon shutdown may explain the failed stop, but the secure error has not been decoded. This candidate follows the matching kernel lifecycle and does not establish a hardware fix. **Missing.** Fresh Sol GO, packed-image checks and a clean offline result before the separate UIM trial.
+
+
+## Shutdown result correction 2180
+
+**Code.** Sol's 2179 review approved one diagnostic offline boot and found that a transport or fatal error first observed during shutdown could leave final_error=0 if PAS subsequently stopped successfully. Patch 2180 logs both flags and returns failure even when memory cleanup succeeds. It changes reporting and acceptance, not the hardware sequence. The active 2179 phone run does not contain this later patch.
+
+**Measured, host.** The added combined test uses the real SSCTL request/response functions, QRTR dispatch, RAM rmtfs handler, SCM/PAS wrapper and cleanup. A simulated modem reads and writes RAM during shutdown, then acknowledges. Cases also cover timeout fallback, permanent PAS failure retaining buffers, and shutdown-time transport/fatal errors with successful PAS. All pass under sanitizers. MMIO, SMC and IPC delivery are simulated; this does not prove hardware shutdown. The full --remake build exited 0. No 2180 phone approval exists yet.

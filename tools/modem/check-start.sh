@@ -44,3 +44,5 @@ runtime=(out/'ModemRuntime.inc').read_text()
 assert runtime.index('!m_gate("sweetmpss")') < runtime.index('uint32_t outoff;if(m_alloc')
 print('PASS: runtime storage references are read-only; rmtfs has no storage API')
 PYCHK
+
+python3 "$root/check-shutdown-joined.py"

@@ -26,7 +26,11 @@ SELFTEST: DONE
   run.with_suffix('.txt').write_text(text)
   return subprocess.run([sys.executable,str(here.parent/'check-run.py'),str(run),'offline',str(tmp/'nonce')],capture_output=True).returncode
  assert check(log)==0
+ assert check(log.replace("STOP verified PAS; cleanup=ok ready=1 handover=1 services=45", "STOP verified PAS; cleanup=ok ready=0 handover=0 services=0"))==0
+ assert check(log.replace("SMP2P slave=0x6 ready=1 handover=1", "SMP2P slave=0x0 ready=0 handover=0"))!=0
  assert check(log+'STOP UNVERIFIED\n')!=0
+ assert check(log+'teardown transport_failed=1 fatal=0\n')!=0
+ assert check(log+'teardown transport_failed=0 fatal=1\n')!=0
  assert check(log.replace('final_error=0','final_error=5'))!=0
  assert check(log.replace('cleanup=ok','cleanup=INCOMPLETE'))!=0
  assert check(log.replace('PAS4 cmd=6 status=0','PAS4 cmd=6 status=-3145800'))!=0

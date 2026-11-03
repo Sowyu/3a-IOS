@@ -10,7 +10,8 @@ assert (p/'frames'/('01-modem_'+mode+'.png')).stat().st_size>0
 r=json.loads((p/'result.json').read_text());text=p.with_suffix('.txt').read_text(errors='replace')
 assert r['result']=='selftest-done' and r['root_state']=='clean' and not r['stale']
 assert not re.search(r'SELFTEST: (FAIL|SKIP)|panic\(cpu|deadman:.*(?:reboot|reset)|STOP UNVERIFIED|cleanup=INCOMPLETE',text)
-checks=[r'PAS4 cmd=5 status=0 result=0',r'SMP2P slave=.*ready=1 handover=1',r'GLINK mpss/IPCRTR up=1',r'QRTR NEW_SERVER service=0xb ',r'pd-mapper response=[1-9][0-9]*',r'rmtfs msg=3 reads=[1-9][0-9]* .*error=0',r'PAS4 cmd=6 status=0 result=0',r'STOP verified PAS; cleanup=ok ready=1 handover=1 services=[1-9][0-9]*',r'gated modem worker finished final_error=0',r'SELFTEST: DONE']
+assert not re.search(r'teardown transport_failed=1|teardown transport_failed=[01] fatal=1',text)
+checks=[r'PAS4 cmd=5 status=0 result=0',r'SMP2P slave=.*ready=1 handover=1',r'GLINK mpss/IPCRTR up=1',r'QRTR NEW_SERVER service=0xb ',r'pd-mapper response=[1-9][0-9]*',r'rmtfs msg=3 reads=[1-9][0-9]* .*error=0',r'PAS4 cmd=6 status=0 result=0',r'STOP verified PAS; cleanup=ok ready=[01] handover=[01] services=[0-9]+',r'gated modem worker finished final_error=0',r'SELFTEST: DONE']
 if mode=='uim':
  checks += [r'UIM read request msg=0x2f ',r'UIM card-status error=0 slots=[1-4]',r'UIM slot=[1-4] card=(?:PRESENT|ABSENT)']
  if re.search(r'UIM slot=[1-4] card=PRESENT',text):

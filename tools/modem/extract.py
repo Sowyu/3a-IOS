@@ -4,7 +4,7 @@ import re
 import sys
 target = sys.argv[3] if len(sys.argv) > 3 else "bsd/dev/sweet_modem.c"
 source = []
-for path in sorted(Path(sys.argv[1]).glob('217*.patch')):
+for path in sorted(Path(sys.argv[1]).glob('[0-9][0-9][0-9][0-9]-*.patch')):
     out, cursor, active, in_hunk = [], 0, False, False
     for line in path.read_text().splitlines(True):
         if line.startswith('--- '):

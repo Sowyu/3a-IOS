@@ -1,0 +1,12 @@
+--- a/bsd/dev/modem/ModemRuntime.inc
++++ b/bsd/dev/modem/ModemRuntime.inc
+@@ -367,7 +367,8 @@
+         if(m.shared)ml_io_unmap(m.shared,M_RMT_SIZE);if(m.args)ml_io_unmap(m.args,PAGE_SIZE);
+         for(unsigned i=0;i<4;i++)if(m.fs.image[i])kfree_data(m.fs.image[i],m.fs.bytes[i]);
+     }
+-    sweet_log_sync();return clean;
++    printf("SWEET MODEM: teardown transport_failed=%u fatal=%u\n",m.failed,m.fatal);
++    sweet_log_sync();return clean && !m.failed && !m.fatal;
+ }
+ static int m_power_inspect(void){
+     static uint8_t dbcopy[0x20000];
