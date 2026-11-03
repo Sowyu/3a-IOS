@@ -1,6 +1,6 @@
 # Modem and SIM: desk findings (2026-11-03)
 
-The read-only firmware preflight passed on the phone in ast146. Patch 2173 is the first offline MPSS start candidate and has passed host checks and a full kernel build. Sol approved exact patches 2170 through 2174 for one bounded offline phone test. M1 has code and host checks. The first offline attempt, ast148, stopped at a power prerequisite before PAS. No modem start or SIM detection has been measured.
+MPSS boots offline and announces UIM, NAS and WDS services. ast151 proved ready, handover, GLINK/QRTR and RAM-backed rmtfs, but PAS shutdown failed. M2 remains incomplete and no SIM status has been queried. Patch 2178 corrects the shutdown sequence and error handling; its host checks and build passed, and Sol approved a bounded offline retry. The data-path plan is below.
 
 Labels as in `docs/input.md`: **Measured**, **Code**, **Inferred**, **Missing**.
 
@@ -10,13 +10,13 @@ Labels as in `docs/input.md`: **Measured**, **Code**, **Inferred**, **Missing**.
 - **Code, DT.** `remoteproc-mss@04080000`, compatible `qcom,volcano-modem-pas`. Its regions are `mpss_mem`, `q6_mpss_dtb_mem` (0x99200000 + 0x80000) and a third (phandle 0x7a). Its interrupts are wdog, fatal, handover, ready, stop-ack and shutdown-ack. It has a "stop" SMP2P state, GLINK edge "mpss" (remote pid 1, IPCC mailbox) and AOP QMP signalling.
 - **Code, memory.** XNU's RAM is 0x8c0000000 + 0x134000000, so the kernel cannot allocate below 4 GB. rmtfs needs a 2.5 MiB buffer below 4 GB. The bank at 0xe0a00000 is the only free low RAM, and 0xe1000000 to 0xe2000000 is unused.
 - **Code, storage.** `sweet_ufs_read_part()` reads `modem_a` and the EFS partitions read-only. The kernel's UFS write path refuses anything outside `userdata`. The modem's EFS (`modemst1`, `modemst2`, `fsg`) holds the IMEI and RF calibration. It must never be written: serve it read-only, and keep any writes in RAM.
-- **Code, missing pieces.** This kernel has no RPMh client for the apps RSC and no AOSS QMP sender for SM7635. Both are needed for the rail votes and `load_state`.
+- **Code.** The modem series now includes an apps-RSC RPMh client coordinated with touch and an AOSS QMP sender. ast151 exercised them before PAS authentication.
 - **Code, reuse.** The Poco F1 port booted SDM845's modem on this same xnu-12377 (`ios-asteroids/xnu/patches-12377/1104` to `1116`: SMP2P, rmtfs over QRTR and GLINK, tftp, pd-mapper). SDM845 used MBA, while this phone uses PAS. rootstock's `ref/UniXNU-asteroids/package/` has SMEM, SMP2P, GLINK, QRTR, QMP and an ADSP start for this phone.
 - **Inferred, from HakiOS (`ref/hakios-xnu-kernel`, SC7280).** The modem announced UIM about 30 s after rmtfs was served, while still offline. Going online without IPA crashed the modem. So reading SIM status needs rmtfs, and likely tftp and pd-mapper too, but not IPA.
 
 ## State
 
-- `plans/modem/src/lift/` holds unfinished drafts that do not compile. The dedicated `ios-asteroids/research/xnu-modem` tree now has the requested daily series plus 2170. Other kernel trees were not edited.
+- `plans/modem/src/lift/` holds unfinished drafts that do not compile. The dedicated `ios-asteroids/research/xnu-modem` tree now has the requested daily series, USB v5 and modem patches 2170 through 2178. Other kernel trees were not edited.
 - The owner wants mobile data only. Calls, SMS and status-bar changes are excluded. A wired-interface approach may avoid Apple baseband integration for data, but still needs a working modem and IPA path.
 
 ## Patch 2170, read-only preflight
@@ -37,11 +37,17 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 
 **Code, DT.** `asteroids.dts:23195` contains a disabled generic `qcom,ipa_fws` node naming `ipa_fws` and PAS id 0x0f. The actual `qcom,ipa@3E00000` node also names that firmware and PAS id. Its `memory-regions` points to phandle 0x26d, the GSI reservation at 0x9ea90000 of size 0xa000. The adjacent IPA reservation is 0x9ea80000 of size 0x10000. Do not choose the adjacent region merely from its name.
 
-**Code, DT.** IPA base is 0x03e00000 with length 0x84000; GSI base is 0x03e04000 with length 0xfc000. The configuration offset is 0x140000. The hardware version property is 0x17, an enum whose mapping must be verified. EE is zero. Core clock, three interconnect paths, IPA/GSI interrupts and IPA SMP2P mappings are specified. AP and microcontroller SMMU streams are 0x4a0 and 0x4a2, with IOVA pools at 0x20000000 of size 0x20000000. The 64-bit DMA property does not remove SMMU mapping requirements.
+**Code, DT.** IPA base is 0x03e00000 with length 0x84000; GSI base is 0x03e04000 with length 0xfc000. The configuration offset is 0x140000. The hardware version property is 0x17, which the matching vendor header identifies as IPA 5.2. EE is zero. Core clock, three interconnect paths, IPA/GSI interrupts and IPA SMP2P mappings are specified. AP and microcontroller SMMU streams are 0x4a0 and 0x4a2, with IOVA pools at 0x20000000 of size 0x20000000. The 64-bit DMA property does not remove SMMU mapping requirements.
 
 **Code, reference.** HakiOS `drivers/modem/hakios.ipa.c` targets IPA 4.11/GSI 2.11 and describes command, LAN RX, modem TX and modem RX endpoints, GSI rings and shared routing/filter tables. These are requirements to investigate, not verified SM7635 register offsets or endpoint IDs. Its PAS loader explicitly warns that loading the adjacent wrong reservation caused unreliable modem behavior.
 
-**Missing.** Inventory the local signed ipa_fws segments read-only, verify their placement and the SM7635 IPA/GSI version, obtain matching endpoint/register tables, arrange clock/interconnect votes, isolated SMMU mappings, bounded DMA buffers and a stop/reset sequence. Implement the modem's IPA QMI setup handshake and tables before online mode. Firmware authentication alone is insufficient. Fresh Sol GO is required before booting these changes. Only then request DMS online and record NAS registration and serving system. Two matching resets stop that attempt.
+**Code, matching vendor source.** Nothing's `sm7635/v/mr` source at commit `d5f5f965fd0b478eaf4eb63fd984c5a4a92135a7` defines `IPA_HW_v5_2 = 23` in [msm_ipa.h](https://github.com/NothingOSS/android_kernel_msm-6.1_nothing_sm7635/blob/d5f5f965fd0b478eaf4eb63fd984c5a4a92135a7/vendor/qcom/opensource/dataipa/drivers/platform/msm/include/uapi/linux/msm_ipa.h#L1073). Its [ipa3_get_gsi_ver](https://github.com/NothingOSS/android_kernel_msm-6.1_nothing_sm7635/blob/d5f5f965fd0b478eaf4eb63fd984c5a4a92135a7/vendor/qcom/opensource/dataipa/drivers/platform/msm/ipa/ipa_v3/ipa.c#L7719) selects GSI_VER_5_2. Use these tables rather than copying HakiOS's IPA 4.11/GSI 2.11 register assumptions. This identifies the software configuration, not a live hardware version read.
+
+**Measured, local firmware inventory.** The stock modem_a backup contains `ipa_fws.mdt` and b00 through b04. The MDT is 4204 bytes. Its three relocatable load segments total 17824 file bytes and occupy a page-aligned span of 0x7000, fitting the DT's 0xa000 GSI reservation. The load addresses begin at zero and require relocation to the selected reservation. The hash segment is metadata, not an executable load. No IPA authentication or MMIO operation has run.
+
+**Missing.** Read the live IPA/GSI version, verify the complete load path and matching endpoint/register tables, arrange clock/interconnect votes, isolated SMMU mappings, bounded DMA buffers and a stop/reset sequence. Implement the modem's IPA QMI setup handshake and tables before online mode. Firmware authentication alone is insufficient. Fresh Sol GO is required before booting these changes. Only then request DMS online and record NAS registration and serving system. Two matching resets stop that attempt.
+
+**Code, IPA handshake.** The vendor [IPA QMI service](https://github.com/NothingOSS/android_kernel_msm-6.1_nothing_sm7635/blob/d5f5f965fd0b478eaf4eb63fd984c5a4a92135a7/vendor/qcom/opensource/dataipa/drivers/platform/msm/ipa/ipa_v3/ipa_qmi_service.c#L27) uses service 0x31, version 1, AP instance 1 and modem instance 2. ast151 already announced the modem endpoint as packed instance 0x201. The setup passes real header, route, filter and shared-memory ranges to the modem. The generated protocol defines indication registration 0x20, modem-driver initialization 0x21, master initialization indication 0x22 and modem completion 0x35. Do not advertise completion before those tables and DMA mappings exist.
 
 ### M5, WDS data call
 
@@ -50,6 +56,18 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 ### M6, IPA/rmnet packets
 
 **Missing.** Implement the SM7635 GSI command/TX/RX/event rings, IPA routing/filter/header tables and QMAP mux framing. Bound DMA lengths and aggregated packet parsing, maintain cache coherency, and reject unknown mux IDs. Prove a returned packet with counters and a bounded network test, then verify stop drains DMA before freeing memory. WDS stop must run on success and failure exits before modem teardown.
+
+**Code, endpoint reference.** The matching vendor [IPA 5.2 endpoint table](https://github.com/NothingOSS/android_kernel_msm-6.1_nothing_sm7635/blob/d5f5f965fd0b478eaf4eb63fd984c5a4a92135a7/vendor/qcom/opensource/dataipa/drivers/platform/msm/ipa/ipa_v3/ipa_utils.c#L5203) and `ipa_gsi_ep_config` identify these endpoint/channel pairs. These are source values awaiting live verification.
+
+| Client | IPA endpoint | GSI channel | Execution environment |
+| --- | ---: | ---: | --- |
+| AP command producer | 9 | 6 | AP |
+| AP LAN producer | 6 | 4 | AP |
+| AP LAN consumer | 11 | 7 | AP |
+| AP WAN producer | 2 | 5 | AP |
+| AP WAN consumer | 18 | 9 | AP |
+| Modem WAN producer | 7 | 0 | Modem |
+| Modem LAN consumer | 12 | 3 | Modem |
 
 ### M7, iOS interface
 
@@ -156,4 +174,7 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 
 **Measured, host.** Production PAS and cleanup tests pass for transient and permanent vendor failures, bounded retries, known fatal errors, stop-bit clearing on acknowledgment and timeout, and retaining buffers after failure. Preflight and UIM tests also pass, and the matching kernel remake finished successfully.
 
-**Missing.** A fresh Sol review and another offline boot must verify shutdown before enabling UIM. The phone was released to the queued tests during this work.
+**Measured, review.** `docs/modem-2178-audit.md` gives a conditional GO for one matching offline image. Its ten rebased kernel segments match the successful build. The retry waits for the queued phone test to finish. UIM remains off until measured M2 and a fresh Sol review.
+
+
+**Code, additional shutdown reference.** Nothing's [volcano MPSS descriptor](https://github.com/NothingOSS/android_kernel_msm-6.1_nothing_sm7635/blob/d5f5f965fd0b478eaf4eb63fd984c5a4a92135a7/drivers/remoteproc/qcom_q6v5_pas.c#L2502) selects free-after-auth behavior, which enables `retry_shutdown` in its probe. Its [qcom_scm_pas_shutdown_retry](https://github.com/NothingOSS/android_kernel_msm-6.1_nothing_sm7635/blob/d5f5f965fd0b478eaf4eb63fd984c5a4a92135a7/drivers/firmware/qcom_scm.c#L860) retries failed shutdown calls at 100 ms intervals up to 50 times. This independently supports bounded retries on this board family. It does not establish the meaning of ast151's vendor status.
