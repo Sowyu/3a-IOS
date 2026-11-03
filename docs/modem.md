@@ -405,6 +405,15 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 
 **Code.** The modem tree now includes data2220 audit7, adapter2221 and IPA2200 through2206. The worker binds IPA after preparation and before data attach, refreshes its readiness at receive/discovery/poll boundaries and quiesces AP channels before detach. An uncertain modem stop retains IPA backing and power. These changes are in IPA2205. The exact application order and hashes are recorded in the workspace's modem README and IPA cutoff manifest.
 
-**Measured, host.** Independent ordered reconstruction matches all19 IPA-touched files in xnu-modem. Isolated firmware, lifecycle, datapath and compiled MMIO checks pass, including the actual worker and real2221 adapter. A combined full build is running.
+**Measured, host.** Independent ordered reconstruction matches all19 IPA-touched files in xnu-modem. Isolated firmware, lifecycle, datapath and compiled MMIO checks pass, including the actual worker and real2221 adapter. The combined full Trash-safe build exited0. All53 frozen source hashes still match. Its kernel SHA256 is e203a6aab91eb59d716a90f2a2812ad57f6dbda9099a0bf84904f185f08286b6.
 
-**Missing.** Additive IPA2207 will guard indirect stage2 references and extended StreamID validity after the frozen build completes. The final image needs a new Sol GO. PAS15, the IPA handshake and ONLINE remain unmeasured. ast170 proved the read-only context survey and showed why the earlier zero-only context selector refused preparation.
+**Code.** Additive IPA2207 now guards indirect stage2 references and extended StreamID validity. It was applied after the full build ended. The fresh IPA source review is NO-GO because global leaf descriptors and a shared VMID permit AP/uC TLB identity collisions despite distinct ASIDs. IPA owns the additive correction. No2206 or2207 image may boot under this review.
+
+**Missing.** The corrected source needs a fresh review, rebuild and exact-image GO. PAS15, the IPA handshake and ONLINE remain unmeasured. ast170 proved the read-only context survey and showed why the earlier zero-only context selector refused preparation.
+
+
+## Bounded data runner
+
+**Code.** `tools/modem/run-data-usb.py` requires a reviewed manifest with pinned artifacts, takes the modem hold and atomic phone lock, and consumes a one-attempt record before invoking dev.py. It refuses replay and extra boot attempts. It verifies the actual first-boot hook composition before launch. Afterward it restores the original network profile from the same phone in clean recovery and verifies the bytes. An uncertain restoration keeps phone ownership.
+
+**Measured, host.** `python3 tools/modem/check-data-runner.py` passes changed-artifact, approval, busy-phone, wrong-phone, dirty-root and restoration-readback refusal cases. No approved manifest exists and this runner has not operated the phone.
