@@ -2,7 +2,7 @@
 
 ## Checkpoint, 2026-11-03
 
-I1 is complete. I2 is in progress: patch 2200 adds a default-off kernel firmware preflight and read-only SMMU survey. The isolated xnu-ipa tree contains the daily series, USB v5 and copied modem 2170 through 2182. Its first full build is running. No IPA firmware, IPA/GSI registers or ONLINE call has run on the phone. Mobile data does not work yet.
+I1 is complete. I2 is in progress. Patch 2200 passed its audited read-only phone run, ast159. Firmware bounds and the APPS SMMU survey passed, with no IPA/GSI MMIO or PAS15 call. The isolated xnu-ipa tree now carries copied modem patches 2170 through 2183. Mobile data does not work yet.
 
 Host inspection of the existing extracted ipa_fws.mdt found three relocatable loads, 17824 file bytes and a page-rounded span of 0x7000. This fits the 0xa000 GSI reservation. `tools/ipa/inspect_mdt.py` checks ELF bounds, overlap and relocation span without loading firmware. It does not check split-file contents or authenticate the image. Three synthetic host tests pass, including nine malformed cases. Local evidence is `plans/ipa/logs/host-check.txt` and `plans/ipa/logs/firmware-inventory.json`.
 
@@ -128,9 +128,15 @@ Initialize empty filter/routing entries to valid mapped zero-rule storage with t
 
 The requested build script's first-clone path executes destructive cleanup and checkout operations even before normal compilation. Its make install also uses cleanup commands. I did not run it under the permanent-deletion policy. The existing modem build-safe wrapper is hard-coded to xnu-modem and must not be reused unchanged. A safe xnu-ipa bootstrap remains work to do, not evidence that a build failed.
 
-The immediate hardware blockers are unmeasured AP/uC context ownership, unimplemented isolated mappings and power votes, and no verified PAS15/DMA stop sequence. The modem's documented PAS4 shutdown failure also prevents claiming a clean combined lifecycle. Sol is reviewing 2200 for a read-only sweetipaprobe=1 boot, conditional on an exact full build and image verification. This grants no PAS15 or IPA/GSI register permission. No phone run is queued before that review.
+The remaining I2 work is isolated AP/uC mappings, power votes, PAS15, GSI rings, IPA tables and the modem QMI handshake. These are implementation tasks. PAS4 teardown remains the modem agent's responsibility.
 
-This work took no phone hold or lock, issued no phone command and left no files on the iOS root. The phone's current mode and current root cleanliness were not measured. Other agents may have changed them. The last modem checkpoint available when read was ast155 with clean root and failed PAS4 shutdown. Raw logs, reference downloads and firmware stay outside the public repo.
+## Read-only phone result
+
+Sol approved the exact 2200 source for one controlled preflight. The full remake with -j6 passed. The boot image was checked against all ten kernel segments and the expected boot arguments before use.
+
+ast159 completed normally in 214 seconds with root clean and no GPU recovery. The per-run completion nonce matched. The kernel reported three firmware loads, 17824 bytes and span 0x7000. APPS SMMU ID0 was 0x4c017e72, ID1 0x60000048 and ID2 0x5111. Streams 0x4a0, 0x4a1 and 0x4a2 had zero matching SMRs. The worker returned final_error=0. PAS15, IPA/GSI registers and SMMU writes were untouched.
+
+Local evidence is ios-asteroids/logs/ast159-ipa-preflight-2200.txt and its result.json, completion marker and summary. The screenshot was blank with hardware scaling, so it is not visual evidence. The phone returned to recovery. The IPA hold and lock were released. The root retains the normal selftest hook, logs, screenshot and /private/var/tmp/ipa-preflight-complete.txt. No data-path program or firmware was installed.
 
 ## 2200 implementation
 
