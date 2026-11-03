@@ -1,6 +1,6 @@
 # Modem and SIM: desk findings (2026-11-03)
 
-Desk work only. Nothing ran on the phone, and no patch exists. The agent stopped before writing the modem start: the assistant's safety system interrupted the TrustZone start code, and the work was not continued.
+Desk work only. Patch 2170 now provides a read-only firmware preflight. It has synthetic host checks but no full kernel rebuild or phone run. M1 is incomplete. MPSS start and SIM detection are not implemented.
 
 Labels as in `docs/input.md`: **Measured**, **Code**, **Inferred**, **Missing**.
 
@@ -16,5 +16,43 @@ Labels as in `docs/input.md`: **Measured**, **Code**, **Inferred**, **Missing**.
 
 ## State
 
-- `plans/modem/src/lift/` holds unfinished drafts that do not compile. `ios-asteroids/research/xnu-modem` is a fresh kernel tree without the daily series applied.
-- Calls, SMS and data need an iOS-side stand-in for Apple's baseband interface. `analysis/daily-driver-gaps.md` section 12 covers that.
+- `plans/modem/src/lift/` holds unfinished drafts that do not compile. The dedicated `ios-asteroids/research/xnu-modem` tree now has the requested daily series plus 2170. Other kernel trees were not edited.
+- The owner wants mobile data only. Calls, SMS and status-bar changes are excluded. A wired-interface approach may avoid Apple baseband integration for data, but still needs a working modem and IPA path.
+
+## Patch 2170, read-only preflight
+
+**Code.** `patches/modem/2170-asteroids-modem-preflight.patch` adds `sweetmodem=1` after UFS initialization on the Nothing board. Absent or zero is inert. Other levels are refused. It validates FAT16 geometry against partition size, bounds every read to modem_a, and checks split ELF32 segment sizes, overlap and the MPSS reservation span. It reads the last byte of each load segment through its FAT chain. It does not authenticate firmware or start hardware.
+
+**Measured, host only.** `tools/modem/check.sh` compiles the source extracted from the public patch with AddressSanitizer and UndefinedBehaviorSanitizer. Synthetic tests pass for boot gates, FAT bounds/cycles, MDT truncation/overflow/span and partition restrictions. Local evidence is `plans/modem/logs/host-check.txt:9`. No phone identifiers or firmware are test fixtures.
+
+**Code.** No UFS write, SMC, MMIO mapping or memory-ownership call exists in the new source. The only storage reader calls `sweet_ufs_read_part("modem_a", ...)` after checking offset and length. This describes the modem patch, not other kernel drivers.
+
+**Missing.** Full kernel build, real firmware acceptance, a Sol review and phone preflight. The build's MakeInc.cmd defines `/bin/rm -f`; install uses it for temporary files and symlinks. Configure recoverable Trash cleanup before the required --remake build. PAS, QMP, coordinated RPMh, SMP2P, GLINK, QRTR and rmtfs remain to implement. The old draft's exclusive DRV2 assumption conflicts with the touch driver's idle-TCS selection and shared IRQ register updates.
+
+## Revised milestones for mobile data
+
+M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires ready and handover bits, announced QRTR services and a verified stop in phone logs. M3 requires UIM card status, application state and at most the last four ICCID digits. A modem response saying no SIM satisfies M3.
+
+### M4, IPA prerequisites and online NAS registration
+
+**Code, DT.** `asteroids.dts:23195` contains a disabled generic `qcom,ipa_fws` node naming `ipa_fws` and PAS id 0x0f. The actual `qcom,ipa@3E00000` node also names that firmware and PAS id. Its `memory-regions` points to phandle 0x26d, the GSI reservation at 0x9ea90000 of size 0xa000. The adjacent IPA reservation is 0x9ea80000 of size 0x10000. Do not choose the adjacent region merely from its name.
+
+**Code, DT.** IPA base is 0x03e00000 with length 0x84000; GSI base is 0x03e04000 with length 0xfc000. The configuration offset is 0x140000. The hardware version property is 0x17, an enum whose mapping must be verified. EE is zero. Core clock, three interconnect paths, IPA/GSI interrupts and IPA SMP2P mappings are specified. AP and microcontroller SMMU streams are 0x4a0 and 0x4a2, with IOVA pools at 0x20000000 of size 0x20000000. The 64-bit DMA property does not remove SMMU mapping requirements.
+
+**Code, reference.** HakiOS `drivers/modem/hakios.ipa.c` targets IPA 4.11/GSI 2.11 and describes command, LAN RX, modem TX and modem RX endpoints, GSI rings and shared routing/filter tables. These are requirements to investigate, not verified SM7635 register offsets or endpoint IDs. Its PAS loader explicitly warns that loading the adjacent wrong reservation caused unreliable modem behavior.
+
+**Missing.** Inventory the local signed ipa_fws segments read-only, verify their placement and the SM7635 IPA/GSI version, obtain matching endpoint/register tables, arrange clock/interconnect votes, isolated SMMU mappings, bounded DMA buffers and a stop/reset sequence. Implement the modem's IPA QMI setup handshake and tables before online mode. Firmware authentication alone is insufficient. Fresh Sol GO is required before booting these changes. Only then request DMS online and record NAS registration and serving system. Two matching resets stop that attempt.
+
+### M5, WDS data call
+
+**Missing.** Read provisioned profiles without changing persistent profiles, obtain the SIM/carrier APN, negotiate WDA framing and bind the correct endpoint and mux before WDS start. Request the IP family and parse assigned IP/prefix, gateway and DNS from runtime settings. Use transient call parameters only. Record the call handle for teardown. Do not guess an APN or treat a WDS success response as packet delivery.
+
+### M6, IPA/rmnet packets
+
+**Missing.** Implement the SM7635 GSI command/TX/RX/event rings, IPA routing/filter/header tables and QMAP mux framing. Bound DMA lengths and aggregated packet parsing, maintain cache coherency, and reject unknown mux IDs. Prove a returned packet with counters and a bounded network test, then verify stop drains DMA before freeing memory. WDS stop must run on success and failure exits before modem teardown.
+
+### M7, iOS interface
+
+**Inferred.** A wired Ethernet presentation is a practical first option. The existing `iokit/Kernel/arm/SweetNetwork.cpp` publishes an IOKit Ethernet facade so configd adopts the USB BSD ifnet. Reuse that pattern for a distinct modem ifnet after M6, keeping USB separate.
+
+**Missing.** IPA carries IP/QMAP, not Ethernet. The adapter must translate Ethernet/ARP or provide a private routed Ethernet link with DHCP and a matching gateway; IPv6 needs its own routing/RA design. A virtual Ethernet label alone does not configure the WDS address or DNS. Test configd adoption, route selection, DNS and app traffic on this iOS build. CommCenter emulation is not planned. No status-bar sysctl is planned.

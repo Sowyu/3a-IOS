@@ -1,0 +1,351 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -706,3 +706,5 @@
+ bsd/skywalk/packet/pbufpool.c			optional skywalk bound-checks
+ bsd/skywalk/packet/pbufpool_kern.c		optional skywalk bound-checks
+ bsd/dev/cpu_copy_in_cksum_gen.c			optional skywalk bound-checks
++
++bsd/dev/sweet_modem.c standard
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -80,6 +80,7 @@
+ extern void sweet_thermal_start(void);
+ extern void sweet_power_survey_start(void);
+ extern void sweet_charger_start(void);
++extern void sweet_modem_start(void);
+ extern void sweet_a630_probe(void);
+ 
+ #define REG_CAP         0x00
+@@ -1321,6 +1322,7 @@
+ 		sweet_thermal_start();
+ 		/* read-only PMIC survey (sweet_power_survey.c, boot-arg sweetpowersurvey=1, default off) */
+ 		sweet_power_survey_start();
++		sweet_modem_start();
+ 		printf("SWEET UFS: Nothing Phone (3a): no SM7150/SDM845 drivers (USB, charger, GPU, Wi-Fi)\n");
+ 		return 0;
+ 	}
+--- /dev/null
++++ b/bsd/dev/sweet_modem.c
+@@ -0,0 +1,322 @@
++/* 2170: read-only MPSS firmware preflight. No PAS, SMEM or MMIO writes.
++ * sweetmodem=1 only. Other values fail closed, including future levels.
++ */
++#if defined(MODEM_HOST_TEST) || defined(ARM64_BOARD_CONFIG_SWEET)
++#ifdef MODEM_HOST_TEST
++#include "modem_host.h"
++#else
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/thread.h>
++#include <kern/kalloc.h>
++#include <pexpert/pexpert.h>
++#include <libkern/libkern.h>
++extern kern_return_t thread_terminate(thread_t);
++extern int sweet_ufs_read_part(const char *, uint64_t, void *, uint64_t);
++extern int sweet_ufs_part_size(const char *, uint8_t *, uint64_t *);
++#endif
++void sweet_modem_start(void);
++static uint64_t modem_partition_bytes;
++static int
++modem_read(const char *part, uint64_t off, void *dst, uint64_t len)
++{
++    if (strcmp(part, "modem_a") || off > modem_partition_bytes ||
++        len > modem_partition_bytes - off) return EINVAL;
++    return sweet_ufs_read_part("modem_a", off, dst, len);
++}
++#define WL_PART_READ(p,o,d,l) modem_read((p),(o),(d),(l))
++
++#define FAT_BUF_MAX     65536u
++#define DIR_BUF_MAX     131072u
++
++struct wl_fat {
++	const char *part;
++	uint32_t bps, spc, reserved, nfats, rootent, fatsz, ncl;
++	uint64_t fat_off, root_off, data_off, cl_bytes;
++};
++
++static uint8_t wl_fatbuf[FAT_BUF_MAX];
++static uint8_t wl_dirbuf[DIR_BUF_MAX];
++
++static uint32_t
++le16(const uint8_t *p)
++{
++	return (uint32_t)p[0] | ((uint32_t)p[1] << 8);
++}
++
++static uint32_t
++le32(const uint8_t *p)
++{
++	return le16(p) | (le16(p + 2) << 16);
++}
++
++static int
++fat_mount(struct wl_fat *f, const char *part)
++{
++	uint8_t b[512];
++	int err = WL_PART_READ(part, 0, b, sizeof(b));
++	if (err) {
++		return err;
++	}
++	if (b[510] != 0x55 || b[511] != 0xaa) {
++		return ENXIO;
++	}
++	f->part = part;
++	f->bps = le16(b + 11);
++	f->spc = b[13];
++	f->reserved = le16(b + 14);
++	f->nfats = b[16];
++	f->rootent = le16(b + 17);
++	uint32_t total = le16(b + 19) ? le16(b + 19) : le32(b + 32);
++	f->fatsz = le16(b + 22);
++	if (f->bps < 512 || f->bps > 4096 || (f->bps & (f->bps - 1)) || f->spc == 0 ||
++	    (f->spc & (f->spc - 1)) || f->nfats == 0 || f->nfats > 2 || f->rootent == 0 ||
++	    f->fatsz == 0 || (uint64_t)f->fatsz * f->bps > FAT_BUF_MAX || f->reserved == 0) {
++		return ENXIO;       /* not FAT12/16 */
++	}
++	f->fat_off = (uint64_t)f->reserved * f->bps;
++	f->root_off = f->fat_off + (uint64_t)f->nfats * f->fatsz * f->bps;
++	uint32_t root_sectors = (f->rootent * 32u + f->bps - 1) / f->bps;
++	f->data_off = f->root_off + (uint64_t)root_sectors * f->bps;
++	f->cl_bytes = (uint64_t)f->spc * f->bps;
++	if (f->data_off > (uint64_t)total * f->bps ||
++	    (uint64_t)total * f->bps > modem_partition_bytes) return EINVAL;
++	uint32_t data_sectors = total - (uint32_t)(f->data_off / f->bps);
++	f->ncl = data_sectors / f->spc;
++	if (f->ncl < 4085 || f->ncl > 65518 || (uint64_t)(f->ncl + 2) * 2 > (uint64_t)f->fatsz * f->bps) {
++		return ENXIO;       /* FAT12 or FAT32 */
++	}
++	return WL_PART_READ(part, f->fat_off, wl_fatbuf, (uint64_t)f->fatsz * f->bps);
++}
++
++static uint32_t
++fat_next(const struct wl_fat *f, uint32_t cl)
++{
++	if (cl < 2 || cl >= f->ncl + 2 || (cl * 2 + 1) >= (uint64_t)f->fatsz * f->bps) {
++		return 0xffff;
++	}
++	return le16(wl_fatbuf + cl * 2);
++}
++
++static int
++fat_read_chain(const struct wl_fat *f, uint32_t cl, uint64_t off, void *dst, uint64_t len)
++{
++	uint8_t *out = (uint8_t *)dst;
++	uint32_t guard = 0;
++	while (off >= f->cl_bytes) {
++		cl = fat_next(f, cl);
++		off -= f->cl_bytes;
++		if (cl < 2 || cl >= f->ncl + 2 || cl >= 0xfff0 || ++guard > f->ncl) {
++			return EIO;
++		}
++	}
++	while (len) {
++		if (cl < 2 || cl >= f->ncl + 2 || cl >= 0xfff0 || ++guard > f->ncl + 1) {
++			return EIO;
++		}
++		uint64_t n = MIN(len, f->cl_bytes - off);
++		int err = WL_PART_READ(f->part, f->data_off + (uint64_t)(cl - 2) * f->cl_bytes + off, out, n);
++		if (err) {
++			return err;
++		}
++		out += n;
++		len -= n;
++		off = 0;
++		if (len) {
++			cl = fat_next(f, cl);
++		}
++	}
++	return 0;
++}
++
++/* Load a directory (cl == 0: root) into wl_dirbuf; returns the entry count. */
++static int
++fat_dir_load(const struct wl_fat *f, uint32_t cl, uint32_t *nent)
++{
++	if (cl == 0) {
++		uint64_t bytes = (uint64_t)f->rootent * 32;
++		if (bytes > DIR_BUF_MAX) {
++			return EFBIG;
++		}
++		*nent = f->rootent;
++		return WL_PART_READ(f->part, f->root_off, wl_dirbuf, bytes);
++	}
++	uint32_t n = 0, guard = 0;
++	while (cl < 0xfff8) {
++		if (cl < 2 || cl >= f->ncl + 2 || cl >= 0xfff0 || ++guard > f->ncl) return EIO;
++		if ((uint64_t)(n + 1) * f->cl_bytes > DIR_BUF_MAX) {
++			return EFBIG;
++		}
++		int err = WL_PART_READ(f->part, f->data_off + (uint64_t)(cl - 2) * f->cl_bytes,
++		    wl_dirbuf + (uint64_t)n * f->cl_bytes, f->cl_bytes);
++		if (err) {
++			return err;
++		}
++		n++;
++		cl = fat_next(f, cl);
++	}
++	*nent = (uint32_t)((uint64_t)n * f->cl_bytes / 32);
++	return 0;
++}
++
++static void
++fat_83(const char *name, size_t n, char out[11])
++{
++	size_t i = 0, o = 0;
++	memset(out, ' ', 11);
++	for (; i < n && name[i] != '.' && o < 8; i++, o++) {
++		out[o] = (name[i] >= 'a' && name[i] <= 'z') ? (char)(name[i] - 32) : name[i];
++	}
++	if (i < n && name[i] == '.') {
++		i++;
++	}
++	for (o = 8; i < n && o < 11; i++, o++) {
++		out[o] = (name[i] >= 'a' && name[i] <= 'z') ? (char)(name[i] - 32) : name[i];
++	}
++}
++
++/* Only plain 8.3 names (all firmware files here are); long names never match. */
++static int
++fat_find(const uint8_t *dir, uint32_t nent, const char *name, size_t n,
++    uint32_t *cluster, uint32_t *size, bool *is_dir)
++{
++	char want[11];
++	fat_83(name, n, want);
++	for (uint32_t i = 0; i < nent; i++) {
++		const uint8_t *e = dir + (uint64_t)i * 32;
++		if (e[0] == 0) {
++			break;
++		}
++		if (e[0] == 0xe5 || (e[11] & 0x0f) == 0x0f || (e[11] & 0x08)) {
++			continue;
++		}
++		if (memcmp(e, want, 11) == 0) {
++			*cluster = le16(e + 26);
++			*size = le32(e + 28);
++			*is_dir = (e[11] & 0x10) != 0;
++			return 0;
++		}
++	}
++	return ENOENT;
++}
++
++/* "image/mba.mbn" style path, one directory level at a time. */
++static int
++fat_open(const struct wl_fat *f, const char *path, uint32_t *cluster, uint32_t *size)
++{
++	uint32_t cl = 0, nent = 0, sz = 0;
++	bool dir = true;
++	const char *p = path;
++	while (*p) {
++		const char *s = p;
++		while (*p && *p != '/') {
++			p++;
++		}
++		if (!dir) {
++			return ENOTDIR;
++		}
++		int err = fat_dir_load(f, cl, &nent);
++		if (err) {
++			return err;
++		}
++		err = fat_find(wl_dirbuf, nent, s, (size_t)(p - s), &cl, &sz, &dir);
++		if (err) {
++			return err;
++		}
++		if (*p == '/') {
++			p++;
++		}
++	}
++	if (dir) return EISDIR;
++	*cluster = cl;
++	*size = sz;
++	return 0;
++}
++
++
++#define MPSS_SIZE 0x0e600000ull
++#define META_MAX 65536u
++/* Validate the split ELF32 MDT before any future loader may use it. */
++static int
++modem_mdt(const uint8_t *b, uint32_t len, const struct wl_fat *f)
++{
++    if (len < 52 || memcmp(b, "\177ELF", 4) || b[4] != 1 || b[5] != 1 ||
++        b[6] != 1 || le32(b + 20) != 1 || le16(b + 40) != 52 ||
++        le16(b + 42) != 32) return EINVAL;
++    uint32_t off = le32(b + 28), count = le16(b + 44);
++    if (!count || count > 64 || off < 52 || off > len || count > (len - off) / 32) return EINVAL;
++    uint64_t lo = UINT64_MAX, hi = 0, bytes = 0;
++    unsigned loads = 0, hashes = 0;
++    for (unsigned i = 0; i < count; i++) {
++        const uint8_t *p = b + off + i * 32;
++        uint32_t flags = le32(p + 24), size = le32(p + 16), mem = le32(p + 20);
++        uint64_t addr = le32(p + 12);
++        if ((flags & (7u << 24)) == (2u << 24)) { hashes++; continue; }
++        if (le32(p) != 1 || !mem) continue;
++        if (!(flags & (1u << 27)) || size > mem || addr + mem > 0x100000000ull) return EINVAL;
++        for (unsigned j = 0; j < i; j++) {
++            const uint8_t *q = b + off + j * 32;
++            uint64_t qa = le32(q + 12), qm = le32(q + 20);
++            if (le32(q) == 1 && qm && (le32(q + 24) & (7u << 24)) != (2u << 24) &&
++                addr < qa + qm && qa < addr + mem) return EINVAL;
++        }
++        if (size) {
++            char name[32]; uint32_t cl, actual;
++            snprintf(name, sizeof(name), "image/modem.b%02u", i);
++            int err = fat_open(f, name, &cl, &actual);
++            if (err) return err;
++            if (actual != size) return EINVAL;
++            /* Prove the chain reaches the last byte, without loading firmware. */
++            uint8_t last;
++            err = fat_read_chain(f, cl, size - 1, &last, 1);
++            if (err) return err;
++        }
++        if (addr < lo) lo = addr;
++        if (addr + mem > hi) hi = addr + mem;
++        bytes += size; loads++;
++    }
++    if (!loads || hashes != 1 || (lo & 4095) || ((hi + 4095) & ~4095ull) - lo > MPSS_SIZE) return EINVAL;
++    printf("SWEET MODEM: firmware preflight PASS loads=%u bytes=%llu span=%#llx\n",
++        loads, (unsigned long long)bytes, (unsigned long long)(((hi + 4095) & ~4095ull) - lo));
++    return 0;
++}
++
++static void
++modem_probe(void *arg, wait_result_t wait)
++{
++    (void)arg; (void)wait;
++    struct wl_fat f;
++    uint8_t lun;
++    uint32_t cl = 0, size = 0;
++    uint8_t *mdt = NULL;
++    int err = sweet_ufs_part_size("modem_a", &lun, &modem_partition_bytes);
++    if (!err) err = fat_mount(&f, "modem_a");
++    if (!err) err = fat_open(&f, "image/modem.mdt", &cl, &size);
++    if (!err && (size < 52 || size > META_MAX)) err = EFBIG;
++    if (!err) {
++        mdt = kalloc_data(size, Z_WAITOK | Z_ZERO);
++        if (!mdt) err = ENOMEM;
++    }
++    if (!err) err = fat_read_chain(&f, cl, 0, mdt, size);
++    if (!err) err = modem_mdt(mdt, size, &f);
++    if (mdt) kfree_data(mdt, size);
++    printf("SWEET MODEM: read-only probe end error=%d; MPSS untouched\n", err);
++    thread_terminate(current_thread());
++}
++
++void
++sweet_modem_start(void)
++{
++    int level = 0;
++    if (!PE_parse_boot_argn("sweetmodem", &level, sizeof(level)) || !level) return;
++    if (level != 1) {
++        printf("SWEET MODEM: refused level %d; only read-only level 1 implemented\n", level);
++        return;
++    }
++    thread_t thread;
++    if (kernel_thread_start(modem_probe, NULL, &thread) == KERN_SUCCESS) thread_deallocate(thread);
++    else printf("SWEET MODEM: probe thread creation failed\n");
++}
++
++#endif
