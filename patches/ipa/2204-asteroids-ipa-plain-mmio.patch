@@ -1,0 +1,128 @@
+diff --git a/bsd/dev/modem/IpaMmio.h b/bsd/dev/modem/IpaMmio.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/modem/IpaMmio.h
+@@ -0,0 +1,26 @@
++#ifndef IPA_MMIO_H
++#define IPA_MMIO_H
++#include <stdint.h>
++/* Gunyah emulates APPS SMMU accesses. It rejects load/store writeback forms.
++ * Keep the access instruction explicit, as the measured touch driver does. */
++#ifdef IPA_HOST_TEST
++#define ipa_mmio_read32(base,off) m_rd((base),(off))
++#define ipa_mmio_write32(base,off,value) m_wr((base),(off),(value))
++#define ipa_mmio_write64(base,off,value) (*(volatile uint64_t *)((base)+(off))=(value))
++#else
++static inline uint32_t ipa_mmio_read32(uintptr_t base,unsigned off){
++    uint32_t value;__asm__ volatile("ldr %w0, [%1]":"=r"(value):"r"(base+off):"memory");
++    __asm__ volatile("dmb sy":::"memory");return value;
++}
++static inline void ipa_mmio_write32(uintptr_t base,unsigned off,uint32_t value){
++    __asm__ volatile("dmb sy":::"memory");
++    __asm__ volatile("str %w0, [%1]"::"r"(value),"r"(base+off):"memory");
++    __asm__ volatile("dsb sy":::"memory");
++}
++static inline void ipa_mmio_write64(uintptr_t base,unsigned off,uint64_t value){
++    __asm__ volatile("dmb sy":::"memory");
++    __asm__ volatile("str %0, [%1]"::"r"(value),"r"(base+off):"memory");
++    __asm__ volatile("dsb sy":::"memory");
++}
++#endif
++#endif
+diff --git a/bsd/dev/modem/IpaProbe.inc b/bsd/dev/modem/IpaProbe.inc
+--- a/bsd/dev/modem/IpaProbe.inc
++++ b/bsd/dev/modem/IpaProbe.inc
+@@ -1,5 +1,6 @@
+ /* 2200: storage and SMMU reads only. No IPA/GSI MMIO or PAS calls. */
+ #include "IpaFirmware.h"
++#include "IpaMmio.h"
+ static int ipa_preflight(const struct wl_fat *f){
+     uint32_t cl=0,size=0;int rc=fat_open(f,"image/ipa_fws.mdt",&cl,&size);
+     if(rc)return rc;if(size<52 || size>IPA_FW_METADATA_MAX)return EFBIG;
+@@ -19,7 +20,7 @@
+     kfree_data(mdt,size);
+     if(rc)return rc;
+     vm_offset_t smmu=ml_io_map(0x15000000,0x100000);if(!smmu)return ENOMEM;
+-    uint32_t id0=m_rd(smmu,0x20),id1=m_rd(smmu,0x24),id2=m_rd(smmu,0x28);
++    uint32_t id0=ipa_mmio_read32(smmu,0x20),id1=ipa_mmio_read32(smmu,0x24),id2=ipa_mmio_read32(smmu,0x28);
+     printf("SWEET IPA: SMMU read-only id0=%#x id1=%#x id2=%#x\n",id0,id1,id2);
+     unsigned count=id0&255,banks=id1&255,shift=(id1>>31)?16:12;
+     uint64_t cbbase=(1ull<<(((id1>>28)&7)+1))<<shift;
+@@ -27,23 +28,23 @@
+     for(unsigned sid=0x4a0;sid<=0x4a2;sid++){
+         unsigned matches=0;
+         for(unsigned i=0;i<count;i++){
+-            uint32_t smr=m_rd(smmu,0x800+4*i),mask=(smr>>16)&0x7fff;
++            uint32_t smr=ipa_mmio_read32(smmu,0x800+4*i),mask=(smr>>16)&0x7fff;
+             if(!(smr>>31) || ((smr^sid)&0x7fff&~mask))continue;
+-            uint32_t s2cr=m_rd(smmu,0xc00+4*i),cb=s2cr&255,sctlr=~0u;
+-            if(((s2cr>>16)&3)==0 && cb<banks)sctlr=m_rd(smmu,(unsigned)(cbbase+((uint64_t)cb<<shift)));
++            uint32_t s2cr=ipa_mmio_read32(smmu,0xc00+4*i),cb=s2cr&255,sctlr=~0u;
++            if(((s2cr>>16)&3)==0 && cb<banks)sctlr=ipa_mmio_read32(smmu,(unsigned)(cbbase+((uint64_t)cb<<shift)));
+             printf("SWEET IPA: SID=%#x SMR=%u raw=%#x S2CR=%#x SCTLR=%#x read_only=1\n",sid,i,smr,s2cr,sctlr);matches++;
+         }
+         printf("SWEET IPA: SID=%#x matches=%u\n",sid,matches);
+     }
+     bool used[256]={0};
+     for(unsigned i=0;i<count;i++){
+-        uint32_t smr=m_rd(smmu,0x800+4*i),s2=m_rd(smmu,0xc00+4*i);
++        uint32_t smr=ipa_mmio_read32(smmu,0x800+4*i),s2=ipa_mmio_read32(smmu,0xc00+4*i);
+         if((smr>>31) && ((s2>>16)&3)==0 && (s2&255)<banks)used[s2&255]=true;
+     }
+     for(unsigned i=0;i<banks;i++){
+         unsigned b=(unsigned)(cbbase+((uint64_t)i<<shift));
+         printf("SWEET IPA: CBsurvey bank=%u referenced=%u SCTLR=%#x TTBR0=%#x:%#x TTBR1=%#x:%#x FSR=%#x CBAR=%#x CBA2R=%#x read_only=1\n",
+-            i,used[i],m_rd(smmu,b),m_rd(smmu,b+0x24),m_rd(smmu,b+0x20),m_rd(smmu,b+0x2c),m_rd(smmu,b+0x28),m_rd(smmu,b+0x58),m_rd(smmu,0x1000+4*i),m_rd(smmu,0x1800+4*i));
++            i,used[i],ipa_mmio_read32(smmu,b),ipa_mmio_read32(smmu,b+0x24),ipa_mmio_read32(smmu,b+0x20),ipa_mmio_read32(smmu,b+0x2c),ipa_mmio_read32(smmu,b+0x28),ipa_mmio_read32(smmu,b+0x58),ipa_mmio_read32(smmu,0x1000+4*i),ipa_mmio_read32(smmu,0x1800+4*i));
+     }
+     vm_offset_t smem=ml_io_map(M_SMEM,M_SM_SIZE);if(!smem)return ENOMEM;
+     QcomSmem shared={(volatile uint8_t *)smem,M_SM_SIZE};QcomSmemPartition part={0};
+diff --git a/bsd/dev/modem/IpaRuntime.inc b/bsd/dev/modem/IpaRuntime.inc
+--- a/bsd/dev/modem/IpaRuntime.inc
++++ b/bsd/dev/modem/IpaRuntime.inc
+@@ -1,5 +1,6 @@
+ /* 2201: guarded IPA5.2 PAS15 lifecycle. No packet endpoint is advertised yet. */
+ #include "IpaSmmu.h"
++#include "IpaMmio.h"
+ #include "IpaMmu.h"
+ #include "IpaPower.h"
+ #ifndef IPA_HOST_TEST
+@@ -22,9 +23,9 @@
+     uint32_t smem_off,smem_bytes;
+     bool enabled,pas_owed,started,retained,clock_pinned,mmu_attempted;
+ } ipa;
+-static uint32_t ipa_mread(void *unused,unsigned off){(void)unused;return m_rd(ipa.smmu,off);}
+-static void ipa_mwrite(void *unused,unsigned off,uint32_t v){(void)unused;m_wr(ipa.smmu,off,v);}
+-static void ipa_mwrite64(void *unused,unsigned off,uint64_t v){(void)unused;IPA_BARRIER();*(volatile uint64_t *)(ipa.smmu+off)=v;IPA_BARRIER();}
++static uint32_t ipa_mread(void *unused,unsigned off){(void)unused;return ipa_mmio_read32(ipa.smmu,off);}
++static void ipa_mwrite(void *unused,unsigned off,uint32_t v){(void)unused;ipa_mmio_write32(ipa.smmu,off,v);}
++static void ipa_mwrite64(void *unused,unsigned off,uint64_t v){(void)unused;ipa_mmio_write64(ipa.smmu,off,v);}
+ static void ipa_mdelay(void *unused){(void)unused;delay(1);}
+ static int ipa_alloc(vm_offset_t *va,uint64_t *pa,vm_size_t size){
+     if(kmem_alloc_contig(kernel_map,va,size,PAGE_MASK,0,0,KMA_DATA|KMA_ZERO,VM_KERN_MEMORY_IOKIT)!=KERN_SUCCESS)return ENOMEM;
+diff --git a/bsd/dev/modem/IpaHardware.inc b/bsd/dev/modem/IpaHardware.inc
+--- a/bsd/dev/modem/IpaHardware.inc
++++ b/bsd/dev/modem/IpaHardware.inc
+@@ -1,4 +1,5 @@
+ #include "IpaGsi.h"
++#include "IpaMmio.h"
+ #include "IpaLayout.h"
+ #include "IpaQmi.h"
+ #include "SweetIpa.h"
+@@ -7,12 +8,12 @@
+     struct {unsigned off;uint32_t old,mask;} saved[128];unsigned count;
+     bool touched,ready,failed,logged;
+ } iph;
+-static uint32_t ipa_gread(void *unused,unsigned o){(void)unused;return m_rd(ipa.block,0x4000+o);}
+-static void ipa_gwrite(void *unused,unsigned o,uint32_t v){(void)unused;m_wr(ipa.block,0x4000+o,v);}
++static uint32_t ipa_gread(void *unused,unsigned o){(void)unused;return ipa_mmio_read32(ipa.block,0x4000+o);}
++static void ipa_gwrite(void *unused,unsigned o,uint32_t v){(void)unused;ipa_mmio_write32(ipa.block,0x4000+o,v);}
+ static void ipa_gsync(void *unused,unsigned o,unsigned n){(void)unused;sweet_dma_sync_va((void *)(ipa.dma+PAGE_SIZE+o),n);}
+ static void ipa_gwait(void *unused,unsigned us){(void)unused;delay(us);}
+-static uint32_t ipa_hr(unsigned o){return m_rd(ipa.block,0x140000+o);}
+-static void ipa_hw(unsigned o,uint32_t v){m_wr(ipa.block,0x140000+o,v);}
++static uint32_t ipa_hr(unsigned o){return ipa_mmio_read32(ipa.block,0x140000+o);}
++static void ipa_hw(unsigned o,uint32_t v){ipa_mmio_write32(ipa.block,0x140000+o,v);}
+ static bool ipa_hconfig(unsigned o,uint32_t v,uint32_t mask){
+     if(iph.count==128)return false;
+     bool saved=false;for(unsigned i=0;i<iph.count;i++)if(iph.saved[i].off==o){saved=true;break;}

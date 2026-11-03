@@ -1,3 +1,4 @@
+#define IPA_HOST_TEST 1
 /* Compile the real hardware/table driver against a bounded GSI+SRAM model. */
 #define main ipa_gsi_test_main
 #include "gsi.c"
@@ -32,7 +33,6 @@ static void sweet_dma_sync_va(const void *p,unsigned n){assert((uintptr_t)p>=(ui
 static void delay(unsigned n){(void)n;}
 static void sweet_log_sync(void){}
 #include "IpaHardware.inc"
-#define IPA_HOST_TEST 1
 #define LCK_GRP_DECLARE(name,label) int name
 #define LCK_MTX_DECLARE(name,group) int *name=group
 static bool queue_locked;

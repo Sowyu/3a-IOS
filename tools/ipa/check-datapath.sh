@@ -4,7 +4,7 @@ here=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 out="$here/tests/out"
 mkdir -p "$out"
 export TMPDIR=/tmp
-for name in IpaFirmware.h SweetIpa.h IpaGsi.h IpaLayout.h IpaQmi.h IpaHardware.inc IpaTxQueue.h IpaData.inc IpaSession.inc; do
+for name in IpaMmio.h IpaFirmware.h SweetIpa.h IpaGsi.h IpaLayout.h IpaQmi.h IpaHardware.inc IpaTxQueue.h IpaData.inc IpaSession.inc; do
     python3 "$here/../modem/extract.py" "$here/../../patches/ipa" "$out/$name" "bsd/dev/modem/$name"
 done
 for name in QcomQrtr.h QcomQrtr.c QcomSmp2p.h QcomSmp2p.c; do

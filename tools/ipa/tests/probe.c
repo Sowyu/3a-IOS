@@ -1,3 +1,4 @@
+#define IPA_HOST_TEST 1
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
