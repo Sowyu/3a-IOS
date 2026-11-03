@@ -13,7 +13,8 @@ prefix += 'static uint16_t le16(const uint8_t *p);\nstatic void m_ipc_poll(void)
 s=(out/'ModemRuntime.inc').read_text()
 def f(start,end):return s[s.index(start):s.index(end)]
 # Hardware barriers have no meaning in this single-threaded host transport.
-rmt=f('static void m_rmtfs_receive(', 'static void m_pd_receive(').replace('__asm__ volatile("dmb sy":::"memory");','').replace('__asm__ volatile("dsb sy":::"memory");','')
+rmt_end='/* Probe only:' if '/* Probe only:' in s else 'static void m_pd_receive('
+rmt=f('static void m_rmtfs_receive(', rmt_end).replace('__asm__ volatile("dmb sy":::"memory");','').replace('__asm__ volatile("dsb sy":::"memory");','')
 code=prefix+f('static int m_scm(', 'static int m_assign(')+rmt+f('static void m_shutdown_receive(', 'static void m_uim_readiness(')+f('static bool m_shutdown_request(', 'static int m_shadow_prepare(')+f('static bool m_cleanup(', 'static int m_power_inspect(')+(here/'tests/lifecycle-tail.c').read_text().split('int main(void)')[0]+(here/'tests/shutdown-joined-tail.c').read_text()
 (out/'shutdown-joined.c').write_text(code)
 env=dict(os.environ,TMPDIR=str(out/'tmp'))

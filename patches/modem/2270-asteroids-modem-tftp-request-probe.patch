@@ -1,0 +1,131 @@
+diff --git a/bsd/dev/modem/ModemRuntime.inc b/bsd/dev/modem/ModemRuntime.inc
+--- a/bsd/dev/modem/ModemRuntime.inc
++++ b/bsd/dev/modem/ModemRuntime.inc
+@@ -14,6 +14,7 @@
+ #include "QcomQrtr.h"
+ #include "QcomQmp.h"
+ #include "QcomRpmh.h"
++#include "ModemTftpProbe.h"
+ #include "QcomScm.h"
+ #include "ModemRmtfs.h"
+ #include "ModemUim.h"
+@@ -36,6 +37,8 @@
+ #define M_RX_SIZE 0x4400u
+ #define M_TX_COUNT 32u
+ static struct {
++    bool tftp_probe;
++    unsigned tftp_requests;
+     vm_offset_t gic, smem, mutex, ipcc, qmpmem, rsc, db, metadata, args, firmware, shared;
+     QcomSmem sm; QcomSmemPartition part; QcomSmp2p sp; QcomQmp qp;
+     QcomGlink gl; QcomGlinkChannel *channel; QcomQrtr qr; ModemRmtfs fs;
+@@ -264,6 +267,17 @@
+     if(n)qcom_qrtr_send_data(qr,port,node,from,answer,n);
+     printf("SWEET MODEM: rmtfs msg=%u reads=%u RAM_writes=%u response=%u error=%u\n",len>=5?le16(data+3):0,m.fs.reads,m.fs.writes,n,n>=14?answer[10]:255);
+ }
++/* Probe only: publish discovery, refuse file reads/writes, and cap responses. */
++static void m_tftp_probe_receive(void *ctx,QcomQrtr *qr,uint32_t port,uint32_t node,uint32_t from,const uint8_t *data,uint32_t len){
++    (void)ctx;
++    if(!m.tftp_probe || m.failed)return;
++    if(m.tftp_requests>=64){m.failed=true;return;}
++    m.tftp_requests++;
++    ModemTftpProbe request;uint8_t reply[15];
++    unsigned n=modem_tftp_probe(data,len,&request,reply,sizeof(reply));
++    if(m.tftp_requests<=32)printf("SWEET MODEM: TFTP probe request=%u opcode=%u valid=%u path=%s reply=%u\n",m.tftp_requests,request.opcode,request.valid,request.path,n);
++    if(n && qcom_qrtr_send_data(qr,port,node,from,reply,n))m.failed=true;
++}
+ static void m_pd_receive(void *ctx,QcomQrtr *qr,uint32_t port,uint32_t node,uint32_t from,const uint8_t *data,uint32_t len){
+     (void)ctx;static const QcomPdDomain domains[]={{"msm/modem/root_pd",180,0}};
+     uint8_t answer[480];uint32_t n=qcom_servloc_answer(domains,1,data,len,answer,sizeof(answer));
+@@ -382,6 +396,8 @@
+     if(m.sysmon && qcom_qrtr_add_service(&m.qr,0,0,0x4003,m_shutdown_receive,0))return EIO;
+     if(m.uim && qcom_qrtr_add_service(&m.qr,0,0,0x4002,m_uim_receive,0))return EIO;
+     if(m.pdm && qcom_qrtr_add_service(&m.qr,64,0x101,0x4001,m_pd_receive,0))return EIO;
++    if(m.tftp_probe && qcom_qrtr_add_service(&m.qr,4096,1,0x4006,m_tftp_probe_receive,0))return EIO;
++    if(m.tftp_probe)printf("SWEET MODEM: TFTP probe service4096 bound; reads and writes denied\n");
+     if(!m_item(480,32,&m.rxoff,&bytes) && bytes<=0x100000 && !(bytes&7))qcom_glink_set_rx(&m.gl,(volatile uint8_t *)(m.smem+m.rxoff),bytes);
+     return m.channel?0:ENOMEM;
+ }
+@@ -560,6 +576,10 @@
+         (!m_gate("sweetmpss") || !m.uim || !m.uim_ready_poll || !m.glink || !m.rmtfs || !m.pdm || !m.sysmon || !m.handover_release ||
+         !m_gate("sweetfbarm") || !m_gate("sweetselftest") || !modem_arg_is(PE_boot_args(),"sweetdeadman","900")))){
+         printf("SWEET MODEM: data session dependencies/900s dev guard missing\n");return EINVAL;
++    }
++    m.tftp_probe=m_gate("sweetmtftpprobe");
++    if(m.tftp_probe && !modem_tftp_probe_allowed(PE_boot_args())){
++        printf("SWEET MODEM: TFTP probe requires offline dependencies and 600s dev guard\n");return EINVAL;
+     }
+     m_sleep(30000);m.began=m_now();int rc=EIO;
+     m.smem=ml_io_map(M_SMEM,M_SM_SIZE);m.mutex=ml_io_map(0x1f43000,0x1000);m.ipcc=ml_io_map(0x405000,0x1000);
+diff --git a/bsd/dev/modem/ModemTftpProbe.h b/bsd/dev/modem/ModemTftpProbe.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/modem/ModemTftpProbe.h
+@@ -0,0 +1,68 @@
++/* Read-only discovery probe. It never opens a file or accepts file data. */
++#ifndef MODEM_TFTP_PROBE_H
++#define MODEM_TFTP_PROBE_H
++#include "ModemGate.h"
++static int modem_tftp_probe_allowed(const char *args)
++{
++    static const char *const required[]={"sweetmtftpprobe","sweetmpss","sweetmglink","sweetmrmtfs","sweetmpdm","sweetmstop","sweetmho","sweetfbarm","sweetselftest"};
++    static const char *const forbidden[]={"sweetmsession","sweetdata","sweetdataonline","sweetqmiraw","sweetipa","sweetipafw","sweetipamap","sweetipaprobe","sweetmprobe","sweetmbcm"};
++    for(unsigned i=0;i<sizeof(required)/sizeof(required[0]);i++)
++        if(!modem_gate(args,required[i]))return 0;
++    for(unsigned i=0;i<sizeof(forbidden)/sizeof(forbidden[0]);i++)
++        if(modem_gate(args,forbidden[i]))return 0;
++    return modem_arg_is(args,"sweetdeadman","600");
++}
++
++typedef struct {
++    unsigned opcode, valid;
++    char path[128];
++} ModemTftpProbe;
++
++static int mtp_string(const uint8_t *data, unsigned size, unsigned *at,
++                      unsigned limit, unsigned *start, unsigned *length)
++{
++    *start=*at;
++    while(*at<size && data[*at]) {
++        if(*at-*start>=limit || data[*at]<32 || data[*at]>126)return 0;
++        ++*at;
++    }
++    if(*at==size || *at==*start)return 0;
++    *length=*at-*start;++*at;return 1;
++}
++
++static unsigned modem_tftp_probe(const uint8_t *data, unsigned size,
++                                 ModemTftpProbe *info, uint8_t *reply, unsigned capacity)
++{
++    static const uint8_t denied[]={0,5,0,2,'p','r','o','b','e',' ','o','n','l','y',0};
++    *info=(ModemTftpProbe){0};
++    if(!data || size<2)return 0;
++    info->opcode=(unsigned)data[0]<<8|data[1];
++    /* Do not answer DATA, ACK or ERROR, avoiding an error-response loop. */
++    if(info->opcode!=1 && info->opcode!=2)return 0;
++    unsigned at=2,path=0,pathlen=0,start=0,len=0;
++    int valid=size<=480 && mtp_string(data,size,&at,127,&path,&pathlen) &&
++              mtp_string(data,size,&at,15,&start,&len) && len==5;
++    static const char octet[]="octet";
++    for(unsigned i=0;valid && i<5;i++) {
++        unsigned c=data[start+i];if(c>='A' && c<='Z')c+='a'-'A';
++        if(c!=(unsigned)octet[i])valid=0;
++    }
++    unsigned options=0;
++    while(valid && at<size) {
++        if(++options>8 || !mtp_string(data,size,&at,24,&start,&len) ||
++           !mtp_string(data,size,&at,24,&start,&len))valid=0;
++    }
++    if(valid) {
++        info->valid=1;
++        for(unsigned i=0;i<pathlen;i++) {
++            unsigned c=data[path+i];
++            info->path[i]=((c>='a'&&c<='z')||(c>='A'&&c<='Z')||
++                (c>='0'&&c<='9')||c=='/'||c=='.'||c=='_'||c=='-')?(char)c:'_';
++        }
++    }
++    if(!reply || capacity<sizeof(denied))return 0;
++    for(unsigned i=0;i<sizeof(denied);i++)reply[i]=denied[i];
++    if(!valid)reply[3]=4;
++    return sizeof(denied);
++}
++#endif

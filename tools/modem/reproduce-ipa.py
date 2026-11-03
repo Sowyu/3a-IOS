@@ -8,7 +8,9 @@ cutoff=int(sys.argv[1]) if len(sys.argv)>1 else 2208
 data=(R/sys.argv[2]).resolve() if len(sys.argv)>2 else R/'plans/modem/snapshots/data'
 assert data.is_relative_to(R) and data.is_dir(),data
 ours=sorted(p for p in (R/'3a-IOS/patches/ipa').glob('22*.patch') if int(p.name[:4])<=cutoff)
-owners=sorted((R/'plans/modem/patches').glob('21*.patch'))+sorted(data.glob('222*.patch'))
+owner_cutoff=int(sys.argv[3]) if len(sys.argv)>3 else 2189
+modem=sorted(p for p in (R/'plans/modem/patches').glob('[0-9][0-9][0-9][0-9]-*.patch') if int(p.name[:4])<=owner_cutoff)
+owners=modem+sorted(data.glob('222*.patch'))
 paths=sorted({s for p in ours+owners for s in re.findall(r'^\+\+\+ b/(.+)$',p.read_text(),re.M)})
 for name in paths:
  result=sp.run(['git','show','HEAD:'+name],cwd=X,capture_output=True)
@@ -20,7 +22,7 @@ series+=sorted((R/'plans/lag/patches').glob('214*.patch'))
 for prefix in ['2150-','2151-','2153-','2152-asteroids-fast-power-v4','2154-']:
  matches=list((R/'plans/input/patches').glob(prefix+'*.patch'));assert len(matches)==1;series+=matches
 series+=sorted((R/'3a-IOS/patches/usb').glob('*-v5.patch'))
-series+=sorted((R/'plans/modem/patches').glob('21*.patch'))
+series+=modem
 series+=sorted(data.glob('222*.patch'))
 series+=ours
 for p in series:
