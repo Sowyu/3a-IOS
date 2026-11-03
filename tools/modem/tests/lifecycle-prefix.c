@@ -14,13 +14,13 @@
 static struct {bool xo_pinned,pas_owed,started,shared_owed,qmp_owed,votes_owed,vote_uncertain,stop_verified;QcomSmp2p sp;int master;uint32_t state;struct{uint32_t remote_count;}qr;uintptr_t firmware,metadata,shared,args;struct{void *image[4];uint32_t bytes[4];}fs;}m;
 static unsigned rawcalls,mode,shutdowns,reclaims,poweroffs,qmpoffs,unmaps,frees,sleeps;
 static int shut_result,shut_status,reclaim_result;static uint64_t now;
-static unsigned stop_updates,transient_failures;static bool stop_asserted,no_ack;
+static unsigned stop_updates,transient_failures;static bool stop_asserted,no_ack,graceful;
 static uint64_t m_now(void){return now;}
 static void m_sleep(unsigned ms){now+=ms;sleeps++;}
 static void m_smc_raw(uint64_t r[8]){
  if(mode==4){
   assert(r[0]==0x42000206 && r[1]==1 && r[2]==4 && !r[3] && !r[4] && !r[5]);
-  assert(!stop_asserted);if(m.started)assert(stop_updates==2);
+  assert(!stop_asserted);if(m.started)assert(stop_updates==(graceful?0u:2u));
   shutdowns++;r[0]=(uint64_t)(transient_failures && shutdowns>transient_failures?0:shut_status);r[1]=(uint64_t)shut_result;return;
  }
  assert(r[1]==2 && r[2]==4 && r[3]==5 && r[4]==6 && r[5]==7 && r[7]==0);
@@ -30,6 +30,7 @@ static void m_smc_raw(uint64_t r[8]){
  else {r[0]=0;r[1]=0;}
  rawcalls++;
 }
+static bool m_shutdown_request(void){return graceful;}
 static int m_assign(bool b){assert(!b);reclaims++;return reclaim_result;}
 static int m_vote(bool b){assert(!b);poweroffs++;return 0;}
 static int m_qsend(bool b){assert(!b);qmpoffs++;return 0;}

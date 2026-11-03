@@ -1,6 +1,6 @@
 # Modem and SIM: desk findings (2026-11-03)
 
-MPSS boots offline and announces UIM, NAS and WDS services. ast151 proved ready, handover, GLINK/QRTR and RAM-backed rmtfs, but PAS shutdown failed. M2 remains incomplete and no SIM status has been queried. Patch 2178 corrects the shutdown sequence and error handling; its host checks and build passed, and Sol approved a bounded offline retry. The data-path plan is below.
+MPSS boots offline and announces UIM, NAS and WDS services. ast151 and ast153 proved ready, handover, GLINK/QRTR and RAM-backed rmtfs, but PAS shutdown still fails. M2 remains incomplete and no SIM status has been queried. Patch 2179 adds the standard Linux sysmon shutdown handshake before PAS. Its host checks and build passed; a fresh Sol review is running. The data-path plan is below.
 
 Labels as in `docs/input.md`: **Measured**, **Code**, **Inferred**, **Missing**.
 
@@ -182,3 +182,18 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 
 
 **Code, additional shutdown reference.** Nothing's [volcano MPSS descriptor](https://github.com/NothingOSS/android_kernel_msm-6.1_nothing_sm7635/blob/d5f5f965fd0b478eaf4eb63fd984c5a4a92135a7/drivers/remoteproc/qcom_q6v5_pas.c#L2502) selects free-after-auth behavior, which enables `retry_shutdown` in its probe. Its [qcom_scm_pas_shutdown_retry](https://github.com/NothingOSS/android_kernel_msm-6.1_nothing_sm7635/blob/d5f5f965fd0b478eaf4eb63fd984c5a4a92135a7/drivers/firmware/qcom_scm.c#L860) retries failed shutdown calls at 100 ms intervals up to 50 times. This independently supports bounded retries on this board family. It does not establish the meaning of ast151's vendor status.
+
+
+## ast153 and sysmon shutdown candidate 2179
+
+**Measured.** ast153 again reached ready and handover and discovered modem services. `ios-asteroids/logs/ast153-modem-offline-2178.txt:10088` records stop-ack and request-bit clearing. Lines 10089 through 10138 show all 50 PAS shutdown calls returning raw status -3145800. Lines 10139 and 10140 retain memory/power and report final_error=5. M2 did not pass. No UIM request was sent.
+
+**Measured, harness.** The selftest stopped before its body because the repeated phone RTC and PID produced an existing frame archive name. The 600-second deadman returned the phone to recovery. result.json records root clean and stale=false. The collision-safe archive loop now tries bounded numeric suffixes and preserves all old frames. Its host test exercises three archives with the same timestamp and PID. No modem-caused reset occurred.
+
+**Code.** Linux's [sysmon shutdown](https://github.com/NothingOSS/android_kernel_msm-6.1_nothing_sm7635/blob/d5f5f965fd0b478eaf4eb63fd984c5a4a92135a7/drivers/remoteproc/qcom_sysmon.c#L359) sends QMI service 43 request 0x21 before remoteproc PAS shutdown. Volcano's sysmon instance is 0x12. ast153 announced packed instance 0x1202 at line 7236. Our earlier runtime omitted that request.
+
+**Code.** Patch 2179 adds a fixed SSCTL client behind `sweetmstop=1`, default off. It binds replies to the selected modem endpoint, accepts only the matching shutdown transaction, and waits at most ten seconds for success plus the shutdown indication or DT shutdown-ack bit 7. It continues RAM-backed rmtfs service during that wait. Missing service, malformed replies, timeout or failure fall back to the existing SMP2P stop and PAS attempt. Only actual PAS success allows reclaim. No generic QMI interface or online command is added.
+
+**Measured, host.** The actual extracted sender and response handler pass sanitizer tests for endpoint binding, truncation, wrong transaction/opcode, duplicate result TLVs, stale acknowledgment, timeout and transport failure. Existing lifecycle tests cover the graceful path skipping the stop bit while still requiring PAS success. `plans/modem/logs/start-check-2179.txt` and `uim-check-2179.txt` pass. The full Trash-safe --remake completed with exit 0 in `build-2179.txt`.
+
+**Inferred.** Missing sysmon shutdown may explain the failed stop, but the secure error has not been decoded. This candidate follows the matching kernel lifecycle and does not establish a hardware fix. **Missing.** Fresh Sol GO, packed-image checks and a clean offline result before the separate UIM trial.

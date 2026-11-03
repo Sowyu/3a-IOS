@@ -19,5 +19,6 @@ int main(void){
  init();shut_status=-4;assert(!m_cleanup());assert(shutdowns==1 && !unmaps);
  init();shut_status=-5;assert(!m_cleanup());assert(shutdowns==1 && !unmaps);
  init();no_ack=true;assert(m_cleanup());assert(now==3000 && stop_updates==2 && !stop_asserted);
+ init();graceful=true;assert(m_cleanup());assert(shutdowns==1 && stop_updates==0 && reclaims==1);
  puts("PASS: actual SCM retry/resume bounds and shutdown/ownership failure cleanup paths");
 }

@@ -1,0 +1,97 @@
+--- a/bsd/dev/modem/ModemRuntime.inc
++++ b/bsd/dev/modem/ModemRuntime.inc
+@@ -43,6 +43,8 @@
+     uint32_t rail_addr[2],rail_index[2],xo_addr,state,services;
+     bool xo_pinned, pas_owed, started, votes_owed, vote_uncertain, qmp_owed, shared_owed, fatal;
+     bool uim, glink, rmtfs, pdm, qr_started, stop_verified, failed;
++    bool sysmon, shutdown_sent, shutdown_response, shutdown_ind;
++    uint32_t shutdown_node, shutdown_port;
+     uint32_t uim_node,uim_port,uim_done,uim_tries[2];
+     uint16_t uim_txn[2];
+     uint64_t uim_next;
+@@ -184,6 +186,20 @@
+     uint8_t answer[480];uint32_t n=qcom_servloc_answer(domains,1,data,len,answer,sizeof(answer));
+     if(n)qcom_qrtr_send_data(qr,port,node,from,answer,n);
+     printf("SWEET MODEM: pd-mapper response=%u\n",n);
++}
++/* SSCTL v2 instance 0x12 is the modem sysmon endpoint in the volcano DT
++ * driver. This fixed client only requests shutdown, never online mode. */
++static void m_shutdown_receive(void *ctx,QcomQrtr *qr,uint32_t port,uint32_t node,uint32_t from,const uint8_t *data,uint32_t len){
++    (void)ctx;(void)qr;(void)port;
++    if(!m.shutdown_sent || node!=m.shutdown_node || from!=m.shutdown_port)return;
++    QcomQmiMessage msg;if(qcom_qmi_parse(data,len,&msg) || msg.message!=0x21)return;
++    if(msg.type==QCOM_QMI_INDICATION && msg.length==0){m.shutdown_ind=true;return;}
++    if(msg.type!=QCOM_QMI_RESPONSE || msg.transaction!=1)return;
++    /* Exactly one standard result TLV. Reject duplicates and trailing fields. */
++    if(msg.length!=7 || msg.tlvs[0]!=2 || le16(msg.tlvs+1)!=4)return;
++    uint16_t result=le16(msg.tlvs+3),error=le16(msg.tlvs+5);
++    printf("SWEET MODEM: SSCTL shutdown response result=%u error=%u\n",result,error);
++    m.shutdown_response=result==0 && error==0;
+ }
+ /* Insert before m_greceive after M2 is measured. Never dumps a QMI packet. */
+ static void m_uim_receive(void *ctx,QcomQrtr *qr,uint32_t port,uint32_t node,uint32_t from,const uint8_t *data,uint32_t len){
+@@ -241,6 +257,7 @@
+     m.channel=qcom_glink_channel(&m.gl,"IPCRTR",M_RX_SIZE,8,m.rx,&client,0,1);
+     qcom_qrtr_init(&m.qr,1,m_qsend_packet,0);
+     if(m.rmtfs && qcom_qrtr_add_service(&m.qr,14,1,0x4000,m_rmtfs_receive,0))return EIO;
++    if(m.sysmon && qcom_qrtr_add_service(&m.qr,0,0,0x4003,m_shutdown_receive,0))return EIO;
+     if(m.uim && qcom_qrtr_add_service(&m.qr,0,0,0x4002,m_uim_receive,0))return EIO;
+     if(m.pdm && qcom_qrtr_add_service(&m.qr,64,0x101,0x4001,m_pd_receive,0))return EIO;
+     if(!m_item(480,32,&m.rxoff,&bytes) && bytes<=0x100000 && !(bytes&7))qcom_glink_set_rx(&m.gl,(volatile uint8_t *)(m.smem+m.rxoff),bytes);
+@@ -255,6 +272,35 @@
+         if(rc==QcomGlinkAgain)break;if(rc){m.failed=true;break;}m.qhead=(m.qhead+1)%M_TX_COUNT;m.qcount--;
+     }
+     if(m.gl.broken)m.failed=true;
++}
++static bool m_shutdown_request(void){
++    if(!m.sysmon || !m.started || !m.qr_started || m.fatal || m.failed)return false;
++    int index=-1;
++    for(unsigned i=0;i<m.qr.remote_count;i++)if(m.qr.remote[i].service==43 &&
++        (m.qr.remote[i].instance==0x1202 || m.qr.remote[i].instance==1)){
++        index=(int)i;break;
++    }
++    if(index<0){printf("SWEET MODEM: SSCTL shutdown service missing; using stop bit\n");return false;}
++    m.shutdown_node=m.qr.remote[index].node;m.shutdown_port=m.qr.remote[index].port;
++    m_smp_poll();
++    if(m.state&0x80){printf("SWEET MODEM: SSCTL stale shutdown ack; using stop bit\n");return false;}
++    m.shutdown_response=false;m.shutdown_ind=false;
++    const uint8_t req[7]={0,1,0,0x21,0,0,0};
++    if(qcom_qrtr_send_data(&m.qr,0x4003,m.shutdown_node,m.shutdown_port,req,sizeof(req)))return false;
++    m.shutdown_sent=true;
++    printf("SWEET MODEM: SSCTL shutdown request node=%u port=%u\n",m.shutdown_node,m.shutdown_port);
++    /* Continue servicing RAM-backed rmtfs while the modem flushes its state.
++     * A response alone is not shutdown completion. DT shutdown-ack is bit 7. */
++    uint64_t end=m_now()+10000;
++    do{
++        m_smp_poll();m_ipc_poll();
++        if(m.shutdown_response && (m.shutdown_ind || (m.state&0x80)))break;
++        if(m.fatal || m.failed)break;m_sleep(2);
++    }while(m_now()<end);
++    bool acked=m.shutdown_response && (m.shutdown_ind || (m.state&0x80));
++    printf("SWEET MODEM: SSCTL shutdown response=%u indication=%u shutdown_ack=%u accepted=%u\n",
++        m.shutdown_response,m.shutdown_ind,!!(m.state&0x80),acked);
++    sweet_log_sync();return acked;
+ }
+ static int m_shadow_prepare(void){
+     static const char *const names[]={"modemst1","modemst2","fsc","fsg"};
+@@ -301,7 +347,8 @@
+ }
+ static bool m_cleanup(void){
+     bool stopped=!m.pas_owed;
+-    if(m.started && m.sp.out){qcom_smp2p_update(&m.sp,m.master,1,1);m_ring(2,2);uint64_t end=m_now()+3000;
++    bool graceful=m_shutdown_request();
++    if(m.started && m.sp.out && !graceful){qcom_smp2p_update(&m.sp,m.master,1,1);m_ring(2,2);uint64_t end=m_now()+3000;
+         while(m_now()<end){m_smp_poll();if(m.state&8)break;m_sleep(10);}
+         /* qcom_q6v5_request_stop clears the request after ack or timeout. */
+         qcom_smp2p_update(&m.sp,m.master,1,0);m_ring(2,2);
+@@ -348,8 +395,8 @@
+ #include "ModemGate.h"
+ static bool m_gate(const char *name){return modem_gate(PE_boot_args(),name)!=0;}
+ static int modem_run(const struct wl_fat *f,const uint8_t *mdt,uint32_t size){
+-    memset(&m,0,sizeof(m));m.master=-1;m.glink=m_gate("sweetmglink");m.rmtfs=m_gate("sweetmrmtfs");m.pdm=m_gate("sweetmpdm");m.uim=m_gate("sweetmuim");
+-    if((m.rmtfs || m.pdm || m.uim) && !m.glink){printf("SWEET MODEM: refused missing GLINK dependency\n");return EINVAL;}
++    memset(&m,0,sizeof(m));m.master=-1;m.glink=m_gate("sweetmglink");m.rmtfs=m_gate("sweetmrmtfs");m.pdm=m_gate("sweetmpdm");m.uim=m_gate("sweetmuim");m.sysmon=m_gate("sweetmstop");
++    if((m.rmtfs || m.pdm || m.uim || m.sysmon) && !m.glink){printf("SWEET MODEM: refused missing GLINK dependency\n");return EINVAL;}
+     m_sleep(30000);m.began=m_now();int rc=EIO;
+     m.smem=ml_io_map(M_SMEM,M_SM_SIZE);m.mutex=ml_io_map(0x1f43000,0x1000);m.ipcc=ml_io_map(0x405000,0x1000);
+     m.qmpmem=ml_io_map(0xc300000,0x400);m.rsc=ml_io_map(0x17a20000,0x4000);m.db=ml_io_map(0x81c60000,0x20000);
