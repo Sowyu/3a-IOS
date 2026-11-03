@@ -346,7 +346,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/data/CellSession.c
-@@ -0,0 +1,642 @@
+@@ -0,0 +1,644 @@
 +#if defined(ARM64_BOARD_CONFIG_SWEET) || !defined(KERNEL)
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 +/* Order and retry behaviour follow ModemManager's QMI bearer for the "ipa" net driver and HakiOS hakios.mpss.c, which learned on
@@ -460,6 +460,7 @@
 +    if (!length) return 0;
 +    const uint16_t message = (uint16_t)(msg[3] | msg[4] << 8), txn = (uint16_t)(msg[1] | msg[2] << 8);
 +    if (find(s, client, service, message) || !(s->services & bit(service))) return 0;
++    if (ending(s) && !(service == QMI_SVC_WDS && message == WDS_STOP_NETWORK)) return 0;  /* teardown sends only Stop Network */
 +    for (unsigned i = 0; i < CELL_PENDING; ++i) {
 +        CellPending *p = &s->pending[i];
 +        if (p->busy) continue;
@@ -691,6 +692,7 @@
 +        if (s->now >= s->next_poll && !find(s, 0, QMI_SVC_NAS, NAS_SERVING_SYSTEM)) {
 +            s->next_poll = s->now + POLL_MS;
 +            SEND(s, 0, QMI_SVC_NAS, nas_get_serving_system);
++            if (ending(s)) return;  /* that poll may have reached the cleanup reserve */
 +        }
 +        if (s->state == CS_REGISTER) {
 +            if (!s->registered) return;
@@ -991,7 +993,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/data/CellSession.h
-@@ -0,0 +1,117 @@
+@@ -0,0 +1,118 @@
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 +/* The data session over QMI, as a polled state machine with no transport of its own:
 + *   services present -> read-only DMS/NAS/WDS queries for the log -> wait for the owner's readiness barrier (USIM ready, IPA
@@ -1098,9 +1100,10 @@
 +void cell_session_stop(CellSession *s);
 +/* True when nothing is live and the session will send nothing more: STOPPED, FAILED, or not past the readiness barrier. */
 +int cell_session_idle(const CellSession *s);
-+/* How cleanup ended, separately from why the session ended. PENDING while not idle; CLEAN when every handle was stopped with a
-+ * successful reply and no start is unresolved; UNRESOLVED when the 5 s deadline passed with a live handle or a start whose answer
-+ * never came (its call may still be up in the modem). */
++/* How cleanup ended, separately from why the session ended. PENDING while not idle; CLEAN when no tracked handle or unresolved start
++ * remains and the stop deadline never passed with one (a handle is retired by a successful Stop Network reply or by a valid
++ * "disconnected" packet service indication); UNRESOLVED when the 5 s deadline passed with a live handle or a start whose answer never
++ * came (its call may still be up in the modem). */
 +typedef enum {CELL_CLEANUP_PENDING, CELL_CLEANUP_CLEAN, CELL_CLEANUP_UNRESOLVED} CellCleanup;
 +CellCleanup cell_session_cleanup(const CellSession *s);
 +const char *cell_state_name(CellState state);
@@ -1246,7 +1249,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/data/QmiData.c
-@@ -0,0 +1,592 @@
+@@ -0,0 +1,595 @@
 +#if defined(ARM64_BOARD_CONFIG_SWEET) || !defined(KERNEL)
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 +/* Layouts: libqmi data/qmi-service-{dms,nas,wds,wda,dpm}.json. Integers are little-endian, IPv6 words big-endian. A string that is a
@@ -1320,6 +1323,9 @@
 +    if (parse_any(data, length, QCOM_QMI_RESPONSE, transaction, message, m)) return -1;
 +    const uint8_t *r = qcom_qmi_tlv(m, 0x02, &n);
 +    if (!r || n != 4) return -1;
++    unsigned results = 0;  /* exactly one result TLV: a second could say something else */
++    for (uint32_t at = 0; at + 3 <= m->length; at += 3u + le16(m->tlvs + at + 1)) results += m->tlvs[at] == 0x02;
++    if (results != 1) return -1;
 +    const uint16_t result = le16(r), error = le16(r + 2);
 +    if (result > 1 || (!result && error) || (result && !error)) return -1;
 +    return error;
@@ -3024,7 +3030,7 @@
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 --- /dev/null
 +++ b/bsd/dev/data/sweet_data.h
-@@ -0,0 +1,37 @@
+@@ -0,0 +1,38 @@
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 +/* The data agent's hooks for the modem runtime and the IPA driver (bsd/dev/data/sweet_data.c). Without sweetdata=1 or sweetqmiraw=1
 + * attach registers nothing and every other hook returns at once; usim and ipa_ready only record a flag. One attach per boot. */
@@ -3044,7 +3050,8 @@
 +void sweet_data_usim(int ready);
 +void sweet_data_stop(void);
 +int sweet_data_idle(void);
-+/* Worker thread, after stop: 0 when every WDS call was stopped with a successful reply (or data never ran), EINPROGRESS while
++/* Worker thread, after stop: 0 when no WDS call or start is left unresolved (each was stopped, or reported disconnected, or data
++ * never ran), EINPROGRESS while
 + * cleanup runs, EIO when the 5 s deadline left a live handle or an unanswered start. Propagate EIO into the runtime's final error and
 + * still shut the modem down. The result stays valid after detach. */
 +int sweet_data_cleanup(void);

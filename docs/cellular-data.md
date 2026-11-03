@@ -101,7 +101,21 @@ Smaller fixes from the same audit:
 - Flow-control commands must be exactly 16 bytes.
 - `sweet_data_cleanup()` gives the modem's stop hook a clean or unresolved outcome.
 
-The live 2187 run measured the selected USIM at app state 7 with no provisioning step. A fourth Sol audit is running.
+The live 2187 run measured the selected USIM at app state 7 with no provisioning step.
+
+**Sol GO.** The fourth audit (`docs/data-2220-audit4.md`, patch hash 28723c9b) gives a conditional GO for one bounded trial each of `sweetqmiraw=1` alone, `sweetdata=1`, and `sweetdata=1 sweetdataonline=1`. Its conditions:
+- the documented wiring
+- the 120 s runtime deadline and deadman
+- one attach per boot
+- treating `EIO` or an unfinished `EINPROGRESS` from `sweet_data_cleanup()` as failure
+- no export or logging of whole raw responses
+
+Its remaining open finding, N1, blocked sessions long enough to exhaust transactions. That is now fixed:
+- In teardown only Stop Network can be sent, and the NAS poll returns when it reaches the reserve.
+- Every response must carry exactly one result TLV.
+- The cleanup comment now covers disconnected indications.
+
+That delta (patch hash adda4660) needs Sol's check before any session longer than the bounded trial.
 
 **Measured, host.** `tools/data/check.sh` rebuilds the source from the public patches and passes under AddressSanitizer and UndefinedBehaviorSanitizer. The session tests cover:
 - Nothing beyond read-only queries before the barrier.

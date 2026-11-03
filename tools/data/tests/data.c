@@ -866,6 +866,26 @@ static void session_audit3(void)
     for (unsigned i = 0; i < sent.n; ++i)
         for (unsigned j = i + 1; j < sent.n; ++j) assert(sent.txn[i] != sent.txn[j] || sent.txn[i] < CELL_TXN_RAW - 65);
     assert(find_sent(0, QMI_SVC_WDS, WDS_STOP_NETWORK) >= 0);
+    /* fourth audit N1: a NAS poll reaching the reserve while IPv4 may restart: after the transition only Stop Network goes out */
+    fresh(&s, &CFG, t = 1000);
+    to_register(&s, &t);
+    registered(&s);
+    bound(&s);
+    answer(&s, 0, QMI_SVC_WDS, WDS_START_NETWORK, QMI_ERR_INVALID_OPERATION, 0, 0);
+    answer(&s, 1, QMI_SVC_WDS, WDS_START_NETWORK, 0, H6, sizeof H6);
+    s.next_txn = CELL_TXN_RAW - 64;
+    s.next_poll = 0;
+    const unsigned before = sent.n;
+    cell_session_poll(&s, t += 6100);  /* the NAS poll and the IPv4 restart are both due */
+    assert(s.state == CS_STOPPING);
+    cell_session_poll(&s, t += 100);
+    for (unsigned i = before; i < sent.n; ++i) assert(sent.service[i] == QMI_SVC_WDS && sent.msg[i] == WDS_STOP_NETWORK);
+    assert(find_sent(1, QMI_SVC_WDS, WDS_STOP_NETWORK) >= (int)before);
+    /* a response with two result TLVs is malformed */
+    static const uint8_t res2[] = {0x02, 4, 0, 1, 0, 0x0e, 0, 0x01, 1, 0, 0};
+    const uint32_t l2 = resp(b, 2, 9, DMS_GET_OPERATING_MODE, 0, res2, sizeof res2);
+    QcomQmiMessage qm;
+    assert(qmi_response(b, l2, 9, DMS_GET_OPERATING_MODE, &qm) == -1);
 }
 
 static void session(void)
