@@ -487,3 +487,6 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 
 
 **Measured, PAS15 prerequisite passed.** ast177 completed the2212 firmware-only trial normally in214seconds, with clean roots before/after, a fresh nonce and stale=false. PAS15 init/memory/authentication returned0 at6628/6630/6631, powered register reads appeared at6632 and shutdown returned0 at6639. DMA guards were intact, private SMMU contexts parked and backing released at6649, final_error0 at6652 and DONE at12610. The exact checker and accepted result/log/marker hashes independently pass. No MPSS, full GSI or ONLINE ran. The offline IPA/GSI/QMI handshake remains before the final data-image review.
+
+
+**Code, review blocker.** The fresh full-mode2212 review reproduced live GSI error-register faults leaving readiness true after setup. Offline B is NO-GO and has not booted. IPA owns additive2213 to check health before callbacks, TX/RX and readiness publication, with actual-path regressions and a new review. Accepted ast177 firmware-only evidence remains valid. The combined2212 ONLINE manifest stays unapproved and requires replacement.
