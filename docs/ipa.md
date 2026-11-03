@@ -414,3 +414,9 @@ I4 requires a new exact combined ONLINE-image Sol GO with the modem owner. Phone
 I3 repeated at7628 with data2220/adapter2221 attached. DPM and WDA advanced, but DMS SET_OPERATING_MODE0x2e was refused at10246. No WDS call or packet attempt followed. I4 remains unproven.
 No GSI fault or kernel panic appears in the full capture. AP quiescence16305 precedes data detach16308, successful data cleanup16309 and SSCTL16310. Known PAS4 retention held IPA backing until normal reset. DONE16975,784seconds, clean roots and stale=false. Evidence is `plans/ipa/logs/combined-2218-online-refused.json`.
 The modem owner confirmed original network preferences restored byte for byte, clean OrangeFox and released claims at23:10:35. No packet helper was installed. The data owner is diagnosing the DMS refusal. IPA source remains frozen through2218, with no IPA boot queued.
+
+## ast184 bounded transition refusal
+
+Combined dataaudit10 with unchanged IPA2218 repeated I3 at7962. ONLINE and LOW_POWER both returned QMI error60 from mode3 at10597..10598. No WDS call or packet attempt followed.
+The784second capture has no GSI fault or kernel panic. AP quiescence15212 precedes detach15213, cleanup0 at15214 and SSCTL15215. Known retention15285..15286 ends at normal reset, DONE15904 and clean roots. Evidence is `plans/ipa/logs/combined-221810-online-refused.json`.
+I4 remains unproven. Modem/data owners are investigating entry into OFFLINE. IPA source stays frozen, with no IPA phone claim or queued run.
