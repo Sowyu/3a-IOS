@@ -139,3 +139,6 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 **Code.** The next read-only probe keeps the exact kernel and image. Its selftest preserves previous frames, checks screenshot success, writes a fresh completion token and waits 15 seconds after DONE before reboot. This fixes evidence collection without widening the modem gates.
 
 **Missing.** Recorded clean probe completion still gates the offline PAS run. No M2 or SIM evidence exists yet.
+
+
+**Measured, ast150.** The repeated probe met the completion conditions. Local log `ios-asteroids/logs/ast150-modem-power-probe-repeat.txt:4970` reports hardware preflight error 0, line 4972 records no-PAS cleanup ok, and line 10587 records DONE. The fresh completion token and checked frame match this run. It returned after 245 seconds with a clean root, no stale files, no fired deadman or panic, and no USB stale/lost TX. The separately reviewed offline image is now being tested with UIM off.
