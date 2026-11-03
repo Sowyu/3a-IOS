@@ -72,6 +72,9 @@ Updated 2026-11-02, about 22:20 AEDT. Update this file whenever the state change
 - Test with the hands-free loop rather than asking them, where a script can do it.
 - Use `say` when you need them, and also say it in chat.
 - No AI attribution in commits. The repo is public, so never commit dumps, logs, serials, firmware or Apple files.
+- If an Anthropic model's safeguards stop a task, rerun it on a GPT model through codex: `gpt-6-astra` (reasoningEffort high) for implementation, and `gpt-6.1-sol` for research and audits (owner, 2026-11-03).
+- SIM mobile data is the top priority, then battery. A reflash of `boot_a` comes after both work and the owner has tried the combined build (owner, 2026-11-03).
+- Use SSH dev sessions for iterative work (`docs/dev-session.md`).
 
 ## Hard lessons from today. Do not repeat them.
 
