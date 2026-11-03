@@ -437,3 +437,12 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 
 
 **Code, reviewed.** Dataaudit8 accepts2220 revisionf331702b with request-only APN authentication and IPv4-first setup. The three changed data files are imported into xnu-modem. The actual modem/data hook tests and isolated protocol, service-cache and adapter suites pass. The replacement combined build waits for the revised IPA teardown cutoff.
+
+
+## Replacement2209 data image
+
+**Code.** IPA2209 retains backing after partial or unproved setup. Verified stopped contexts are left disabled with zero TTBRs and their private VMIDs, instead of replaying unknown reset fields. The shared APPS allocator excludes those parked banks. The replacement data image combines this change with reviewed dataaudit8 APN/authentication support.
+
+**Measured, host.** All56 combined source files reconstruct exactly. The lifecycle, datapath and modem/data hook tests pass. The safe kernel build passed, and all10 packed segments match the replacement image. Its kernel SHA256 isbfa56dd9f1198ff099ebe7a62df26d9d5ae8897498687c3298e39b74b400738b and image SHA256 isf2360ae9a17f538a3452f48c5301809647bf4299942e2c73533c9a2d66120a50.
+
+**Missing.** A new exact-image review is running. Separate benign root cleaning, SMMU-only validation, PAS15 and offline IPA handshake trials must pass before ONLINE. The77-artifact manifest remains unapproved. No replacement image has touched the phone.
