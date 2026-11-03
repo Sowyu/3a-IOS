@@ -57,7 +57,7 @@ static void requests(void)
     p.profile = 2;
     n = wds_modify_profile(b, sizeof b, 17, &p);
     EQ(n, b, 0, 17, 0, 0x28, 0, 19, 0, 0x01, 2, 0, 0, 2, 0x11, 1, 0, 3, 0x14, 3, 0, 'a', 'p', 'n', 0x1d, 1, 0, 0);
-    WdaFormat f = {WDA_LINK_RAW_IP, WDA_AGG_QMAP, WDA_AGG_QMAP, 32, 16384, 0, 0, QMI_ENDPOINT_EMBEDDED, 1};
+    WdaFormat f = {WDA_LINK_RAW_IP, WDA_AGG_QMAP, WDA_AGG_QMAP, 32, 16384, 0, 0, QMI_ENDPOINT_EMBEDDED, 1, 0};
     n = wda_set_data_format(b, sizeof b, 18, &f);
     EQ(n, b, 0, 18, 0, 0x20, 0, 46, 0, 0x11, 4, 0, 2, 0, 0, 0, 0x12, 4, 0, 5, 0, 0, 0, 0x13, 4, 0, 5, 0, 0, 0,
        0x15, 4, 0, 32, 0, 0, 0, 0x16, 4, 0, 0, 0x40, 0, 0, 0x17, 8, 0, 4, 0, 0, 0, 1, 0, 0, 0);
@@ -410,7 +410,9 @@ static const CellConfig CFG = {0, 1, 1, "internet", 0, 1, 1, 2, 18};
 static const CellReady READY = {QMAP_V1, 32, 16384};
 static const uint8_t SVCS[] = {QMI_SVC_DMS, QMI_SVC_NAS, QMI_SVC_WDS, QMI_SVC_WDA, QMI_SVC_DPM};
 static const uint8_t ONLINE_MODE[] = {0x01, 1, 0, 0}, OFFLINE_MODE[] = {0x01, 1, 0, 3};
-static const uint8_t WDA_OK[] = {0x11, 4, 0, 2, 0, 0, 0, 0x12, 4, 0, 5, 0, 0, 0, 0x13, 4, 0, 5, 0, 0, 0};
+static const uint8_t WDA_OK[] = {0x11, 4, 0, 2, 0, 0, 0, 0x12, 4, 0, 5, 0, 0, 0, 0x13, 4, 0, 5, 0, 0, 0,
+                                0x15, 4, 0, 16, 0, 0, 0, 0x16, 4, 0, 0, 0x20, 0, 0};
+static const uint8_t WDA_NOLIMITS[] = {0x11, 4, 0, 2, 0, 0, 0, 0x12, 4, 0, 5, 0, 0, 0, 0x13, 4, 0, 5, 0, 0, 0};
 static const uint8_t H4[] = {0x01, 4, 0, 0x44, 0x44, 0, 0}, H6[] = {0x01, 4, 0, 0x66, 0x66, 0, 0};
 static const uint8_t SET4[] = {0x1e, 4, 0, 5, 2, 0, 10, 0x29, 4, 0, 0xdc, 5, 0, 0};
 static const uint8_t SET6[] = {0x25, 17, 0, 0x20, 1, 0xd, 0xb8, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, 64};
@@ -463,13 +465,14 @@ static void session_order(void)
     for (t = 1000; t < 20000; t += 100) cell_session_poll(&s, t);
     assert(count_sent(QMI_SVC_DPM, DPM_OPEN_PORT) == 0 && count_sent(QMI_SVC_WDA, WDA_SET_DATA_FORMAT) == 0 && cell_session_idle(&s));
     for (unsigned i = 0; i < sent.n; ++i)
-        assert(sent.msg[i] == DMS_GET_REVISION || sent.msg[i] == DMS_GET_IDS || sent.msg[i] == NAS_REGISTER_INDICATIONS ||
-               sent.msg[i] == NAS_GET_OPERATOR_NAME || sent.msg[i] == NAS_GET_SIGNAL_INFO || sent.msg[i] == WDS_GET_PROFILE_LIST);
+        assert(sent.msg[i] == DMS_GET_REVISION || sent.msg[i] == DMS_GET_IDS || sent.msg[i] == NAS_GET_OPERATOR_NAME || sent.msg[i] == NAS_GET_SIGNAL_INFO || sent.msg[i] == WDS_GET_PROFILE_LIST);
     /* a bad readiness record is refused */
     const CellReady bad = {QMAP_V1, 0, 16384};
     cell_session_ready(&s, &bad);
     assert(s.state == CS_WAIT_READY);
+    assert(count_sent(QMI_SVC_NAS, NAS_REGISTER_INDICATIONS) == 0);
     cell_session_ready(&s, &READY);
+    assert(count_sent(QMI_SVC_NAS, NAS_REGISTER_INDICATIONS) == 1);
     int i = find_sent(0, QMI_SVC_DPM, DPM_OPEN_PORT);
     assert(s.state == CS_DPM && i >= 0 && sent.body[i][19] == 2 && sent.body[i][23] == 18);
     /* a stray response with a raw-tool transaction is ignored */
@@ -481,6 +484,13 @@ static void session_order(void)
     /* an echo with no format TLVs is verified with Get Data Format */
     answer(&s, 0, QMI_SVC_WDA, WDA_SET_DATA_FORMAT, 0, 0, 0);
     assert(s.state == CS_WDA_VERIFY && find_sent(0, QMI_SVC_WDA, WDA_GET_DATA_FORMAT) >= 0);
+    {   /* Get without the limits fails closed */
+        CellSession v = s; Sent keep = sent;
+        answer(&v, 0, QMI_SVC_WDA, WDA_GET_DATA_FORMAT, 0, WDA_NOLIMITS, sizeof WDA_NOLIMITS);
+        cell_session_poll(&v, t);
+        assert(v.state == CS_STOPPING || v.state == CS_FAILED);
+        sent = keep;
+    }
     answer(&s, 0, QMI_SVC_WDA, WDA_GET_DATA_FORMAT, 0, WDA_OK, sizeof WDA_OK);
     assert(s.state == CS_ONLINE && find_sent(0, QMI_SVC_DMS, DMS_GET_OPERATING_MODE) >= 0);
     /* offline and online not allowed: never a set mode */
@@ -698,12 +708,107 @@ static void session_bounds(void)
     assert(count_sent(QMI_SVC_WDS, WDS_START_NETWORK) == 20 && s.call[0].exhausted && s.state == CS_FAILED);
 }
 
+/* The re-audit's cases (docs/data-2220-reaudit.md B2 to B5, N3). */
+static void session_reaudit(void)
+{
+    CellSession s;
+    uint64_t t = 1000;
+    /* B3: a start that times out, then stop, then its late success: the handle is stopped and idle waits for it */
+    fresh(&s, &CFG, t);
+    to_register(&s, &t);
+    registered(&s);
+    bound(&s);
+    const int st0 = find_sent(0, QMI_SVC_WDS, WDS_START_NETWORK);
+    const uint16_t txn0 = sent.txn[st0];
+    cell_session_poll(&s, t += 5100);           /* past the reply deadline */
+    assert(s.call[0].start_unknown);
+    const int starts = count_sent(QMI_SVC_WDS, WDS_START_NETWORK);
+    cell_session_poll(&s, t += 7000);           /* no second start while the first is unresolved */
+    assert(count_sent(QMI_SVC_WDS, WDS_START_NETWORK) == starts);
+    cell_session_stop(&s);
+    cell_session_poll(&s, t += 1000);
+    assert(!cell_session_idle(&s));
+    uint32_t len = resp(b, 2, txn0, WDS_START_NETWORK, 0, H4, sizeof H4);
+    cell_session_receive(&s, 0, QMI_SVC_WDS, b, len);
+    assert(s.call[0].handle == 0x4444 && find_sent(0, QMI_SVC_WDS, WDS_STOP_NETWORK) >= 0);
+    answer(&s, 0, QMI_SVC_WDS, WDS_STOP_NETWORK, 0, 0, 0);
+    /* the IPv6 start is unresolved too: idle only at the 5 s deadline, reported unconfirmed */
+    assert(!cell_session_idle(&s));
+    errors = 0;
+    cell_session_poll(&s, t += 4100);
+    assert(cell_session_idle(&s) && errors >= 1);
+    /* B3 outside shutdown: a late success in CALLS is adopted, then its settings are read */
+    fresh(&s, &CFG, t = 1000);
+    to_register(&s, &t);
+    registered(&s);
+    bound(&s);
+    const uint16_t txn1 = sent.txn[find_sent(0, QMI_SVC_WDS, WDS_START_NETWORK)];
+    cell_session_poll(&s, t += 5100);
+    len = resp(b, 2, txn1, WDS_START_NETWORK, 0, H4, sizeof H4);
+    cell_session_receive(&s, 0, QMI_SVC_WDS, b, len);
+    assert(s.call[0].handle == 0x4444 && !s.call[0].start_unknown && find_sent(0, QMI_SVC_WDS, WDS_GET_CURRENT_SETTINGS) >= 0);
+    /* a start never answered ends its call after 30 s */
+    fresh(&s, &CFG, t = 1000);
+    to_register(&s, &t);
+    registered(&s);
+    bound(&s);
+    for (unsigned k = 0; k < 320; ++k) cell_session_poll(&s, t += 100);
+    assert(s.call[0].exhausted && s.call[1].exhausted);
+    /* B4: an explicit zero limit fails */
+    static const uint8_t zero[] = {0x11, 4, 0, 2, 0, 0, 0, 0x12, 4, 0, 5, 0, 0, 0, 0x13, 4, 0, 5, 0, 0, 0,
+                                   0x15, 4, 0, 0, 0, 0, 0, 0x16, 4, 0, 0, 0x20, 0, 0};
+    fresh(&s, &CFG, 0);
+    cell_session_ready(&s, &READY);
+    answer(&s, 0, QMI_SVC_DPM, DPM_OPEN_PORT, 0, 0, 0);
+    answer(&s, 0, QMI_SVC_WDA, WDA_SET_DATA_FORMAT, 0, zero, sizeof zero);
+    cell_session_poll(&s, 100);
+    assert(s.state == CS_STOPPED || s.state == CS_FAILED);
+    /* a duplicated format TLV is malformed */
+    static const uint8_t dup[] = {0x11, 4, 0, 2, 0, 0, 0, 0x11, 4, 0, 2, 0, 0, 0};
+    fresh(&s, &CFG, 0);
+    cell_session_ready(&s, &READY);
+    answer(&s, 0, QMI_SVC_DPM, DPM_OPEN_PORT, 0, 0, 0);
+    answer(&s, 0, QMI_SVC_WDA, WDA_SET_DATA_FORMAT, 0, dup, sizeof dup);
+    assert(s.state >= CS_STOPPING);
+    /* B5: readiness revoked, then the pending WDA answer arrives: no mode traffic follows */
+    fresh(&s, &CFG, 0);
+    s.cfg.allow_online = 1;
+    cell_session_ready(&s, &READY);
+    answer(&s, 0, QMI_SVC_DPM, DPM_OPEN_PORT, 0, 0, 0);
+    cell_session_ready(&s, 0);
+    answer(&s, 0, QMI_SVC_WDA, WDA_SET_DATA_FORMAT, 0, WDA_OK, sizeof WDA_OK);
+    cell_session_poll(&s, 100);
+    assert(count_sent(QMI_SVC_DMS, DMS_GET_OPERATING_MODE) == 0 && count_sent(QMI_SVC_DMS, DMS_SET_OPERATING_MODE) == 0);
+    assert(s.state >= CS_STOPPING);
+    /* N3: a reconfigure withdraws the presented family, and stop does not need to again */
+    fresh(&s, &CFG, t = 1000);
+    to_register(&s, &t);
+    registered(&s);
+    bound(&s);
+    answer(&s, 0, QMI_SVC_WDS, WDS_START_NETWORK, 0, H4, sizeof H4);
+    answer(&s, 0, QMI_SVC_WDS, WDS_GET_CURRENT_SETTINGS, 0, SET4, sizeof SET4);
+    assert(ups == 1);
+    len = IND(0x22, 0x01, 2, 0, 2, 1);
+    cell_session_receive(&s, 0, QMI_SVC_WDS, b, len);
+    assert(downs == 1 && !s.call[0].up);
+    /* N4: unusable addresses and a conflicting family */
+    static const uint8_t mcast[] = {0x1e, 4, 0, 1, 0, 0, 224};
+    static const uint8_t wrongfam[] = {0x1e, 4, 0, 5, 2, 0, 10, 0x2b, 1, 0, 6};
+    cell_session_poll(&s, t += 1100);
+    answer(&s, 0, QMI_SVC_WDS, WDS_GET_CURRENT_SETTINGS, 0, mcast, sizeof mcast);
+    assert(!s.call[0].up);
+    cell_session_poll(&s, t += 1100);
+    answer(&s, 0, QMI_SVC_WDS, WDS_GET_CURRENT_SETTINGS, 0, wrongfam, sizeof wrongfam);
+    assert(!s.call[0].up);
+}
+
 static void session(void)
 {
     session_order();
     session_calls();
     session_stop_edges();
     session_bounds();
+    session_reaudit();
 }
 
 /* ---- raw allow list ---- */
@@ -742,8 +847,9 @@ static void raw(void)
     };
     for (unsigned i = 0; i < sizeof denied / sizeof denied[0]; ++i) assert(raw_id(denied[i].svc, denied[i].id) == 1);
     assert(!raw_id(QMI_SVC_NAS, 0x24) && !raw_id(QMI_SVC_WDS, 0x2a) && !raw_id(QMI_SVC_UIM, 0x2f) && !raw_id(QMI_SVC_WDA, 0x21));
-    /* DMS set mode: online or low power, one TLV, nothing else */
-    n = dms_set_operating_mode(m, sizeof m, 0, 0); assert(!raw_try(QMI_SVC_DMS, 0, m, n));
+    /* no setter at all: online and mode preference are the session's, behind its barrier */
+    n = dms_set_operating_mode(m, sizeof m, 0, 0); assert(raw_try(QMI_SVC_DMS, 0, m, n) == 1);
+    n = dms_set_operating_mode(m, sizeof m, 0, 1); assert(raw_try(QMI_SVC_DMS, 0, m, n) == 1);
     m[10] = 6; assert(raw_try(QMI_SVC_DMS, 0, m, n) == 1);
     m[10] = 4; assert(raw_try(QMI_SVC_DMS, 0, m, n) == 1);
     qmi_begin(&o, m, sizeof m, 0, 0x2e); qmi_put_u8(&o, 1, 0); qmi_put_u8(&o, 1, 4); n = qmi_end(&o);
@@ -751,7 +857,7 @@ static void raw(void)
     qmi_begin(&o, m, sizeof m, 0, 0x2e); qmi_put_u8(&o, 1, 0); qmi_put_u8(&o, 0x10, 1); n = qmi_end(&o);
     assert(raw_try(QMI_SVC_DMS, 0, m, n) == 1);                           /* an unknown extra TLV */
     /* NAS mode preference only until power cycle */
-    n = nas_set_mode_preference(m, sizeof m, 0, 1 << 4); assert(!raw_try(QMI_SVC_NAS, 0, m, n));
+    n = nas_set_mode_preference(m, sizeof m, 0, 1 << 4); assert(raw_try(QMI_SVC_NAS, 0, m, n) == 1);
     qmi_begin(&o, m, sizeof m, 0, 0x33); qmi_put_u16(&o, 0x11, 16); n = qmi_end(&o); assert(raw_try(QMI_SVC_NAS, 0, m, n) == 1);
     qmi_begin(&o, m, sizeof m, 0, 0x33); qmi_put_u16(&o, 0x11, 16); qmi_put_u8(&o, 0x17, 1); n = qmi_end(&o);
     assert(raw_try(QMI_SVC_NAS, 0, m, n) == 1);

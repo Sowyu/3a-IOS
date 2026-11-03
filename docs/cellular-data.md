@@ -79,7 +79,19 @@ Every gate is off by default.
 - Ethernet padding is trimmed before QMAP framing.
 - An unsolicited RA goes out when IPv6 comes up, refreshed every 10 minutes.
 
-A second Sol audit is running.
+The second audit (`docs/data-2220-reaudit.md`) found five blockers and six smaller problems, all now fixed:
+- The raw interface is reads only, so no raw request can put the modem online or around the barrier.
+- NAS indication registration waits for the barrier.
+- A start past its reply deadline keeps ownership of any late handle, blocks new starts for its client, and holds cleanup until it resolves or the 5 s deadline reports it.
+- WDA must confirm positive downlink limits within the IPA's 16 datagrams and 8192 bytes. Duplicate or wrong-length format TLVs are refused.
+- A readiness loss applies on the worker before any receive, service change or poll can send.
+- Transactions are never reused in one attach, and attach is allowed once per boot.
+- The start budget runs until a call comes up, and an unusable call that will not stop is ended.
+- A reconfiguration withdraws the presented family first.
+- Settings must carry a usable address of the call's own family.
+- QMAP commands need clear reserved bits.
+
+A third Sol audit is running.
 
 **Measured, host.** `tools/data/check.sh` rebuilds the source from the public patches and passes under AddressSanitizer and UndefinedBehaviorSanitizer. The session tests cover:
 - Nothing beyond read-only queries before the barrier.
