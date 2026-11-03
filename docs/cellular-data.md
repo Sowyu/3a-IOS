@@ -48,4 +48,16 @@ From the IPA agent:
 
 ## Status
 
-**Code, desk only.** QMI encoders and decoders for DMS, NAS, WDS, WDA and DPM (`QmiData.c`), QMAP v1 and v5 (`Qmap.c`), the Ethernet presentation (`CellLink.c`), the session state machine (`CellSession.c`) and the raw allow list (`QmiRaw.c`). Host tests are next. Nothing has run on the phone and no patch is numbered yet.
+**Code.** Patch 2220 (`patches/data/2220-asteroids-data-qmi-session-and-link.patch`) adds `bsd/dev/data/`: QMI encoders and decoders for DMS, NAS, WDS, WDA and DPM (`QmiData.c`), QMAP v1 and v5 (`Qmap.c`), the Ethernet presentation (`CellLink.c`), the session state machine (`CellSession.c`), the raw allow list (`QmiRaw.c`) and the kernel glue (`sweet_data.c`): two QRTR client ports, `en2`, `kern.sweet_qmi` and `kern.sweet_qmi_ind`, and the hooks in `sweet_data.h`. Every gate is off by default. Nothing calls the hooks yet: the modem agent adds the three runtime calls and the IPA agent the two data calls.
+
+**Measured, host.** `tools/data/check.sh` rebuilds the source from the public patches and passes under AddressSanitizer and UndefinedBehaviorSanitizer. It checks every request against its byte layout, every decoder against hand-built responses, including malformed lengths and wrong transactions, and the IMEI's last four digits. It also covers QMAP aggregates, pads, empty frames, commands and v5 checksum headers, plus ARP, DHCP offer, ACK and NAK, IPv6 RA and NA with valid checksums, the session order with a fake modem (no online without the gate, retry after error 0x46, a call dropping and coming back, stop), and the allow list.
+
+**Measured, compile.** All six kernel files compile against the xnu-12377 headers with the modem tree's exact flags (`-fsyntax-only`, no warnings from this code). There is no full kernel build or link yet.
+
+**Missing.** Sol review of 2220 before any boot with `sweetdata` or `sweetqmiraw`. The modem agent's port and hook changes. The IPA data path. The USB proof of the presentation path (below).
+
+## USB proof of the presentation path
+
+The plan is to show configd making a kernel Ethernet ifnet the primary route through IPConfiguration DHCP, with no kernel change, using `ue0` and the Mac's Internet Sharing as the uplink. `tools/data/phone/sweetdhcp` runs `dhcp ue0`, waits for a lease, prints configd's global IPv4 and DNS state, resolves a name, fetches a page with NSURLSession and opens it in Safari.
+
+The owner's one step is to switch on System Settings > General > Sharing > Internet Sharing, sharing Wi-Fi to "Sweet iOS (USB Ethernet)", only while the data agent's session runs. Switch it off afterward. Sharing moves `en8` into `bridge100`, and other agents' scripts reach the phone at `fe80::5eff:fe77:ee02%en8`.
