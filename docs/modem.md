@@ -387,4 +387,6 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 
 **Measured, host.** The extracted worker and real CellSession pass the cleared-state/no-traffic freshness regression. The actual modem receive and data discovery functions pass DEL_DPM/late-reply and DEL/NEW tests with real QRTR, DataServices and CellSession under ASAN/UBSAN. `tools/modem/check-data-hooks.sh` reproduces these checks. The first2189 revision built successfully. The corrected revision is rebuilding.
 
-**Missing.** Fresh Sol re-review of both fixes, the final combined build and IPA readiness/quiescence approval. No2189 phone image is approved. PAS4 retention remains the owner-accepted bounded-trial policy, with M2 incomplete. M3 and sustained USIM READY are measured in ast168.
+**Code, reviewed.** Sol closed both findings and approved the source wiring and guarded600-second lifetime in `docs/modem-2189-reaudit.md`. Fresh isolated host checks passed and35 reconstructed source files match production.
+
+**Missing.** The final combined build and IPA readiness/quiescence approval. No2189 phone image is approved. PAS4 retention remains the owner-accepted bounded-trial policy, with M2 incomplete. M3 and sustained USIM READY are measured in ast168.
