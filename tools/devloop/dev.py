@@ -310,6 +310,8 @@ class Cycle:
         state = self.root_state(serial)
         res['root_before'] = state
         if state != 'clean':
+            if getattr(self.a, 'no_replay', False):
+                raise Stop('root not clean; --no-replay forbids a journal replay boot: ' + state)
             self.say('root not clean (%s): one boot to replay the journal' % state)
             self.to_fastboot()
             self.run_test(self.a.replay_image or self.a.image, {})
@@ -436,6 +438,7 @@ def main(argv=None, runner=None, say=None):
     ap.add_argument('--ref', help='reference frames for framecmp')
     ap.add_argument('--logs', default=str(REPO / 'logs'))
     ap.add_argument('--replay-image', help='image for a replay boot when the root is dirty (default: the test image)')
+    ap.add_argument('--no-replay', action='store_true', help='refuse a dirty root before any replay boot')
     ap.add_argument('--no-push', action='store_true')
     ap.add_argument('--find-wait', type=int, default=120)
     ap.add_argument('--button-wait', type=int, default=1800)
