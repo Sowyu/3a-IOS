@@ -64,14 +64,23 @@ def blocked(since):
     return lines[-1].strip() if lines else None
 
 
-def interface():
-    """The ECM interface: (name, has an IPv6 link-local address, ifconfig text), by the host MAC."""
+def interfaces():
+    """ifconfig -a as {name: block}."""
     rc, out = run(['ifconfig', '-a'], 10)
-    for block in re.split(r'\n(?=\S)', out):
-        if re.search(r'\bether %s\b' % HOST_MAC, block, re.I):
-            name = block.split(':', 1)[0]
-            return name, bool(re.search(r'inet6 fe80::', block)), block
-    return None, False, ''
+    return {b.split(':', 1)[0]: b for b in re.split(r'\n(?=\S)', out) if b.strip()}
+
+
+def interface(base):
+    """The ECM interface: (name, has an IPv6 link-local address, ifconfig text), by the host MAC, or else the one
+    Ethernet interface that did not exist when the check started. ast143: macOS brought up en8 for the phone with
+    ether 02:00:00:00:00:00, not HOST_MAC."""
+    now = interfaces()
+    hit = [n for n, b in now.items() if re.search(r'\bether %s\b' % HOST_MAC, b, re.I)]
+    hit = hit or [n for n, b in now.items() if n not in base and re.search(r'\bether ', b)]
+    if len(hit) != 1:
+        return None, False, ''
+    b = now[hit[0]]
+    return hit[0], bool(re.search(r'inet6 fe80::', b)), b
 
 
 def main():
@@ -80,6 +89,7 @@ def main():
     ap.add_argument('out')
     ap.add_argument('--wait', type=int, default=2400, help='how long to wait for the gadget to appear')
     a = ap.parse_args()
+    base = set(interfaces())          # before the phone boots: anything new later is the gadget
     out = pathlib.Path(a.out)
     res = {'level': a.level, 'start': time.strftime('%Y-%m-%d %H:%M:%S'), 'steps': []}
 
@@ -139,7 +149,7 @@ def main():
 
     name, ll = None, False
     while time.monotonic() - seen < 90:
-        name, ll, text = interface()
+        name, ll, text = interface(base)
         if name and ll:
             break
         time.sleep(2)
@@ -151,8 +161,15 @@ def main():
     target = '%s%%%s' % (PHONE_LL, name)
     rc, txt = run(['ping6', '-c', '3', '-i', '1', target], 15)
     note('ping6', rc == 0, txt)
-    rc, txt = run(['nc', '-z', '-G', '5', '-w', '5', target, '22'], 12)
-    note('port 22', rc == 0, txt)
+    # The kernel brings the link up about 15 s into the boot, long before launchd starts dropbear (ast144: refused at
+    # 2 s). Wait for the port while the self-test keeps the boot alive.
+    p0 = time.monotonic()
+    while True:
+        rc, txt = run(['nc', '-z', '-G', '5', '-w', '5', target, '22'], 12)
+        if rc == 0 or time.monotonic() - p0 > 150:
+            break
+        time.sleep(3)
+    note('port 22', rc == 0, '%s after %.0f s' % (txt, time.monotonic() - p0))
     if not KEY.exists():
         finish(False, 'ssh: no key %s' % KEY)
     rc, txt = run(['ssh', *SSH_OPTS, 'root@' + target, 'uname -a; id; echo SSH-OK'], 30)

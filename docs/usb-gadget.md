@@ -313,3 +313,19 @@ Nothing needed sudo, approval or a system setting. Left to the owner by design:
 1. A fresh Sol audit of the v2 patches.
 2. Copy `selftest/usb.sh` into `3a-IOS/tools/devloop/selftest/scripts/`.
 3. After a GO, build from a fresh copy of the combined tree, not either live tree. The kernel in `research/xnu-usb` was built from v1 and must be rebuilt.
+
+## Levels 3 and 4 pass (2026-11-03)
+
+The owner set System Settings > Privacy & Security > Allow accessories to connect to "Always". On "Ask for new accessories", macOS blocked the device with "device functionality blocked by transport restrictions" and never showed a prompt (ast142).
+
+**Measured:**
+
+- **Level 3, ast141:** the Mac enumerated and configured the device, and it left by itself 20 s later. Verdict: `USBVERDICT L3 PASS phone and Mac agree`.
+- **Level 4, ast145:** `ssh root@fe80::5eff:fe77:ee02%en8` returned `uname` and `id` (uid 0). A 4 MiB random blob piped through `sha256sum` on the phone matched the Mac's hash. ping6 over the cable took 0.6 to 10 ms. Verdict: `USBVERDICT L4 PASS phone and Mac agree`.
+
+Two checker bugs, both fixed in `tools/usb/host/usb-check.py`, with tests in `test_usb_check.py`:
+
+1. macOS gave the phone's ECM interface the address `ether 02:00:00:00:00:00`, not the `iMACAddress` 02:00:5e:77:ee:01 that the gadget sends (ast143). The checker now also accepts the single Ethernet interface that did not exist when it started. The interface came up as en8 with link active and an IPv6 link-local address.
+2. The kernel brings the link up about 15 s into the boot, but dropbear starts with launchd about a minute later (ast144: refused). The checker now waits up to 150 s for port 22.
+
+**Daily kernel:** 2160 v4 and 2161 v4 apply cleanly on the daily tree (`research/xnu-combined`, with 2130 v4, 2140 to 2144 and 2150 to 2154). The kernel is `next-combined/kernel-daily-usb` (sha256 565dfd76...). The image is `combo-ub-usb` from `tools/boot/build-combined.sh`, which is combo-ub plus `sweetusb=4`, 605 of 607 bytes. Sol's audit 3 covers one isolated test boot only, so a daily-use audit (`docs/usb-gadget-audit4.md`) comes before the owner gets it.

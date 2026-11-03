@@ -49,9 +49,10 @@ en9: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
 
 class Phone:
     """Plays the Mac's tools for one scenario."""
-    def __init__(self, bcd=0x104, leaves_after=None, ll=True, ssh_ok=True, checksum_ok=True, configured_after=1):
+    def __init__(self, bcd=0x104, leaves_after=None, ll=True, ssh_ok=True, checksum_ok=True, configured_after=1,
+                 blocked=False):
         self.bcd, self.leaves_after, self.ll, self.ssh_ok, self.checksum_ok = bcd, leaves_after, ll, ssh_ok, checksum_ok
-        self.configured_after = configured_after
+        self.configured_after, self.blocked = configured_after, blocked
         self.ioreg_calls, self.iface_calls, self.cmds = 0, 0, []
 
     def run(self, argv, timeout, data=None):
@@ -68,7 +69,14 @@ class Phone:
             if self.leaves_after is not None and self.ioreg_calls > self.leaves_after:
                 return 0, IOREG.split('  +-o Sweet')[0]
             return 0, IOREG % self.bcd
+        if tool == 'log':
+            assert argv[1] == 'show' and 'sudo' not in argv
+            return 0, ('2026-11-03 01:48:18.250 Df kernel[0:11abb5a] (IOUSBHostFamily) usb-drd2-port-hs@02100000: '
+                       'AppleUSBHostPort::enumerateDeviceComplete_block_invoke: device functionality blocked by '
+                       'transport restrictions\n') if self.blocked else 'Timestamp               Ty Process[PID:TID]\n'
         if tool == 'ifconfig':
+            if self.blocked:                    # never matched: no ECM driver, no interface
+                return 0, IFCONFIG.split('en9:')[0]
             return 0, IFCONFIG % ('inet6 fe80::4b2:aa:bb:cc%en9 prefixlen 64 secured scopeid 0x14' if self.ll else '')
         if tool in ('ping6', 'nc'):
             assert argv[-1 if tool == 'ping6' else -2] == 'fe80::5eff:fe77:ee02%en9', argv
@@ -117,6 +125,12 @@ def expect(name, got, code, pattern):
 
 
 expect('L3 pass', scenario(3, Phone(bcd=0x103, leaves_after=5)), 0, r'^USBCHECK L3 PASS enumerated')
+expect('L3 v4 identity (bcdDevice 0x0101) pass', scenario(3, Phone(bcd=0x101, leaves_after=5)), 0, r'^USBCHECK L3 PASS')
+expect('L4 v4 identity pass', scenario(4, Phone(bcd=0x101)), 0, r'^USBCHECK L4 PASS')
+expect('L3 blocked by accessory security (ast108)', scenario(3, Phone(bcd=0x103, leaves_after=60, configured_after=None,
+       blocked=True)), 1, r'L3 FAIL BLOCKED by macOS accessory security')
+expect('L4 blocked by accessory security', scenario(4, Phone(bcd=0x101, configured_after=None, blocked=True)), 1,
+       r'L4 FAIL BLOCKED by macOS accessory security')
 expect('L3 seen, never configured, then gone', scenario(3, Phone(bcd=0x103, leaves_after=60, configured_after=None)),
        1, r'L3 FAIL configured')
 expect('L3 never leaves', scenario(3, Phone(bcd=0x103)), 1, r'L3 FAIL soft-disconnect')
@@ -145,10 +159,28 @@ for name, level, log, check, ok, pat in [
     ('verdict L3 stop not verified', 3, L3.replace('stop verified', 'stop NOT verified'), HOST3, False, r'missing|NOT'),
     ('verdict L3 kernel fine, Mac failed', 3, L3, 'USBCHECK L3 FAIL soft-disconnect\n', False, r'mac: USBCHECK L3 FAIL'),
     ('verdict L3 a gate line', 3, L3 + 'ASTEROIDS USB GATE: canary\n', HOST3, False, r'GATE'),
+    ('verdict L3 an old passing boot, then a failing one', 3,
+     L3 + L3.split('ASTEROIDS USB L3: configured')[0] + 'ASTEROIDS USB L3: FAIL no SET_CONFIGURATION in 120 s\n',
+     HOST3, False, r'missing|FAIL'),
+    ('verdict L3 an old passing boot, then one that went quiet', 3,
+     L3 + 'ASTEROIDS USB L3: start (sweetusb=3)\n', HOST3, False, r'missing'),
+    ('verdict L3 an old failing boot, then a passing one', 3,
+     'ASTEROIDS USB L3: start (sweetusb=3)\nASTEROIDS USB GATE: canary\n' + L3, HOST3, True, r'phone and Mac agree'),
 ]:
     got = uv.verdict(level, log, check)
     good = got[0] == ok and re.search(pat, got[1])
     fails += not good
     print('%-4s %-36s %s' % ('ok' if good else 'FAIL', name, got[1]))
+# ast143: macOS named the phone's interface en8 with ether 02:00:00:00:00:00, so the one new interface counts too
+NEWIF = IFCONFIG.replace('02:00:5e:77:ee:01', '02:00:00:00:00:00') % 'inet6 fe80::dd:1%en9 prefixlen 64 scopeid 0x1a'
+for name, base, text, want in [
+    ('interface new en9, other MAC', {'en0'}, NEWIF, 'en9'),
+    ('interface en9 already there before', {'en0', 'en9'}, NEWIF, None),
+    ('interface by HOST_MAC', {'en0', 'en9'}, IFCONFIG % '', 'en9'),
+]:
+    uc.run = lambda argv, timeout, data=None, t=text: (0, t)
+    got = uc.interface(base)[0]
+    fails += got != want
+    print('%-4s %-36s %s' % ('ok' if got == want else 'FAIL', name, got))
 print('%s: %d failed' % ('FAIL' if fails else 'PASS', fails))
 sys.exit(1 if fails else 0)
