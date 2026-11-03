@@ -1,6 +1,6 @@
 # Modem and SIM: desk findings (2026-11-03)
 
-MPSS boots offline and announces UIM, NAS and WDS services. ast151 and ast153 proved ready, handover, GLINK/QRTR and RAM-backed rmtfs, but PAS shutdown still fails. M2 remains incomplete and no SIM status has been queried. Patch 2179 adds the standard Linux sysmon shutdown handshake before PAS. Its host checks and build passed; a fresh Sol review is running. The data-path plan is below.
+MPSS boots offline and announces UIM, NAS and WDS services. ast155 also completed the standard sysmon shutdown handshake and flushed rmtfs writes into RAM, but secure PAS shutdown still fails. M2 remains incomplete and no SIM status has been queried. Patches 2180 and 2181 improve failure reporting and add a read-only bandwidth-metadata survey. The next probe has no modem start or power votes.
 
 Labels as in `docs/input.md`: **Measured**, **Code**, **Inferred**, **Missing**.
 
@@ -204,3 +204,16 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 **Code.** Sol's 2179 review approved one diagnostic offline boot and found that a transport or fatal error first observed during shutdown could leave final_error=0 if PAS subsequently stopped successfully. Patch 2180 logs both flags and returns failure even when memory cleanup succeeds. It changes reporting and acceptance, not the hardware sequence. The active 2179 phone run does not contain this later patch.
 
 **Measured, host.** The added combined test uses the real SSCTL request/response functions, QRTR dispatch, RAM rmtfs handler, SCM/PAS wrapper and cleanup. A simulated modem reads and writes RAM during shutdown, then acknowledges. Cases also cover timeout fallback, permanent PAS failure retaining buffers, and shutdown-time transport/fatal errors with successful PAS. All pass under sanitizers. MMIO, SMC and IPC delivery are simulated; this does not prove hardware shutdown. The full --remake build exited 0. No 2180 phone approval exists yet.
+
+
+## ast155 and read-only BCM survey 2181
+
+**Measured.** `ios-asteroids/logs/ast155-modem-offline-2179.txt:10521` sends SSCTL shutdown. Line 10522 receives result0/error0. Line 10524 records the second RAM-only rmtfs write. Line 10526 records the response, indication and new shutdown-ack bit all accepted. All 50 subsequent PAS shutdown attempts still return -3145800. Lines 10585 and 10586 retain memory/power and report final_error=5. No UIM request was sent.
+
+**Measured, harness.** ast155 finished normally in 361 seconds, with one fresh screenshot, the matching nonce, DONE at line11342, root clean and stale=false. The frame archive correction works on the phone. This is not M2 because PAS did not verify shutdown.
+
+**Code, vendor prerequisite.** The matching [PAS driver](https://github.com/NothingOSS/android_kernel_msm-6.1_nothing_sm7635/blob/d5f5f965fd0b478eaf4eb63fd984c5a4a92135a7/drivers/remoteproc/qcom_q6v5_pas.c#L1124) votes crypto-to-DDR bandwidth before PAS shutdown. Its helper requests UINT_MAX average and peak bandwidth. Our runtime does not yet make these interconnect votes. The [volcano interconnect table](https://github.com/NothingOSS/android_kernel_msm-6.1_nothing_sm7635/blob/d5f5f965fd0b478eaf4eb63fd984c5a4a92135a7/drivers/interconnect/qcom/volcano.c#L1661) maps the path through CE0, SN3, SN0, SH1, SH0, MC0 and ACV. **Inferred.** Missing votes are a candidate cause, not a decoded explanation of the secure error.
+
+**Code.** 2181 adds `sweetmbcm=1`, default off, to the read-only `sweetmprobe=1` survey. It logs bounded command-db metadata for those seven resources and IPA's IP0. BCM auxiliary data is a little-endian 32-bit unit, 16-bit width, byte VCD and reserved byte. It is not an ARC voltage list. The code copies at most eight bytes after the existing extent checks and issues no BCM vote, PAS start, shared-memory write or new mapping.
+
+**Measured, host.** Start/control, metadata and joined shutdown tests pass in `plans/modem/logs/start-check-2181.txt`. They cover valid metadata, missing resources, truncated auxiliary data, opted-out behavior and unchanged ARC decoding. The full --remake exited0 and the new BCM image's ten rebased segments match kernel SHA256 `93f7555614ce18a9a2077caf92ed0cb282ece47b39eef99e9ad89418338c5f6a`. Image SHA256 is `1dc152b77e3bc705717fbfeb072c96d5f543e40072a3ad123905cdaed32fcfe4`. Sol review is running. **Missing.** Live BCM metadata and an audited interconnect implementation before another modem start.

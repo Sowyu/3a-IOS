@@ -28,6 +28,9 @@ int main(void){
  uint8_t db[256]={0};w32(db+4,QCOM_CMD_DB_MAGIC);w16(db+8,3);w16(db+10,0);w16(db+12,32);w16(db+14,1);
  memcpy(db+144,"cx.lvl",6);w32(db+160,0x12340);w16(db+164,8);w16(db+176,0);w16(db+178,16);w16(db+180,256);w16(db+182,384);
  QcomRpmhResource r;uint32_t index;assert(!qcom_cmd_db_find(db,sizeof(db),"cx.lvl",&r));assert(!qcom_rpmh_level_index(&r,384,&index) && index==3);
+ assert(r.slave_id==3 && r.aux_bytes==8 && !memcmp(r.aux_prefix,db+176,8));
+ w16(db+164,1);assert(!qcom_cmd_db_find(db,sizeof(db),"cx.lvl",&r));assert(r.aux_prefix[0]==0 && r.aux_prefix[1]==0 && r.aux_bytes==1);
+ w16(db+164,8);w16(db+166,79);assert(qcom_cmd_db_find(db,sizeof(db),"cx.lvl",&r)==QcomRpmhCorrupt);w16(db+166,0);
  w16(db+10,65535);assert(qcom_cmd_db_find(db,sizeof(db),"cx.lvl",&r)==QcomRpmhCorrupt);
  puts("PASS: strict stage gates, QMP handshake/bounds, SMP2P ready/handover and command-db bounds");
 }

@@ -9,6 +9,13 @@ int main(void){
  w16(db+188,7);assert(m_power_inspect()==EINVAL);w16(db+188,8);
  w16(db+188,2);assert(m_power_inspect()==EINVAL);w16(db+188,8);
  w32(db+208,0x30000);assert(m_power_inspect()==EINVAL);w32(db+208,0x30020);
+ m.bcm_probe=true;assert(m_power_inspect()==EINVAL); /* Missing BCMs fail the opted-in survey. */
+ const char *bcm_names[]={"CE0","SN3","SN0","SH1","SH0","MC0","ACV","IP0"};
+ w16(db+24,5);w16(db+26,256);w16(db+28,512);w16(db+30,8);w16(db+32,0x1000);
+ for(unsigned i=0;i<8;i++){uint8_t *e=db+400+24*i;memcpy(e,bcm_names[i],strlen(bcm_names[i]));w32(e+16,0x50000+4*i);w16(e+20,8);w16(e+22,8*i);w32(db+656+8*i,1000+i);w16(db+660+8*i,8);db[662+8*i]=i;}
+ assert(!m_power_inspect());
+ w16(db+420,7);assert(m_power_inspect()==EINVAL);w16(db+420,8);
+ m.bcm_probe=false;w16(db+420,7);assert(!m_power_inspect());
  w32(db+4,0);assert(m_power_inspect()==EINVAL);
  puts("PASS: actual read-only power inspection, valid resources, 320 maximum clamping, malformed/truncated table and address/database refusal");
 }
