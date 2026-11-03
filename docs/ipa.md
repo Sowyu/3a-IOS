@@ -402,3 +402,9 @@ A fresh Sol source/exact-image review precedes one diagnostic boot. The phone is
 ast181 returned cleanly after368seconds. Raw7143 captures the first command completion with producer20003010, matching TRE20002000, code2, type23 and channel6. The type22 predicate caused EIO. PAS15 shutdown7280, guarded release7389 and DONE12958 succeeded. No PAS4 or I3.
 2218 expects type23 only on the command channel and retains type22 on data channels, which remain unmeasured. Nothing's pinned `gsi.c:690` uses the pointer layout for non-GCI events and `gsi.h:1602` defines GCI as28. These sources support the layout, not a named type23 constant. Applying the measured command type to subsequent immediate opcodes is an inference.
 Apply after2217, SHA25634f02df2d682ccf4b7ea59807c91ed082fb8408f73fdd2d60a6c86c7b9b9274a. Tests replay the measured fields and all256 types on all four channels with unchanged terminal rejection. A fresh source/exact-image GO is required. Phone idle in recovery, ordinary2217 selftest files remain.
+
+## I3 accepted in ast182
+
+2218 passed offline I3. Raw8150 verifies tables/SRAM,8151 AP endpoints,9149 PAS4 authentication,9458 all QMI flags and9461 handshake completion after the transmit queue drained. The worker ended successfully at12176 after122319ms.
+AP channels quiesced at12177 before SSCTL12178. Known PAS4 shutdown failures retained IPA/modem backing at12235..12236 until normal reset. DONE12722,363seconds, clean roots before/after, stale=false and fresh nonce/frame. Exact checker passes. Evidence is pinned in `plans/ipa/logs/handshake-2218-accepted.json`.
+I4 requires a new exact combined ONLINE-image Sol GO with the modem owner. Phone idle in OrangeFox, no claims. The root retains only the ordinary2218 selftest hook, log/frame and completion marker. No data-channel completion type or IP packet transfer is measured yet.
