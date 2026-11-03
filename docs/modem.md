@@ -501,3 +501,8 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 
 
 **Code.** Combined2214 adds bounded read-only GSI refusal diagnostics, preserving the ownership guard and lifecycle. Its56-file reproduction, datapath sanitizer checks, safe build and ten-segment image comparison pass. The data candidate remains unapproved until the hardware refusal is understood and the offline handshake passes.
+
+
+**Measured, refusal identified.** ast179 completed normally in362seconds with clean roots and stale=false. At6249 the GSI status is1, ERROR_LOG is0x83c7ffe1 and general IRQ status is0. All18 AP channels and17 event contexts are state0 at6250 through6284. The guard still refused EBUSY16. PAS15 stopped at6330, backing was parked/released at6359, final_error16 appeared at6372 and DONE at12601. MPSS and I3 did not start.
+
+**Inferred.** The error-log value may be uninitialized state. It sets reserved bits in the primary register definition, and Linux initializes ERROR_LOG before channel setup. This capture does not establish a pending global-error interrupt. IPA owns further investigation and any separately reviewed initialization change. No guard relaxation or fault clear is approved by the diagnostic trial.
