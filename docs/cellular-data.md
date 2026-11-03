@@ -28,7 +28,7 @@ Modem runtime, all on its single worker thread:
 - `sweet_data_attach(&qr)` after `qcom_qrtr_init` and after every other port is registered, and before `qcom_qrtr_start`.
 - `sweet_data_poll(&qr, now_ms)` every worker iteration.
 - `sweet_data_usim(1)` once a selected USIM reports app state 7, and `sweet_data_usim(0)` when that evidence is lost. The 2185 run saw the USIM at app state 1 (initializing), so this needs a status poll on the modem side.
-- Teardown: `sweet_data_stop()`, then keep pumping GLINK and QRTR and calling poll until `sweet_data_idle()` or 5 s have passed. Then drain IPA, then `sweet_data_detach()`, then SSCTL and PAS. A data-session gate may extend the 120 s probe lifetime, but the hard deadline and deadman stay.
+- Teardown: `sweet_data_stop()`, then keep pumping GLINK and QRTR and calling poll until `sweet_data_idle()` or 5 s have passed. Then read `sweet_data_cleanup()`: 0 means every WDS call was stopped with a successful reply, EIO means a handle or an unanswered start is unresolved, and EINPROGRESS means cleanup has not finished. Put EIO into the runtime's final error and still shut the modem down. Then drain IPA, then `sweet_data_detach()`, then SSCTL and PAS. A data-session gate may extend the 120 s probe lifetime, but the hard deadline and deadman stay.
 
 IPA driver (its API: `sweet_ipa_transmit`, `sweet_ipa_register_rx`, `sweet_ipa_ready` in `bsd/dev/modem/SweetIpa.h`):
 - `sweet_data_set_ipa(tx, ctx, 1, 8192, 16)` once, before the modem starts. Here `tx` wraps `sweet_ipa_transmit`, which copies the frame before it returns. The values are QMAP v1 with no checksum offload, 8192-byte receive buffers, and at most 16 datagrams per aggregate.
@@ -112,6 +112,21 @@ A third Sol audit is running.
 
 ## USB proof of the presentation path
 
-The plan is to show configd making a kernel Ethernet ifnet the primary route through IPConfiguration DHCP, with no kernel change, using `ue0` and the Mac's Internet Sharing as the uplink. `tools/data/phone/sweetdhcp` runs `dhcp ue0`, waits for a lease, prints configd's global IPv4 and DNS state, resolves a name, fetches a page with NSURLSession and opens it in Safari.
+The plan was to show iOS routing real traffic through a kernel Ethernet ifnet with no kernel change, using `ue0` and the Mac's Internet Sharing as the uplink. `tools/data/phone/sweetdhcp` asks configd's IPConfiguration for DHCP on an interface, dumps the store, resolves names, fetches pages and opens URLs. Two runs on 2026-11-03 used the existing USB dev image, with nothing flashed and the root left clean.
 
-The owner's one step is to switch on System Settings > General > Sharing > Internet Sharing, sharing Wi-Fi to "Sweet iOS (USB Ethernet)", only while the data agent's session runs. Switch it off afterward. Sharing moves `en8` into `bridge100`, and other agents' scripts reach the phone at `fe80::5eff:fe77:ee02%en8`.
+**Measured, ast163.**
+- Before sharing, configd already had `ue0` as its IPv4 primary, with a default route via 192.168.7.1 and DNS 1.1.1.1 and 8.8.8.8, from the state keys `sweetnetcfg` writes.
+- With sharing on (bridge100 at 192.168.2.1, en8 a member), `sweetdhcp dhcp ue0` returned status 0, and `ue0` took the lease 192.168.2.2 from the Mac.
+- configd then added `default via 192.168.2.1` itself (`SWEET NET: configd route add 0.0.0.0 gw 192.168.2.1`). Right after, iOS set its clock from the network (`SWEET RTC: time set 1793688922`, the correct time). That is real IPv4 traffic from iOS to a time server through the Mac.
+- Before that route appeared, a name resolved through the Mac's DNS (IPv6 answers only), and an HTTP fetch failed because only the IPv6 route existed.
+
+**Measured, ast164.**
+- With the clock already right, the root's preconfigured `ue0` service (Manual 192.168.7.2, router 192.168.7.1) stayed primary.
+- Writing that service's state with the DHCP values did not stick, because IPConfiguration rewrote it from the preferences file. Switching the preferences file to DHCP needs a configd restart, and the root has no `killall`.
+- No page loaded, and Safari was not tested. The original preferences file is back, byte for byte.
+
+**Inferred.** configd makes a DHCP-configured Ethernet ifnet the primary route with no IOKit object. That is the path the cellular `en2` uses, and `en2` has no competing preferences service. For `ue0`, the root's manual `ue0` service from `tools/sweet-root-tweaks.py` and the `org.sweet.netcfg` job compete with DHCP.
+
+**Next try (about 15 minutes):** push a preferences file with the `ue0` service set to DHCP before boot (`06-hfs-put` replaces existing files), switch Internet Sharing on, then fetch and open Safari.
+
+**Harness bug.** The `usbdev` self-test hook computes uptime as the wall clock minus boot time. A network clock jump ended ast163's session at once ("time over at 11950000 s"). Any session that reaches the internet hits this, so the hook needs a monotonic uptime. That hook belongs to the USB/devloop owner.

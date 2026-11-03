@@ -570,7 +570,7 @@ static void session_calls(void)
     cell_session_poll(&s, t += 1100);
     answer(&s, 0, QMI_SVC_WDS, WDS_STOP_NETWORK, 0, 0, 0);
     answer(&s, 1, QMI_SVC_WDS, WDS_STOP_NETWORK, 0, 0, 0);
-    assert(cell_session_idle(&s) && s.state == CS_STOPPED && downs == 2);
+    assert(cell_session_idle(&s) && s.state == CS_STOPPED && downs == 2 && cell_session_cleanup(&s) == CELL_CLEANUP_CLEAN);
     /* nothing is sent once stopped */
     const unsigned n = sent.n;
     for (unsigned k = 0; k < 100; ++k) cell_session_poll(&s, t += 100);
@@ -606,7 +606,7 @@ static void session_stop_edges(void)
     fresh(&s, &CFG, t);
     const unsigned n0 = sent.n;
     cell_session_stop(&s);
-    assert(s.state == CS_STOPPED && sent.n == n0);
+    assert(s.state == CS_STOPPED && sent.n == n0 && cell_session_cleanup(&s) == CELL_CLEANUP_CLEAN);
     /* a service leaving with a live call stops the call before FAILED */
     fresh(&s, &CFG, t);
     to_register(&s, &t);
@@ -637,7 +637,7 @@ static void session_stop_edges(void)
     cell_session_poll(&s, t += 4000);
     assert(!cell_session_idle(&s));
     cell_session_poll(&s, t += 1100);
-    assert(s.state == CS_FAILED);
+    assert(s.state == CS_FAILED && cell_session_cleanup(&s) == CELL_CLEANUP_UNRESOLVED);
     /* an unanswered stop still ends after 5 s */
     fresh(&s, &CFG, 0);
     s.state = CS_CALLS; s.call[0].handle = 7;
@@ -735,8 +735,9 @@ static void session_reaudit(void)
     /* the IPv6 start is unresolved too: idle only at the 5 s deadline, reported unconfirmed */
     assert(!cell_session_idle(&s));
     errors = 0;
+    assert(cell_session_cleanup(&s) == CELL_CLEANUP_PENDING);
     cell_session_poll(&s, t += 4100);
-    assert(cell_session_idle(&s) && errors >= 1);
+    assert(cell_session_idle(&s) && errors >= 1 && cell_session_cleanup(&s) == CELL_CLEANUP_UNRESOLVED);
     /* B3 outside shutdown: a late success in CALLS is adopted, then its settings are read */
     fresh(&s, &CFG, t = 1000);
     to_register(&s, &t);

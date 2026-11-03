@@ -346,7 +346,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/data/CellSession.c
-@@ -0,0 +1,620 @@
+@@ -0,0 +1,632 @@
 +#if defined(ARM64_BOARD_CONFIG_SWEET) || !defined(KERNEL)
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 +/* Order and retry behaviour follow ModemManager's QMI bearer for the "ipa" net driver and HakiOS hakios.mpss.c, which learned on
@@ -618,7 +618,10 @@
 +        }
 +    }
 +    if (live && s->now - s->state_since < STOP_MS) return;
-+    if (live) event(s, CE_ERROR, WDS_STOP_NETWORK, 0, "cleanup not confirmed within 5 s: a handle or a start is unresolved");
++    if (live) {
++        s->unresolved = 1;
++        event(s, CE_ERROR, WDS_STOP_NETWORK, 0, "cleanup not confirmed within 5 s: a handle or a start is unresolved");
++    }
 +    finish(s);
 +}
 +
@@ -966,10 +969,19 @@
 +{
 +    return s->state == CS_STOPPED || s->state == CS_FAILED || s->state == CS_WAIT_READY;
 +}
++
++CellCleanup cell_session_cleanup(const CellSession *s)
++{
++    if (!cell_session_idle(s)) return CELL_CLEANUP_PENDING;
++    if (s->unresolved) return CELL_CLEANUP_UNRESOLVED;
++    for (unsigned i = 0; i < 2; ++i)
++        if (s->call[i].handle != WDS_HANDLE_NONE || s->call[i].start_unknown) return CELL_CLEANUP_UNRESOLVED;
++    return CELL_CLEANUP_CLEAN;
++}
 +#endif
 --- /dev/null
 +++ b/bsd/dev/data/CellSession.h
-@@ -0,0 +1,112 @@
+@@ -0,0 +1,117 @@
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 +/* The data session over QMI, as a polled state machine with no transport of its own:
 + *   services present -> read-only DMS/NAS/WDS queries for the log -> wait for the owner's readiness barrier (USIM ready, IPA
@@ -1054,7 +1066,7 @@
 +    CellReady ready;
 +    CellState state;
 +    uint8_t services;            /* bit per service present: 0 DMS, 1 NAS, 2 WDS, 3 WDA, 4 DPM */
-+    uint8_t is_ready, info_sent, indications_sent, mode_known, mode, registered, online_sent, tries, failing;
++    uint8_t is_ready, info_sent, indications_sent, mode_known, mode, registered, online_sent, tries, failing, unresolved;
 +    uint16_t next_txn;
 +    uint64_t now, next_poll, state_since, backoff_until;
 +    CellPending pending[CELL_PENDING];
@@ -1076,6 +1088,11 @@
 +void cell_session_stop(CellSession *s);
 +/* True when nothing is live and the session will send nothing more: STOPPED, FAILED, or not past the readiness barrier. */
 +int cell_session_idle(const CellSession *s);
++/* How cleanup ended, separately from why the session ended. PENDING while not idle; CLEAN when every handle was stopped with a
++ * successful reply and no start is unresolved; UNRESOLVED when the 5 s deadline passed with a live handle or a start whose answer
++ * never came (its call may still be up in the modem). */
++typedef enum {CELL_CLEANUP_PENDING, CELL_CLEANUP_CLEAN, CELL_CLEANUP_UNRESOLVED} CellCleanup;
++CellCleanup cell_session_cleanup(const CellSession *s);
 +const char *cell_state_name(CellState state);
 +
 +#ifdef __cplusplus
@@ -2128,7 +2145,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/data/sweet_data.c
-@@ -0,0 +1,829 @@
+@@ -0,0 +1,845 @@
 +/*
 + * SWEET DATA: mobile data above the modem runtime (bsd/dev/modem) and the IPA.
 + *
@@ -2745,6 +2762,22 @@
 +	return !sd.attached || !sd.session_on || cell_session_idle(&sd.session);
 +}
 +
++int
++sweet_data_cleanup(void)
++{
++	if (!sd.session_on) {
++		return 0;
++	}
++	switch (cell_session_cleanup(&sd.session)) {
++	case CELL_CLEANUP_CLEAN:
++		return 0;
++	case CELL_CLEANUP_PENDING:
++		return EINPROGRESS;
++	default:
++		return EIO;
++	}
++}
++
 +void
 +sweet_data_detach(void)
 +{
@@ -2960,7 +2993,7 @@
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 --- /dev/null
 +++ b/bsd/dev/data/sweet_data.h
-@@ -0,0 +1,33 @@
+@@ -0,0 +1,37 @@
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 +/* The data agent's hooks for the modem runtime and the IPA driver (bsd/dev/data/sweet_data.c). Without sweetdata=1 or sweetqmiraw=1
 + * attach registers nothing and every other hook returns at once; usim and ipa_ready only record a flag. One attach per boot. */
@@ -2980,6 +3013,10 @@
 +void sweet_data_usim(int ready);
 +void sweet_data_stop(void);
 +int sweet_data_idle(void);
++/* Worker thread, after stop: 0 when every WDS call was stopped with a successful reply (or data never ran), EINPROGRESS while
++ * cleanup runs, EIO when the 5 s deadline left a live handle or an unanswered start. Propagate EIO into the runtime's final error and
++ * still shut the modem down. The result stays valid after detach. */
++int sweet_data_cleanup(void);
 +void sweet_data_detach(void);
 +
 +/* IPA driver, any thread except interrupt context.

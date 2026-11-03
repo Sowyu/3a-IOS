@@ -7,6 +7,8 @@
  *   resolve NAME     getaddrinfo through mDNSResponder
  *   fetch URL        NSURLSession: status and byte count
  *   open URL         ask SpringBoard to open the URL (Safari for http/https)
+ *   keys REGEX       dynamic-store keys matching REGEX, with values
+ *   publish SERVICE IF ADDR MASK ROUTER DNS   write that service's IPv4 and DNS state, as sweetnetcfg does for 192.168.7.x
  * The IPConfiguration call layout is bootp's ipconfig.defs (subsystem 20000, routine 11), as HakiOS userland/src/net_test.m uses it. */
 #import <Foundation/Foundation.h>
 #include <arpa/inet.h>
@@ -99,6 +101,43 @@ static void state(void)
 	}
 }
 
+static void *sc(const char *name)
+{
+	static void *h;
+	if (!h) h = dlopen("/System/Library/Frameworks/SystemConfiguration.framework/SystemConfiguration", RTLD_NOW);
+	return h ? dlsym(h, name) : NULL;
+}
+
+/* every dynamic-store key matching a regex, with its value */
+static void keys(const char *pattern)
+{
+	SCDynamicStoreRef (*create)(CFAllocatorRef, CFStringRef, void *, void *) = sc("SCDynamicStoreCreate");
+	CFArrayRef (*list)(SCDynamicStoreRef, CFStringRef) = sc("SCDynamicStoreCopyKeyList");
+	CFPropertyListRef (*copy)(SCDynamicStoreRef, CFStringRef) = sc("SCDynamicStoreCopyValue");
+	SCDynamicStoreRef st = create(NULL, CFSTR("sweetdhcp"), NULL, NULL);
+	NSArray *k = CFBridgingRelease(list(st, (__bridge CFStringRef)@(pattern)));
+	for (NSString *key in k) {
+		CFPropertyListRef v = copy(st, (__bridge CFStringRef)key);
+		printf("key %s = %s\n", key.UTF8String, v ? [[(__bridge id)v description] UTF8String] : "(none)");
+		if (v) CFRelease(v);
+	}
+}
+
+/* State:/Network/Service/SERVICE/{IPv4,DNS} and the service entry, as IPConfiguration would write them */
+static int publish(const char *service, const char *ifname, const char *addr, const char *mask, const char *router, const char *dns)
+{
+	SCDynamicStoreRef (*create)(CFAllocatorRef, CFStringRef, void *, void *) = sc("SCDynamicStoreCreate");
+	Boolean (*set)(SCDynamicStoreRef, CFStringRef, CFPropertyListRef) = sc("SCDynamicStoreSetValue");
+	SCDynamicStoreRef st = create(NULL, CFSTR("sweetdhcp"), NULL, NULL);
+	NSString *base = [NSString stringWithFormat:@"State:/Network/Service/%s", service];
+	NSDictionary *v4 = @{@"Addresses": @[@(addr)], @"SubnetMasks": @[@(mask)], @"Router": @(router), @"InterfaceName": @(ifname)};
+	BOOL ok = set(st, (__bridge CFStringRef)base, (__bridge CFDictionaryRef)@{@"InterfaceName": @(ifname)}) &&
+	    set(st, (__bridge CFStringRef)[base stringByAppendingString:@"/IPv4"], (__bridge CFDictionaryRef)v4) &&
+	    set(st, (__bridge CFStringRef)[base stringByAppendingString:@"/DNS"], (__bridge CFDictionaryRef)@{@"ServerAddresses": @[@(dns)]});
+	printf("publish %s on %s: %s\n", service, ifname, ok ? "done" : "FAILED");
+	return !ok;
+}
+
 static int resolve(const char *name)
 {
 	struct addrinfo hints = {.ai_socktype = SOCK_STREAM}, *list = NULL;
@@ -164,6 +203,11 @@ int main(int argc, char **argv)
 				i += 2;
 			} else if (!strcmp(a, "state")) state();
 			else if (!strcmp(a, "resolve") && x) {rc |= resolve(x); ++i;}
+			else if (!strcmp(a, "keys") && x) {keys(x); ++i;}
+			else if (!strcmp(a, "publish") && i + 6 < argc) {
+				rc |= publish(argv[i + 1], argv[i + 2], argv[i + 3], argv[i + 4], argv[i + 5], argv[i + 6]);
+				i += 6;
+			}
 			else if (!strcmp(a, "fetch") && x) {rc |= fetch(x); ++i;}
 			else if (!strcmp(a, "open") && x) {rc |= open_url(x); ++i;}
 			else {fprintf(stderr, "usage: sweetdhcp [dhcp IF] [wait IF S] [state] [resolve NAME] [fetch URL] [open URL]\n"); return 2;}
