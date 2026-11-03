@@ -1,0 +1,35 @@
+diff --git a/bsd/dev/modem/IpaGsi.h b/bsd/dev/modem/IpaGsi.h
+--- a/bsd/dev/modem/IpaGsi.h
++++ b/bsd/dev/modem/IpaGsi.h
+@@ -130,13 +130,17 @@
+ static inline int ipa_gsi_event(IpaGsi *s,unsigned i,unsigned *buffer,unsigned *bytes){
+     if(i>=4 || !ipa_gsi_healthy(s))return -1;IpaGsiChannel *ch=&s->ch[i];
+     uint32_t base=s->base+ch->events,producer=ipa_gr(s,ipa_gev(ch->event,4));
+-    if(producer<base || producer-base>=ch->slots*16 || ((producer-base)&15)){s->failed=true;return -1;}
++    if(producer<base || producer-base>=ch->slots*16 || ((producer-base)&15)){
++        s->failed=true;
++        printf("SWEET IPA: GSI producer invalid channel=%u event=%u producer=%#x base=%#x slots=%u posted=%u completed=%u consumed=%u ieob=%#x\n",ch->channel,ch->event,producer,base,ch->slots,ch->posted,ch->completed,ch->consumed,ipa_gr(s,0x250a8));return -1;
++    }
+     if((producer-base)/16==ch->consumed%ch->slots)return 0;
+     unsigned at=ch->events+(ch->consumed%ch->slots)*16;s->io.sync(s->io.ctx,at,16);IpaEvent ev;memcpy(&ev,s->dma+at,16);
+     if(!ipa_gsi_healthy(s))return -1;
+     if(ch->completed==ch->posted || ev.transfer!=s->base+ch->ring+(ch->completed%ch->slots)*16 ||
+        ev.channel!=ch->channel || ev.type!=0x22 || (ev.code!=1 && ev.code!=2 && ev.code!=4) || (!ch->tx && ev.length>ch->buffer_size)){
+-        s->failed=true;return -1;
++        s->failed=true;
++        printf("SWEET IPA: GSI completion invalid channel=%u event=%u producer=%#x transfer=%#llx expected=%#x length=%u code=%#x type=%#x chid=%u posted=%u completed=%u consumed=%u ieob=%#x\n",ch->channel,ch->event,producer,(unsigned long long)ev.transfer,s->base+ch->ring+(ch->completed%ch->slots)*16,ev.length,ev.code,ev.type,ev.channel,ch->posted,ch->completed,ch->consumed,ipa_gr(s,0x250a8));return -1;
+     }
+     *buffer=ch->buffer+(ch->completed%ch->slots)*ch->buffer_size;*bytes=ev.length;
+     if(!ch->tx)s->io.sync(s->io.ctx,*buffer,ch->buffer_size);
+diff --git a/bsd/dev/modem/IpaHardware.inc b/bsd/dev/modem/IpaHardware.inc
+--- a/bsd/dev/modem/IpaHardware.inc
++++ b/bsd/dev/modem/IpaHardware.inc
+@@ -50,7 +50,7 @@
+     IpaGsi *g=&iph.gsi;if(!ipa_gsi_post(g,0,(uint16_t)opcode,payload,bytes))return false;
+     unsigned off,n;
+     for(unsigned us=0;us<200000;us+=100){
+-        int rc=ipa_gsi_event(g,0,&off,&n);if(rc>0)return true;if(rc<0)return false;delay(100);
++        int rc=ipa_gsi_event(g,0,&off,&n);if(rc>0)return true;if(rc<0){printf("SWEET IPA: immediate opcode=%#x completion refused\n",opcode);sweet_log_sync();return false;}delay(100);
+     }
+     g->failed=true;printf("SWEET IPA: immediate opcode=%#x timed out\n",opcode);return false;
+ }

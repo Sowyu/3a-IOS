@@ -94,5 +94,12 @@ int main(void){
   assert(s.error_log==0x02301000 && (k?s.irq_status==2:s.global_status==1));
   assert(ipa_gsi_stop(&s));assert(regs[0x25240/4]==0x02301000 && !error_inits);
  }
+ const uint32_t bad_producer[]={0,0x20003001,0x20003200,0xffffffff};
+ for(unsigned k=0;k<sizeof(bad_producer)/sizeof(bad_producer[0]);k++){
+  reset();assert(ipa_gsi_setup(&s,io,dma,0x20000000));assert(ipa_gsi_start(&s,0));assert(ipa_gsi_post(&s,0,7,payload,sizeof(payload)));
+  regs[ipa_gev(0,4)/4]=bad_producer[k];unsigned before=writes;
+  assert(ipa_gsi_event(&s,0,&buf,&n)<0 && s.failed && !s.ch[0].completed && !s.ch[0].consumed && writes==before);
+  assert(ipa_gsi_stop(&s));
+ }
  puts("IPA GSI5.2 layout, ring wrap, event validation, command timeout and DMA stop PASS");return 0;
 }

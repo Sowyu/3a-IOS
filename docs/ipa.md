@@ -390,3 +390,9 @@ Patch2216 freshly samples global and general status after the final context scan
 This is polling, not an atomic hardware snapshot. A fault arriving after the final status sample can still precede the store. The post-write health check retains its latched pending status and refuses allocation. The single AP owner and setup-before-MPSS ordering remain required. No pending status or log-clear register is written.
 
 Apply `2216-asteroids-ipa-final-pending-status-check.patch` after2215, SHA256 `1433c032e17a1224e27d1d00a8be1c2c69b9acfa812184f34a13dae3263f5424`. All56 files reproduce and the actual sanitizer suite passes. A fresh source/exact B review is required. Accepted A remains unchanged, I3 remains unproven and ONLINE is suspended.
+
+## ast180 and2217 completion diagnostics
+
+ast180 completed363seconds with clean roots, fresh nonce/frame and normal DONE12549. GSI setup passed at6221, then EIO at6222 with raw/global/general faults0 at6223. AP quiescence6224, PAS15 shutdown6231 and guarded release6234 succeeded. No PAS4 or I3.
+2217 adds bounded invalid-producer/completion and immediate-opcode logs without changing validation or teardown. Four actual invalid-producer regressions, the sanitizer suite,56-file reproduction and --remake-j6 build pass. Apply after2216, SHA256331f3a22fd69b2120e5eae71fd8b81bcd2c970a0679af07f9775b2cef3a63ab5.
+A fresh Sol source/exact-image review precedes one diagnostic boot. The phone is idle in OrangeFox with no claims. The root retains the ordinary2216 selftest hook, log/frame and completion marker.
