@@ -306,3 +306,12 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 **Measured.** Selftest DONE is at12577, after worker completion. The completion marker matches the frozen script nonce, one checked frame exists, stale=false and root before/after is clean. The phone returned to OrangeFox recovery. Root changes are the inert selftest hook, completion markers and frame archives. No firmware or modem executable was pushed. Acceptance follows the explicit2185 diagnostic audit; the strict M2 checker still fails the known PAS condition and has not been weakened.
 
 **Missing.** M2 still needs verified PAS shutdown. M4 needs a ready USIM, completed IPA setup and a fresh integrated audit before ONLINE. The next UIM change will poll card status and preserve the primary GW provisioning index. HakiOS found an unprovisioned index0xffff can leave an application detected until a provisioning session is activated. That state-changing request is not part of this read-only result.
+
+
+## ast162 bandwidth completion measured
+
+**Measured.** ast162-modem-offline-2186 completed in362 seconds with normal DONE, a fresh matching nonce/frame, stale=false and clean root. Local console line7766 reads IRQ37 group1=1, priority0, enabled0, active0. The seven-command bandwidth vote completed at7767. PAS authentication succeeded at8519, ready/handover at8536 and MSS proxy release at8542. Touch preserved maximumSN3 at10608 and its transaction completed. This establishes the guarded completion path on this phone.
+
+**Measured.** SSCTL completed at11711. PAS shutdown still returned raw-3145800 fifty times. Lines11778 and11779 retain backing and report final_error5. DONE is12623. No shutdown-time fatal/transport failure or post-retention reclamation was logged. The bandwidth fix did not resolve secure shutdown, so M2 remains incomplete. No UIM or IPA ran in this test.
+
+**Missing.** The secure error still needs diagnosis. The known proxy-vote and bandwidth discrepancies are now corrected but neither changed it. Repeating these same settings will not answer the remaining question. The data agent has the next reserved phone slot; modem work continues at the desk.
