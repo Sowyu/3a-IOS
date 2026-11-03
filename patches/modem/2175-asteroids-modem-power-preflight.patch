@@ -1,0 +1,69 @@
+diff --git a/bsd/dev/sweet_modem.c b/bsd/dev/sweet_modem.c
+--- a/bsd/dev/sweet_modem.c
++++ b/bsd/dev/sweet_modem.c
+@@ -352,11 +352,11 @@
+     if (!err) err = fat_read_chain(&f, cl, 0, mdt, size);
+     if (!err) err = modem_mdt(mdt, size, &f);
+ #ifndef MODEM_HOST_TEST
+-    if (!err && m_gate("sweetmpss")) modem_run(&f,mdt,size);
++    if (!err && (m_gate("sweetmpss") || m_gate("sweetmprobe"))) modem_run(&f,mdt,size);
+ #endif
+     if (mdt) kfree_data(mdt, size);
+ #ifndef MODEM_HOST_TEST
+-    if (m_gate("sweetmpss")) printf("SWEET MODEM: gated modem worker finished preflight_error=%d\n",err);
++    if (m_gate("sweetmpss") || m_gate("sweetmprobe")) printf("SWEET MODEM: gated modem worker finished preflight_error=%d\n",err);
+     else
+ #endif
+     printf("SWEET MODEM: read-only probe end error=%d; MPSS untouched\n", err);
+@@ -368,7 +368,7 @@
+ {
+     char level[4] = {0};
+ #ifndef MODEM_HOST_TEST
+-    bool pas=m_gate("sweetmpss");
++    bool pas=m_gate("sweetmpss") || m_gate("sweetmprobe");
+     if (!pas && (!PE_parse_boot_arg_str("sweetmodem",level,sizeof(level)) || !strcmp(level,"0"))) return;
+     if (pas) {level[0]='1';level[1]=0;}
+ #else
+diff --git a/bsd/dev/modem/ModemRuntime.inc b/bsd/dev/modem/ModemRuntime.inc
+--- a/bsd/dev/modem/ModemRuntime.inc
++++ b/bsd/dev/modem/ModemRuntime.inc
+@@ -264,6 +264,23 @@
+     }
+     sweet_log_sync();return clean;
+ }
++static int m_power_inspect(void){
++    static uint8_t dbcopy[0x20000];
++    for(unsigned i=0;i<sizeof(dbcopy);i+=4){uint32_t v=m_rd(m.db,i);memcpy(dbcopy+i,&v,4);}
++    printf("SWEET MODEM: cmd-db version=%#x magic=%#x\n",le32(dbcopy),le32(dbcopy+4));
++    int error=0;static const char *const rails[]={"cx.lvl","mss.lvl","xo.lvl"};
++    for(unsigned i=0;i<3;i++){
++        QcomRpmhResource r={0};int rc=qcom_cmd_db_find(dbcopy,sizeof(dbcopy),rails[i],&r);
++        printf("SWEET MODEM: resource=%s lookup=%d address=%#x levels=%u\n",rails[i],rc,r.address,r.level_count);
++        if(!rc)for(unsigned j=0;j<r.level_count;j++)printf("SWEET MODEM: resource=%s index=%u level=%u\n",rails[i],j,r.levels[j]);
++        if(rc || !r.address){error=EINVAL;continue;}
++        if(i==2){m.xo_addr=r.address;continue;}
++        if(!r.level_count || r.levels[r.level_count-1]<384 || qcom_rpmh_level_index(&r,384,&m.rail_index[i])){error=EINVAL;continue;}
++        m.rail_addr[i]=r.address;m.rail_index[i]=r.level_count-1;
++    }
++    if(m.xo_addr==m.rail_addr[0] || m.xo_addr==m.rail_addr[1] || m.rail_addr[0]==m.rail_addr[1])error=EINVAL;
++    sweet_log_sync();return error;
++}
+ #include "ModemGate.h"
+ static bool m_gate(const char *name){return modem_gate(PE_boot_args(),name)!=0;}
+ static void modem_run(const struct wl_fat *f,const uint8_t *mdt,uint32_t size){
+@@ -276,13 +293,8 @@
+     m.sm=(QcomSmem){(volatile uint8_t *)m.smem,M_SM_SIZE};if(qcom_smem_partition(&m.sm,0,1,&m.part))goto out;
+     uint64_t supported=0;rc=m_scm(qcom_scm_fn(2,7),1,4,0,0,0,&supported);if(rc || supported!=1){rc=ENOTSUP;goto out;}
+     if(((m_rd(m.rsc,0)>>16)&255)!=3){rc=ENOTSUP;goto out;}
+-    static uint8_t dbcopy[0x20000];for(unsigned i=0;i<sizeof(dbcopy);i+=4){uint32_t v=m_rd(m.db,i);memcpy(dbcopy+i,&v,4);}
+-    static const char *const rails[]={"cx.lvl","mss.lvl"};for(unsigned i=0;i<2;i++){QcomRpmhResource r;
+-        if(qcom_cmd_db_find(dbcopy,sizeof(dbcopy),rails[i],&r) || !r.level_count || r.levels[r.level_count-1]<384 || qcom_rpmh_level_index(&r,384,&m.rail_index[i])){rc=EINVAL;goto out;}m.rail_addr[i]=r.address;m.rail_index[i]=r.level_count-1;}
+-    QcomRpmhResource xo;
+-    if(qcom_cmd_db_find(dbcopy,sizeof(dbcopy),"xo.lvl",&xo) || !xo.address){rc=EINVAL;goto out;}
+-    m.xo_addr=xo.address;
+-    if(m.xo_addr==m.rail_addr[0] || m.xo_addr==m.rail_addr[1]){rc=EINVAL;goto out;}
++    rc=m_power_inspect();
++    if(rc || !m_gate("sweetmpss")){printf("SWEET MODEM: hardware preflight error=%d; no PAS start or shared-memory writes\n",rc);goto out;}
+     uint32_t prior_off,prior_size;
+     if(!m_item(435,QCOM_SMP2P_ITEM_BYTES,&prior_off,&prior_size)){
+         QcomSmp2p prior={0};prior.in=(volatile uint32_t *)(m.smem+prior_off);prior.local_pid=0;prior.remote_pid=1;

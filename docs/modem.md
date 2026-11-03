@@ -1,6 +1,6 @@
 # Modem and SIM: desk findings (2026-11-03)
 
-The read-only firmware preflight passed on the phone in ast146. Patch 2173 is the first offline MPSS start candidate and has passed host checks and a full kernel build. Sol approved exact patches 2170 through 2174 for one bounded offline phone test. M1 has code and host checks. No modem start or SIM detection has been measured.
+The read-only firmware preflight passed on the phone in ast146. Patch 2173 is the first offline MPSS start candidate and has passed host checks and a full kernel build. Sol approved exact patches 2170 through 2174 for one bounded offline phone test. M1 has code and host checks. The first offline attempt, ast148, stopped at a power prerequisite before PAS. No modem start or SIM detection has been measured.
 
 Labels as in `docs/input.md`: **Measured**, **Code**, **Inferred**, **Missing**.
 
@@ -106,3 +106,25 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 **Code.** The first-start image has 599 bytes of arguments, the four reviewed stage gates, sweetfbarm=1, sweetselftest=1 and sweetdeadman=600. The selftest waits 240 seconds and takes one frame before normal recovery. A phone result must show ready, handover, QRTR services and verified PAS shutdown. Intentional XO/CX floors are distinct from an uncertain or incomplete cleanup.
 
 **Missing.** The first offline test is in progress. UIM remains a separate staged change. USB v5 SSH can help later NAS/WDS iteration. A root-only QMI request interface would need bounded buffers, request/reply matching, timeouts, a default-off gate and a fresh audit before use. It is deferred until it saves more time than a controlled rebuild.
+
+## ast148, safe refusal before PAS
+
+**Measured.** Local `ios-asteroids/logs/ast148-modem-offline.txt:4331` records error 22 after 4 ms. Line 4332 confirms no PAS activity and cleanup=ok. Firmware preflight passed at line 222. No power vote or shared-memory initialization was reached. The selftest completed after 353 seconds with a clean root. M2 remains incomplete. No modem crash or reset was observed.
+
+**Inferred.** The failure is in the CX/MSS/XO resource lookup or level validation. The old log cannot distinguish those cases. Do not waive the check or attribute the refusal to a missing clock without another measurement.
+
+**Code.** Patch 2175 adds strict `sweetmprobe=1` for read-only hardware prerequisite inspection. It reports command-db lookup errors and bounded level tables, then exits before any shared-memory write if `sweetmpss` is off. Patch 2176 prepares strict `sweetmuim=1` for UIM Get Card Status and Get Slot Status. It sends only those two read requests, matches endpoint and transaction, bounds retries, and emits at most four ICCID digits. The client has no generic QMI injection API. Wire layouts follow [libqmi's UIM schema](https://github.com/linux-mobile-broadband/libqmi/blob/main/data/qmi-service-uim.json).
+
+**Measured, host.** `check-uim.sh` covers present/absent card status, app state, suffix-only BCD parsing, malformed lengths, actual sender gates, request opcodes, reply matching and retry limits. Existing protocol and lifecycle checks still pass. The actual power inspector is tested against valid, missing and malformed resource data. These are synthetic checks, not SIM evidence.
+
+**Missing.** A combined Sol review and matching build are pending for 2175, 2176 and USB v5. The next phone step is the read-only power probe. UIM stays off until a prior modem run proves M2. The owner has the phone after ast148; verify fastboot or OrangeFox before any next run. The last measured modem-run root was clean, with the inert firstboot hook and normal selftest files.
+
+## 2177, ARC level clamping
+
+**Inferred.** Read-only analysis of the local stock AOP image finds a candidate MSS table whose maximum is 320. The prior minimum of 384 rejects that table. Its relationship to the live command database still requires the phone probe. No firmware bytes or table dump are included here.
+
+**Code.** [Linux rpmhpd](https://github.com/torvalds/linux/blob/master/drivers/pmdomain/qcom/rpmhpd.c) clamps requests above the supported maximum. Patch 2177 follows that behavior and retains the highest complete CX/MSS proxy floor. It exposes the original aux length, refuses truncated or malformed tables and reports the chosen index. It does not substitute a resource address or claim the live refusal is resolved.
+
+**Measured, host.** The actual power inspector passes the maximum-320 regression and rejects oversized, odd, short and descending tables. The UIM suite now explicitly rejects a matching response before its first request. The combined USB/modem full build and final remake passed. Every rebased kernel segment in the three prepared stage images matches the built kernel. Their command lines contain 553, 591 and 603 bytes.
+
+**Missing.** Fresh 2177 Sol review and the live read-only power probe precede another PAS attempt. The previous audit is `docs/modem-2175-2176-audit.md`; its staged approvals do not cover an unreviewed power change. The owner has lifted the time reservation, but every run still requires fastboot or OrangeFox and no active dev.py.

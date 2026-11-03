@@ -16,5 +16,13 @@ int main(void){
  w(msg+22,0);w(msg+26,r.window_pa-1);assert(modem_rmtfs_request(&r,msg,34,out,sizeof(out))==14 && out[10]);
  w(msg+26,r.window_pa);msg[17]=2;assert(modem_rmtfs_request(&r,msg,34,out,sizeof(out))==14 && out[10]);
  assert(modem_rmtfs_request(&r,msg,33,out,sizeof(out))==0);
+ /* Reject malformed OPEN even if its four-byte value aliases a valid caller id. */
+ memset(msg,0,sizeof(msg));msg[3]=1;msg[5]=7;msg[7]=1;msg[8]=4;
+ assert(modem_rmtfs_request(&r,msg,14,out,sizeof(out))==14 && out[10]);
+ /* A bad second vector must prevent writes from the valid first vector too. */
+ memset(msg,0,sizeof(msg));msg[3]=3;msg[5]=39;msg[7]=1;msg[8]=4;msg[14]=2;msg[15]=1;msg[17]=1;msg[18]=3;msg[19]=25;msg[21]=2;
+ w(msg+26,r.window_pa);w(msg+30,1);w(msg+34,UINT32_MAX);w(msg+38,r.window_pa);w(msg+42,1);
+ window[0]=0x99;unsigned before=r.writes;uint8_t saved=shadow[0];
+ assert(modem_rmtfs_request(&r,msg,46,out,sizeof(out))==14 && out[10]);assert(r.writes==before && shadow[0]==saved);
  puts("PASS: rmtfs open/read, writes only change RAM, invalid ranges/direction/truncation rejected");
 }

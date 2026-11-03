@@ -1,0 +1,45 @@
+diff --git a/bsd/dev/modem/ModemRuntime.inc b/bsd/dev/modem/ModemRuntime.inc
+--- a/bsd/dev/modem/ModemRuntime.inc
++++ b/bsd/dev/modem/ModemRuntime.inc
+@@ -313,11 +313,17 @@
+     int error=0;static const char *const rails[]={"cx.lvl","mss.lvl","xo.lvl"};
+     for(unsigned i=0;i<3;i++){
+         QcomRpmhResource r={0};int rc=qcom_cmd_db_find(dbcopy,sizeof(dbcopy),rails[i],&r);
+-        printf("SWEET MODEM: resource=%s lookup=%d address=%#x levels=%u\n",rails[i],rc,r.address,r.level_count);
++        printf("SWEET MODEM: resource=%s lookup=%d address=%#x levels=%u aux_bytes=%u\n",rails[i],rc,r.address,r.level_count,r.aux_bytes);
+         if(!rc)for(unsigned j=0;j<r.level_count;j++)printf("SWEET MODEM: resource=%s index=%u level=%u\n",rails[i],j,r.levels[j]);
+         if(rc || !r.address){error=EINVAL;continue;}
+         if(i==2){m.xo_addr=r.address;continue;}
+-        if(!r.level_count || r.levels[r.level_count-1]<384 || qcom_rpmh_level_index(&r,384,&m.rail_index[i])){error=EINVAL;continue;}
++        /* Linux rpmhpd clamps a requested level above the table to its maximum.
++         * A short but complete table is valid; never silently truncate a longer one. */
++        bool valid=r.level_count>=2 && r.levels[0]==0 && r.aux_bytes &&
++            !(r.aux_bytes&1) && r.aux_bytes<=sizeof(r.levels);
++        for(unsigned j=1;valid && j<r.level_count;j++)valid=r.levels[j]>=r.levels[j-1] && r.levels[j]!=0;
++        if(!valid || qcom_rpmh_level_index(&r,384,&m.rail_index[i])){error=EINVAL;continue;}
++        printf("SWEET MODEM: resource=%s request=384 bounded_index=%u floor_index=%u\n",rails[i],m.rail_index[i],r.level_count-1);
+         m.rail_addr[i]=r.address;m.rail_index[i]=r.level_count-1;
+     }
+     if(m.xo_addr==m.rail_addr[0] || m.xo_addr==m.rail_addr[1] || m.rail_addr[0]==m.rail_addr[1])error=EINVAL;
+diff --git a/bsd/dev/modem/QcomRpmh.c b/bsd/dev/modem/QcomRpmh.c
+--- a/bsd/dev/modem/QcomRpmh.c
++++ b/bsd/dev/modem/QcomRpmh.c
+@@ -30,6 +30,7 @@
+             r.address = le32(entry + 16);
+             const size_t length = le16(entry + 20), at = data + le16(entry + 22);
+             if (!r.address || !fits(at, length, bytes)) return QcomRpmhCorrupt;
++            r.aux_bytes = (unsigned)length;
+             for (size_t l = 0; l + 1 < length && r.level_count < QCOM_RPMH_MAX_LEVELS; l += 2) {
+                 const uint16_t level = le16(db + at + l);
+                 if (r.level_count && !level) break;  /* the list is zero padded */
+diff --git a/bsd/dev/modem/QcomRpmh.h b/bsd/dev/modem/QcomRpmh.h
+--- a/bsd/dev/modem/QcomRpmh.h
++++ b/bsd/dev/modem/QcomRpmh.h
+@@ -19,6 +19,7 @@
+     uint32_t address;
+     uint16_t levels[QCOM_RPMH_MAX_LEVELS];
+     unsigned level_count;
++    unsigned aux_bytes; /* complete source length, so callers can reject truncation */
+ } QcomRpmhResource;
+ 
+ enum {QcomRpmhOk = 0, QcomRpmhNoDb = -1, QcomRpmhMissing = -2, QcomRpmhCorrupt = -3, QcomRpmhNoLevel = -4, QcomRpmhArgument = -5};

@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import subprocess
+os.environ["TMPDIR"] = "/tmp"
 root = Path(__file__).resolve().parents[3]
 repo = root / 'ios-asteroids'
 out = root / 'plans/modem/out'
