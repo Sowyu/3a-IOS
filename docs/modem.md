@@ -476,3 +476,8 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 **Code, blocker.** The current hardware setup also rejects measured flavor0xb0f0b1a because its producer-range check uses the wrong direction. The reference defines our RX as an IPA producer and our TX as an IPA consumer. IPA owns a separate correction before the offline handshake trial.
 
 **Missing.** A reviewed benign root cleanup, accepted firmware teardown and offline IPA/GSI/QMI handshake still precede a fresh exact ONLINE-image review. No data profile or packet-proof helper has been installed.
+
+
+**Code.** Additive2212 fixes the measured flavor partition check. It validates AP TX endpoints against the hardware consumer range and AP RX against the producer range before configuration writes.
+
+**Measured, host.** The actual0xb0f0b1a flavor and0x880 shared-memory value pass the hardware setup model. Invalid partitions are refused before writes. The combined datapath sanitizer suite,56-file reproduction, safe build and10-segment image comparison pass. The frozen data kernel is a37e260bf19409e2f4dadf8615ef786cb1e6eb93c18644d40f0061c77a61303e. Its image remains unapproved pending hardware prerequisites and a fresh exact-image review.
