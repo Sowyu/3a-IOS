@@ -434,3 +434,6 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 **Code, APN plan.** The replacement trial line includes the carrier APN from the operator's public help page and its authentication setting within607bytes. Carrier-specific values stay in private workspace notes. It drops sweetsb=1 and sweettu=sysmem,nocb,nolrz and shortens the panic-screen delay from10 to9 seconds. Every modem/IPA/data gate and all required dev, thermal, fetch-sync and USB arguments remain. The builder refuses an old kernel without authentication parsing. This requires the data owner's reviewed APN/auth update and a new exact-image review.
 
 **Measured, blocker.** ast171 failed IPA preparation before PAS15 and reset after63seconds, leaving a dirty root. The2208 ONLINE candidate is suspended. IPA is preparing a different SMMU-only probe and revised teardown under a fresh review. No modem phone operation or APN request has occurred.
+
+
+**Code, reviewed.** Dataaudit8 accepts2220 revisionf331702b with request-only APN authentication and IPv4-first setup. The three changed data files are imported into xnu-modem. The actual modem/data hook tests and isolated protocol, service-cache and adapter suites pass. The replacement combined build waits for the revised IPA teardown cutoff.

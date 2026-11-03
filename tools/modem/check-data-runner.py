@@ -2,6 +2,8 @@
 """Host-only checks for frozen identity and fail-closed profile restoration."""
 import importlib.util
 import tempfile
+import sys
+sys.dont_write_bytecode = True
 from pathlib import Path
 from unittest.mock import patch
 
