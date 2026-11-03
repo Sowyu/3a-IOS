@@ -41,8 +41,16 @@ if [ "$st_run" = 1 ]; then
 	}
 	# Retain earlier evidence without permanent deletion.
 	if [ -e "$ST_OUT" ]; then
-		st_saved="$ST_OUT.saved.$(date +%s).$$"
-		[ ! -e "$st_saved" ] && mv "$ST_OUT" "$st_saved" || { say "FAIL preserve frames"; exit 1; }
+		st_saved_base="$ST_OUT.saved.$(date +%s).$$"
+		st_saved="$st_saved_base"
+		st_saved_n=0
+		# Phone time and launchd PIDs repeat across boots.
+		while [ -e "$st_saved" ]; do
+			st_saved_n=$((st_saved_n + 1))
+			[ "$st_saved_n" -lt 1000 ] || { say "FAIL archive names exhausted"; exit 1; }
+			st_saved="$st_saved_base.$st_saved_n"
+		done
+		mv "$ST_OUT" "$st_saved" || { say "FAIL preserve frames"; exit 1; }
 	fi
 	mkdir -p "$ST_OUT" || { say "FAIL create frames"; exit 1; }
 	say "start"
