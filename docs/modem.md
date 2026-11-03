@@ -349,3 +349,6 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 **Measured, host.** Sanitizer tests cover60 replies through a ten-packet peer window, exact header/payload fields, backpressure, duplicate confirms, queue capacity, bad destinations and truncated packets. An extracted real worker test checks drain-before-retry and failure propagation. The existing storage check permits only sweet_ufs_read_part and sweet_ufs_part_size. No partition write API is added. Full Trash-safe kernel build passed and the image matches all ten kernel segments.
 
 **Missing.** Fresh Sol approval and phone confirmation for2188. Data worker integration moves to2189 and is not in this image. IPA, data sessions, provisioning and ONLINE remain absent.
+
+
+**Code, revision2.** Sol rejected2188 revision1 because the real TX queue marked acknowledgment backpressure fatal. Revision2 keeps retry-owned RESUME_TX pending without poisoning the worker and preserves failure on ordinary reply loss. The regression now includes the real queue callback and five consecutive GLINK refusals, followed by exactly one delivered response and acknowledgment. Full build and host checks pass. Image21881 needs fresh review. The rejected image must not boot.

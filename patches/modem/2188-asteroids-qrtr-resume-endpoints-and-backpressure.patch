@@ -91,7 +91,22 @@ diff --git a/bsd/dev/modem/QcomQrtr.h b/bsd/dev/modem/QcomQrtr.h
 diff --git a/bsd/dev/modem/ModemRuntime.inc b/bsd/dev/modem/ModemRuntime.inc
 --- a/bsd/dev/modem/ModemRuntime.inc
 +++ b/bsd/dev/modem/ModemRuntime.inc
-@@ -370,7 +370,7 @@
+@@ -248,7 +248,13 @@
+     if(value&1)m.fatal=true;
+ }
+ static int m_qsend_packet(void *context,const uint8_t *data,uint32_t length){
+-    (void)context;if(length>512 || m.qcount==M_TX_COUNT){m.failed=true;return -1;}
++    (void)context;
++    if(length>512){m.failed=true;return -1;}
++    if(m.qcount==M_TX_COUNT){
++        /* QRTR owns and retries RESUME_TX. Ordinary replies have no retry owner. */
++        if(length!=52 || le32(data)!=1 || le32(data+4)!=QCOM_QRTR_RESUME_TX)m.failed=true;
++        return -1;
++    }
+     unsigned i=(m.qhead+m.qcount)%M_TX_COUNT;m.queue[i].len=length;memcpy(m.queue[i].data,data,length);m.qcount++;return 0;
+ }
+ static void m_rmtfs_receive(void *ctx,QcomQrtr *qr,uint32_t port,uint32_t node,uint32_t from,const uint8_t *data,uint32_t len){
+@@ -370,7 +376,7 @@
          int rc=qcom_glink_send(&m.gl,m.channel,m.queue[m.qhead].data,m.queue[m.qhead].len);
          if(rc==QcomGlinkAgain)break;if(rc){m.failed=true;break;}m.qhead=(m.qhead+1)%M_TX_COUNT;m.qcount--;
      }
@@ -100,7 +115,7 @@ diff --git a/bsd/dev/modem/ModemRuntime.inc b/bsd/dev/modem/ModemRuntime.inc
  }
  static bool m_shutdown_request(void){
      if(!m.sysmon || !m.started || !m.qr_started || m.fatal || m.failed)return false;
-@@ -447,6 +447,7 @@
+@@ -447,6 +453,7 @@
  static bool m_cleanup(void){
      bool stopped=!m.pas_owed;
      bool graceful=m_shutdown_request();
