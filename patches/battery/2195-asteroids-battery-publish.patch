@@ -1,0 +1,92 @@
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -13,6 +13,8 @@
+ #include <libkern/c++/OSCollectionIterator.h>
+ #include <pexpert/pexpert.h>
+ #include "../../../bsd/dev/sweet_board.h"
++#include "../../../bsd/dev/battery/BatterySnapshot.h"
++#include "../../../bsd/dev/battery/ModemGate.h"
+ /* bsd/dev/sweet_spmi.c */
+ extern "C" int sweet_spmi_init(void);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+@@ -48,7 +50,8 @@
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+ 	void publish(unsigned percent, unsigned mv, int ma, bool external,
+-	    bool capable, bool charging, bool full, bool measured, bool currentValid);
++	    bool capable, bool charging, bool full, bool measured, bool currentValid,
++	    bool gauge = false, int temperature = 2500);
+ 	void poll(void);
+ 	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
+ 	static IOReturn stopPolling(OSObject *owner, void *, void *, void *, void *);
+@@ -117,7 +120,8 @@
+ 
+ void
+ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+-    bool capable, bool charging, bool full, bool measured, bool currentValid)
++    bool capable, bool charging, bool full, bool measured, bool currentValid,
++    bool gauge, int temperature)
+ {
+ 	/*
+ 	 * Patch 0130: iOS' AppleSmartBattery publishes the UI state of charge as
+@@ -218,11 +222,11 @@
+ 	putNumber("DesignCapacity", 5020);
+ 	putNumber("InstantAmperage", (UInt32)ma);
+ 	/* iOS battery convention: centidegrees C; fixed 25 C, NOT measured. */
+-	putNumber("Temperature", 2500);
++	putNumber("Temperature", (UInt32)temperature);
+ 	putBool("SweetBatteryHardwareSampleValid", measured);
+ 	putBool("SweetBatteryCurrentValid", currentValid);
+-	putBool("SweetBatterySOCEstimated", measured);
+-	putBool("SweetBatteryTemperatureEstimated", true);
++	putBool("SweetBatterySOCEstimated", measured && !gauge);
++	putBool("SweetBatteryTemperatureEstimated", !gauge);
+ 	putBool("SweetBatteryFallback", !measured);
+ 	putNumber("SweetBatteryPercent", percent);
+ 
+@@ -249,7 +253,7 @@
+ 	int mode = measured ? 1 : 0;
+ 	if (mode != fLastMode) {
+ 		IOLog("SWEET BATTERY: %s, %u%% %umV external=%d charging=%d\n",
+-		    measured ? (sweet_board_beryllium() ? "PMI8998 FG SOC" : "PM6150 / estimated SOC") : "static fallback",
++		    measured ? (gauge ? "ADSP fuel gauge" : sweet_board_beryllium() ? "PMI8998 FG SOC" : "PM6150 / estimated SOC") : "static fallback",
+ 		    percent, mv, external, charging);
+ 		fLastMode = mode;
+ 	}
+@@ -347,6 +351,18 @@
+ void
+ SweetBattery::poll(void)
+ {
++    if (sweet_board_asteroids() && modem_gate(PE_boot_args(), "sweetbpub")) {
++        BatterySnapshot sample;
++        if (sweet_adsp_battery_snapshot(&sample)) {
++            publish(sample.percent, sample.millivolts, sample.milliamps,
++                sample.external, sample.external, sample.charging, sample.full,
++                true, true, true, sample.temperature);
++        } else {
++            publish(100, 4200, 0, true, true, false, true, false, false);
++        }
++        return;
++    }
++
+ 	if (fReal && sweet_board_beryllium()) {
+ 		pollBeryllium();
+ 		return;
+@@ -397,7 +413,7 @@
+ 	SweetBattery *self = OSDynamicCast(SweetBattery, owner);
+ 	if (self && self->fRunning) {
+ 		self->poll();
+-		sender->setTimeoutMS(30000);
++		sender->setTimeoutMS(modem_gate(PE_boot_args(), "sweetbpub") ? 5000 : 30000);
+ 	}
+ }
+ 
+@@ -419,7 +435,7 @@
+ 		if (fLoop && fTimer && fLoop->addEventSource(fTimer) == kIOReturnSuccess) {
+ 			fTimerAdded = true;
+ 			fRunning = true;
+-			fTimer->setTimeoutMS(30000);
++			fTimer->setTimeoutMS(modem_gate(PE_boot_args(), "sweetbpub") ? 5000 : 30000);
+ 		} else {
+ 			fReal = false;
+ 			poll();

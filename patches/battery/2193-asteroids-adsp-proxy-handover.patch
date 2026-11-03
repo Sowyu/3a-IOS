@@ -1,0 +1,71 @@
+--- a/bsd/dev/battery/AdspHelpers.inc
++++ b/bsd/dev/battery/AdspHelpers.inc
+@@ -46,7 +46,6 @@
+ }
+ 
+ static int m_vote(bool on){
+-    if(!on)return EINVAL; /* never lower inherited ADSP/XO votes in this bounded probe */
+     sweet_apps_rsc_lock();int chosen=-1,rc=ENODEV;unsigned base=0;
+     for(unsigned i=0;i<3;i++){
+         unsigned t=0xd00+i*0x2a0;
+@@ -55,14 +54,14 @@
+     if(chosen<0)goto out;
+     if(on)m.votes_owed=true;
+     uint32_t bit=1u<<chosen,irq=m_rd(m.rsc,0xd00);m_wr(m.rsc,0xd00,irq&~bit);
+-    unsigned count=on?3:1,mask=(1u<<count)-1;
++    unsigned count=on?3:2,mask=(1u<<count)-1;
+     for(unsigned i=0;i<count;i++){
+-        unsigned rail=on?i:1; /* only the modem-specific MSS vote can go to zero */
++        unsigned rail=i; /* release only ADSP-specific lcx/lmx; shared XO stays pinned */
+         uint32_t addr=rail==2?m.xo_addr:m.rail_addr[rail];
+         uint32_t value=rail==2?3:(on?m.rail_index[rail]:0);
+         m_wr(m.rsc,base+0x34+i*24,0x10108);m_wr(m.rsc,base+0x38+i*24,addr);m_wr(m.rsc,base+0x3c+i*24,value);
+     }
+-    /* Retain ADSP proxy floors and shared XO until the guarded devloop reset. */
++    /* Rootstock and the vendor driver release lcx/lmx after handover. Keep shared XO pinned. */
+     if(on)m.xo_pinned=true;
+     m_wr(m.rsc,base+0x20,mask);m_wr(m.rsc,base+0x2c,mask);m_wr(m.rsc,base+0x24,1u<<16);m_wr(m.rsc,base+0x24,(1u<<16)|(1u<<24));
+     rc=ETIMEDOUT;
+@@ -102,6 +101,11 @@
+     if(qcom_smp2p_service(&m.sp,"slave-kernel",&value,&changed))m_ring(3,2);
+     if(changed){m.state=value;printf("SWEET BATTERY: SMP2P slave=%#x ready=%u handover=%u stop_ack=%u\n",value,!!(value&2),!!(value&4),!!(value&8));sweet_log_sync();}
+     if(value&1)m.fatal=true;
++    if(!m.fatal && (value&6)==6 && m.votes_owed && !m.proxy_released && !m.vote_uncertain){
++        int rc=m_vote(false);
++        if(rc)m.failed=true;else m.proxy_released=true;
++        printf("SWEET BATTERY: B2 ADSP proxy handover release error=%d\n",rc);
++    }
+ }
+ 
+ static int m_qsend_packet(void *context,const uint8_t *data,uint32_t length){
+--- a/bsd/dev/battery/AdspRuntime.inc
++++ b/bsd/dev/battery/AdspRuntime.inc
+@@ -40,7 +40,7 @@
+  uint8_t rx[M_RX_SIZE*8],brx[512*4];
+  struct {uint32_t len;uint8_t data[512];} queue[M_TX_COUNT];
+  uint32_t qhead,qcount,rxoff,state,rail_addr[2],rail_index[2],xo_addr;
+- bool failed,fatal,qr_started,battery_up,votes_owed,vote_uncertain,xo_pinned,qmp_owed,glink;
++ bool failed,fatal,qr_started,battery_up,votes_owed,vote_uncertain,xo_pinned,qmp_owed,glink,proxy_released;
+  int master;
+  struct adsp_image images[2];
+ } m;
+@@ -116,6 +116,10 @@
+   im->owed=false;
+  }
+  if(m.vote_uncertain){printf("SWEET BATTERY: B2 cleanup incomplete: TCS ownership uncertain\n");return false;}
++ if(m.votes_owed && !m.proxy_released){
++  if(m_vote(false)){printf("SWEET BATTERY: B2 cleanup incomplete: proxy release\n");return false;}
++  m.proxy_released=true;
++ }
+  if(m.qmp_owed && m_qsend(false)){printf("SWEET BATTERY: B2 cleanup incomplete: QMP release\n");return false;}
+  for(unsigned i=0;i<2;i++){
+   struct adsp_image *im=&m.images[i];
+@@ -126,7 +130,7 @@
+  if(m.db)ml_io_unmap(m.db,0x20000);if(m.rsc)ml_io_unmap(m.rsc,0x4000);
+  if(m.qmpmem)ml_io_unmap(m.qmpmem,0x400);if(m.ipcc)ml_io_unmap(m.ipcc,0x1000);
+  if(m.mutex)ml_io_unmap(m.mutex,0x1000);if(m.smem)ml_io_unmap(m.smem,M_SM_SIZE);
+- printf("SWEET BATTERY: B2 STOP verified; cleanup=ok; ADSP/XO floors retained until reset=%u\n",m.votes_owed);
++ printf("SWEET BATTERY: B2 STOP verified; cleanup=ok; shared XO retained until reset=%u\n",m.xo_pinned);
+  sweet_log_sync();return true;
+ }
+ static int adsp_run(bool glink){

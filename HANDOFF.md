@@ -77,6 +77,8 @@ Updated 2026-11-02, about 22:20 AEDT. Update this file whenever the state change
 - If an Anthropic model's safeguards stop a task, rerun it on a GPT model through codex: `gpt-6-astra` (reasoningEffort high) for implementation, and `gpt-6.1-sol` for research and audits (owner, 2026-11-03).
 - SIM mobile data is the top priority, then battery. A reflash of `boot_a` comes after both work and the owner has tried the combined build (owner, 2026-11-03).
 - Use SSH dev sessions for iterative work (`docs/dev-session.md`).
+- Codex usage ran out on 2026-11-04 00:02 and resets 2026-11-10 18:54. Until then, a separate Opus 5.5 high agent audits each boot against Sol's checklist. Anything touching TrustZone/PAS or firmware-loading code still waits for Sol (owner, 2026-11-04).
+- Never use a fast or priority tier for agents. Codex threads use `serviceTier: default`, and Claude agents use `fastMode: false` (owner, 2026-11-04).
 
 ## Hard lessons from today. Do not repeat them.
 

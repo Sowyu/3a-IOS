@@ -1,0 +1,1880 @@
+--- /dev/null
++++ b/bsd/dev/sweet_adsp.c
+@@ -0,0 +1,29 @@
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/thread.h>
++#include <libkern/libkern.h>
++#include <pexpert/pexpert.h>
++#include "battery/ModemGate.h"
++#include "battery/AdspRuntime.inc"
++extern kern_return_t thread_terminate(thread_t);
++void sweet_adsp_start(void);
++static void adsp_worker(void *arg,wait_result_t wait){
++ (void)arg;(void)wait;m_sleep(30000);
++ int rc=adsp_run(modem_gate(PE_boot_args(),"sweetbglink")!=0);
++ printf("SWEET BATTERY: B2 worker final_error=%d\n",rc);sweet_log_sync();thread_terminate(current_thread());
++}
++void sweet_adsp_start(void){
++ const char *args=PE_boot_args();
++ if(!modem_gate(args,"sweetbadsp"))return;
++ int deadman=0;
++ if(!modem_gate(args,"sweetfbarm") || !modem_gate(args,"sweetselftest") ||
++    !PE_parse_boot_argn("sweetdeadman",&deadman,sizeof(deadman)) || deadman!=600 ||
++    modem_gate(args,"sweetbprobe") || modem_gate(args,"sweetmpss")){
++  printf("SWEET BATTERY: B2 refused missing safeguards or conflicting probe\n");return;
++ }
++ thread_t thread=THREAD_NULL;kern_return_t rc=kernel_thread_start(adsp_worker,NULL,&thread);
++ if(rc==KERN_SUCCESS)thread_deallocate(thread);else printf("SWEET BATTERY: B2 thread failure %d\n",rc);
++}
++#endif
+--- /dev/null
++++ b/bsd/dev/battery/AdspRuntime.inc
+@@ -0,0 +1,173 @@
++/* B2 draft. Not linked into the B1 image. Bounded ADSP PAS36/PAS1 lifecycle.
++ * Hardware constants from volcano DT and rootstock's same-phone ADSP port.
++ */
++#include <kern/clock.h>
++#include <kern/sched_prim.h>
++#include <kern/kalloc.h>
++#include <machine/machine_routines.h>
++#include <vm/pmap.h>
++#include "QcomSmem.h"
++#include "QcomSmp2p.h"
++#include "QcomGlink.h"
++#include "QcomQrtr.h"
++#include "QcomQmp.h"
++#include "QcomRpmh.h"
++#include "QcomScm.h"
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t,vm_size_t,unsigned int);
++extern void ml_io_unmap(vm_offset_t,vm_size_t);
++extern void sweet_apps_rsc_lock(void);
++extern void sweet_apps_rsc_unlock(void);
++extern void sweet_log_sync(void);
++extern int sweet_ufs_read_part(const char *,uint64_t,void *,uint64_t);
++extern int sweet_ufs_part_size(const char *,uint8_t *,uint64_t *);
++#include "AdspFirmware.inc"
++static int adsp_part_read(uint64_t off,void *dst,uint64_t bytes){return sweet_ufs_read_part("modem_a",off,dst,bytes);}
++#define M_SM_SIZE 0x200000u
++#define M_FIFO 0x4000u
++#define M_RX_SIZE 0x4400u
++#define M_TX_COUNT 32u
++#define META_MAX 65536u
++struct adsp_image {
++ const char *stem;unsigned pas;uint64_t base,bytes,meta_pa;
++ uint8_t *mdt;uint32_t mdt_bytes;
++ vm_offset_t mapping,metadata;
++ bool owed,started;
++};
++static struct {
++ vm_offset_t smem,mutex,ipcc,qmpmem,rsc,db;
++ QcomSmem sm;QcomSmemPartition part;QcomSmp2p sp;QcomQmp qp;
++ QcomGlink gl;QcomGlinkChannel *channel,*battery;QcomQrtr qr;
++ uint8_t rx[M_RX_SIZE*8],brx[512*4];
++ struct {uint32_t len;uint8_t data[512];} queue[M_TX_COUNT];
++ uint32_t qhead,qcount,rxoff,state,rail_addr[2],rail_index[2],xo_addr;
++ bool failed,fatal,qr_started,battery_up,votes_owed,vote_uncertain,xo_pinned,qmp_owed,glink;
++ int master;
++ struct adsp_image images[2];
++} m;
++static void m_bstate(void *ctx,QcomGlinkChannel *ch,int up){
++ (void)ctx;(void)ch;m.battery_up=up!=0;
++ printf("SWEET BATTERY: B2 PMIC_RTR_ADSP_APPS up=%d\n",up);
++ if(!up)m.failed=true;
++}
++static void m_breceive(void *ctx,QcomGlinkChannel *ch,const uint8_t *data,uint32_t bytes){
++ (void)ctx;(void)ch;(void)data;
++ /* B2 has no client sender, including notification registration. */
++ printf("SWEET BATTERY: B2 unsolicited PMIC bytes=%u ignored\n",bytes);
++}
++#include "AdspHelpers.inc"
++static int adsp_open_images(struct wl_fat *f){
++ int rc=sweet_ufs_part_size("modem_a",NULL,&adsp_partition_bytes);if(rc)return rc;
++ if((rc=fat_mount(f,"modem_a")))return rc;
++ m.images[0]=(struct adsp_image){.stem="adsp_dtb",.pas=36,.base=0x99280000,.bytes=0x80000,.meta_pa=0xe1400000};
++ m.images[1]=(struct adsp_image){.stem="adsp",.pas=1,.base=0x99300000,.bytes=0x2800000,.meta_pa=0xe1410000};
++ for(unsigned i=0;i<2;i++){
++  struct adsp_image *im=&m.images[i];char path[32];uint32_t cl;
++  snprintf(path,sizeof(path),"image/%s.mdt",im->stem);
++  if((rc=fat_open(f,path,&cl,&im->mdt_bytes)))return rc;
++  if(!im->mdt_bytes || im->mdt_bytes>META_MAX)return EINVAL;
++  im->mdt=kalloc_data(im->mdt_bytes,Z_WAITOK|Z_ZERO);if(!im->mdt)return ENOMEM;
++  if((rc=fat_read_chain(f,cl,0,im->mdt,im->mdt_bytes)))return rc;
++  if((rc=adsp_mdt(im->mdt,im->mdt_bytes,f,im->stem,im->bytes)))return rc;
++ }
++ return 0;
++}
++static int adsp_load_image(struct wl_fat *f,struct adsp_image *im){
++ unsigned off=le32(im->mdt+28),count=le16(im->mdt+44);uint64_t low=UINT64_MAX,high=0;
++ for(unsigned i=0;i<count;i++){
++  const uint8_t *p=im->mdt+off+32*i;uint32_t mem=le32(p+20);
++  if(le32(p)!=1 || !mem || (le32(p+24)&(7u<<24))==(2u<<24))continue;
++  uint64_t addr=le32(p+12);if(addr<low)low=addr;if(addr+mem>high)high=addr+mem;
++ }
++ uint64_t span=((high+4095)&~4095ull)-low;
++ if(low==UINT64_MAX || !span || span>im->bytes)return EINVAL;
++ im->metadata=ml_io_map_unmappable(im->meta_pa,META_MAX,VM_WIMG_WCOMB);
++ if(!im->metadata)return ENOMEM;
++ memcpy((void *)im->metadata,im->mdt,im->mdt_bytes);__asm__ volatile("dsb sy":::"memory");
++ /* Shutdown is owed even if secure firmware returns an uncertain init result. */
++ im->owed=true;
++ int rc=m_pas(im->pas,1,qcom_scm_args(2,0,2,0),im->meta_pa,0);if(rc)return rc;
++ if((rc=m_pas(im->pas,2,qcom_scm_args(3,0,0,0),im->base,span)))return rc;
++ im->mapping=ml_io_map_unmappable(im->base,im->bytes,VM_WIMG_WCOMB);if(!im->mapping)return ENOMEM;
++ for(unsigned i=0;i<count;i++){
++  const uint8_t *p=im->mdt+off+32*i;uint32_t mem=le32(p+20),file=le32(p+16);
++  if(le32(p)!=1 || !mem || (le32(p+24)&(7u<<24))==(2u<<24))continue;
++  uint64_t at=(uint64_t)le32(p+12)-low;if(at>im->bytes || mem>im->bytes-at || file>mem)return EINVAL;
++  if(file){char path[32];uint32_t cl,actual;snprintf(path,sizeof(path),"image/%s.b%02u",im->stem,i);
++   if((rc=fat_open(f,path,&cl,&actual)))return rc;if(actual!=file)return EINVAL;
++   if((rc=fat_read_chain(f,cl,0,(void *)(im->mapping+at),file)))return rc;
++  }
++  if(mem>file)memset((void *)(im->mapping+at+file),0,mem-file);
++ }
++ __asm__ volatile("dsb sy":::"memory");
++ rc=m_pas(im->pas,5,1,0,0);if(!rc)im->started=true;return rc;
++}
++static bool adsp_cleanup(void){
++ if(m.images[1].started && m.sp.out){
++  qcom_smp2p_update(&m.sp,m.master,1,1);m_ring(3,2);uint64_t end=m_now()+3000;
++  while(m_now()<end){m_smp_poll();if(m.state&8)break;m_sleep(10);}
++  qcom_smp2p_update(&m.sp,m.master,1,0);m_ring(3,2);
++  printf("SWEET BATTERY: B2 stop request cleared ack=%u\n",!!(m.state&8));
++ }
++ /* Stop the running processor before its DTB dependency. */
++ for(int i=1;i>=0;i--){
++  struct adsp_image *im=&m.images[i];if(!im->owed)continue;
++  int rc=EIO;for(unsigned retry=0;retry<50;retry++){rc=m_pas(im->pas,6,1,0,0);if(rc!=-EINVAL)break;m_sleep(100);}
++  if(rc){printf("SWEET BATTERY: B2 STOP UNVERIFIED PAS%u; retaining memory, DTB and power\n",im->pas);sweet_log_sync();return false;}
++  im->owed=false;
++ }
++ if(m.vote_uncertain){printf("SWEET BATTERY: B2 cleanup incomplete: TCS ownership uncertain\n");return false;}
++ if(m.qmp_owed && m_qsend(false)){printf("SWEET BATTERY: B2 cleanup incomplete: QMP release\n");return false;}
++ for(unsigned i=0;i<2;i++){
++  struct adsp_image *im=&m.images[i];
++  if(im->mapping)ml_io_unmap(im->mapping,im->bytes);
++  if(im->metadata)ml_io_unmap(im->metadata,META_MAX);
++  if(im->mdt)kfree_data(im->mdt,im->mdt_bytes);
++ }
++ if(m.db)ml_io_unmap(m.db,0x20000);if(m.rsc)ml_io_unmap(m.rsc,0x4000);
++ if(m.qmpmem)ml_io_unmap(m.qmpmem,0x400);if(m.ipcc)ml_io_unmap(m.ipcc,0x1000);
++ if(m.mutex)ml_io_unmap(m.mutex,0x1000);if(m.smem)ml_io_unmap(m.smem,M_SM_SIZE);
++ printf("SWEET BATTERY: B2 STOP verified; cleanup=ok; ADSP/XO floors retained until reset=%u\n",m.votes_owed);
++ sweet_log_sync();return true;
++}
++static int adsp_run(bool glink){
++ memset(&m,0,sizeof(m));m.master=-1;m.glink=glink;struct wl_fat f;
++ int rc=adsp_open_images(&f);if(rc)goto out;
++ m.smem=ml_io_map_unmappable(0x81d00000,M_SM_SIZE,VM_WIMG_IO);
++ m.mutex=ml_io_map_unmappable(0x1f43000,0x1000,VM_WIMG_IO);
++ m.ipcc=ml_io_map_unmappable(0x405000,0x1000,VM_WIMG_IO);
++ m.qmpmem=ml_io_map_unmappable(0xc300000,0x400,VM_WIMG_IO);
++ m.rsc=ml_io_map_unmappable(0x17a20000,0x4000,VM_WIMG_IO);
++ m.db=ml_io_map_unmappable(0x81c60000,0x20000,VM_WIMG_IO);
++ if(!m.smem || !m.mutex || !m.ipcc || !m.qmpmem || !m.rsc || !m.db){rc=ENOMEM;goto out;}
++ m.sm=(QcomSmem){(volatile uint8_t *)m.smem,M_SM_SIZE};if(qcom_smem_partition(&m.sm,0,2,&m.part)){rc=EIO;goto out;}
++ if(((m_rd(m.rsc,0)>>16)&255)!=3){rc=ENOTSUP;goto out;}
++ if((rc=m_power_inspect()))goto out;
++ uint32_t prior,bytes;
++ if(!m_item(443,QCOM_SMP2P_ITEM_BYTES,&prior,&bytes)){
++  uint32_t snapshot[QCOM_SMP2P_ITEM_BYTES/4];for(unsigned i=0;i<sizeof(snapshot)/4;i++)snapshot[i]=qcom_smem_read32(&m.sm,prior+i*4);
++  QcomSmp2p view={0};view.in=snapshot;
++  if(!qcom_smp2p_check_in(snapshot,0,2)){int index=qcom_smp2p_find_in(&view,"slave-kernel");
++   if(index>=0 && qcom_smp2p_in_value(&view,index)){rc=EBUSY;goto out;}}
++ }
++ uint32_t outoff;if((rc=m_alloc(429,QCOM_SMP2P_ITEM_BYTES,&outoff)))goto out;
++ qcom_smp2p_init_out(&m.sp,(volatile uint32_t *)(m.smem+outoff),0,2);
++ m.master=qcom_smp2p_add_entry(&m.sp,"master-kernel");if(m.master<0){rc=EIO;goto out;}m_ring(3,2);
++ if(glink && (rc=m_glink_prepare()))goto out;
++ qcom_qmp_init(&m.qp,(volatile uint32_t *)m.qmpmem,0x400,m_qkick,0);
++ if((rc=m_qwait(3000)))goto out;m.qmp_owed=true;if((rc=m_qsend(true)))goto out;
++ if((rc=m_vote(true)))goto out;
++ if((rc=adsp_load_image(&f,&m.images[0])))goto out;
++ if((rc=adsp_load_image(&f,&m.images[1])))goto out;
++ uint64_t ready=m_now()+10000,end=m_now()+120000;
++ while(m_now()<end){
++  m_smp_poll();if(glink)m_ipc_poll();
++  if(m.fatal || m.failed){rc=EIO;break;}
++  if(!(m.state&2) && m_now()>ready){rc=ETIMEDOUT;break;}
++  m_sleep(2);
++ }
++ if(!rc && ((m.state&6)!=6 || (glink && !m.battery_up)))rc=ETIMEDOUT;
++out:
++ printf("SWEET BATTERY: B2 run end error=%d ready=%u handover=%u pmic=%u\n",rc,!!(m.state&2),!!(m.state&4),m.battery_up);
++ if(!adsp_cleanup())rc=EIO;
++ return rc;
++}
+--- /dev/null
++++ b/bsd/dev/battery/AdspHelpers.inc
+@@ -0,0 +1,177 @@
++/* Copied from modem runtime after 2178, adapted only in battery draft. */
++static uint64_t m_now(void){uint64_t ns;absolutetime_to_nanoseconds(mach_absolute_time(),&ns);return ns/NSEC_PER_MSEC;}
++static void m_sleep(unsigned ms){uint64_t d;clock_interval_to_deadline(ms,NSEC_PER_MSEC,&d);assert_wait_deadline(&m,THREAD_UNINT,d);thread_block(THREAD_CONTINUE_NULL);}
++static uint32_t m_rd(vm_offset_t p,unsigned o){uint32_t v=*(volatile uint32_t *)(p+o);__asm__ volatile("dmb sy":::"memory");return v;}
++static void m_wr(vm_offset_t p,unsigned o,uint32_t v){__asm__ volatile("dmb sy":::"memory");*(volatile uint32_t *)(p+o)=v;__asm__ volatile("dsb sy":::"memory");}
++static void m_ring(unsigned client,unsigned signal){m_wr(m.ipcc,0x0c,client<<16|signal);}
++static void m_qkick(void *unused){(void)unused;m_ring(0,0);}
++static void m_gkick(void *unused){(void)unused;m_ring(3,0);}
++/* Preserve the original arguments and x6 session across interrupted calls. */
++static void m_smc_raw(uint64_t r[8]){
++    register uint64_t x0 __asm__("x0")=r[0],x1 __asm__("x1")=r[1],x2 __asm__("x2")=r[2],x3 __asm__("x3")=r[3];
++    register uint64_t x4 __asm__("x4")=r[4],x5 __asm__("x5")=r[5],x6 __asm__("x6")=r[6],x7 __asm__("x7")=r[7];
++    __asm__ volatile("smc #0":"+r"(x0),"+r"(x1),"+r"(x2),"+r"(x3),"+r"(x4),"+r"(x5),"+r"(x6),"+r"(x7)::"x8","x9","x10","x11","x12","x13","x14","x15","x16","x17","cc","memory");
++    r[0]=x0;r[1]=x1;r[2]=x2;r[3]=x3;r[4]=x4;r[5]=x5;r[6]=x6;r[7]=x7;
++}
++static int m_scm(uint32_t fn,uint32_t info,uint64_t a,uint64_t b,uint64_t c,uint64_t ext,uint64_t *result){
++    for(unsigned busy=0;busy<4;busy++){
++        uint64_t function=fn,token=0;bool retry=false;
++        for(unsigned resume=0;resume<256;resume++){
++            uint64_t r[8]={function,info,a,b,c,ext,token,0};m_smc_raw(r);
++            if((int64_t)r[0]==1){function=1;token=r[6];continue;}
++            if((int64_t)r[0]==-12){retry=true;break;}
++            *result=r[1];return (int)r[0];
++        }
++        if(!retry)return ETIMEDOUT;
++        m_sleep(30);
++    }
++    return ETIMEDOUT;
++}
++static int m_pas(unsigned pas,unsigned cmd,uint32_t info,uint64_t b,uint64_t c){
++    uint64_t result=~0ull;int rc=m_scm(qcom_scm_fn(2,cmd),info,pas,b,c,0,&result);
++    printf("SWEET BATTERY: PAS%u cmd=%u status=%d result=%lld\n",pas,cmd,rc,(long long)result);sweet_log_sync();
++    /* Linux maps unrecognized SCM transport failures to -EINVAL. Its modem
++     * decrypt-shutdown poll retries that class; ast151 returned raw -3145800.
++     * Keep raw status in the log, and never normalize a failure to success. */
++    if(cmd==6 && rc<0){
++        switch(rc){
++        case -1:return -EIO;
++        case -4:return -ENOTSUP;
++        case -5:return -ENOMEM;
++        case -12:return -EBUSY;
++        default:return -EINVAL;
++        }
++    }
++    return rc?rc:(int)result;
++}
++
++static int m_vote(bool on){
++    if(!on)return EINVAL; /* never lower inherited ADSP/XO votes in this bounded probe */
++    sweet_apps_rsc_lock();int chosen=-1,rc=ENODEV;unsigned base=0;
++    for(unsigned i=0;i<3;i++){
++        unsigned t=0xd00+i*0x2a0;
++        if(m_rd(m.rsc,t+0x28) && !m_rd(m.rsc,t+0x24) && !m_rd(m.rsc,t+0x2c) && !m_rd(m.rsc,t+0x20) && !(m_rd(m.rsc,0xd04)&(1u<<i))){chosen=i;base=t;break;}
++    }
++    if(chosen<0)goto out;
++    if(on)m.votes_owed=true;
++    uint32_t bit=1u<<chosen,irq=m_rd(m.rsc,0xd00);m_wr(m.rsc,0xd00,irq&~bit);
++    unsigned count=on?3:1,mask=(1u<<count)-1;
++    for(unsigned i=0;i<count;i++){
++        unsigned rail=on?i:1; /* only the modem-specific MSS vote can go to zero */
++        uint32_t addr=rail==2?m.xo_addr:m.rail_addr[rail];
++        uint32_t value=rail==2?3:(on?m.rail_index[rail]:0);
++        m_wr(m.rsc,base+0x34+i*24,0x10108);m_wr(m.rsc,base+0x38+i*24,addr);m_wr(m.rsc,base+0x3c+i*24,value);
++    }
++    /* Retain ADSP proxy floors and shared XO until the guarded devloop reset. */
++    if(on)m.xo_pinned=true;
++    m_wr(m.rsc,base+0x20,mask);m_wr(m.rsc,base+0x2c,mask);m_wr(m.rsc,base+0x24,1u<<16);m_wr(m.rsc,base+0x24,(1u<<16)|(1u<<24));
++    rc=ETIMEDOUT;
++    for(unsigned us=0;us<100000;us++){
++        bool done=m_rd(m.rsc,base+0x28)!=0;
++        for(unsigned i=0;i<count;i++)done &= (m_rd(m.rsc,base+0x40+i*24)&0x10100)==0x10100;
++        if(done){rc=0;break;}delay(1);
++    }
++    if(!rc){m_wr(m.rsc,base+0x24,0);m_wr(m.rsc,base+0x2c,0);m_wr(m.rsc,base+0x20,0);m_wr(m.rsc,0xd08,bit);m_wr(m.rsc,0xd00,(m_rd(m.rsc,0xd00)&~bit)|(irq&bit));}
++    if(rc==ETIMEDOUT)m.vote_uncertain=true;
++    /* On timeout retain the owned TCS exactly as it is. Never reprogram it. */
++out:sweet_apps_rsc_unlock();printf("SWEET BATTERY: RPMh on=%d tcs=%d error=%d\n",on,chosen,rc);return rc;
++}
++static int m_qwait(unsigned timeout){uint64_t end=m_now()+timeout;do{int st=qcom_qmp_step(&m.qp);if(st==QcomQmpOpen)return 0;if(st<0)return EIO;m_sleep(1);}while(m_now()<end);return ETIMEDOUT;}
++static int m_qsend(bool on){
++    if(m.qp.state!=QcomQmpOpen && m_qwait(1000))return EBUSY;
++    int rc=qcom_qmp_send(&m.qp,on?"{class: image, res: load_state, name: adsp, val: on}":"{class: image, res: load_state, name: adsp, val: off}");
++    return rc==QcomQmpSending?m_qwait(1000):EIO;
++}
++static int m_item(uint16_t id,uint32_t minimum,uint32_t *off,uint32_t *bytes){
++    int rc=qcom_smem_find(&m.sm,&m.part,id,off,bytes);
++    if(rc || *bytes<minimum || *off>M_SM_SIZE || *bytes>M_SM_SIZE-*off || (*off&3))return ENOENT;
++    return 0;
++}
++static int m_alloc(uint16_t id,uint32_t bytes,uint32_t *off){
++    bool locked=false;for(unsigned us=0;us<100000;us++){m_wr(m.mutex,0,1);if(m_rd(m.mutex,0)==1){locked=true;break;}delay(1);}
++    if(!locked)return EBUSY;
++    int rc=qcom_smem_alloc(&m.sm,&m.part,id,bytes);m_wr(m.mutex,0,0);
++    uint32_t actual=0;return rc!=QcomSmemOk && rc!=QcomSmemExists?EIO:m_item(id,bytes,off,&actual);
++}
++
++static void m_smp_poll(void){
++    uint32_t off,bytes;
++    if(m_item(443,QCOM_SMP2P_ITEM_BYTES,&off,&bytes))return;
++    m.sp.in=(volatile uint32_t *)(m.smem+off);
++    uint32_t value=0,changed=0;
++    if(qcom_smp2p_service(&m.sp,"slave-kernel",&value,&changed))m_ring(3,2);
++    if(changed){m.state=value;printf("SWEET BATTERY: SMP2P slave=%#x ready=%u handover=%u stop_ack=%u\n",value,!!(value&2),!!(value&4),!!(value&8));sweet_log_sync();}
++    if(value&1)m.fatal=true;
++}
++
++static int m_qsend_packet(void *context,const uint8_t *data,uint32_t length){
++    (void)context;if(length>512 || m.qcount==M_TX_COUNT){m.failed=true;return -1;}
++    unsigned i=(m.qhead+m.qcount)%M_TX_COUNT;m.queue[i].len=length;memcpy(m.queue[i].data,data,length);m.qcount++;return 0;
++}
++
++static void m_pd_receive(void *ctx,QcomQrtr *qr,uint32_t port,uint32_t node,uint32_t from,const uint8_t *data,uint32_t len){
++    (void)ctx;static const QcomPdDomain domains[]={{"msm/adsp/root_pd",74,0},{"msm/adsp/charger_pd",74,0}};
++    uint8_t answer[480];uint32_t n=qcom_servloc_answer(domains,2,data,len,answer,sizeof(answer));
++    if(n)qcom_qrtr_send_data(qr,port,node,from,answer,n);
++    printf("SWEET BATTERY: pd-mapper response=%u\n",n);
++}
++
++static void m_greceive(void *ctx,QcomGlinkChannel *ch,const uint8_t *data,uint32_t len){
++    (void)ctx;(void)ch;
++    if(qcom_qrtr_receive(&m.qr,data,len)){printf("SWEET BATTERY: invalid QRTR packet\n");return;}
++    if(len>=52 && le32(data+4)==QCOM_QRTR_NEW_LOOKUP)
++        printf("SWEET BATTERY: QRTR NEW_LOOKUP service=%#x\n",le32(data+36));
++    if(len>=52 && le32(data+4)==QCOM_QRTR_NEW_SERVER && le32(data+20)>=20)
++        printf("SWEET BATTERY: QRTR NEW_SERVER service=%#x instance=%#x node=%u port=%u\n",le32(data+36),le32(data+40),le32(data+44),le32(data+48));
++}
++static void m_gstate(void *ctx,QcomGlinkChannel *ch,int up){(void)ctx;(void)ch;printf("SWEET BATTERY: GLINK adsp/IPCRTR up=%d\n",up);if(!up)m.failed=true;}
++
++static int m_glink_prepare(void){
++    uint32_t desc,tx,bytes;
++    if(m_alloc(478,16,&desc) || m_alloc(479,M_FIFO,&tx))return EIO;
++    volatile uint32_t *d=(volatile uint32_t *)(m.smem+desc);
++    QcomGlinkFifo tf={d+1,d,(volatile uint8_t *)(m.smem+tx),M_FIFO},rf={d+3,d+2,0,0};
++    qcom_glink_init(&m.gl,tf,rf,m_gkick,0);
++    static const QcomGlinkClient client={m_gstate,m_greceive};
++    m.channel=qcom_glink_channel(&m.gl,"IPCRTR",M_RX_SIZE,8,m.rx,&client,0,1);
++    qcom_qrtr_init(&m.qr,1,m_qsend_packet,0);
++    if(qcom_qrtr_add_service(&m.qr,64,0x101,0x4001,m_pd_receive,0))return EIO;
++    if(!m_item(480,32,&m.rxoff,&bytes) && bytes<=0x100000 && !(bytes&7))qcom_glink_set_rx(&m.gl,(volatile uint8_t *)(m.smem+m.rxoff),bytes);
++    static const QcomGlinkClient battery_client={m_bstate,m_breceive};
++    m.battery=qcom_glink_channel(&m.gl,"PMIC_RTR_ADSP_APPS",512,4,m.brx,&battery_client,0,1);
++    return m.channel && m.battery?0:ENOMEM;
++}
++static void m_ipc_poll(void){
++    if(!m.gl.rx.data){uint32_t off,bytes;if(!m_item(480,32,&off,&bytes) && bytes<=0x100000 && !(bytes&7))qcom_glink_set_rx(&m.gl,(volatile uint8_t *)(m.smem+off),bytes);}
++    qcom_glink_poll(&m.gl);
++    if(m.channel->up && !m.qr_started){qcom_qrtr_start(&m.qr);m.qr_started=true;}
++    while(m.qcount && m.channel->up){
++        int rc=qcom_glink_send(&m.gl,m.channel,m.queue[m.qhead].data,m.queue[m.qhead].len);
++        if(rc==QcomGlinkAgain)break;if(rc){m.failed=true;break;}m.qhead=(m.qhead+1)%M_TX_COUNT;m.qcount--;
++    }
++    if(m.gl.broken)m.failed=true;
++}
++
++static int m_power_inspect(void){
++    static uint8_t dbcopy[0x20000];
++    for(unsigned i=0;i<sizeof(dbcopy);i+=4){uint32_t v=m_rd(m.db,i);memcpy(dbcopy+i,&v,4);}
++    printf("SWEET BATTERY: cmd-db version=%#x magic=%#x\n",le32(dbcopy),le32(dbcopy+4));
++    int error=0;static const char *const rails[]={"lcx.lvl","lmx.lvl","xo.lvl"};
++    for(unsigned i=0;i<3;i++){
++        QcomRpmhResource r={0};int rc=qcom_cmd_db_find(dbcopy,sizeof(dbcopy),rails[i],&r);
++        printf("SWEET BATTERY: resource=%s lookup=%d address=%#x levels=%u aux_bytes=%u\n",rails[i],rc,r.address,r.level_count,r.aux_bytes);
++        if(!rc)for(unsigned j=0;j<r.level_count;j++)printf("SWEET BATTERY: resource=%s index=%u level=%u\n",rails[i],j,r.levels[j]);
++        if(rc || !r.address){error=EINVAL;continue;}
++        if(i==2){m.xo_addr=r.address;continue;}
++        /* Linux rpmhpd clamps a requested level above the table to its maximum.
++         * A short but complete table is valid; never silently truncate a longer one. */
++        bool valid=r.level_count>=2 && r.levels[0]==0 && r.aux_bytes &&
++            !(r.aux_bytes&1) && r.aux_bytes<=sizeof(r.levels);
++        for(unsigned j=1;valid && j<r.level_count;j++)valid=r.levels[j]>=r.levels[j-1] && r.levels[j]!=0;
++        if(!valid || qcom_rpmh_level_index(&r,384,&m.rail_index[i])){error=EINVAL;continue;}
++        printf("SWEET BATTERY: resource=%s request=384 bounded_index=%u floor_index=%u\n",rails[i],m.rail_index[i],r.level_count-1);
++        m.rail_addr[i]=r.address;m.rail_index[i]=r.level_count-1;
++    }
++    if(m.xo_addr==m.rail_addr[0] || m.xo_addr==m.rail_addr[1] || m.rail_addr[0]==m.rail_addr[1])error=EINVAL;
++    sweet_log_sync();return error;
++}
+--- /dev/null
++++ b/bsd/dev/battery/AdspFirmware.inc
+@@ -0,0 +1,327 @@
++/* FAT16 and split MDT reader copied from sweet_modem.c after 2178.
++ * Read-only callback, bounded to modem_a. No hardware operations here.
++ */
++#ifdef ADSP_HOST_TEST
++#include <stdint.h>
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdio.h>
++#include <string.h>
++#include <errno.h>
++#define MIN(a,b) ((a)<(b)?(a):(b))
++#else
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#endif
++static uint64_t adsp_partition_bytes;
++static int adsp_part_read(uint64_t off,void *dst,uint64_t length);
++static int adsp_read(const char *part,uint64_t off,void *dst,uint64_t length){
++    if(strcmp(part,"modem_a") || off>adsp_partition_bytes || length>adsp_partition_bytes-off)return EINVAL;
++    return adsp_part_read(off,dst,length);
++}
++#define WL_PART_READ(p,o,d,l) adsp_read((p),(o),(d),(l))
++#define FAT_BUF_MAX     65536u
++#define DIR_BUF_MAX     131072u
++
++struct wl_fat {
++	const char *part;
++	uint32_t bps, spc, reserved, nfats, rootent, fatsz, ncl;
++	uint64_t fat_off, root_off, data_off, cl_bytes;
++};
++
++static uint8_t wl_fatbuf[FAT_BUF_MAX];
++static uint8_t wl_dirbuf[DIR_BUF_MAX];
++
++static uint32_t
++le16(const uint8_t *p)
++{
++	return (uint32_t)p[0] | ((uint32_t)p[1] << 8);
++}
++
++static uint32_t
++le32(const uint8_t *p)
++{
++	return le16(p) | (le16(p + 2) << 16);
++}
++
++static int
++fat_mount(struct wl_fat *f, const char *part)
++{
++	uint8_t b[512];
++	int err = WL_PART_READ(part, 0, b, sizeof(b));
++	if (err) {
++		return err;
++	}
++	if (b[510] != 0x55 || b[511] != 0xaa) {
++		return ENXIO;
++	}
++	f->part = part;
++	f->bps = le16(b + 11);
++	f->spc = b[13];
++	f->reserved = le16(b + 14);
++	f->nfats = b[16];
++	f->rootent = le16(b + 17);
++	uint32_t total = le16(b + 19) ? le16(b + 19) : le32(b + 32);
++	f->fatsz = le16(b + 22);
++	if (f->bps < 512 || f->bps > 4096 || (f->bps & (f->bps - 1)) || f->spc == 0 ||
++	    (f->spc & (f->spc - 1)) || f->nfats == 0 || f->nfats > 2 || f->rootent == 0 ||
++	    f->fatsz == 0 || (uint64_t)f->fatsz * f->bps > FAT_BUF_MAX || f->reserved == 0) {
++		return ENXIO;       /* not FAT12/16 */
++	}
++	f->fat_off = (uint64_t)f->reserved * f->bps;
++	f->root_off = f->fat_off + (uint64_t)f->nfats * f->fatsz * f->bps;
++	uint32_t root_sectors = (f->rootent * 32u + f->bps - 1) / f->bps;
++	f->data_off = f->root_off + (uint64_t)root_sectors * f->bps;
++	f->cl_bytes = (uint64_t)f->spc * f->bps;
++	if (f->data_off > (uint64_t)total * f->bps ||
++	    (uint64_t)total * f->bps > adsp_partition_bytes) return EINVAL;
++	uint32_t data_sectors = total - (uint32_t)(f->data_off / f->bps);
++	f->ncl = data_sectors / f->spc;
++	if (f->ncl < 4085 || f->ncl > 65518 || (uint64_t)(f->ncl + 2) * 2 > (uint64_t)f->fatsz * f->bps) {
++		return ENXIO;       /* FAT12 or FAT32 */
++	}
++	return WL_PART_READ(part, f->fat_off, wl_fatbuf, (uint64_t)f->fatsz * f->bps);
++}
++
++static uint32_t
++fat_next(const struct wl_fat *f, uint32_t cl)
++{
++	if (cl < 2 || cl >= f->ncl + 2 || (cl * 2 + 1) >= (uint64_t)f->fatsz * f->bps) {
++		return 0xffff;
++	}
++	return le16(wl_fatbuf + cl * 2);
++}
++
++static int
++fat_read_chain(const struct wl_fat *f, uint32_t cl, uint64_t off, void *dst, uint64_t len)
++{
++	uint8_t *out = (uint8_t *)dst;
++	uint32_t guard = 0;
++	while (off >= f->cl_bytes) {
++		cl = fat_next(f, cl);
++		off -= f->cl_bytes;
++		if (cl < 2 || cl >= f->ncl + 2 || cl >= 0xfff0 || ++guard > f->ncl) {
++			return EIO;
++		}
++	}
++	while (len) {
++		if (cl < 2 || cl >= f->ncl + 2 || cl >= 0xfff0 || ++guard > f->ncl + 1) {
++			return EIO;
++		}
++		uint64_t n = MIN(len, f->cl_bytes - off);
++		int err = WL_PART_READ(f->part, f->data_off + (uint64_t)(cl - 2) * f->cl_bytes + off, out, n);
++		if (err) {
++			return err;
++		}
++		out += n;
++		len -= n;
++		off = 0;
++		if (len) {
++			cl = fat_next(f, cl);
++		}
++	}
++	return 0;
++}
++
++/* Load a directory (cl == 0: root) into wl_dirbuf; returns the entry count. */
++static int
++fat_dir_load(const struct wl_fat *f, uint32_t cl, uint32_t *nent)
++{
++	if (cl == 0) {
++		uint64_t bytes = (uint64_t)f->rootent * 32;
++		if (bytes > DIR_BUF_MAX) {
++			return EFBIG;
++		}
++		*nent = f->rootent;
++		return WL_PART_READ(f->part, f->root_off, wl_dirbuf, bytes);
++	}
++	uint32_t n = 0, guard = 0;
++	while (cl < 0xfff8) {
++		if (cl < 2 || cl >= f->ncl + 2 || cl >= 0xfff0 || ++guard > f->ncl) return EIO;
++		if ((uint64_t)(n + 1) * f->cl_bytes > DIR_BUF_MAX) {
++			return EFBIG;
++		}
++		int err = WL_PART_READ(f->part, f->data_off + (uint64_t)(cl - 2) * f->cl_bytes,
++		    wl_dirbuf + (uint64_t)n * f->cl_bytes, f->cl_bytes);
++		if (err) {
++			return err;
++		}
++		n++;
++		cl = fat_next(f, cl);
++	}
++	*nent = (uint32_t)((uint64_t)n * f->cl_bytes / 32);
++	return 0;
++}
++
++static void
++fat_83(const char *name, size_t n, char out[11])
++{
++	size_t i = 0, o = 0;
++	memset(out, ' ', 11);
++	for (; i < n && name[i] != '.' && o < 8; i++, o++) {
++		out[o] = (name[i] >= 'a' && name[i] <= 'z') ? (char)(name[i] - 32) : name[i];
++	}
++	if (i < n && name[i] == '.') {
++		i++;
++	}
++	for (o = 8; i < n && o < 11; i++, o++) {
++		out[o] = (name[i] >= 'a' && name[i] <= 'z') ? (char)(name[i] - 32) : name[i];
++	}
++}
++
++/* Only plain 8.3 names (all firmware files here are); long names never match. */
++/* modem names fit one VFAT slot; reject longer names rather than guess aliases. */
++static bool
++fat_lfn_match(const uint8_t *e, const char *name, size_t n)
++{
++    static const uint8_t at[13] = {1,3,5,7,9,14,16,18,20,22,24,28,30};
++    if (e[0] != 0x41 || e[12] || le16(e + 26) || n > 13) return false;
++    for (unsigned i = 0; i < 13; i++) {
++        uint32_t c = le16(e + at[i]);
++        if (i < n) {
++            uint8_t want = (uint8_t)name[i];
++            if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
++            if (want >= 'A' && want <= 'Z') want += 'a' - 'A';
++            if (c != want) return false;
++        } else if (c != (i == n ? 0 : 0xffff)) return false;
++    }
++    return true;
++}
++
++static int
++fat_find(const uint8_t *dir, uint32_t nent, const char *name, size_t n,
++    uint32_t *cluster, uint32_t *size, bool *is_dir)
++{
++	char want[11];
++	fat_83(name, n, want);
++	bool lfn = false;
++	uint8_t checksum = 0;
++	for (uint32_t i = 0; i < nent; i++) {
++		const uint8_t *e = dir + (uint64_t)i * 32;
++		if (e[0] == 0) {
++			break;
++		}
++        if (e[0] == 0xe5) { lfn = false; continue; }
++        if (e[11] == 0x0f) {
++            lfn = fat_lfn_match(e, name, n); checksum = e[13]; continue;
++        }
++        uint8_t sum = 0;
++        for (unsigned j = 0; j < 11; j++) sum = (uint8_t)((sum >> 1) | (sum << 7)) + e[j];
++        bool match = (lfn && sum == checksum) || memcmp(e, want, 11) == 0;
++        lfn = false;
++        if (e[11] & 0x08) continue;
++        if (match) {
++			*cluster = le16(e + 26);
++			*size = le32(e + 28);
++			*is_dir = (e[11] & 0x10) != 0;
++			return 0;
++		}
++	}
++	return ENOENT;
++}
++
++/* A file must occupy exactly its required chain, ending at EOC. */
++static int
++fat_validate_file(const struct wl_fat *f, uint32_t cl, uint32_t size)
++{
++    static uint8_t seen[8192];
++    memset(seen, 0, sizeof(seen));
++    uint64_t count = ((uint64_t)size + f->cl_bytes - 1) / f->cl_bytes;
++    if (!count) return cl == 0 ? 0 : EIO;
++    if (count > f->ncl) return EIO;
++    for (uint64_t i = 0; i < count; i++) {
++        if (cl < 2 || cl >= f->ncl + 2 || cl >= 0xfff0 || (seen[cl / 8] & (1u << (cl % 8)))) return EIO;
++        seen[cl / 8] |= 1u << (cl % 8);
++        cl = fat_next(f, cl);
++    }
++    return cl >= 0xfff8 ? 0 : EIO;
++}
++
++/* "image/mba.mbn" style path, one directory level at a time. */
++static int
++fat_open(const struct wl_fat *f, const char *path, uint32_t *cluster, uint32_t *size)
++{
++	uint32_t cl = 0, nent = 0, sz = 0;
++	bool dir = true;
++	const char *p = path;
++	while (*p) {
++		const char *s = p;
++		while (*p && *p != '/') {
++			p++;
++		}
++		if (!dir) {
++			return ENOTDIR;
++		}
++		int err = fat_dir_load(f, cl, &nent);
++		if (err) {
++			return err;
++		}
++		err = fat_find(wl_dirbuf, nent, s, (size_t)(p - s), &cl, &sz, &dir);
++		if (err) {
++			return err;
++		}
++		if (dir && (cl < 2 || cl >= f->ncl + 2)) return EIO;
++		if (*p == '/') {
++			p++;
++		}
++	}
++	if (dir) return EISDIR;
++	int chain_error = fat_validate_file(f, cl, sz);
++	if (chain_error) return chain_error;
++	*cluster = cl;
++	*size = sz;
++	return 0;
++}
++
++
++static int
++adsp_mdt(const uint8_t *b, uint32_t len, const struct wl_fat *f, const char *stem, uint64_t carveout)
++{
++    if (len < 52 || memcmp(b, "\177ELF", 4) || b[4] != 1 || b[5] != 1 ||
++        b[6] != 1 || le32(b + 20) != 1 || le16(b + 40) != 52 ||
++        le16(b + 42) != 32) return EINVAL;
++    uint32_t off = le32(b + 28), count = le16(b + 44);
++    if (!count || count > 64 || off < 52 || off > len || count > (len - off) / 32) return EINVAL;
++    unsigned machine=!strcmp(stem,"adsp")?164:!strcmp(stem,"adsp_dtb")?1:0;
++    if (!machine || le16(b+16)!=2 || le16(b+18)!=machine) return EINVAL;
++    const uint8_t *first=b+off;
++    uint32_t header=off+count*32, hash_bytes=0;
++    if (le32(first)!=0 || le32(first+4)!=0 || le32(first+16)!=header) return EINVAL;
++    uint64_t lo = UINT64_MAX, hi = 0, bytes = 0;
++    unsigned loads = 0, hashes = 0;
++    for (unsigned i = 0; i < count; i++) {
++        const uint8_t *p = b + off + i * 32;
++        uint32_t flags = le32(p + 24), size = le32(p + 16), mem = le32(p + 20);
++        uint64_t addr = le32(p + 12);
++        if ((flags & (7u << 24)) == (2u << 24)) { if (le32(p)!=0) return EINVAL; hash_bytes=size; hashes++; continue; }
++        if (le32(p) != 1) continue;
++        if (!mem) { if (size) return EINVAL; continue; }
++        if (!(flags & (1u << 27)) || size > mem || addr + mem > 0x100000000ull) return EINVAL;
++        for (unsigned j = 0; j < i; j++) {
++            const uint8_t *q = b + off + j * 32;
++            uint64_t qa = le32(q + 12), qm = le32(q + 20);
++            if (le32(q) == 1 && qm && (le32(q + 24) & (7u << 24)) != (2u << 24) &&
++                addr < qa + qm && qa < addr + mem) return EINVAL;
++        }
++        if (size) {
++            char name[32]; uint32_t cl, actual;
++            snprintf(name, sizeof(name), "image/%s.b%02u", stem, i);
++            int err = fat_open(f, name, &cl, &actual);
++            if (err) return err;
++            if (actual != size) return EINVAL;
++            /* Prove the chain reaches the last byte, without loading firmware. */
++            uint8_t last;
++            err = fat_read_chain(f, cl, size - 1, &last, 1);
++            if (err) return err;
++        }
++        if (addr < lo) lo = addr;
++        if (addr + mem > hi) hi = addr + mem;
++        bytes += size; loads++;
++    }
++    if (!hash_bytes || header>len || hash_bytes!=len-header || !loads || hashes != 1 || (lo & 4095) || ((hi + 4095) & ~4095ull) - lo > carveout) return EINVAL;
++    printf("SWEET BATTERY: firmware preflight PASS loads=%u bytes=%llu span=%#llx\n",
++        loads, (unsigned long long)bytes, (unsigned long long)(((hi + 4095) & ~4095ull) - lo));
++    return 0;
++}
++
+--- /dev/null
++++ b/bsd/dev/battery/QcomGlink.c
+@@ -0,0 +1,465 @@
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(MODEM_PROTOCOL_HOST_TEST)
++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
++#include "QcomGlink.h"
++
++/* The sender keeps 8 bytes so a full FIFO never looks empty, and 16 more for a READ_NOTIF when it runs out of room. */
++#define FULL_RESERVE 8u
++#define BLOCKED_RESERVE 16u
++#define GLINK_VERSION_1 1u
++
++static void barrier(void)
++{
++#if defined(__aarch64__) && defined(KERNEL)
++    __asm__ volatile("dmb osh" ::: "memory");
++#endif
++}
++static uint32_t align8(uint32_t v) {return (v + 7u) & ~7u;}
++static uint32_t le32(const uint8_t *p) {return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;}
++static void put32(uint8_t *p, uint32_t v) {p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);}
++static size_t name_length(const char *s) {size_t n = 0; while (n < QCOM_GLINK_NAME - 1 && s[n]) ++n; return n;}
++
++uint32_t qcom_glink_rx_avail(const QcomGlinkFifo *f)
++{
++    if (!f->data || !f->length) return 0;
++    const uint32_t head = *f->head, tail = *f->tail;
++    if (head >= f->length || tail >= f->length) return 0;
++    return head >= tail ? head - tail : f->length - tail + head;
++}
++
++uint32_t qcom_glink_tx_avail(const QcomGlinkFifo *f)
++{
++    const uint32_t head = *f->head, tail = *f->tail;
++    if (head >= f->length || tail >= f->length) return 0;
++    const uint32_t avail = tail <= head ? f->length - head + tail : tail - head;
++    return avail < FULL_RESERVE + BLOCKED_RESERVE ? 0 : avail - FULL_RESERVE - BLOCKED_RESERVE;
++}
++
++static void rx_peek(const QcomGlinkFifo *f, uint32_t offset, uint8_t *to, uint32_t count)
++{
++    uint32_t at = *f->tail + offset;
++    if (at >= f->length) at -= f->length;
++    for (uint32_t i = 0; i < count; ++i) {
++        to[i] = f->data[at];
++        if (++at == f->length) at = 0;
++    }
++}
++
++static void rx_advance(QcomGlinkFifo *f, uint32_t count)
++{
++    uint32_t tail = *f->tail + count;
++    if (tail >= f->length) tail -= f->length;
++    barrier();
++    *f->tail = tail;
++}
++
++/* Writes header and payload as one message (padded to 8 bytes); the caller checked the room. */
++static void tx_write(QcomGlink *g, const uint8_t *header, uint32_t header_length, const uint8_t *data, uint32_t data_length)
++{
++    QcomGlinkFifo *f = &g->tx;
++    uint32_t head = *f->head;
++    for (uint32_t i = 0; i < header_length; ++i) {f->data[head] = header[i]; if (++head == f->length) head = 0;}
++    for (uint32_t i = 0; i < data_length; ++i) {f->data[head] = data[i]; if (++head == f->length) head = 0;}
++    head = align8(head);
++    if (head >= f->length) head -= f->length;
++    barrier();
++    *f->head = head;
++    g->tx_messages++;
++    g->kick_pending = 1;
++}
++
++static int tx(QcomGlink *g, const uint8_t *header, uint32_t header_length, const uint8_t *data, uint32_t data_length)
++{
++    if (g->tx.length < 32 || header_length > g->tx.length - 8 ||
++        data_length > g->tx.length - 8 - header_length) return QcomGlinkTooBig;
++    if (align8(header_length + data_length) > qcom_glink_tx_avail(&g->tx)) return QcomGlinkAgain;
++    tx_write(g, header, header_length, data, data_length);
++    return QcomGlinkOk;
++}
++
++static int command(QcomGlink *g, uint16_t cmd, uint16_t param1, uint32_t param2)
++{
++    uint8_t m[8];
++    m[0] = (uint8_t)cmd; m[1] = (uint8_t)(cmd >> 8); m[2] = (uint8_t)param1; m[3] = (uint8_t)(param1 >> 8);
++    put32(m + 4, param2);
++    return tx(g, m, 8, 0, 0);
++}
++
++void qcom_glink_init(QcomGlink *g, QcomGlinkFifo txf, QcomGlinkFifo rxf, void (*kick)(void *), void *kick_context)
++{
++    for (size_t i = 0; i < sizeof *g; ++i) ((uint8_t *)g)[i] = 0;
++    g->tx = txf;
++    g->rx = rxf;
++    g->kick = kick;
++    g->kick_context = kick_context;
++    g->features = QCOM_GLINK_FEATURE_INTENT_REUSE;
++    g->next_lcid = 1;
++    *g->tx.head = 0;
++    *g->rx.tail = 0;
++    barrier();
++}
++
++void qcom_glink_set_rx(QcomGlink *g, volatile uint8_t *data, uint32_t length)
++{
++    g->rx.data = data;
++    g->rx.length = length;
++}
++
++QcomGlinkChannel *qcom_glink_channel(QcomGlink *g, const char *name, uint32_t intent_size, uint32_t intent_count, uint8_t *storage,
++                                     const QcomGlinkClient *client, void *context, int open_now)
++{
++    if (!name || !client || intent_count > QCOM_GLINK_MAX_LOCAL_INTENTS || (intent_count && (!storage || !intent_size))) return 0;
++    for (unsigned i = 0; i < QCOM_GLINK_MAX_CHANNELS; ++i) {
++        QcomGlinkChannel *c = &g->channel[i];
++        if (c->used) continue;
++        for (size_t b = 0; b < sizeof *c; ++b) ((uint8_t *)c)[b] = 0;
++        const size_t n = name_length(name);
++        for (size_t b = 0; b < n; ++b) c->name[b] = name[b];
++        c->used = 1;
++        c->lcid = g->next_lcid++;
++        c->client = *client;
++        c->context = context;
++        c->storage = storage;
++        c->intent_size = intent_size;
++        c->intent_count = intent_count;
++        c->initiator = open_now != 0;
++        c->open_sent = open_now ? 0 : 2;  /* 2: wait for the remote's OPEN before sending ours */
++        return c;
++    }
++    return 0;
++}
++
++static QcomGlinkChannel *by_lcid(QcomGlink *g, uint32_t lcid)
++{
++    for (unsigned i = 0; i < QCOM_GLINK_MAX_CHANNELS; ++i)
++        if (g->channel[i].used && g->channel[i].lcid == lcid) return &g->channel[i];
++    return 0;
++}
++static QcomGlinkChannel *by_rcid(QcomGlink *g, uint32_t rcid)
++{
++    for (unsigned i = 0; i < QCOM_GLINK_MAX_CHANNELS; ++i)
++        if (g->channel[i].used && g->channel[i].remote_open && g->channel[i].rcid == rcid) return &g->channel[i];
++    return 0;
++}
++
++static int send_open(QcomGlink *g, QcomGlinkChannel *c)
++{
++    uint8_t m[8];
++    const uint32_t n = (uint32_t)name_length(c->name) + 1;
++    m[0] = QCOM_GLINK_OPEN; m[1] = 0; m[2] = (uint8_t)c->lcid; m[3] = (uint8_t)(c->lcid >> 8);
++    put32(m + 4, n);
++    if (align8(8 + n) > qcom_glink_tx_avail(&g->tx)) return QcomGlinkAgain;
++    tx_write(g, m, 8, (const uint8_t *)c->name, n);
++    c->open_sent = 1;
++    return QcomGlinkOk;
++}
++
++static int advertise(QcomGlink *g, QcomGlinkChannel *c, unsigned index)
++{
++    uint8_t m[16];
++    m[0] = QCOM_GLINK_INTENT; m[1] = 0; m[2] = (uint8_t)c->lcid; m[3] = (uint8_t)(c->lcid >> 8);
++    put32(m + 4, 1);
++    put32(m + 8, c->intent_size);
++    put32(m + 12, index + 1);
++    const int rc = tx(g, m, 16, 0, 0);
++    if (!rc) {c->local[index].advertised = 1; c->local[index].fill = 0;}
++    return rc;
++}
++
++static void reset_channel(QcomGlinkChannel *c)
++{
++    c->open_acked = c->remote_open = c->up = c->intent_asked = 0;
++    c->open_sent = c->initiator ? 0 : 2;
++    for (unsigned i = 0; i < QCOM_GLINK_MAX_LOCAL_INTENTS; ++i) c->local[i].advertised = c->local[i].busy = 0, c->local[i].fill = 0;
++    for (unsigned i = 0; i < QCOM_GLINK_MAX_REMOTE_INTENTS; ++i) c->remote[i].valid = 0;
++}
++
++/* Channel bring-up and our intents: whatever is due and fits in the FIFO now. */
++static void progress(QcomGlink *g)
++{
++    if (!g->version_sent) {
++        if (command(g, QCOM_GLINK_VERSION, GLINK_VERSION_1, g->features)) return;
++        g->version_sent = 1;
++    }
++    if (!g->version_agreed) return;
++    for (unsigned i = 0; i < QCOM_GLINK_MAX_CHANNELS; ++i) {
++        QcomGlinkChannel *c = &g->channel[i];
++        if (!c->used) continue;
++        if (c->open_sent == 0 || (c->open_sent == 2 && c->remote_open)) {
++            if (send_open(g, c)) return;
++        }
++        if (c->open_sent == 1 && c->open_acked && c->remote_open && !c->up) {
++            for (unsigned k = 0; k < c->intent_count; ++k)
++                if (!c->local[k].advertised && advertise(g, c, k)) return;
++            c->up = 1;
++            if (c->client.state) c->client.state(c->context, c, 1);
++        }
++        if (c->up) {
++            for (unsigned k = 0; k < c->intent_count; ++k) {
++                /* busy means delivered once, completion still owed. Do not reuse early. */
++                if (c->local[k].busy) {
++                    const int reuse = (g->features & QCOM_GLINK_FEATURE_INTENT_REUSE) != 0;
++                    if (command(g, reuse ? QCOM_GLINK_RX_DONE_W_REUSE : QCOM_GLINK_RX_DONE, c->lcid, k + 1)) return;
++                    c->local[k].busy = 0;
++                    c->local[k].fill = 0;
++                    if (!reuse) c->local[k].advertised = 0;
++                }
++                if (!c->local[k].advertised && advertise(g, c, k)) return;
++            }
++        }
++    }
++}
++
++static int handle_data(QcomGlink *g, uint16_t cmd, uint32_t rcid, uint32_t liid, uint32_t avail)
++{
++    uint8_t h[16];
++    if (avail < 16) return 0;
++    rx_peek(&g->rx, 0, h, 16);
++    const uint32_t chunk = le32(h + 8), left = le32(h + 12);
++    if (g->rx.length < 32 || chunk > g->rx.length - 24) return QcomGlinkCorrupt;
++    if (avail < align8(16 + chunk)) return 0;  /* not all there yet */
++    QcomGlinkChannel *c = by_rcid(g, rcid);
++    const unsigned index = liid - 1;
++    if (!c || !liid || index >= c->intent_count || !c->local[index].advertised) {
++        g->dropped++;
++    } else {
++        if (c->local[index].busy) return QcomGlinkCorrupt;
++        uint32_t fill = cmd == QCOM_GLINK_TX_DATA ? 0 : c->local[index].fill;
++        if ((uint64_t)fill + chunk + left > c->intent_size) {
++            g->dropped++;
++            fill = 0;
++        } else {
++            rx_peek(&g->rx, 16, c->storage + (size_t)index * c->intent_size + fill, chunk);
++            fill += chunk;
++            if (!left) {
++                c->local[index].busy = 1;
++                g->rx_data++;
++                if (c->client.receive) c->client.receive(c->context, c, c->storage + (size_t)index * c->intent_size, fill);
++                /* progress retries RX_DONE after FIFO backpressure. The client was called once. */
++                fill = 0;
++            }
++        }
++        c->local[index].fill = fill;
++    }
++    rx_advance(&g->rx, align8(16 + chunk));
++    return 1;
++}
++
++/* One message at the FIFO tail: 1 handled, 0 incomplete (wait for more), negative on a broken stream. */
++
++/* Adds name to the list of opens nobody serves unless it is there already or does not fit. */
++static void note_unknown(QcomGlink *g, const char *name)
++{
++    char *list = g->unknown_names;
++    const unsigned cap = sizeof g->unknown_names;
++    unsigned n = 0, used = 0;
++    while (n < QCOM_GLINK_NAME && name[n]) ++n;
++    while (used < cap && list[used]) ++used;
++    for (unsigned at = 0; at < used;) {
++        unsigned end = at;
++        while (end < used && list[end] != ' ') ++end;
++        unsigned same = end - at == n;
++        for (unsigned b = 0; same && b < n; ++b) same = list[at + b] == name[b];
++        if (same) return;
++        at = end + 1;
++    }
++    if (!n || used + (used ? 1 : 0) + n + 1 > cap) return;
++    if (used) list[used++] = ' ';
++    for (unsigned b = 0; b < n; ++b) list[used++] = name[b];
++    list[used] = 0;
++}
++static int receive_one(QcomGlink *g)
++{
++    const uint32_t avail = qcom_glink_rx_avail(&g->rx);
++    uint8_t m[8];
++    if (avail < 8) return 0;
++    rx_peek(&g->rx, 0, m, 8);
++    const uint16_t cmd = (uint16_t)(m[0] | m[1] << 8), param1 = (uint16_t)(m[2] | m[3] << 8);
++    const uint32_t param2 = le32(m + 4);
++    QcomGlinkChannel *c;
++    switch (cmd) {
++    case QCOM_GLINK_VERSION:
++        if (param1 == GLINK_VERSION_1) g->features &= param2;
++        if (param1 && command(g, QCOM_GLINK_VERSION_ACK, GLINK_VERSION_1, g->features)) return 0;
++        g->version_agreed = param1 != 0;
++        break;
++    case QCOM_GLINK_VERSION_ACK:
++        if (param1 == GLINK_VERSION_1 && param2 != g->features) {
++            g->features &= param2;
++            if (command(g, QCOM_GLINK_VERSION, GLINK_VERSION_1, g->features)) return 0;
++        }
++        g->version_agreed = param1 != 0;
++        break;
++    case QCOM_GLINK_OPEN: {
++        const uint32_t n = param2 & 0xffff;
++        if (g->rx.length < 24 || n > g->rx.length - 16 || n == 0) return QcomGlinkCorrupt;
++        if (avail < align8(8 + n)) return 0;
++        char name[QCOM_GLINK_NAME] = {0};
++        rx_peek(&g->rx, 8, (uint8_t *)name, n < QCOM_GLINK_NAME ? n : QCOM_GLINK_NAME - 1);
++        name[QCOM_GLINK_NAME - 1] = 0;
++        c = 0;
++        for (unsigned i = 0; i < QCOM_GLINK_MAX_CHANNELS && !c; ++i) {
++            QcomGlinkChannel *k = &g->channel[i];
++            unsigned same = k->used;
++            for (unsigned b = 0; same && b < QCOM_GLINK_NAME; ++b) {
++                if (k->name[b] != name[b]) same = 0;
++                if (!name[b]) break;
++            }
++            if (same) c = k;
++        }
++        if (!c) {
++            g->unknown_opens++;
++            for (unsigned b = 0; b < QCOM_GLINK_NAME; ++b) g->last_unknown[b] = name[b];
++            note_unknown(g, name);
++        } else {
++            if (c->remote_open && c->up && c->client.state) c->client.state(c->context, c, 0);
++            if (c->remote_open) reset_channel(c);
++            if (command(g, QCOM_GLINK_OPEN_ACK, param1, 0)) return 0;
++            c->rcid = param1;
++            c->remote_open = 1;
++        }
++        rx_advance(&g->rx, align8(8 + n));
++        g->rx_messages++;
++        return 1;
++    }
++    case QCOM_GLINK_OPEN_ACK:
++        if ((c = by_lcid(g, param1)) && c->open_sent == 1) c->open_acked = 1;
++        break;
++    case QCOM_GLINK_CLOSE:
++        if (command(g, QCOM_GLINK_CLOSE_ACK, param1, 0)) return 0;
++        if ((c = by_rcid(g, param1))) {
++            const int was = c->up;
++            if (c->open_sent == 1 && command(g, QCOM_GLINK_CLOSE, c->lcid, 0)) return 0;
++            reset_channel(c);
++            if (was && c->client.state) c->client.state(c->context, c, 0);
++        }
++        break;
++    case QCOM_GLINK_CLOSE_ACK:
++        break;
++    case QCOM_GLINK_INTENT: {
++        if (param2 > (g->rx.length - 8) / 8) return QcomGlinkCorrupt;
++        const uint32_t bytes = 8 + 8 * param2;
++        if (avail < bytes) return 0;
++        c = by_rcid(g, param1);
++        for (uint32_t i = 0; i < param2; ++i) {
++            uint8_t pair[8];
++            rx_peek(&g->rx, 8 + 8 * i, pair, 8);
++            if (!c) continue;
++            unsigned slot = QCOM_GLINK_MAX_REMOTE_INTENTS;
++            for (unsigned k = 0; k < QCOM_GLINK_MAX_REMOTE_INTENTS; ++k)
++                if (!c->remote[k].valid) {slot = k; break;}
++            /* Full: a larger intent (the one a send asked for) replaces the smallest idle one, so it is never lost. */
++            if (slot == QCOM_GLINK_MAX_REMOTE_INTENTS)
++                for (unsigned k = 0; k < QCOM_GLINK_MAX_REMOTE_INTENTS; ++k)
++                    if (!c->remote[k].busy && c->remote[k].size < le32(pair) &&
++                        (slot == QCOM_GLINK_MAX_REMOTE_INTENTS || c->remote[k].size < c->remote[slot].size)) slot = k;
++            if (slot == QCOM_GLINK_MAX_REMOTE_INTENTS) {g->dropped++; continue;}
++            c->remote[slot].size = le32(pair);
++            c->remote[slot].id = le32(pair + 4);
++            c->remote[slot].valid = 1;
++            c->remote[slot].busy = 0;
++        }
++        if (c) c->intent_asked = 0;
++        rx_advance(&g->rx, align8(bytes));
++        g->rx_messages++;
++        return 1;
++    }
++    case QCOM_GLINK_RX_DONE:
++    case QCOM_GLINK_RX_DONE_W_REUSE:
++        if ((c = by_rcid(g, param1)))
++            for (unsigned k = 0; k < QCOM_GLINK_MAX_REMOTE_INTENTS; ++k)
++                if (c->remote[k].valid && c->remote[k].id == param2) {
++                    c->remote[k].busy = 0;
++                    if (cmd == QCOM_GLINK_RX_DONE) c->remote[k].valid = 0;
++                    break;
++                }
++        break;
++    case QCOM_GLINK_RX_INTENT_REQ: {
++        /* Grant it if a buffer of ours that is big enough is not advertised (all are, normally: then refuse). */
++        int granted = 0;
++        if ((c = by_rcid(g, param1)) && c->up && param2 <= c->intent_size)
++            for (unsigned k = 0; k < c->intent_count; ++k)
++                if (!c->local[k].advertised && !c->local[k].busy) {
++                    if (advertise(g, c, k)) return 0;
++                    granted = 1;
++                    break;
++                }
++        if (command(g, QCOM_GLINK_RX_INTENT_REQ_ACK, c ? c->lcid : param1, (uint32_t)granted)) return 0;
++        break;
++    }
++    case QCOM_GLINK_RX_INTENT_REQ_ACK:
++        if ((c = by_rcid(g, param1)) && !param2) c->intent_asked = 0;
++        break;
++    case QCOM_GLINK_TX_DATA:
++    case QCOM_GLINK_TX_DATA_CONT: {
++        const int rc = handle_data(g, cmd, param1, param2, avail);
++        if (rc == 1) g->rx_messages++;
++        return rc;
++    }
++    case QCOM_GLINK_READ_NOTIF:
++        g->kick_pending = 1;
++        break;
++    case QCOM_GLINK_SIGNALS:
++        break;
++    default:
++        return QcomGlinkCorrupt;
++    }
++    rx_advance(&g->rx, 8);
++    g->rx_messages++;
++    return 1;
++}
++
++int qcom_glink_poll(QcomGlink *g)
++{
++    if (g->broken) return QcomGlinkCorrupt;
++    int handled = 0;
++    g->notify_sent = 0;
++    progress(g);
++    /* Bounded: at most one FIFO's worth of minimal messages per call. */
++    for (uint32_t budget = g->rx.length / 8 + 1; g->rx.data && budget; --budget) {
++        const int rc = receive_one(g);
++        if (rc < 0) {g->broken = 1; handled = rc; break;}
++        if (!rc) break;
++        ++handled;
++    }
++    if (!g->broken) progress(g);
++    if (g->kick_pending && g->kick) {g->kick_pending = 0; g->kick(g->kick_context);}
++    return handled;
++}
++
++int qcom_glink_send(QcomGlink *g, QcomGlinkChannel *c, const void *data, uint32_t length)
++{
++    if (!g || !c || (!data && length)) return QcomGlinkArgument;
++    if (g->broken || !c->up) return QcomGlinkNotOpen;
++    if (g->tx.length < 32 || length > g->tx.length / 2 - 16 || align8(16 + length) > g->tx.length / 2) return QcomGlinkTooBig;
++    unsigned best = QCOM_GLINK_MAX_REMOTE_INTENTS;
++    for (unsigned k = 0; k < QCOM_GLINK_MAX_REMOTE_INTENTS; ++k)
++        if (c->remote[k].valid && !c->remote[k].busy && c->remote[k].size >= length &&
++            (best == QCOM_GLINK_MAX_REMOTE_INTENTS || c->remote[k].size < c->remote[best].size))
++            best = k;
++    if (best == QCOM_GLINK_MAX_REMOTE_INTENTS) {
++        if (!c->intent_asked && command(g, QCOM_GLINK_RX_INTENT_REQ, c->lcid, length) == QcomGlinkOk) c->intent_asked = 1;
++        if (g->kick_pending && g->kick) {g->kick_pending = 0; g->kick(g->kick_context);}
++        return QcomGlinkAgain;
++    }
++    uint8_t h[16];
++    h[0] = QCOM_GLINK_TX_DATA; h[1] = 0; h[2] = (uint8_t)c->lcid; h[3] = (uint8_t)(c->lcid >> 8);
++    put32(h + 4, c->remote[best].id);
++    put32(h + 8, length);
++    put32(h + 12, 0);
++    if (tx(g, h, 16, (const uint8_t *)data, length)) {
++        /* Ask the remote to ring us once it has read, so the owner retries then. */
++        const uint32_t head = *g->tx.head, tail = *g->tx.tail;
++        if (!g->notify_sent && head < g->tx.length && tail < g->tx.length) {
++            uint8_t m[8] = {QCOM_GLINK_READ_NOTIF, 0, 0, 0, 0, 0, 0, 0};
++            const uint32_t raw = tail <= head ? g->tx.length - head + tail : tail - head;
++            if (raw >= FULL_RESERVE + 8) {tx_write(g, m, 8, 0, 0); g->notify_sent = 1;}
++        }
++        if (g->kick_pending && g->kick) {g->kick_pending = 0; g->kick(g->kick_context);}
++        return QcomGlinkAgain;
++    }
++    c->remote[best].busy = 1;
++    if (g->kick) {g->kick_pending = 0; g->kick(g->kick_context);}
++    return QcomGlinkOk;
++}
++
++#endif
+--- /dev/null
++++ b/bsd/dev/battery/QcomGlink.h
+@@ -0,0 +1,100 @@
++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
++/* GLINK over shared memory: the native GLINK protocol (version handshake, channel open/close, receive intents, data, done) on a pair of
++ * SMEM FIFOs. Event driven and allocation free: the owner calls qcom_glink_poll whenever the remote rings the GLINK doorbell (and after
++ * sending), every call does a bounded amount of work, and nothing here waits. A send that cannot go out yet (no remote intent, no FIFO
++ * room) returns QcomGlinkAgain and the owner tries again on the next event; an intent is asked for once per pending send. */
++#ifndef QCOM_GLINK_H
++#define QCOM_GLINK_H
++#include <stddef.h>
++#include <stdint.h>
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define QCOM_GLINK_MAX_CHANNELS 6u
++#define QCOM_GLINK_MAX_REMOTE_INTENTS 48u   /* the audio DSP offers 24 small intents on adsp_apps before granting a larger one */
++#define QCOM_GLINK_MAX_LOCAL_INTENTS 24u
++#define QCOM_GLINK_NAME 32u
++#define QCOM_GLINK_FEATURE_INTENT_REUSE 1u
++
++enum {
++    QCOM_GLINK_VERSION = 0, QCOM_GLINK_VERSION_ACK = 1, QCOM_GLINK_OPEN = 2, QCOM_GLINK_CLOSE = 3, QCOM_GLINK_OPEN_ACK = 4,
++    QCOM_GLINK_INTENT = 5, QCOM_GLINK_RX_DONE = 6, QCOM_GLINK_RX_INTENT_REQ = 7, QCOM_GLINK_RX_INTENT_REQ_ACK = 8,
++    QCOM_GLINK_TX_DATA = 9, QCOM_GLINK_CLOSE_ACK = 11, QCOM_GLINK_TX_DATA_CONT = 12, QCOM_GLINK_READ_NOTIF = 13,
++    QCOM_GLINK_RX_DONE_W_REUSE = 14, QCOM_GLINK_SIGNALS = 15,
++};
++
++enum {
++    QcomGlinkOk = 0,
++    QcomGlinkAgain = -1,    /* not now: no intent or no FIFO room yet */
++    QcomGlinkNotOpen = -2,
++    QcomGlinkTooBig = -3,
++    QcomGlinkFull = -4,     /* no channel slot */
++    QcomGlinkCorrupt = -5,  /* the receive FIFO holds something that cannot be a message: the link is stopped */
++    QcomGlinkArgument = -6,
++};
++
++/* One direction's FIFO in SMEM: indices are byte offsets into data. */
++typedef struct {
++    volatile uint32_t *head, *tail;
++    volatile uint8_t *data;
++    uint32_t length;
++} QcomGlinkFifo;
++
++typedef struct QcomGlinkChannel QcomGlinkChannel;
++typedef struct {
++    void (*state)(void *context, QcomGlinkChannel *channel, int up);
++    /* A complete message; data stays valid for the duration of the call only. */
++    void (*receive)(void *context, QcomGlinkChannel *channel, const uint8_t *data, uint32_t length);
++} QcomGlinkClient;
++
++struct QcomGlinkChannel {
++    char name[QCOM_GLINK_NAME];
++    uint16_t lcid, rcid;
++    uint8_t used, initiator, open_sent, open_acked, remote_open, up, intent_asked;
++    QcomGlinkClient client;
++    void *context;
++    /* Our receive intents: count buffers of size bytes in storage (count * size). */
++    uint8_t *storage;
++    uint32_t intent_size, intent_count;
++    struct {uint32_t fill; uint8_t advertised, busy;} local[QCOM_GLINK_MAX_LOCAL_INTENTS];
++    /* The remote's intents we may send into. */
++    struct {uint32_t id, size; uint8_t valid, busy;} remote[QCOM_GLINK_MAX_REMOTE_INTENTS];
++};
++
++typedef struct {
++    QcomGlinkFifo tx, rx;
++    void (*kick)(void *context);
++    void *kick_context;
++    uint32_t features;
++    uint8_t version_sent, version_agreed, broken, kick_pending, notify_sent;
++    uint16_t next_lcid;
++    QcomGlinkChannel channel[QCOM_GLINK_MAX_CHANNELS];
++    /* Counters for the log. */
++    uint32_t rx_messages, tx_messages, rx_data, unknown_opens, dropped;
++    char last_unknown[QCOM_GLINK_NAME];
++    char unknown_names[96];  /* the distinct names of those opens, space separated, as many as fit */
++} QcomGlink;
++
++/* Sets up the link on its FIFOs (rx may have no data yet: the remote makes its FIFO later) and resets the indices we own. */
++void qcom_glink_init(QcomGlink *g, QcomGlinkFifo tx, QcomGlinkFifo rx, void (*kick)(void *), void *kick_context);
++/* The remote's FIFO once it exists. */
++void qcom_glink_set_rx(QcomGlink *g, volatile uint8_t *data, uint32_t length);
++/* Registers a channel by name with intent_count receive buffers of intent_size bytes in storage. open_now: we send OPEN ourselves;
++ * otherwise we answer when the remote opens it. */
++QcomGlinkChannel *qcom_glink_channel(QcomGlink *g, const char *name, uint32_t intent_size, uint32_t intent_count, uint8_t *storage,
++                                     const QcomGlinkClient *client, void *context, int open_now);
++/* Sends VERSION (once) and any channel OPEN that is due, then handles every complete message in the receive FIFO. Returns the number of
++ * messages handled or QcomGlinkCorrupt. Rings the remote when anything was written. */
++int qcom_glink_poll(QcomGlink *g);
++/* Queues one message on an open channel (single chunk, up to the remote intent size). */
++int qcom_glink_send(QcomGlink *g, QcomGlinkChannel *channel, const void *data, uint32_t length);
++
++/* FIFO primitives, exposed for the tests. */
++uint32_t qcom_glink_rx_avail(const QcomGlinkFifo *f);
++uint32_t qcom_glink_tx_avail(const QcomGlinkFifo *f);
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+--- /dev/null
++++ b/bsd/dev/battery/QcomQrtr.c
+@@ -0,0 +1,238 @@
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(MODEM_PROTOCOL_HOST_TEST)
++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
++#include "QcomQrtr.h"
++
++static uint16_t le16(const uint8_t *p) {return (uint16_t)(p[0] | (uint16_t)p[1] << 8);}
++static uint32_t le32(const uint8_t *p) {return (uint32_t)le16(p) | (uint32_t)le16(p + 2) << 16;}
++static void put16(uint8_t *p, uint32_t v) {p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);}
++static void put32(uint8_t *p, uint32_t v) {put16(p, v); put16(p + 2, v >> 16);}
++
++#define CTRL_BYTES 20u  /* command and four words */
++#define MAX_PACKET 512u
++
++void qcom_qrtr_init(QcomQrtr *q, uint32_t local_node, QcomQrtrSend send, void *send_context)
++{
++    *q = (QcomQrtr){0};
++    q->local_node = local_node;
++    q->remote_node = QCOM_QRTR_NODE_BROADCAST;
++    q->send = send;
++    q->send_context = send_context;
++}
++
++static int emit(QcomQrtr *q, uint32_t type, uint32_t from_port, uint32_t node, uint32_t port, const uint8_t *data, uint32_t length)
++{
++    uint8_t packet[MAX_PACKET];
++    if (length > MAX_PACKET - QCOM_QRTR_HEADER || (!data && length)) return -1;
++    const uint32_t padded = (length + 3) & ~3u;
++    if (QCOM_QRTR_HEADER + padded > sizeof packet) return -1;
++    put32(packet, 1);
++    put32(packet + 4, type);
++    put32(packet + 8, q->local_node);
++    put32(packet + 12, from_port);
++    put32(packet + 16, 0);  /* confirm_rx: we never ask for flow control acks */
++    put32(packet + 20, length);
++    put32(packet + 24, node);
++    put32(packet + 28, port);
++    for (uint32_t i = 0; i < padded; ++i) packet[QCOM_QRTR_HEADER + i] = i < length ? data[i] : 0;
++    if (q->send(q->send_context, packet, QCOM_QRTR_HEADER + padded)) {q->tx_refused++; return -1;}
++    q->tx_packets++;
++    return 0;
++}
++
++static int control(QcomQrtr *q, uint32_t command, const uint32_t words[4])
++{
++    uint8_t pkt[CTRL_BYTES] = {0};
++    put32(pkt, command);
++    for (unsigned i = 0; words && i < 4; ++i) put32(pkt + 4 + 4 * i, words[i]);
++    return emit(q, command, QCOM_QRTR_PORT_CTRL, q->remote_node, QCOM_QRTR_PORT_CTRL, pkt, sizeof pkt);
++}
++
++static void announce(QcomQrtr *q, unsigned i)
++{
++    if (!q->local[i].service) return; /* client-only port, never announce a server */
++    const uint32_t words[4] = {q->local[i].service, q->local[i].instance, q->local_node, q->local[i].port};
++    control(q, QCOM_QRTR_NEW_SERVER, words);
++}
++
++int qcom_qrtr_add_service(QcomQrtr *q, uint32_t service, uint32_t instance, uint32_t port, QcomQrtrReceive receive, void *context)
++{
++    if (!receive || q->local_count == QCOM_QRTR_MAX_LOCAL || port == QCOM_QRTR_PORT_CTRL) return -1;
++    const unsigned i = q->local_count++;
++    q->local[i].service = service; q->local[i].instance = instance; q->local[i].port = port;
++    q->local[i].receive = receive; q->local[i].context = context;
++    if (q->hello_received) announce(q, i);
++    return 0;
++}
++
++void qcom_qrtr_start(QcomQrtr *q)
++{
++    if (!control(q, QCOM_QRTR_HELLO, 0)) q->hello_sent = 1;
++}
++
++int qcom_qrtr_find_remote(const QcomQrtr *q, uint32_t service)
++{
++    for (uint32_t i = 0; i < q->remote_count; ++i) if (q->remote[i].service == service) return (int)i;
++    return -1;
++}
++
++static void remote_server(QcomQrtr *q, const uint8_t *w, int add)
++{
++    const uint32_t service = le32(w), instance = le32(w + 4), node = le32(w + 8), port = le32(w + 12);
++    if (!service && !instance && !node && !port) return;  /* the end of a listing */
++    for (uint32_t i = 0; i < q->remote_count; ++i) {
++        if (q->remote[i].node != node || q->remote[i].port != port) continue;
++        if (add) {q->remote[i].service = service; q->remote[i].instance = instance; return;}
++        q->remote[i] = q->remote[--q->remote_count];
++        return;
++    }
++    if (!add || q->remote_count == QCOM_QRTR_MAX_REMOTE) return;
++    q->remote[q->remote_count].service = service; q->remote[q->remote_count].instance = instance;
++    q->remote[q->remote_count].node = node; q->remote[q->remote_count].port = port;
++    q->remote_count++;
++}
++
++int qcom_qrtr_receive(QcomQrtr *q, const uint8_t *packet, uint32_t length)
++{
++    if (length < QCOM_QRTR_HEADER || le32(packet) != 1) {q->rx_bad++; return -1;}
++    const uint32_t type = le32(packet + 4), src_node = le32(packet + 8), src_port = le32(packet + 12);
++    const uint32_t confirm = le32(packet + 16), size = le32(packet + 20), dst_port = le32(packet + 28);
++    if (size > length - QCOM_QRTR_HEADER) {q->rx_bad++; return -1;}
++    const uint8_t *data = packet + QCOM_QRTR_HEADER;
++    q->rx_packets++;
++    if (type == QCOM_QRTR_DATA) {
++        q->rx_data++;
++        unsigned i = 0;
++        while (i < q->local_count && q->local[i].port != dst_port) ++i;
++        if (i < q->local_count) q->local[i].receive(q->local[i].context, q, dst_port, src_node, src_port, data, size);
++        else q->rx_unrouted++;
++        if (confirm) {  /* the sender waits for this before it sends more to the port */
++            const uint32_t words[4] = {src_node, src_port, 0, 0};
++            if (!control(q, QCOM_QRTR_RESUME_TX, words)) q->resumes_sent++;
++        }
++        return 0;
++    }
++    /* control packets carry their command again in the payload */
++    if (size < 4 || le32(data) != type) {q->rx_bad++; return -1;}
++    switch (type) {
++    case QCOM_QRTR_HELLO:
++        q->remote_node = src_node;
++        if (!q->hello_sent) qcom_qrtr_start(q);
++        q->hello_received = 1;
++        for (unsigned i = 0; i < q->local_count; ++i) announce(q, i);
++        break;
++    case QCOM_QRTR_NEW_SERVER:
++    case QCOM_QRTR_DEL_SERVER:
++        if (size >= CTRL_BYTES) remote_server(q, data + 4, type == QCOM_QRTR_NEW_SERVER);
++        break;
++    case QCOM_QRTR_BYE:
++        q->remote_count = 0;
++        q->hello_received = 0;
++        break;
++    default:  /* DEL_CLIENT, RESUME_TX (we never ask), PING, lookups (the remote keeps its own name service) */
++        break;
++    }
++    return 0;
++}
++
++int qcom_qrtr_send_data(QcomQrtr *q, uint32_t from_port, uint32_t node, uint32_t port, const uint8_t *data, uint32_t length)
++{
++    return emit(q, QCOM_QRTR_DATA, from_port, node, port, data, length);
++}
++
++/* ---- QMI ---- */
++int qcom_qmi_parse(const uint8_t *data, uint32_t length, QcomQmiMessage *m)
++{
++    if (length < QCOM_QMI_HEADER) return -1;
++    m->type = data[0];
++    m->transaction = le16(data + 1);
++    m->message = le16(data + 3);
++    m->length = le16(data + 5);
++    if (m->length != length - QCOM_QMI_HEADER ||
++        (m->type != QCOM_QMI_REQUEST && m->type != QCOM_QMI_RESPONSE && m->type != QCOM_QMI_INDICATION)) return -1;
++    for (uint32_t at = QCOM_QMI_HEADER; at < length;) {
++        if (length - at < 3) return -1;
++        const uint32_t bytes = le16(data + at + 1);
++        if (bytes > length - at - 3) return -1;
++        at += 3 + bytes;
++    }
++    m->tlvs = data + QCOM_QMI_HEADER;
++    return 0;
++}
++
++const uint8_t *qcom_qmi_tlv(const QcomQmiMessage *m, uint8_t type, uint32_t *size)
++{
++    for (uint32_t at = 0; at + 3 <= m->length;) {
++        const uint32_t n = le16(m->tlvs + at + 1);
++        if (n > m->length - at - 3) return 0;
++        if (m->tlvs[at] == type) {*size = n; return m->tlvs + at + 3;}
++        at += 3 + n;
++    }
++    return 0;
++}
++
++/* ---- the service locator ---- */
++#define NAME_MAX_ 64u
++#define LIST_MAX 32u
++
++static int same(const char *a, const uint8_t *b, uint32_t n)
++{
++    uint32_t i = 0;
++    for (; i < n && a[i]; ++i) if ((uint8_t)a[i] != b[i]) return 0;
++    return i == n && !a[i];
++}
++
++static int provides(const QcomPdDomain *d, const uint8_t *name, uint32_t n)
++{
++    if (same("tms/servreg", name, n)) return 1;
++    for (unsigned i = 0; d->services && d->services[i]; ++i) if (same(d->services[i], name, n)) return 1;
++    return 0;
++}
++
++uint32_t qcom_servloc_answer(const QcomPdDomain *domains, unsigned count, const uint8_t *request, uint32_t length, uint8_t *out,
++                             uint32_t capacity)
++{
++    QcomQmiMessage m;
++    uint32_t name_size = 0, offset_size = 0;
++    if (qcom_qmi_parse(request, length, &m) || m.type != QCOM_QMI_REQUEST || m.message != QCOM_SERVLOC_GET_DOMAIN_LIST) return 0;
++    const uint8_t *name = qcom_qmi_tlv(&m, 0x01, &name_size);
++    const uint8_t *skip = qcom_qmi_tlv(&m, 0x10, &offset_size);
++    if (!name || name_size > NAME_MAX_ || (skip && offset_size != 4)) return 0;
++    while (name_size && !name[name_size - 1]) --name_size;  /* a sender may count the terminating zero */
++    const uint32_t first = skip ? le32(skip) : 0;
++    if (capacity < QCOM_QMI_HEADER + 7 + 5 + 5 + 4) return 0;
++    uint8_t *p = out + QCOM_QMI_HEADER;
++    /* result: success, no error */
++    p[0] = 0x02; put16(p + 1, 4); put32(p + 3, 0); p += 7;
++    uint32_t total = 0, listed = 0;
++    uint8_t *list = p + 5 + 5, *entry = list + 4;
++    for (unsigned i = 0; i < count; ++i) {
++        if (!provides(&domains[i], name, name_size)) continue;
++        const uint32_t index = total++;
++        if (index < first || listed == LIST_MAX) continue;
++        uint32_t n = 0;
++        while (domains[i].domain[n] && n < NAME_MAX_) ++n;
++        if ((uint32_t)(entry - out) + 1 + n + 9 > capacity) return 0;
++        entry[0] = (uint8_t)n;
++        for (uint32_t b = 0; b < n; ++b) entry[1 + b] = (uint8_t)domains[i].domain[b];
++        entry += 1 + n;
++        put32(entry, domains[i].instance);  /* instance, then service data valid (no) and service data */
++        entry[4] = 0;
++        put32(entry + 5, 0);
++        entry += 9;
++        listed++;
++    }
++    /* total domains, the database revision, then the list (a one-byte count before its entries) */
++    p[0] = 0x10; put16(p + 1, 2); put16(p + 3, total); p += 5;
++    p[0] = 0x11; put16(p + 1, 2); put16(p + 3, 1); p += 5;
++    if (listed) {
++        p[0] = 0x12; put16(p + 1, (uint32_t)(entry - p - 3)); p[3] = (uint8_t)listed;
++        p = entry;
++    }
++    out[0] = QCOM_QMI_RESPONSE;
++    put16(out + 1, m.transaction);
++    put16(out + 3, m.message);
++    put16(out + 5, (uint32_t)(p - out - QCOM_QMI_HEADER));
++    return (uint32_t)(p - out);
++}
++
++#endif
+--- /dev/null
++++ b/bsd/dev/battery/QcomQrtr.h
+@@ -0,0 +1,79 @@
++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
++/* The IPC router (QRTR, version 1 headers) on one link to one remote node, with the name service duties of this side: say hello, announce
++ * our services to the remote once it has said hello, answer flow control, and keep the list of the services the remote announces. Our
++ * services are ports with a receive callback. No allocation and no waiting: the owner feeds every received packet in and gives a send
++ * callback that queues one packet (it may refuse; the counters show it). */
++#ifndef QCOM_QRTR_H
++#define QCOM_QRTR_H
++#include <stdint.h>
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define QCOM_QRTR_HEADER 32u
++#define QCOM_QRTR_PORT_CTRL 0xfffffffeu
++#define QCOM_QRTR_NODE_BROADCAST 0xffffffffu
++#define QCOM_QRTR_MAX_LOCAL 4u
++#define QCOM_QRTR_MAX_REMOTE 128u
++
++enum {
++    QCOM_QRTR_DATA = 1, QCOM_QRTR_HELLO = 2, QCOM_QRTR_BYE = 3, QCOM_QRTR_NEW_SERVER = 4, QCOM_QRTR_DEL_SERVER = 5,
++    QCOM_QRTR_DEL_CLIENT = 6, QCOM_QRTR_RESUME_TX = 7, QCOM_QRTR_EXIT = 8, QCOM_QRTR_PING = 9, QCOM_QRTR_NEW_LOOKUP = 10,
++    QCOM_QRTR_DEL_LOOKUP = 11,
++};
++
++typedef struct QcomQrtr QcomQrtr;
++/* One packet of length bytes (header included); returns 0 when queued. */
++typedef int (*QcomQrtrSend)(void *context, const uint8_t *packet, uint32_t length);
++/* A data packet for one of our ports from node:port. */
++typedef void (*QcomQrtrReceive)(void *context, QcomQrtr *q, uint32_t port, uint32_t node, uint32_t from_port, const uint8_t *data,
++                                uint32_t length);
++
++struct QcomQrtr {
++    uint32_t local_node, remote_node;  /* remote_node: QCOM_QRTR_NODE_BROADCAST until the remote's hello */
++    uint8_t hello_sent, hello_received;
++    QcomQrtrSend send;
++    void *send_context;
++    struct {uint32_t service, instance, port; QcomQrtrReceive receive; void *context;} local[QCOM_QRTR_MAX_LOCAL];
++    uint32_t local_count;
++    struct {uint32_t service, instance, node, port;} remote[QCOM_QRTR_MAX_REMOTE];
++    uint32_t remote_count;
++    /* counters for the log */
++    uint32_t rx_packets, rx_data, rx_bad, rx_unrouted, tx_packets, tx_refused, resumes_sent;
++};
++
++void qcom_qrtr_init(QcomQrtr *q, uint32_t local_node, QcomQrtrSend send, void *send_context);
++/* Adds one of our services (instance as announced: version | instance << 8) on port; announced to the remote after its hello, or at
++ * once when that has been. service=0 binds an unannounced client port. Returns 0, or -1 when full. */
++int qcom_qrtr_add_service(QcomQrtr *q, uint32_t service, uint32_t instance, uint32_t port, QcomQrtrReceive receive, void *context);
++/* The link is up: says hello. */
++void qcom_qrtr_start(QcomQrtr *q);
++/* One received packet. Returns 0, or -1 when it was not a valid packet. */
++int qcom_qrtr_receive(QcomQrtr *q, const uint8_t *packet, uint32_t length);
++/* A data packet from our port to the remote's node:port. capacity bounds the packet built on the stack. Returns 0 when queued. */
++int qcom_qrtr_send_data(QcomQrtr *q, uint32_t from_port, uint32_t node, uint32_t port, const uint8_t *data, uint32_t length);
++/* Index of a remote service in the list, -1 when not announced. */
++int qcom_qrtr_find_remote(const QcomQrtr *q, uint32_t service);
++
++/* ---- QMI messages carried in data packets: a 7-byte header (type, transaction, message id, length) and TLVs ---- */
++#define QCOM_QMI_HEADER 7u
++enum {QCOM_QMI_REQUEST = 0, QCOM_QMI_RESPONSE = 2, QCOM_QMI_INDICATION = 4};
++typedef struct {uint8_t type; uint16_t transaction, message; const uint8_t *tlvs; uint32_t length;} QcomQmiMessage;
++int qcom_qmi_parse(const uint8_t *data, uint32_t length, QcomQmiMessage *m);
++/* The value of TLV type in m (length in *size), or null. */
++const uint8_t *qcom_qmi_tlv(const QcomQmiMessage *m, uint8_t type, uint32_t *size);
++
++/* ---- the service locator (service 64): which protection domains provide a service ---- */
++#define QCOM_SERVLOC_SERVICE 0x40u
++#define QCOM_SERVLOC_INSTANCE 0x101u  /* as announced: version 0x101, instance 0 */
++#define QCOM_SERVLOC_GET_DOMAIN_LIST 0x21u
++typedef struct {const char *domain; uint32_t instance; const char *const *services;} QcomPdDomain;
++/* Answers a locator request (a whole QMI message) into out; returns the answer's length, 0 when the request is not one to answer. Every
++ * domain provides "tms/servreg"; services lists the others. */
++uint32_t qcom_servloc_answer(const QcomPdDomain *domains, unsigned count, const uint8_t *request, uint32_t length, uint8_t *out,
++                             uint32_t capacity);
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+--- /dev/null
++++ b/bsd/dev/battery/QcomQmp.c
+@@ -0,0 +1,106 @@
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(MODEM_PROTOCOL_HOST_TEST)
++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
++#include "QcomQmp.h"
++
++/* Descriptor words (byte offset / 4): magic, version, features; the AOP's link state, its ack, channel state, its ack, mailbox size and
++ * offset; then the same six for our side. */
++#define MAGIC 0x4d41494cu
++#define D_MAGIC 0
++#define D_VERSION 1
++#define D_UCORE_LINK 3
++#define D_UCORE_LINK_ACK 4
++#define D_UCORE_CH 5
++#define D_UCORE_CH_ACK 6
++#define D_MCORE_LINK 9
++#define D_MCORE_LINK_ACK 10
++#define D_MCORE_CH 11
++#define D_MCORE_CH_ACK 12
++#define D_MCORE_SIZE 13
++#define D_MCORE_OFFSET 14
++#define UP 0x0000ffffu
++
++static void barrier(void)
++{
++#if defined(__aarch64__) && defined(KERNEL)
++    __asm__ volatile("dsb sy" ::: "memory");
++#endif
++}
++static void kick(QcomQmp *q) {barrier(); if (q->kick) q->kick(q->context);}
++
++void qcom_qmp_init(QcomQmp *q, volatile uint32_t *ram, uint32_t ram_bytes, void (*k)(void *), void *context)
++{
++    *q = (QcomQmp){ram, ram_bytes, 0, 0, QcomQmpIdle, k, context};
++}
++
++int qcom_qmp_step(QcomQmp *q)
++{
++    if (!q || !q->ram || q->ram_bytes < 0x3c) return QcomQmpBadDescriptor;
++    volatile uint32_t *r = q->ram;
++    switch (q->state) {
++    case QcomQmpIdle: {
++        if (r[D_MAGIC] != MAGIC || r[D_VERSION] != 1) return q->state = QcomQmpBadDescriptor;
++        const uint32_t box = r[D_MCORE_OFFSET], size = r[D_MCORE_SIZE];
++        if ((box & 3) || size < QCOM_QMP_MESSAGE + 4 || box < 0x3c || box > q->ram_bytes || size > q->ram_bytes - box)
++            return q->state = QcomQmpBadDescriptor;
++        q->box = box;
++        q->box_size = size;
++        /* A channel a boot stage left open is used as it is. */
++        if (r[D_MCORE_LINK] == UP && r[D_MCORE_LINK_ACK] == UP && r[D_MCORE_CH] == UP && r[D_UCORE_CH] == UP && r[D_MCORE_CH_ACK] == UP)
++            return q->state = QcomQmpOpen;
++        r[D_UCORE_LINK_ACK] = r[D_UCORE_LINK];
++        r[D_MCORE_LINK] = UP;
++        kick(q);
++        q->state = QcomQmpLinkWait;
++    }
++        /* fall through: the ack may already be there */
++    case QcomQmpLinkWait:
++        if (r[D_MCORE_LINK_ACK] != UP) return q->state;
++        r[D_MCORE_CH] = UP;
++        kick(q);
++        q->state = QcomQmpChannelWait;
++        /* fall through */
++    case QcomQmpChannelWait:
++        if (r[D_UCORE_CH] != UP) return q->state;
++        r[D_UCORE_CH_ACK] = UP;
++        kick(q);
++        q->state = QcomQmpAckWait;
++        /* fall through */
++    case QcomQmpAckWait:
++        if (r[D_MCORE_CH_ACK] != UP) return q->state;
++        return q->state = QcomQmpOpen;
++    case QcomQmpSending:
++        if (r[q->box / 4] != 0) return q->state;
++        return q->state = QcomQmpOpen;
++    default:
++        return q->state;
++    }
++}
++
++int qcom_qmp_send(QcomQmp *q, const char *text)
++{
++    if (q->state != QcomQmpOpen) return QcomQmpBusy;
++    uint32_t words[QCOM_QMP_MESSAGE / 4] = {0};
++    unsigned n = 0;
++    while (text[n]) {
++        if (n >= QCOM_QMP_MESSAGE - 1) return QcomQmpTooLong;
++        words[n / 4] |= (uint32_t)(uint8_t)text[n] << (8 * (n % 4));
++        ++n;
++    }
++    volatile uint32_t *r = q->ram;
++    if (r[q->box / 4] != 0) return QcomQmpBusy;
++    for (unsigned i = 0; i < QCOM_QMP_MESSAGE / 4; ++i) r[q->box / 4 + 1 + i] = words[i];
++    barrier();
++    r[q->box / 4] = QCOM_QMP_MESSAGE;
++    kick(q);
++    return q->state = QcomQmpSending;
++}
++
++void qcom_qmp_abandon(QcomQmp *q)
++{
++    if (q->state != QcomQmpSending) return;
++    q->ram[q->box / 4] = 0;
++    barrier();
++    q->state = QcomQmpOpen;
++}
++
++#endif
+--- /dev/null
++++ b/bsd/dev/battery/QcomQmp.h
+@@ -0,0 +1,47 @@
++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
++/* The AOSS QMP mailbox: a message RAM shared with the always-on processor, a link and channel handshake, then one text message at a
++ * time ("{class: image, res: load_state, name: adsp, val: on}"). Written as a state machine stepped on each doorbell from the AOP (or a
++ * timer): qcom_qmp_step never waits, it returns what it is waiting for and the owner calls it again when the AOP rings or the deadline
++ * passes. Ringing the AOP is the owner's kick callback. */
++#ifndef QCOM_QMP_H
++#define QCOM_QMP_H
++#include <stdint.h>
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define QCOM_QMP_MESSAGE 0x64u  /* message length the AOP takes (padded with zeroes) */
++
++enum {
++    QcomQmpIdle = 0,         /* closed, nothing started */
++    QcomQmpLinkWait = 1,     /* our link is up, waiting for the AOP's ack */
++    QcomQmpChannelWait = 2,  /* our channel is up, waiting for the AOP's channel */
++    QcomQmpAckWait = 3,      /* the AOP's channel acked, waiting for its ack of ours */
++    QcomQmpOpen = 4,
++    QcomQmpSending = 5,      /* a message is in the mailbox, waiting for the AOP to take it */
++    QcomQmpBadDescriptor = -1,
++    QcomQmpBusy = -2,
++    QcomQmpTooLong = -3,
++};
++
++typedef struct {
++    volatile uint32_t *ram;  /* the message RAM (0x400 bytes on SM8550) */
++    uint32_t ram_bytes;
++    uint32_t box, box_size;  /* our mailbox inside it */
++    int state;
++    void (*kick)(void *context);
++    void *context;
++} QcomQmp;
++
++void qcom_qmp_init(QcomQmp *q, volatile uint32_t *ram, uint32_t ram_bytes, void (*kick)(void *), void *context);
++/* Advances the handshake or the pending send; returns the state reached. */
++int qcom_qmp_step(QcomQmp *q);
++/* Puts a message in the mailbox once the channel is open (QcomQmpSending), QcomQmpBusy otherwise. */
++int qcom_qmp_send(QcomQmp *q, const char *text);
++/* Gives up a send the AOP did not take before the owner's deadline: the mailbox is cleared. */
++void qcom_qmp_abandon(QcomQmp *q);
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+--- /dev/null
++++ b/bsd/dev/battery/QcomScm.h
+@@ -0,0 +1,44 @@
++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
++/* Secure channel manager calls of the peripheral authentication service (PAS) in the SMCCC convention: the function id (standard call,
++ * SMC64, SiP owner, service 2) and the argument-type word in x1. The SMC itself lives in the kernel glue; these encoders are what the
++ * host tests check. */
++#ifndef QCOM_SCM_H
++#define QCOM_SCM_H
++#include <stdint.h>
++
++#define QCOM_SCM_SVC_PIL 0x02u
++#define QCOM_SCM_PAS_INIT_IMAGE 0x01u
++#define QCOM_SCM_PAS_MEM_SETUP 0x02u
++#define QCOM_SCM_PAS_AUTH_AND_RESET 0x05u
++#define QCOM_SCM_PAS_SHUTDOWN 0x06u
++#define QCOM_SCM_PAS_IS_SUPPORTED 0x07u
++#define QCOM_SCM_VAL 0u
++#define QCOM_SCM_RO 1u
++#define QCOM_SCM_RW 2u
++#define QCOM_SCM_INTERRUPTED 1    /* x0 of a call the secure world wants resumed (x6 carries its session) */
++#define QCOM_SCM_V2_EBUSY (-12)   /* busy: retry after a pause */
++
++static inline uint32_t qcom_scm_fn(uint32_t svc, uint32_t cmd)
++{
++    return (1u << 30) /* SMC64 */ | (2u << 24) /* SiP */ | ((svc & 0xff) << 8) | (cmd & 0xff);
++}
++/* Argument count in bits 3:0, the type of argument i in bits 5+2i:4+2i. */
++static inline uint32_t qcom_scm_args(unsigned count, unsigned t0, unsigned t1, unsigned t2)
++{
++    return (count & 0xf) | (t0 & 3) << 4 | (t1 & 3) << 6 | (t2 & 3) << 8;
++}
++
++/* IPCC (the inter-processor doorbells): a doorbell id is client << 16 | signal. */
++#define QCOM_IPCC_SEND 0x0cu
++#define QCOM_IPCC_RECV_ID 0x10u
++#define QCOM_IPCC_RECV_ENABLE 0x14u
++#define QCOM_IPCC_RECV_DISABLE 0x18u
++#define QCOM_IPCC_RECV_CLEAR 0x1cu
++#define QCOM_IPCC_NONE 0xffffffffu
++#define QCOM_IPCC_CLIENT_AOP 0u
++#define QCOM_IPCC_CLIENT_LPASS 3u
++#define QCOM_IPCC_SIGNAL_GLINK_QMP 0u
++#define QCOM_IPCC_SIGNAL_SMP2P 2u
++static inline uint32_t qcom_ipcc_id(uint32_t client, uint32_t signal) {return client << 16 | (signal & 0xffff);}
++
++#endif
+--- a/bsd/dev/sweet_touch_asteroids.c
++++ b/bsd/dev/sweet_touch_asteroids.c
+@@ -29,6 +29,7 @@
+ #include <sys/systm.h>
+ #include <sys/errno.h>
+ #include <kern/clock.h>
++#include <kern/locks.h>
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+@@ -389,7 +390,7 @@
+ 
+ /* One active (AMC) request of n <= 3 commands to addr + off[c], all acked. */
+ static int
+-at_amc(const char *res, uint32_t addr, const uint32_t *off, const uint32_t *val, unsigned n)
++at_amc_locked(const char *res, uint32_t addr, const uint32_t *off, const uint32_t *val, unsigned n)
+ {
+ 	uint32_t mask = (1u << n) - 1u;
+ 	int t = -1;
+@@ -441,6 +442,17 @@
+ 	at_wr(at.rsc, TCS_BASE + R_IRQ_EN,
+ 	    (at_rd(at.rsc, TCS_BASE + R_IRQ_EN) & ~bit) | (irq_en & bit));
+ 	return 0;
++}
++
++/* Copied from modem 2173; shared with ADSP: serialize all active-TCS and IRQ mask updates. */
++static LCK_GRP_DECLARE(sweet_rsc_group,"sweet-apps-rsc");
++static LCK_MTX_DECLARE(sweet_rsc_mutex,&sweet_rsc_group);
++void sweet_apps_rsc_lock(void);
++void sweet_apps_rsc_unlock(void);
++void sweet_apps_rsc_lock(void){lck_mtx_lock(&sweet_rsc_mutex);}
++void sweet_apps_rsc_unlock(void){lck_mtx_unlock(&sweet_rsc_mutex);}
++static int at_amc(const char *res,uint32_t addr,const uint32_t *off,const uint32_t *val,unsigned n){
++    sweet_apps_rsc_lock();int rc=at_amc_locked(res,addr,off,val,n);sweet_apps_rsc_unlock();return rc;
+ }
+ 
+ /* VRM: voltage, mode HPM (7), enable */
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -1,3 +1,4 @@
++extern void sweet_adsp_start(void);
+ extern void sweet_battery_start(void);
+ /*
+  * SWEET internal UFS root device.
+@@ -1327,6 +1328,7 @@
+ 		/* read-only PMIC survey (sweet_power_survey.c, boot-arg sweetpowersurvey=1, default off) */
+ 		sweet_power_survey_start();
+ 		sweet_battery_start();
++		sweet_adsp_start();
+ 		printf("SWEET UFS: Nothing Phone (3a): no SM7150/SDM845 drivers (USB, charger, GPU, Wi-Fi)\n");
+ 		return 0;
+ 	}
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -711,3 +711,7 @@
+ bsd/dev/battery/QcomSmem.c standard
+ bsd/dev/battery/QcomSmp2p.c standard
+ bsd/dev/battery/QcomRpmh.c standard
++bsd/dev/sweet_adsp.c standard
++bsd/dev/battery/QcomGlink.c standard
++bsd/dev/battery/QcomQrtr.c standard
++bsd/dev/battery/QcomQmp.c standard

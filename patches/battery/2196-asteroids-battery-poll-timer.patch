@@ -1,0 +1,60 @@
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -45,7 +45,7 @@
+ private:
+ 	IOWorkLoop *fLoop;
+ 	IOTimerEventSource *fTimer;
+-	bool fTimerAdded, fRunning, fReal;
++	bool fTimerAdded, fRunning, fReal, fADSP;
+ 	int fLastMode;
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+@@ -72,7 +72,7 @@
+ 	}
+ 	fLoop = NULL;
+ 	fTimer = NULL;
+-	fTimerAdded = fRunning = fReal = false;
++	fTimerAdded = fRunning = fReal = fADSP = false;
+ 	if (dictionary) {
+ 		OSCollectionIterator *it = OSCollectionIterator::withCollection(dictionary);
+ 		if (!it) {
+@@ -351,7 +351,7 @@
+ void
+ SweetBattery::poll(void)
+ {
+-    if (sweet_board_asteroids() && modem_gate(PE_boot_args(), "sweetbpub")) {
++    if (fADSP) {
+         BatterySnapshot sample;
+         if (sweet_adsp_battery_snapshot(&sample)) {
+             publish(sample.percent, sample.millivolts, sample.milliamps,
+@@ -413,7 +413,7 @@
+ 	SweetBattery *self = OSDynamicCast(SweetBattery, owner);
+ 	if (self && self->fRunning) {
+ 		self->poll();
+-		sender->setTimeoutMS(modem_gate(PE_boot_args(), "sweetbpub") ? 5000 : 30000);
++		sender->setTimeoutMS(self->fADSP ? 5000 : 30000);
+ 	}
+ }
+ 
+@@ -427,17 +427,18 @@
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
+ 	/* sweet_spmi.c is the SM7150/SDM845 arbiter (v5): not the Nothing Phone (3a)'s (v7) */
+ 	fReal = real == 1 && !sweet_board_asteroids() && sweet_spmi_init() == 0;
++	fADSP = sweet_board_asteroids() && modem_gate(PE_boot_args(), "sweetbpub");
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+ 	poll();
+-	if (fReal) {
++	if (fReal || fADSP) {
+ 		fLoop = IOWorkLoop::workLoop();
+ 		fTimer = IOTimerEventSource::timerEventSource(this, &SweetBattery::timerFired);
+ 		if (fLoop && fTimer && fLoop->addEventSource(fTimer) == kIOReturnSuccess) {
+ 			fTimerAdded = true;
+ 			fRunning = true;
+-			fTimer->setTimeoutMS(modem_gate(PE_boot_args(), "sweetbpub") ? 5000 : 30000);
++			fTimer->setTimeoutMS(fADSP ? 5000 : 30000);
+ 		} else {
+-			fReal = false;
++			fReal = fADSP = false;
+ 			poll();
+ 			IOLog("SWEET BATTERY: timer unavailable; static fallback\n");
+ 		}
