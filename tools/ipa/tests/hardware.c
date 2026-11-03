@@ -23,7 +23,7 @@ static void command_complete(void){
  else if(tre.length==3 || tre.length==4 || tre.length==7 || tre.length==8){uint64_t a,flags,b;memcpy(&a,p,8);memcpy(&flags,p+8,8);memcpy(&b,p+16,8);local_copy(a,(flags>>12)&65535,flags&4095,false);local_copy(b,(flags>>40)&65535,(flags>>28)&4095,false);}
  else if(tre.length==9){uint64_t address;uint32_t flags;memcpy(&address,p,8);memcpy(&flags,p+8,4);local_copy(address,(flags>>12)&65535,flags&4095,false);}else assert(0);
  unsigned er=regs[ipa_gev(0,2)/4]-IPA_DMA_IOVA;
- IpaEvent ev={IPA_DMA_IOVA+at,0,0,2,0,0x22,6};memcpy(dma+er+((cmd_seen-1)%slots)*16,&ev,16);regs[ipa_gev(0,4)/4]=IPA_DMA_IOVA+er+(cmd_seen%slots)*16;
+ IpaEvent ev={IPA_DMA_IOVA+at,1,0,2,0,0x23,6};memcpy(dma+er+((cmd_seen-1)%slots)*16,&ev,16);regs[ipa_gev(0,4)/4]=IPA_DMA_IOVA+er+(cmd_seen%slots)*16;
 }
 static void m_wr(vm_offset_t p,unsigned o,uint32_t v){
  assert(p==ipa.block);if(o>=0x140000){assert(o<0x150000);cfg_writes++;if(cfg_writes==cfg_drop)return;unsigned off=o-0x140000;if(off==0x6b0){if(!hold_aggregate)cfg[0x100/4]&=~v;return;}cfg[off/4]=v;return;}

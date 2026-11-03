@@ -1,0 +1,23 @@
+diff --git a/bsd/dev/modem/IpaGsi.h b/bsd/dev/modem/IpaGsi.h
+--- a/bsd/dev/modem/IpaGsi.h
++++ b/bsd/dev/modem/IpaGsi.h
+@@ -126,7 +126,9 @@
+     if(!ipa_gsi_healthy(s))return false;ch->posted++;
+     ipa_gw(s,0x24004+8*ch->channel,0);ipa_gw(s,0x24000+8*ch->channel,s->base+ch->ring+(ch->posted%ch->slots)*16);return true;
+ }
+-/* One event per TRE. Bad pointers/codes never release or repost DMA buffers. */
++/* ast181 measured type 0x23 for the GPI immediate-command channel. Data
++ * stays at its existing 0x22 contract until measured. Never accept both.
++ * Bad pointers/codes never release or repost DMA buffers. */
+ static inline int ipa_gsi_event(IpaGsi *s,unsigned i,unsigned *buffer,unsigned *bytes){
+     if(i>=4 || !ipa_gsi_healthy(s))return -1;IpaGsiChannel *ch=&s->ch[i];
+     uint32_t base=s->base+ch->events,producer=ipa_gr(s,ipa_gev(ch->event,4));
+@@ -138,7 +140,7 @@
+     unsigned at=ch->events+(ch->consumed%ch->slots)*16;s->io.sync(s->io.ctx,at,16);IpaEvent ev;memcpy(&ev,s->dma+at,16);
+     if(!ipa_gsi_healthy(s))return -1;
+     if(ch->completed==ch->posted || ev.transfer!=s->base+ch->ring+(ch->completed%ch->slots)*16 ||
+-       ev.channel!=ch->channel || ev.type!=0x22 || (ev.code!=1 && ev.code!=2 && ev.code!=4) || (!ch->tx && ev.length>ch->buffer_size)){
++       ev.channel!=ch->channel || ev.type!=(ch->command?0x23:0x22) || (ev.code!=1 && ev.code!=2 && ev.code!=4) || (!ch->tx && ev.length>ch->buffer_size)){
+         s->failed=true;
+         printf("SWEET IPA: GSI completion invalid channel=%u event=%u producer=%#x transfer=%#llx expected=%#x length=%u code=%#x type=%#x chid=%u posted=%u completed=%u consumed=%u ieob=%#x\n",ch->channel,ch->event,producer,(unsigned long long)ev.transfer,s->base+ch->ring+(ch->completed%ch->slots)*16,ev.length,ev.code,ev.type,ev.channel,ch->posted,ch->completed,ch->consumed,ipa_gr(s,0x250a8));return -1;
+     }

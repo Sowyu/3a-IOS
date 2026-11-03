@@ -396,3 +396,9 @@ Apply `2216-asteroids-ipa-final-pending-status-check.patch` after2215, SHA256 `1
 ast180 completed363seconds with clean roots, fresh nonce/frame and normal DONE12549. GSI setup passed at6221, then EIO at6222 with raw/global/general faults0 at6223. AP quiescence6224, PAS15 shutdown6231 and guarded release6234 succeeded. No PAS4 or I3.
 2217 adds bounded invalid-producer/completion and immediate-opcode logs without changing validation or teardown. Four actual invalid-producer regressions, the sanitizer suite,56-file reproduction and --remake-j6 build pass. Apply after2216, SHA256331f3a22fd69b2120e5eae71fd8b81bcd2c970a0679af07f9775b2cef3a63ab5.
 A fresh Sol source/exact-image review precedes one diagnostic boot. The phone is idle in OrangeFox with no claims. The root retains the ordinary2216 selftest hook, log/frame and completion marker.
+
+## ast181 and2218 command completion type
+
+ast181 returned cleanly after368seconds. Raw7143 captures the first command completion with producer20003010, matching TRE20002000, code2, type23 and channel6. The type22 predicate caused EIO. PAS15 shutdown7280, guarded release7389 and DONE12958 succeeded. No PAS4 or I3.
+2218 expects type23 only on the command channel and retains type22 on data channels, which remain unmeasured. Nothing's pinned `gsi.c:690` uses the pointer layout for non-GCI events and `gsi.h:1602` defines GCI as28. These sources support the layout, not a named type23 constant. Applying the measured command type to subsequent immediate opcodes is an inference.
+Apply after2217, SHA25634f02df2d682ccf4b7ea59807c91ed082fb8408f73fdd2d60a6c86c7b9b9274a. Tests replay the measured fields and all256 types on all four channels with unchanged terminal rejection. A fresh source/exact-image GO is required. Phone idle in recovery, ordinary2217 selftest files remain.

@@ -35,7 +35,7 @@ static void wait1(void *c,unsigned us){(void)c;assert(us<=1000);}
 static IpaGsiIo io={0,rd,wr,sync1,wait1};
 static void reset(void){memset(regs,0,sizeof(regs));memset(dma,0,sizeof(dma));writes=commands=fail_command=drop_at=error_inits=0;init_fault=false;survey_fault_register=0;sync_seen=false;fault_sync_offset=~0u;regs[0x25000/4]=1;regs[0x25040/4]=32;regs[0x25050/4]=32;}
 static void emit(IpaGsi *s,unsigned i,uint64_t address,unsigned len,unsigned code){
- IpaGsiChannel *ch=&s->ch[i];IpaEvent ev={address,len,0,code,0,0x22,ch->channel};memcpy(dma+ch->events+(ch->consumed%ch->slots)*16,&ev,16);regs[ipa_gev(ch->event,4)/4]=s->base+ch->events+((ch->consumed+1)%ch->slots)*16;
+ IpaGsiChannel *ch=&s->ch[i];IpaEvent ev={address,len,0,code,0,ch->command?0x23:0x22,ch->channel};memcpy(dma+ch->events+(ch->consumed%ch->slots)*16,&ev,16);regs[ipa_gev(ch->event,4)/4]=s->base+ch->events+((ch->consumed+1)%ch->slots)*16;
 }
 int main(void){
  IpaGsi s;reset();assert(ipa_gsi_setup(&s,io,dma,0x20000000));assert(commands==8);
@@ -99,6 +99,21 @@ int main(void){
   reset();assert(ipa_gsi_setup(&s,io,dma,0x20000000));assert(ipa_gsi_start(&s,0));assert(ipa_gsi_post(&s,0,7,payload,sizeof(payload)));
   regs[ipa_gev(0,4)/4]=bad_producer[k];unsigned before=writes;
   assert(ipa_gsi_event(&s,0,&buf,&n)<0 && s.failed && !s.ch[0].completed && !s.ch[0].consumed && writes==before);
+  assert(ipa_gsi_stop(&s));
+ }
+ /* ast181 exact command completion fields, then every type on all channels. */
+ reset();assert(ipa_gsi_setup(&s,io,dma,0x20000000));assert(ipa_gsi_start(&s,0));assert(ipa_gsi_post(&s,0,0x13,payload,sizeof(payload)));
+ const uint8_t measured[16]={0x00,0x20,0x00,0x20,0,0,0,0,1,0,0,2,0,0,0x23,6};
+ memcpy(dma+0x3000,measured,16);regs[ipa_gev(0,4)/4]=0x20003010;regs[0x250a8/4]=1;
+ unsigned before=writes;assert(ipa_gsi_event(&s,0,&buf,&n)==1 && n==1 && buf==0x1000);
+ assert(s.ch[0].completed==1 && s.ch[0].consumed==1 && writes==before+1 && !s.failed);assert(ipa_gsi_stop(&s));
+ for(unsigned i=0;i<4;i++)for(unsigned type=0;type<256;type++){
+  reset();assert(ipa_gsi_setup(&s,io,dma,0x20000000));assert(ipa_gsi_start(&s,i));
+  assert(ipa_gsi_post(&s,i,8,s.ch[i].tx?payload:0,s.ch[i].tx?8:0));emit(&s,i,s.base+s.ch[i].ring,1,2);
+  dma[s.ch[i].events+14]=(uint8_t)type;unsigned w=writes;buf=n=~0u;
+  int rc=ipa_gsi_event(&s,i,&buf,&n);bool valid=type==(i?0x22:0x23);
+  assert(rc==(valid?1:-1) && s.failed==!valid && s.ch[i].completed==valid && s.ch[i].consumed==valid);
+  assert(writes==w+(valid?1:0));if(!valid)assert(buf==~0u && n==~0u);
   assert(ipa_gsi_stop(&s));
  }
  puts("IPA GSI5.2 layout, ring wrap, event validation, command timeout and DMA stop PASS");return 0;
