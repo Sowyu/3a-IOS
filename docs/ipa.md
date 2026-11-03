@@ -2,7 +2,9 @@
 
 ## Checkpoint, 2026-11-03
 
-I1 is complete. I2 is in progress. Patch 2200 passed its audited read-only phone run, ast159. Firmware bounds and the APPS SMMU survey passed, with no IPA/GSI MMIO or PAS15 call. The isolated xnu-ipa tree now carries copied modem patches 2170 through 2188 revision 2. Mobile data does not work yet.
+I1 is complete. The I2 implementation builds with patches2200 through2210, copied modem2189v2, data2220audit8 and adapter2221. I3 and I4 remain unproven, and no IPA firmware has been started.
+
+Read-only surveys ast159 and ast170 passed. ast172 cleaned the root after ast171. ast173 safely refused the optional ASIDPNE hint. Patch2210 leaves that hint clear. Its reviewed SMMU-only run ast174 passed in214seconds with clean roots and fresh evidence. AP/uC private contexts installed, then parked with intact guards and backing released. PAS15 firmware and the offline handshake still need separate reviewed runs.
 
 Host inspection of the existing extracted ipa_fws.mdt found three relocatable loads, 17824 file bytes and a page-rounded span of 0x7000. This fits the 0xa000 GSI reservation. `tools/ipa/inspect_mdt.py` checks ELF bounds, overlap and relocation span without loading firmware. It does not check split-file contents or authenticate the image. Three synthetic host tests pass, including nine malformed cases. Local evidence is `plans/ipa/logs/host-check.txt` and `plans/ipa/logs/firmware-inventory.json`.
 
@@ -300,3 +302,11 @@ The maintained MMU model now clears ASIDPNE on control writes, matching ast173. 
 This cutoff also copies the data agent's reviewed2220audit8 bytes unchanged, SHA f331702b1bf1f5583a43bef11f76786f0da0000a543fbc987c2bf174af04359c. Only CellSession.c, CellSession.h and sweet_data.c differ from the prior data cutoff. Modem2189v2 and adapter2221 are unchanged. Data remains disabled in the SMMU-only image. The owner controls private carrier arguments for a later data image.
 
 Apply2210 after2209 and the earlier frozen series. Patch SHA256 is6ddf230d66ca5c63890a40e6be3fe93b0e2696f3fdb35eaa329e627de06c72e3. Reproduce with `python3 plans/ipa/tools/reproduce-cutoff.py`; it now pins data owner bytes to300c86c and modem bytes tocf1e583. Host commands remain the lifecycle/datapath/map-probe suites, with `python3 plans/ipa/tools/check-smmu-2210-test.py` for exact acceptance checks. The runner/checker preserve the reviewed v3 ordered-write validation and accepted-C evidence hashes, with only new image/script identities. A fresh Sol review must approve this exact new SMMU-only candidate. No replay of the failed image, new journal-clean boot, PAS15 or ONLINE trial is authorized by the earlier approval.
+
+## ast174, SMMU setup and cleanup passed
+
+The exact2210 S image df39ea12 completed normally in214seconds on2026-11-03. Both root checks were clean, stale=false and nonce8d0de1b55b2c4c35aa71a490a2b7bf47 matched. The exact checker accepted the capture. The raw log has private AP/uC context installation at7732, setup complete at7734, parked contexts and released backing with intact DMA guards at7940, final_error0 at7942 and DONE at11129. No PAS15 command, powered IPA/GSI work, panic or unverified cleanup appears.
+
+Evidence is ios-asteroids/logs/ast174-ipa-smmu-2210.txt and its result.json directory. The accepted record is plans/ipa/logs/smmu-2210-accepted.json. Source and exact-image review is plans/ipa/sol-2210-audit.md. The phone returned to recovery, the runner exited0 and its hold/lock were released. The root retains the normal selftest hook, log/frame and ipa-smmu-complete.txt marker. No partition changed.
+
+This proves setup and known-format parking on this boot. It does not prove hardware DMA translations, PAS15, GSI rings or I3. Next is a newly reviewed PAS15-only image on the unchanged2210 kernel.
