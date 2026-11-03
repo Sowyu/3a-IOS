@@ -1,0 +1,42 @@
+--- a/bsd/dev/modem/ModemUim.c
++++ b/bsd/dev/modem/ModemUim.c
+@@ -3,9 +3,20 @@
+ #include "ModemUim.h"
+ #include "QcomQrtr.h"
+ static uint32_t u32(const uint8_t *p){return (uint32_t)p[0]|(uint32_t)p[1]<<8|(uint32_t)p[2]<<16|(uint32_t)p[3]<<24;}
++/* qcom_qmi_parse already validated every extent. Ambiguous singleton TLVs
++ * cannot establish card presence or an identifier suffix. */
++static const uint8_t *unique_tlv(const QcomQmiMessage *m,uint8_t type,uint32_t *length){
++ const uint8_t *found=0;*length=0;
++ for(uint32_t at=0;at<m->length;){
++  const uint8_t *p=m->tlvs+at;uint32_t n=p[1]|p[2]<<8;
++  if(p[0]==type){if(found){*length=0;return 0;}found=p+3;*length=n;}
++  at+=3+n;
++ }
++ return found;
++}
+ static int response(const uint8_t *p,uint32_t n,uint16_t txn,uint16_t id,QcomQmiMessage *m){
+  if(qcom_qmi_parse(p,n,m) || m->type!=QCOM_QMI_RESPONSE || m->message!=id || m->transaction!=txn)return -1;
+- uint32_t len=0;const uint8_t *r=qcom_qmi_tlv(m,2,&len);
++ uint32_t len=0;const uint8_t *r=unique_tlv(m,2,&len);
+  if(!r || len!=4)return -1;
+  unsigned result=r[0]|r[1]<<8,error=r[2]|r[3]<<8;
+  if(result>1 || (!result && error) || (result && !error))return -1;
+@@ -13,7 +24,7 @@
+ }
+ int modem_uim_status(const uint8_t *p,uint32_t n,uint16_t txn,ModemUimStatus *out){
+  *out=(ModemUimStatus){0};QcomQmiMessage m;int rc=response(p,n,txn,0x2f,&m);if(rc)return rc;
+- uint32_t len=0;const uint8_t *v=qcom_qmi_tlv(&m,0x10,&len);
++ uint32_t len=0;const uint8_t *v=unique_tlv(&m,0x10,&len);
+  if(!v || len<9 || v[8]>MODEM_UIM_CARDS)return -1;
+  ModemUimStatus s={0};s.count=v[8];uint32_t at=9;
+  for(unsigned i=0;i<s.count;i++){
+@@ -44,7 +55,7 @@
+ }
+ int modem_uim_slots(const uint8_t *p,uint32_t n,uint16_t txn,ModemUimSlots *out){
+  *out=(ModemUimSlots){0};QcomQmiMessage m;int rc=response(p,n,txn,0x47,&m);if(rc)return rc;
+- uint32_t len=0;const uint8_t *v=qcom_qmi_tlv(&m,0x10,&len);
++ uint32_t len=0;const uint8_t *v=unique_tlv(&m,0x10,&len);
+  if(!v || !len || v[0]>MODEM_UIM_CARDS)return -1;
+  ModemUimSlots s={0};s.count=v[0];uint32_t at=1;
+  for(unsigned i=0;i<s.count;i++){

@@ -20,6 +20,17 @@ int main(void){
  for(unsigned i=0;i<n;i++)assert(modem_uim_slots(msg,i,7,&slots)==-1);
  v[20]=0xf3;n=wrap(msg,0x47,v,21);assert(!modem_uim_slots(msg,n,7,&slots) && !strcmp(slots.slot[0].suffix,"1123"));
  v[19]=0xf1;n=wrap(msg,0x47,v,21);assert(modem_uim_slots(msg,n,7,&slots)==-1 && !slots.count);
+ /* Duplicate standard results and duplicate status bodies are ambiguous. */
+ memset(v,0,sizeof(v));v[8]=1;n=wrap(msg,0x2f,v,15);
+ memcpy(msg+n,msg+7,7);msg[n+3]=1;msg[n+5]=3;msg[5]+=7;
+ assert(modem_uim_status(msg,n+7,7,&s)==-1 && !s.count);
+ n=wrap(msg,0x2f,v,15);memcpy(msg+n,msg+14,18);msg[5]+=18;
+ assert(modem_uim_status(msg,n+18,7,&s)==-1 && !s.count);
+ memset(v,0,sizeof(v));v[0]=1;n=wrap(msg,0x47,v,11);
+ memcpy(msg+n,msg+14,14);msg[5]+=14;
+ assert(modem_uim_slots(msg,n+14,7,&slots)==-1 && !slots.count);
+ n=wrap(msg,0x47,v,11);msg[n]=0x7e;msg[n+1]=msg[n+2]=0;msg[5]+=3;
+ assert(!modem_uim_slots(msg,n+3,7,&slots)); /* Unknown optional TLV is allowed. */
  char suffix[5];uint8_t bad[]={0xaa};assert(modem_uim_suffix(bad,1,suffix)==-1 && !suffix[0]);
  puts("PASS: UIM card/app status, absent/error, transaction/length checks and ICCID suffix-only BCD parsing");
 }

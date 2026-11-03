@@ -1,6 +1,6 @@
 # Modem and SIM: desk findings (2026-11-03)
 
-MPSS boots offline and announces UIM, NAS and WDS services. ast158 released the MSS proxy vote at handover, but PAS shutdown still failed after a successful SSCTL handshake. The root is clean. M2 remains incomplete and UIM requests remain off. Patch 2183 adds the vendor crypto-to-DDR bandwidth floor using resources measured in ast157. Host tests and the full build pass. Sol review is running.
+MPSS boots offline and announces UIM, NAS and WDS services. PAS shutdown remains unresolved. ast160's bandwidth test timed out before starting MPSS and retained its uncertain transaction. The root is clean. Patch 2185 hardens UIM reply parsing. A separate offline SIM diagnostic will use the previously measured power sequence with the bandwidth stage disabled, only after a fresh Sol approval. It cannot establish M2 if PAS shutdown fails.
 
 Labels as in `docs/input.md`: **Measured**, **Code**, **Inferred**, **Missing**.
 
@@ -271,3 +271,14 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 **Measured, host.** One mocked RSC now runs the actual touch at_bcm, at_amc and at_amc_locked functions alongside the actual modem bandwidth function. Both startup orders preserve the effective SN3 request. Replacing only at_bcm with the exact pre2184 function makes the regression fail. The full sanitizer suite and Trash-safe build pass. Production runtime and bandwidth encoding are unchanged from2183.
 
 **Missing.** Fresh Sol GO for2184 and one offline phone trial. UIM remains off.
+
+
+## ast160 bandwidth timeout and independent SIM diagnostic
+
+**Measured.** ast160-modem-offline-2184 timed out in the bandwidth transaction at9736 before any PAS initialization or modem start. Line9740 reports cleanup INCOMPLETE, and9743 reports final_error5. Touch then selected maximumSN3 at10664 and completed its separate TCS1 transaction at10665. The selftest reached DONE at12557 in366 seconds, with fresh nonce/frame and cleanroot. The timeout does not establish that masked IRQ reporting was its cause.
+
+**Code.** 2185 rejects duplicate singleton QMI result/card-status/slot-status TLVs. Sanitizer tests cover conflicting duplicates and retain support for unknown optional TLVs. The client still sends only UIM GetCardStatus0x2f and GetSlotStatus0x47, with at most three attempts each. It never sends a PIN, changes slots or provisioning, or requests online mode. ICCID output remains suffix4 only.
+
+**Code, proposed diagnostic scope.** The next UIM image omits sweetmbw. Its modem power sequence therefore matches the measured2182 run, including MSS proxy handover and shared CX/XO retention. PAS shutdown remains mandatory on all exits. An unsuccessful secure stop retains backing and reports failure until the guarded reset. Reading SIM status under that known limitation requires an explicit fresh Sol review. It would measure M3 independently and would not claim M2 or approve ONLINE.
+
+**Missing.** Fresh Sol approval and actual UIM phone evidence. Bandwidth completion needs its own diagnosis before that stage can be used again.
