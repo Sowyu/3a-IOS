@@ -25,5 +25,10 @@ int main(void){
  init();reg[0xd28/4]=0;assert(!m_bandwidth_vote() && !reg[0xd24/4] && reg[(0xd00+0x2a0+0x38)/4]==0x50000);
  init();reg[0xd28/4]=reg[(0xd28+0x2a0)/4]=0;assert(!m_bandwidth_vote() && reg[(0xd00+2*0x2a0+0x38)/4]==0x50000);
  init();reg[0xd28/4]=reg[(0xd28+0x2a0)/4]=reg[(0xd28+2*0x2a0)/4]=0;assert(m_bandwidth_vote()==ENODEV && !writes && m.failed);
- puts("PASS: measured BCM map, VCD grouping, saturation, actual RSC fresh completion, timeout retention, all TCS choices and default off");
+ init();boot_args="sweetmbw=1";assert(!m_bandwidth_vote());assert(!at_bcm("SN3"));assert((effective_sn3&0x0fffffff)==0x0fffffff && m.bandwidth_pinned);
+ init();boot_args="sweetmbw=1";assert(!at_bcm("SN3"));assert(!m_bandwidth_vote());assert((effective_sn3&0x0fffffff)==0x0fffffff);
+ const char *off[]={"","sweetmbw","sweetmbw=0","sweetmbw=01","sweetmbw=1 sweetmbw=1"};
+ for(unsigned i=0;i<sizeof(off)/sizeof(off[0]);i++){init();boot_args=off[i];assert(!at_bcm("SN3"));assert((effective_sn3&0x0fffffff)==0x4001);}
+ init();boot_args="sweetmbw=1";assert(!at_bcm("IP0"));assert(!effective_sn3 && reg[0xd3c/4]==0x60004001);
+ puts("PASS: measured BCM map, VCD grouping, saturation, actual RSC fresh completion, timeout retention, all TCS choices default off and both real touch/modem vote orders");
 }

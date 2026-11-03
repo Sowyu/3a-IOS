@@ -8,6 +8,7 @@
 static struct {bool bandwidth,bandwidth_pinned,vote_uncertain,failed;uintptr_t rsc,db;}m;
 static uint8_t db[0x20000];
 static uint32_t reg[0x4000/4];
+static uint32_t effective_sn3;
 static unsigned mode,locked,triggers,reads,writes,delays;
 static void sweet_apps_rsc_lock(void){assert(!locked);locked=1;}
 static void sweet_apps_rsc_unlock(void){assert(locked);locked=0;}
@@ -25,7 +26,9 @@ static void m_wr(uintptr_t p,unsigned o,uint32_t v){
  for(unsigned t=0;t<3;t++){
   unsigned b=0xd00+t*0x2a0;
   if(o==b+0x24 && (v&(1u<<24))){
-   triggers++;assert(reg[(b+0x20)/4]==0x75 && reg[(b+0x2c)/4]==0x7f);
+   triggers++;uint32_t mask=reg[(b+0x2c)/4];assert(mask==1 || mask==0x7f);
+   assert(reg[(b+0x20)/4]==(mask==1?1:0x75));
+   for(unsigned i=0;i<7;i++)if((mask&(1u<<i)) && reg[(b+0x38+i*24)/4]==0x5001c)effective_sn3=reg[(b+0x3c+i*24)/4];
    if(mode!=1)reg[0xd04/4]|=1u<<t;
    for(unsigned i=0;i<7;i++)reg[(b+0x40+i*24)/4]=(mode==2 && i==3)?0x100:0x10100;
   }
@@ -36,7 +39,7 @@ static void sweet_log_sync(void){}
 static void w16(uint8_t *p,unsigned v){p[0]=v;p[1]=v>>8;}
 static void w32(uint8_t *p,uint32_t v){w16(p,v);w16(p+2,v>>16);}
 static void init(void){
- memset(&m,0,sizeof(m));memset(db,0,sizeof(db));memset(reg,0,sizeof(reg));mode=locked=triggers=reads=writes=delays=0;
+ memset(&m,0,sizeof(m));memset(db,0,sizeof(db));memset(reg,0,sizeof(reg));mode=locked=triggers=reads=writes=delays=effective_sn3=0;
  m.bandwidth=true;m.rsc=1;m.db=2;reg[0xc/4]=16u<<27;reg[0xd00/4]=5;
  for(unsigned t=0;t<3;t++)reg[(0xd00+t*0x2a0+0x28)/4]=1;
  static const uint32_t addr[]={0x50034,0x5001c,0x50010,0x50008,0x50004,0x50000,0x50068};

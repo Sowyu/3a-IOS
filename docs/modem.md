@@ -260,3 +260,14 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 **Measured, build.** The full Trash-safe --remake exited 0. Both images contain all ten expected kernel segments. Offline arguments are 586 bytes and UIM arguments are 598 bytes.
 
 **Missing.** Sol audit and phone measurement. The bandwidth hypothesis comes from the vendor driver and does not decode the secure error. No further unchanged 2182 run is planned.
+
+
+## 2184 shared SN3 correction
+
+**Code, review finding.** Sol rejected2183 because touch's later SN3 keepalive replaces the same APPS request. A shared mutex serializes transactions but does not combine requested levels. ast158 log9474 shows touch writing SN3 after modem startup. See docs/modem-2183-audit.md. No2183image booted.
+
+**Code.** 2184 makes the touch SN3 vote use the maximum x/y fields only with the same strict sweetmbw=1 gate. Other resources and absent, bare, duplicate or invalid gate values retain the original keepalive. This preserves the modem floor regardless of thread order without changing the default touch behavior.
+
+**Measured, host.** One mocked RSC now runs the actual touch at_bcm, at_amc and at_amc_locked functions alongside the actual modem bandwidth function. Both startup orders preserve the effective SN3 request. Replacing only at_bcm with the exact pre2184 function makes the regression fail. The full sanitizer suite and Trash-safe build pass. Production runtime and bandwidth encoding are unchanged from2183.
+
+**Missing.** Fresh Sol GO for2184 and one offline phone trial. UIM remains off.

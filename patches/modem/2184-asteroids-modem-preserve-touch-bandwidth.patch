@@ -1,0 +1,27 @@
+--- a/bsd/dev/sweet_touch_asteroids.c
++++ b/bsd/dev/sweet_touch_asteroids.c
+@@ -40,6 +40,7 @@
+ #include <pexpert/pexpert.h>
+ #include <pexpert/device_tree.h>
+ #include <libkern/libkern.h>
++#include "modem/ModemGate.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+@@ -464,12 +465,14 @@
+ 	return at_amc(res, at_db_lookup(res, SLAVE_VRM), off, val, 3);
+ }
+ 
+-/* BCM: commit, valid, x = y = 1 (bcm-voter keepalive); RPMh takes the max. */
++/* BCM keepalive. Preserve the modem floor on our shared APPS voter. */
+ static int
+ at_bcm(const char *res)
+ {
+ 	static const uint32_t off[1] = {0};
+-	static const uint32_t val[1] = {(1u << 30) | (1u << 29) | (1u << 14) | 1u};
++	uint32_t floor = !strcmp(res, "SN3") && modem_gate(PE_boot_args(), "sweetmbw") ? 0x3fffu : 1u;
++	const uint32_t val[1] = {(1u << 30) | (1u << 29) | (floor << 14) | floor};
++	if (floor > 1) printf("SWEET TOUCH: SN3 preserves PAS bandwidth floor x=y=16383\n");
+ 	return at_amc(res, at_db_lookup(res, SLAVE_BCM), off, val, 1);
+ }
+ 
