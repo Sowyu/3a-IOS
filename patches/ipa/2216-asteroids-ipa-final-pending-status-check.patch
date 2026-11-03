@@ -1,0 +1,18 @@
+diff --git a/bsd/dev/modem/IpaGsi.h b/bsd/dev/modem/IpaGsi.h
+--- a/bsd/dev/modem/IpaGsi.h
++++ b/bsd/dev/modem/IpaGsi.h
+@@ -77,6 +77,14 @@
+      * Recheck the whole idle EE after masking output. Never clear pending
+      * status or ERROR_LOG_CLR. No channel/event allocation has happened yet. */
+     if(!ipa_gsi_available(io)){s->failed=true;return false;}
++    /* Context reads can span a newly latched fault. Sample pending status
++     * again after that scan, preserving any observed record before the store.
++     * This is polling, not an atomic hardware snapshot. Post-write health
++     * still refuses allocation if status arrives after the final sample. */
++    uint32_t global=ipa_gr(s,0x25200),general=ipa_gr(s,0x2520c);
++    if(global || general){
++        s->error_log=ipa_gr(s,0x25240);s->global_status=global;s->irq_status=general;s->failed=true;return false;
++    }
+     if(!ipa_gwrite_checked(s,0x25240,0,~0u) || !ipa_gsi_healthy(s))return false;
+     for(unsigned i=0;i<4;i++){
+         IpaGsiChannel *ch=&s->ch[i];ch->ring=0x2000+0x2000*i;ch->events=ch->ring+0x1000;

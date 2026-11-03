@@ -2,7 +2,7 @@
 
 ## Checkpoint, 2026-11-03
 
-I1 is complete. The I2 implementation builds with patches2200 through2215, copied modem2189v2, data2220audit8 and adapter2221. I3 and I4 remain unproven.
+I1 is complete. The I2 implementation builds with patches2200 through2216, copied modem2189v2, data2220audit8 and adapter2221. I3 and I4 remain unproven.
 
 Read-only surveys ast159 and ast170 passed. SMMU-only ast174 passed setup and parking. After fixing the CPU VA page-size bug in2211 and the endpoint direction guard in2212, benign ast176 cleaned the journal and PAS15-only ast177 passed authentication, shutdown and complete cleanup with clean roots. The first offline attempt ast178 safely refused GSI availability before configuration. ast179 identified a nonzero raw error log with every AP context free. Guarded error-log initialization is next.
 
@@ -380,3 +380,13 @@ Patch2215 rejects any pending global or general status and every occupied AP con
 Maintained tests cover the measured raw value, pending global error and generic status refusal, a dropped initialization write, a fault arriving during initialization, runtime global status, both prior hardware fault classes and uncertain-stop retention. The model checks idle contexts and clear pending status at the actual zero write. Actual2214 refuses the measured-value/no-pending-status negative control. Readback mismatches and unverified commands now log their registers and expected values without weakening checks.
 
 Apply `2215-asteroids-ipa-initialize-error-log.patch` after2214, SHA256 `bb1360646f45ed0f10a7d4dffd6fceec0e3b5046521581f805136aa4a957db30`. No PAS15, SMMU, power or modem lifecycle changes. A NEW Sol source/exact-image decision is required before this initialization write reaches the phone. ONLINE remains suspended.
+
+## 2216 closes the final survey window
+
+The2215 audit found a fault could arrive during the last context scan, after its initial pending-status reads. Initialization then overwrote that new raw record. The post-write health check prevented allocation, but the evidence was lost. No2215 phone attempt occurred.
+
+Patch2216 freshly samples global and general status after the final context scan, immediately before initialization. An observed pending condition preserves raw/global/general values and refuses without the zero write. Maintained tests inject global and general faults during the last event read at the measured18/17 counts. Both preserve the record, initialize0 times and allocate0 channels. Actual2215 fails the new regression at the attempted zero write.
+
+This is polling, not an atomic hardware snapshot. A fault arriving after the final status sample can still precede the store. The post-write health check retains its latched pending status and refuses allocation. The single AP owner and setup-before-MPSS ordering remain required. No pending status or log-clear register is written.
+
+Apply `2216-asteroids-ipa-final-pending-status-check.patch` after2215, SHA256 `1433c032e17a1224e27d1d00a8be1c2c69b9acfa812184f34a13dae3263f5424`. All56 files reproduce and the actual sanitizer suite passes. A fresh source/exact B review is required. Accepted A remains unchanged, I3 remains unproven and ONLINE is suspended.
