@@ -24,9 +24,12 @@ required = ['cpus=8', 'sweetpanel=0', 'sweetfb_noconsole', 'sweetfbarm=1',
     'sweetdeadman=900', 'sweetselftest=1', 'sweetmpss=1', 'sweetmglink=1',
     'sweetmrmtfs=1', 'sweetmpdm=1', 'sweetmstop=1', 'sweetmho=1',
     'sweetusb=4', 'sweetmuim=1', 'sweetmready=1', 'sweetmsession=1',
-    'sweetdata=1', 'sweetdataonline=1', 'sweetipa=1']
+    'sweetdata=1', 'sweetdataonline=1', 'sweetipa=1', 'sweetthermal=3',
+    'sweetfetchsync=1', 'sweetapnauth=pap', 'sweetpanicfb=9']
 assert all(x in args for x in required), 'missing data-session guard'
 assert not any(x.startswith('sweetqmiraw') for x in args), 'raw exports forbidden in first session'
+assert any(x.startswith('sweetapn=') and x != 'sweetapn=' for x in args), 'missing carrier APN'
+assert b'sweetapnauth\0' in kernel.read_bytes(), 'rebuild the reviewed APN/auth kernel first'
 # Hardware stages and final image still need a separate exact-artifact Sol GO.
 (out / (name + '-args.txt')).write_text(cmdline + '\n')
 shim = out / (name + '-shim')
