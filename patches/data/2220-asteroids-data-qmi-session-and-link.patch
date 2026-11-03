@@ -1,6 +1,6 @@
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -716,3 +716,9 @@
+@@ -716,3 +716,10 @@
  bsd/dev/modem/QcomRpmh.c standard
  bsd/dev/modem/ModemRmtfs.c standard
  bsd/dev/modem/ModemUim.c			standard
@@ -9,6 +9,7 @@
 +bsd/dev/data/CellLink.c standard
 +bsd/dev/data/CellSession.c standard
 +bsd/dev/data/QmiRaw.c standard
++bsd/dev/data/DataServices.c standard
 +bsd/dev/data/sweet_data.c standard
 --- /dev/null
 +++ b/bsd/dev/data/CellLink.c
@@ -1113,6 +1114,97 @@
 +#endif
 +#endif
 --- /dev/null
++++ b/bsd/dev/data/DataServices.c
+@@ -0,0 +1,50 @@
++#if defined(ARM64_BOARD_CONFIG_SWEET) || !defined(KERNEL)
++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
++/* Moved out of sweet_data.c so the cache can be tested with the real QRTR and session code (modem 2189 audit, finding 1). */
++#include "DataServices.h"
++
++const uint8_t data_service_ids[DATA_SERVICE_COUNT] = {QMI_SVC_DMS, QMI_SVC_NAS, QMI_SVC_WDS, QMI_SVC_WDA, QMI_SVC_DPM, QMI_SVC_UIM};
++
++void data_services_sync(DataServices *d, const QcomQrtr *qr, CellSession *session, DataServiceLost lost, void *context)
++{
++    for (unsigned i = 0; i < DATA_SERVICE_COUNT; ++i) {
++        const int r = qcom_qrtr_find_remote(qr, data_service_ids[i]);
++        const int moved = r >= 0 && d->svc[i].present &&
++                          (d->svc[i].node != qr->remote[r].node || d->svc[i].port != qr->remote[r].port);
++        if (d->svc[i].present && (r < 0 || moved)) {
++            d->svc[i].present = 0;
++            if (lost) lost(context, data_service_ids[i]);
++            if (session) cell_session_service(session, data_service_ids[i], 0);
++        }
++        if (r >= 0 && !d->svc[i].present) {
++            d->svc[i].node = qr->remote[r].node;
++            d->svc[i].port = qr->remote[r].port;
++            d->svc[i].present = 1;
++            if (session) cell_session_service(session, data_service_ids[i], 1);
++        }
++    }
++}
++
++int data_services_lookup(const DataServices *d, uint32_t node, uint32_t port)
++{
++    for (unsigned i = 0; i < DATA_SERVICE_COUNT; ++i)
++        if (d->svc[i].present && d->svc[i].node == node && d->svc[i].port == port) return data_service_ids[i];
++    return -1;
++}
++
++int data_services_endpoint(const DataServices *d, uint8_t service, uint32_t *node, uint32_t *port)
++{
++    for (unsigned i = 0; i < DATA_SERVICE_COUNT; ++i) {
++        if (data_service_ids[i] != service || !d->svc[i].present) continue;
++        *node = d->svc[i].node;
++        *port = d->svc[i].port;
++        return 0;
++    }
++    return -1;
++}
++
++void data_services_clear(DataServices *d)
++{
++    for (unsigned i = 0; i < DATA_SERVICE_COUNT; ++i) d->svc[i].present = 0;
++}
++#endif
+--- /dev/null
++++ b/bsd/dev/data/DataServices.h
+@@ -0,0 +1,35 @@
++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
++/* Where each QMI service the data side uses lives, as the modem's QRTR name service last announced it, and the session's view of it.
++ * data_services_sync compares the cache with the QRTR remote list and tells the session about every service that went away or came
++ * back. The owner calls it after every QRTR control packet (so a DEL_SERVER is seen before the next data packet, and a DEL then NEW
++ * at the same endpoint is still seen as a loss) and again before readiness and session work. Pure, worker-thread only. */
++#ifndef DATA_SERVICES_H
++#define DATA_SERVICES_H
++#include <stdint.h>
++#include "CellSession.h"
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define DATA_SERVICE_COUNT 6u
++extern const uint8_t data_service_ids[DATA_SERVICE_COUNT];  /* DMS, NAS, WDS, WDA, DPM, UIM */
++
++typedef struct {
++    struct {uint32_t node, port; int present;} svc[DATA_SERVICE_COUNT];
++} DataServices;
++
++/* Called for a service that went away (before the session hears of it), for example to fail a raw request waiting on it. */
++typedef void (*DataServiceLost)(void *context, uint8_t service);
++
++/* Brings the cache in line with qr's remote list. A service whose endpoint moved counts as lost, then found. session may be null. */
++void data_services_sync(DataServices *d, const QcomQrtr *qr, CellSession *session, DataServiceLost lost, void *context);
++/* The service at node:port in the cache, or -1. */
++int data_services_lookup(const DataServices *d, uint32_t node, uint32_t port);
++/* The cached endpoint of service: 0 and node/port set when present, -1 otherwise. */
++int data_services_endpoint(const DataServices *d, uint8_t service, uint32_t *node, uint32_t *port);
++void data_services_clear(DataServices *d);
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+--- /dev/null
 +++ b/bsd/dev/data/Qmap.c
 @@ -0,0 +1,79 @@
 +#if defined(ARM64_BOARD_CONFIG_SWEET) || !defined(KERNEL)
@@ -2182,7 +2274,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/data/sweet_data.c
-@@ -0,0 +1,845 @@
+@@ -0,0 +1,834 @@
 +/*
 + * SWEET DATA: mobile data above the modem runtime (bsd/dev/modem) and the IPA.
 + *
@@ -2229,6 +2321,7 @@
 +#include "CellLink.h"
 +#include "CellSession.h"
 +#include "QmiRaw.h"
++#include "DataServices.h"
 +#include "sweet_data.h"
 +
 +#define PORT_CLIENT0 0x4010u
@@ -2243,7 +2336,6 @@
 +
 +static const uint8_t sd_mac[6] = {0x02, 0x53, 0x57, 0x44, 0x41, 0x01};     /* locally administered "SWDA" 1 */
 +static const uint8_t sd_router_mac[6] = {0x02, 0x53, 0x57, 0x44, 0x41, 0xfe};
-+static const uint8_t sd_services[] = {QMI_SVC_DMS, QMI_SVC_NAS, QMI_SVC_WDS, QMI_SVC_WDA, QMI_SVC_DPM, QMI_SVC_UIM};
 +
 +enum {RAW_FREE, RAW_COPYING, RAW_QUEUED, RAW_SENT, RAW_DONE};
 +
@@ -2252,7 +2344,7 @@
 +	QcomQrtr *qr;                   /* worker thread only */
 +	CellSession session;            /* worker thread only */
 +	char apn[101];
-+	struct {uint32_t node, port; int present;} svc[sizeof sd_services];
++	DataServices services;          /* worker thread only */
 +	int usim, ready_given;          /* worker thread only */
 +	uint64_t next_ra;
 +	/* the presentation, under sd_lock */
@@ -2296,27 +2388,16 @@
 +	return ns / NSEC_PER_MSEC;
 +}
 +
-+static int
-+sd_index(uint8_t service)
-+{
-+	for (unsigned i = 0; i < sizeof sd_services; ++i) {
-+		if (sd_services[i] == service) {
-+			return (int)i;
-+		}
-+	}
-+	return -1;
-+}
-+
 +/* Worker thread. */
 +static int
 +sd_send(void *ctx, unsigned client, uint8_t service, const uint8_t *msg, uint32_t length)
 +{
 +	(void)ctx;
-+	const int i = sd_index(service);
-+	if (i < 0 || !sd.svc[i].present || sd.qr == NULL || client > 1 || (client == 1 && !sd.session_on)) {
++	uint32_t node, port;
++	if (data_services_endpoint(&sd.services, service, &node, &port) || sd.qr == NULL || client > 1 || (client == 1 && !sd.session_on)) {
 +		return -1;
 +	}
-+	return qcom_qrtr_send_data(sd.qr, client ? PORT_CLIENT1 : PORT_CLIENT0, sd.svc[i].node, sd.svc[i].port, msg, length);
++	return qcom_qrtr_send_data(sd.qr, client ? PORT_CLIENT1 : PORT_CLIENT0, node, port, msg, length);
 +}
 +
 +/* ---- the ifnet ---- */
@@ -2570,6 +2651,7 @@
 +}
 +
 +static void sd_readiness(void);
++static void sd_sync_services(QcomQrtr *qr);
 +
 +/* ---- QRTR receive (worker thread) ---- */
 +static void
@@ -2583,15 +2665,15 @@
 +static void
 +sd_receive(void *ctx, QcomQrtr *q, uint32_t port, uint32_t node, uint32_t from_port, const uint8_t *data, uint32_t length)
 +{
-+	(void)ctx; (void)q;
++	(void)ctx;
 +	const unsigned client = port == PORT_CLIENT1;
-+	int service = -1;
-+	for (unsigned i = 0; i < sizeof sd_services; ++i) {
-+		if (sd.svc[i].present && sd.svc[i].node == node && sd.svc[i].port == from_port) {
-+			service = sd_services[i];
-+		}
++	if (!sd.attached || q != sd.qr) {
++		return;
 +	}
-+	if (!sd.attached || service < 0 || length < QCOM_QMI_HEADER) {
++	/* the QRTR list is the truth: a DEL_SERVER earlier in this batch must count before this reply is routed */
++	sd_sync_services(q);
++	const int service = data_services_lookup(&sd.services, node, from_port);
++	if (service < 0 || length < QCOM_QMI_HEADER) {
 +		return;
 +	}
 +	const uint16_t txn = (uint16_t)(data[1] | data[2] << 8), message = (uint16_t)(data[3] | data[4] << 8);
@@ -2676,30 +2758,31 @@
 +}
 +
 +static void
-+sd_service_changes(QcomQrtr *qr)
++sd_service_lost(void *ctx, uint8_t service)
 +{
-+	for (unsigned i = 0; i < sizeof sd_services; ++i) {
-+		const int r = qcom_qrtr_find_remote(qr, sd_services[i]);
-+		const int moved = r >= 0 && sd.svc[i].present && (sd.svc[i].node != qr->remote[r].node || sd.svc[i].port != qr->remote[r].port);
-+		if (sd.svc[i].present && (r < 0 || moved)) {
-+			sd.svc[i].present = 0;
-+			lck_mtx_lock(&sd_lock);
-+			if (sd.raw.state == RAW_SENT && sd.raw.service == sd_services[i]) {
-+				sd_raw_finish(ENOENT);
-+			}
-+			lck_mtx_unlock(&sd_lock);
-+			if (sd.session_on) {
-+				cell_session_service(&sd.session, sd_services[i], 0);
-+			}
-+		}
-+		if (r >= 0 && !sd.svc[i].present) {
-+			sd.svc[i].node = qr->remote[r].node;
-+			sd.svc[i].port = qr->remote[r].port;
-+			sd.svc[i].present = 1;
-+			if (sd.session_on) {
-+				cell_session_service(&sd.session, sd_services[i], 1);
-+			}
-+		}
++	(void)ctx;
++	lck_mtx_lock(&sd_lock);
++	if (sd.raw.state == RAW_SENT && sd.raw.service == service) {
++		sd_raw_finish(ENOENT);
++	}
++	lck_mtx_unlock(&sd_lock);
++}
++
++static void
++sd_sync_services(QcomQrtr *qr)
++{
++	data_services_sync(&sd.services, qr, sd.session_on ? &sd.session : NULL, sd_service_lost, NULL);
++}
++
++void
++sweet_data_discovery(QcomQrtr *qr)
++{
++	if (!sd.attached || qr != sd.qr) {
++		return;
++	}
++	sd_sync_services(qr);
++	if (sd.session_on) {
++		sd_readiness();
 +	}
 +}
 +
@@ -2748,10 +2831,10 @@
 +	if (!sd.attached || qr != sd.qr) {
 +		return;
 +	}
++	sd_sync_services(qr);  /* before readiness, so a readiness transition never sends through a stale endpoint */
 +	if (sd.session_on) {
 +		sd_readiness();
 +	}
-+	sd_service_changes(qr);
 +	sd_raw_poll();
 +	if (sd.session_on) {
 +		cell_session_poll(&sd.session, now_ms);
@@ -2829,9 +2912,7 @@
 +	sd.attached = 0;
 +	sd.qr = NULL;
 +	lck_mtx_unlock(&sd_lock);
-+	for (unsigned i = 0; i < sizeof sd_services; ++i) {
-+		sd.svc[i].present = 0;
-+	}
++	data_services_clear(&sd.services);
 +	sd.ready_given = 0;
 +	printf("SWEET DATA: detached\n");
 +}
@@ -3030,7 +3111,7 @@
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 --- /dev/null
 +++ b/bsd/dev/data/sweet_data.h
-@@ -0,0 +1,38 @@
+@@ -0,0 +1,43 @@
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 +/* The data agent's hooks for the modem runtime and the IPA driver (bsd/dev/data/sweet_data.c). Without sweetdata=1 or sweetqmiraw=1
 + * attach registers nothing and every other hook returns at once; usim and ipa_ready only record a flag. One attach per boot. */
@@ -3042,11 +3123,16 @@
 +/* Modem runtime, from its worker thread only.
 + *   attach   after qcom_qrtr_init, before qcom_qrtr_start. Returns 0, also when every data gate is off.
 + *   poll     every worker iteration.
++ *   discovery after every QRTR control packet, before the next packet is dispatched (see below).
 + *   usim     1 once UIM card status shows the USIM application ready, 0 when that is lost.
 + *   stop     before the modem stops; then keep receiving and polling until idle() or 5 s have passed.
 + *   detach   after idle() (or the 5 s), before the QRTR object goes away. Nothing in this file touches it afterwards. */
 +int sweet_data_attach(QcomQrtr *qr);
 +void sweet_data_poll(QcomQrtr *qr, uint64_t now_ms);
++/* After every QRTR control packet (NEW_SERVER, DEL_SERVER, BYE), before the worker dispatches the next packet: brings the data
++ * side's service cache in line, so a removal is seen before any later reply from that service, even when the same endpoint is
++ * announced again in the same batch. Does nothing unless attached to this qr. */
++void sweet_data_discovery(QcomQrtr *qr);
 +void sweet_data_usim(int ready);
 +void sweet_data_stop(void);
 +int sweet_data_idle(void);

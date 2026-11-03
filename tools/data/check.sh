@@ -10,12 +10,16 @@ for f in QcomQrtr.c QcomQrtr.h; do python3 -I "$root/../modem/extract.py" "$root
 src=${DATA_SRC:-}
 if [ -z "$src" ]; then
 	src="$out/data"; mkdir -p "$src"
-	for f in QmiData.c QmiData.h Qmap.c Qmap.h CellLink.c CellLink.h CellSession.c CellSession.h QmiRaw.c QmiRaw.h; do
+	for f in QmiData.c QmiData.h Qmap.c Qmap.h CellLink.c CellLink.h CellSession.c CellSession.h QmiRaw.c QmiRaw.h DataServices.c DataServices.h; do
 		python3 -I "$root/../modem/extract.py" "$root/../../patches/data" "$src/$f" "bsd/dev/data/$f"
 	done
 fi
 cc -std=gnu11 -DMODEM_PROTOCOL_HOST_TEST -Wall -Wextra -Werror -fsanitize=address,undefined -I"$out" -I"$src" "$root/tests/data.c" "$src/QmiData.c" "$src/Qmap.c" \
 	"$src/CellLink.c" "$src/CellSession.c" "$src/QmiRaw.c" "$out/QcomQrtr.c" -o "$out/check-data"
+# modem 2189 audit finding 1: the real service cache between real QRTR and the real session
+cc -std=gnu11 -DMODEM_PROTOCOL_HOST_TEST -Wall -Wextra -Werror -fsanitize=address,undefined -I"$out" -I"$src" "$root/tests/services.c" \
+	"$src/DataServices.c" "$src/CellSession.c" "$src/QmiData.c" "$out/QcomQrtr.c" -o "$out/check-services"
+"$out/check-services"
 "$out/check-data"
 # 2221: the IPA adapter against stubs of 2220's hooks and 2202's API
 t="$out/ipa"; mkdir -p "$t/bsd/dev/data" "$t/bsd/dev/modem" "$t/inc/libkern"

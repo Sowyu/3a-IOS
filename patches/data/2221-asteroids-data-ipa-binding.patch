@@ -1,8 +1,8 @@
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -722,3 +722,4 @@
- bsd/dev/data/CellSession.c standard
+@@ -723,3 +723,4 @@
  bsd/dev/data/QmiRaw.c standard
+ bsd/dev/data/DataServices.c standard
  bsd/dev/data/sweet_data.c standard
 +bsd/dev/data/sweet_data_ipa.c standard
 --- /dev/null
