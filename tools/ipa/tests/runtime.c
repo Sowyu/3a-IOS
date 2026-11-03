@@ -77,6 +77,10 @@ static void reset(void){
  for(unsigned i=0;i<allocations;i++)if(allocation[i].ptr)free(allocation[i].ptr);
  allocations=freed=unmapped=alloc_calls=fail_alloc=fail_pas=shutdown_fails=clocks=0;held=timeout=drop_irq_enable=drop_irq_clear=false;memset(pas_calls,0,sizeof(pas_calls));memset(&ipa,0,sizeof(ipa));ipa.enabled=true;
  memset(smmu,0,sizeof(smmu));smmu[0x20/4]=0x4c017e72;smmu[0x24/4]=0x60000048;smmu[0x28/4]=0x5111;
+ for(unsigned i=0;i<72;i++){
+  smmu[ipa_cb(i)/4]=0x3ec9850c;
+  for(unsigned j=1;j<9;j++)smmu[(ipa_cb(i)+ipa_mmu_regs[j])/4]=0x9191f7efu+i+j;
+ }
  memset(rsc,0,sizeof(rsc));for(unsigned i=0;i<3;i++)rsc[(0xd00+i*0x2a0+0x28)/4]=1;
  m.rsc=(uintptr_t)rsc;m.db=1;m.bandwidth_pinned=m.bandwidth_irq=true;m.vote_uncertain=false;
  memset(gic,0,sizeof(gic));m.gic=(uintptr_t)gic;gic[0x424/4]=0xa000;

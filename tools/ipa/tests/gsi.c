@@ -45,5 +45,11 @@ int main(void){
  reset();assert(ipa_gsi_setup(&s,io,dma,0x20000000));assert(ipa_gsi_start(&s,0));fail_command=commands+1;assert(!ipa_gsi_stop(&s));assert(s.uncertain && s.ch[0].channel_owned);
  reset();assert(ipa_gsi_setup(&s,io,dma,0x20000000));assert(ipa_gsi_start(&s,3));assert(ipa_gsi_post(&s,3,8192,0,0));emit(&s,3,s.base+s.ch[3].ring,8193,2);assert(ipa_gsi_event(&s,3,&buf,&n)<0);assert(ipa_gsi_stop(&s));
  reset();assert(ipa_gsi_setup(&s,io,dma,0x20000000));assert(ipa_gsi_start(&s,0));assert(ipa_gsi_post(&s,0,7,payload,sizeof(payload)));emit(&s,0,s.base+s.ch[0].ring,0,0x11);assert(ipa_gsi_event(&s,0,&buf,&n)<0);assert(ipa_gsi_stop(&s));
+ for(unsigned nth=1;nth<=4;nth++){
+  reset();assert(ipa_gsi_setup(&s,io,dma,0x20000000));for(unsigned i=0;i<4;i++)assert(ipa_gsi_start(&s,i));
+  fail_command=commands+nth;assert(!ipa_gsi_quiesce(&s));
+  for(unsigned i=0;i<4;i++)assert(s.ch[i].channel_owned && s.ch[i].event_owned);
+  unsigned before=writes;assert(!ipa_gsi_stop(&s) && writes==before);
+ }
  puts("IPA GSI5.2 layout, ring wrap, event validation, command timeout and DMA stop PASS");return 0;
 }

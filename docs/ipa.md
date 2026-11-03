@@ -216,3 +216,32 @@ The worker binds exactly once for sweetdata, after IPA preparation and before at
 After bounded WDS cleanup, the worker closes RX aggregation and stops owned AP GSI channels before data detach. It keeps channel/event ownership, mappings and power until verified PAS4 stop permits final GSI/PAS15 teardown. An uncertain stop remains an error and retains backing. Host sanitizer fixtures exercise the actual merged receive/stop code, real2221 partial-bind failure, successful handshake followed by service/GSI failure, DEL_SERVER followed by a data reply, and all four channel-stop failures.
 
 This is private desk work while the reviewed2204 survey runs. It is not yet a public frozen2205 cutoff, full integrated build or phone GO. The data agent is checking one further readiness-before-service-sync edge before the combined review.
+
+## ast170 and frozen integration cutoff
+
+ast170 completed normally in214seconds, with fresh nonce48c6e4d1660b4ae78061c3f2943d8757, stale=false and clean root before and after. All72 context records and the SMEM record survived. No PAS15, power vote or GSI access occurred. The phone returned to recovery, with the IPA hold and lock released. The root retains the normal inert selftest hook, logs, frame and IPA completion markers. The blank hardware-scaled frame is not visual evidence.
+
+The first five banks are referenced. Every unreferenced bank5 through71 has SCTLR.M clear, but nonzero SCTLR and TTBR reset values, with CBAR/CBA2R/FSR zero. The zero-only2201 selector necessarily rejects all of them. SMEM item497 is absent, while the partition has ample free space for its0xb000-byte allocation. The earlier ast166 log did not distinguish allocation from selection failure. The survey proves a selector defect, not which return executed in ast166.
+
+Patch2206 accepts an unreferenced bank only when SCTLR.M, CFRE, CFIE and CFCFG are clear, CBAR/CBA2R are zero and FSR is zero. It saves the nonzero fields, rechecks ownership/state, clears control before configuration, and restores the original disabled control after other fields. Every saved register must match before backing can be freed. Dropped write, active/configured/faulted bank and measured nonzero-state tests pass. The arbitrary reset fields are consistent with ARM IHI0062D.c section16.2 and16.5.29, https://documentation-service.arm.com/static/5f900d34f86e16515cdc08fb. This is a source fix requiring a fresh Sol image review before any write probe. Powered identification reads now use the same explicit plain-MMIO accessor. Cleanup logs distinguish PAS15 not started and SMMU untouched.
+
+2205 now implements all three obligations from data2221's audit: immediate terminal readiness revocation, bind before attach with per-pass and per-receive refresh, and AP channel quiescence before data detach. This includes offline/partial-start shutdown when data never attached. It also initializes all four FNR statistics base registers before handing tables to the modem. Data2220audit7 supplies revoke-sync-grant ordering before callbacks can advance setup.
+
+### Exact application order
+
+Start with the brief's2130v4,2140..2144,2150,2151,2153,2152v4,2154 and USB2160/2161v5 series. Apply copied modem2170..2189 in its README order, including2187revision2,2188revision2 and2189revision2. Apply data2220audit7 and2221 unchanged. Apply the current IPA2200..2206 in numeric order. The current2200..2202 runtime hunks are rebased onto2189v2. Do not use their older2188-based copies. Their non-runtime hunks and2203/2204 are unchanged.
+
+From the project root, run `python3 plans/ipa/tools/reproduce-cutoff.py`. It checks copied owner bytes and reproduces every IPA-touched file from pristine source and the full ordered series. Run `sh tools/ipa/check.sh`, `sh tools/ipa/check-lifecycle.sh`, `sh tools/ipa/check-datapath.sh` and `sh tools/ipa/check-mmio.sh` from3a-IOS. The datapath suite reconstructs actual worker functions and the real2221 adapter, including partial bind failure, receive/discovery ordering, stopped-channel retention and teardown outcomes. Build only in your own tree with --remake -j6. The integrated IPA build is running. These source tests are not image approval or I3 evidence.
+
+Frozen source hashes follow. No phone image is approved by this cutoff.
+
+- `2189-asteroids-modem-data-worker-hooks.patch` `9b4b570d07d9a5b02288f006e500a733bfdea0876acaa938ef5b7395497ed58f`
+- `2220-asteroids-data-qmi-session-and-link.patch` `410ee41d9269ab7e6f97b1beb4c4550af28464b5503c5719790094bedc2ebdf8`
+- `2221-asteroids-data-ipa-binding.patch` `4bdc74ce4ad45000ba2efe18bf45454169dcb6464483d5722c918892875e1e49`
+- `2200-asteroids-ipa-read-only-preflight.patch` `eee590a673ad46eabbb272825d576b660122531437ad45898f58b5cf9fb49b9a`
+- `2201-asteroids-ipa-pas15-isolated-dma.patch` `334ea045a2c066fa59fc48836312e2865d637127c59062f1857b7e24570ca9b9`
+- `2202-asteroids-ipa-gsi-qmi-data.patch` `c54dc55bdeee05a74a0ac7f50c5e8bef30aada631e11e6ce6b49b67efb0ceef3`
+- `2203-asteroids-ipa-memory-read-only-survey.patch` `0aec26665a2f71c227d6dd9bbf480d04b0934ae5b865bfc1297d9309c87b9c52`
+- `2204-asteroids-ipa-plain-mmio.patch` `15b52570e717c5537435e490a1477fd97af632bac31298cdc8e2b43eb76e28b3`
+- `2205-asteroids-ipa-data-worker-integration.patch` `479f4c1df57b857745b75262b8f4e9895d44e8d22e643c9fa6ef81beaf067590`
+- `2206-asteroids-ipa-unused-context-reset.patch` `0e2795df6d0bd53aa9bd790eba558d261b8a098bd91cd893d08f6629811d9425`

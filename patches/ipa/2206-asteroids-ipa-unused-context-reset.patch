@@ -1,0 +1,63 @@
+diff --git a/bsd/dev/modem/IpaMmu.h b/bsd/dev/modem/IpaMmu.h
+--- a/bsd/dev/modem/IpaMmu.h
++++ b/bsd/dev/modem/IpaMmu.h
+@@ -40,7 +40,12 @@
+     unsigned nb=0;
+     for(unsigned i=0;i<72 && nb<2;i++){
+         unsigned b=ipa_cb(i);
+-        if(used[i] || io->read(c,b) || io->read(c,b+0x20) || io->read(c,b+0x24) || io->read(c,b+0x28) || io->read(c,b+0x2c) || io->read(c,b+0x58))continue;
++        /* ast170: unused banks have UNKNOWN SCTLR/TTBR reset fields.
++         * ARM IHI0062D.c 16.2 does not require those fields to be zero.
++         * Only claim a disabled, unreferenced, unconfigured, fault-free bank.
++         * CFRE/CFIE/CFCFG must also be clear, as measured on banks5..71. */
++        if(used[i] || (io->read(c,b)&0xe1) || io->read(c,b+0x58) ||
++           io->read(c,0x1000+4*i) || io->read(c,0x1800+4*i))continue;
+         IpaMmuContext *p=&s->context[nb];p->slot=slots[nb];p->bank=i;p->sid=nb?0x4a2:0x4a0;
+         p->smr=io->read(c,0x800+4*p->slot);p->s2cr=io->read(c,0xc00+4*p->slot);
+         p->cbar=io->read(c,0x1000+4*i);p->cba2r=io->read(c,0x1800+4*i);
+@@ -56,7 +61,11 @@
+         IpaMmuContext *p=&s->context[n];unsigned b=ipa_cb(p->bank);
+         /* Recheck ownership immediately before touching each reserved slot. */
+         if(io->read(c,0x800+4*p->slot)!=p->smr || io->read(c,0xc00+4*p->slot)!=p->s2cr || io->read(c,b)!=p->saved[0])return false;
++        if(io->read(c,0x1000+4*p->bank)!=p->cbar || io->read(c,0x1800+4*p->bank)!=p->cba2r || io->read(c,b+0x58))return false;
++        for(unsigned j=1;j<9;j++)if(io->read(c,b+ipa_mmu_regs[j])!=p->saved[j])return false;
+         p->touched=true;
++        /* Clear unknown controls before switching context format. M was zero. */
++        io->write(c,b,0);if(io->read(c,b))return false;
+         io->write(c,0x1800+4*p->bank,1); /* 64-bit context */
+         io->write(c,0x1000+4*p->bank,0x1f300); /* stage 1, stage 2 bypass */
+         /* SEP=7, PASIZE=1 (36-bit), 36-bit IOVA, EPD1, noncached walks. */
+@@ -98,6 +107,8 @@
+         io->write64(c,b+0x28,(uint64_t)p->saved[7]|(uint64_t)p->saved[8]<<32);
+         for(unsigned j=1;j<=6;j++)if(j!=2 && j!=3)io->write(c,b+ipa_mmu_regs[j],p->saved[j]);
+         io->write(c,0x1800+4*p->bank,p->cba2r);io->write(c,0x1000+4*p->bank,p->cbar);
++        /* Restore the saved disabled control after tables and format. */
++        io->write(c,b,p->saved[0]);
+         if(io->read(c,0x800+4*p->slot)!=p->smr || io->read(c,0xc00+4*p->slot)!=p->s2cr){s->retained=true;return false;}
+         for(unsigned j=0;j<9;j++)if(io->read(c,b+ipa_mmu_regs[j])!=p->saved[j]){s->retained=true;return false;}
+         if(io->read(c,0x1800+4*p->bank)!=p->cba2r || io->read(c,0x1000+4*p->bank)!=p->cbar){s->retained=true;return false;}
+diff --git a/bsd/dev/modem/IpaRuntime.inc b/bsd/dev/modem/IpaRuntime.inc
+--- a/bsd/dev/modem/IpaRuntime.inc
++++ b/bsd/dev/modem/IpaRuntime.inc
+@@ -145,11 +145,12 @@
+     if((rc=ipa_load_firmware(f)))return rc;
+     ipa.block=ml_io_map_unmappable(0x3e00000,0x200000,VM_WIMG_IO);if(!ipa.block)return ENOMEM;
+     printf("SWEET IPA: powered read-only flavor=%#x shared_mem=%#x GSI_status=%#x param2=%#x param4=%#x\n",
+-        m_rd(ipa.block,0x140000),m_rd(ipa.block,0x140040),m_rd(ipa.block,0x4000+0x25000),m_rd(ipa.block,0x4000+0x25040),m_rd(ipa.block,0x4000+0x25050));
++        ipa_mmio_read32(ipa.block,0x140000),ipa_mmio_read32(ipa.block,0x140040),ipa_mmio_read32(ipa.block,0x4000+0x25000),ipa_mmio_read32(ipa.block,0x4000+0x25040),ipa_mmio_read32(ipa.block,0x4000+0x25050));
+     sweet_log_sync();return 0;
+ }
+ static bool ipa_cleanup(bool modem_stopped){
+     if(!ipa.enabled)return true;
++    bool pas_was_owed=ipa.pas_owed,mmu_touched=ipa.mmu.context[0].touched || ipa.mmu.context[1].touched;
+     if(!modem_stopped){ipa.retained=true;goto retain;}
+     if(ipa.pas_owed){
+         int rc=EIO;for(unsigned n=0;n<4;n++){rc=ipa_pas(6,1,0,0);if(!rc)break;m_sleep(100);}
+@@ -168,6 +169,6 @@
+     if(ipa.metadata)kmem_free(kernel_map,ipa.metadata,IPA_FW_METADATA_MAX);
+     if(ipa.dma)kmem_free(kernel_map,ipa.dma,IPA_DMA_BYTES+2*PAGE_SIZE);
+     for(unsigned i=0;i<2;i++)if(ipa.pt[i])kmem_free(kernel_map,ipa.pt[i],IPA_PT_BYTES);
+-    printf("SWEET IPA: PAS15 stopped; DMA guards intact; SMMU restored; backing released; shared power floors pinned=%u\n",ipa.clock_pinned);sweet_log_sync();return true;
++    printf("SWEET IPA: PAS15 %s; DMA guards intact; SMMU %s; backing released; shared power floors pinned=%u\n",pas_was_owed?"stopped":"not started",mmu_touched?"restored":"untouched",ipa.clock_pinned);sweet_log_sync();return true;
+ retain:printf("SWEET IPA: cleanup UNVERIFIED; retain memory, mappings and power until reset\n");sweet_log_sync();return false;
+ }

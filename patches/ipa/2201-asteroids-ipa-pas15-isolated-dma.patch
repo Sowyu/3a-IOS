@@ -44,32 +44,33 @@ diff --git a/bsd/dev/sweet_touch_asteroids.c b/bsd/dev/sweet_touch_asteroids.c
 diff --git a/bsd/dev/modem/ModemRuntime.inc b/bsd/dev/modem/ModemRuntime.inc
 --- a/bsd/dev/modem/ModemRuntime.inc
 +++ b/bsd/dev/modem/ModemRuntime.inc
-@@ -515,8 +515,11 @@
+@@ -552,8 +552,11 @@
  #include "ModemGate.h"
  static bool m_gate(const char *name){return modem_gate(PE_boot_args(),name)!=0;}
  #include "IpaProbe.inc"
 +#include "IpaRuntime.inc"
  static int modem_run(const struct wl_fat *f,const uint8_t *mdt,uint32_t size){
-     memset(&m,0,sizeof(m));m.master=-1;m.glink=m_gate("sweetmglink");m.rmtfs=m_gate("sweetmrmtfs");m.pdm=m_gate("sweetmpdm");m.uim=m_gate("sweetmuim");m.uim_ready_poll=m_gate("sweetmready");m.sysmon=m_gate("sweetmstop");m.bcm_probe=m_gate("sweetmbcm");m.handover_release=m_gate("sweetmho");m.bandwidth=m_gate("sweetmbw");m.bandwidth_irq=m_gate("sweetmbwi");
+     memset(&m,0,sizeof(m));m.master=-1;m.glink=m_gate("sweetmglink");m.rmtfs=m_gate("sweetmrmtfs");m.pdm=m_gate("sweetmpdm");m.uim=m_gate("sweetmuim");m.uim_ready_poll=m_gate("sweetmready");m.data_session=m_gate("sweetmsession");m.sysmon=m_gate("sweetmstop");m.bcm_probe=m_gate("sweetmbcm");m.handover_release=m_gate("sweetmho");m.bandwidth=m_gate("sweetmbw");m.bandwidth_irq=m_gate("sweetmbwi");
 +    memset(&ipa,0,sizeof(ipa));ipa.enabled=m_gate("sweetipafw");
 +    if(ipa.enabled && (!m.bandwidth || !m.bandwidth_irq || !m_gate("sweetmpss"))){printf("SWEET IPA: requires strict sweetmpss, sweetmbw and sweetmbwi gates\n");return EINVAL;}
      if((m.rmtfs || m.pdm || m.uim || m.sysmon) && !m.glink){printf("SWEET MODEM: refused missing GLINK dependency\n");return EINVAL;}
      if(m.uim_ready_poll && !m.uim){printf("SWEET MODEM: readiness polling requires UIM\n");return EINVAL;}
-     m_sleep(30000);m.began=m_now();int rc=EIO;
-@@ -543,11 +546,12 @@
+     bool data_requested=m_gate("sweetdata") || m_gate("sweetqmiraw");
+@@ -586,6 +589,7 @@
      m.qmp_owed=true;if((rc=m_qsend(true)))goto out;
      if((rc=m_vote(true)))goto out;
      if((rc=m_bandwidth_vote()))goto out;
 +    if(ipa.enabled){rc=ipa_prepare(f);goto out;} /* PAS15-only probe stops before MPSS authentication. */
+     /* IPA must install its immutable TX hook before this attach. */
+     if(m.data_session){m.data_attached=true;if((rc=sweet_data_attach(&m.qr)))goto out;}
      if((rc=m_load(f,mdt,size)))goto out;
-     if((rc=m_pas(5,1,0,0)))goto out;m.started=true;
-     uint64_t end=m_now()+120000,ready_deadline=m_now()+10000;
-     while(m_now()<end){m_smp_poll();if((rc=m_handover()))break;if(m.glink)m_ipc_poll();if(m.uim && (m.state&6)==6)m_uim_poll();if(m.fatal || m.failed){rc=EIO;break;}
+@@ -599,5 +603,5 @@
+         if(m.fatal || m.failed){rc=EIO;break;}
          if(!(m.state&2) && m_now()>ready_deadline){rc=ETIMEDOUT;break;}m_sleep(2);}
      if(!m.fatal && !m.failed && (m.state&6)==6)rc=0;else if(!rc)rc=ETIMEDOUT;
--out:printf("SWEET MODEM: offline run end error=%d elapsed_ms=%llu\n",rc,(unsigned long long)(m_now()-m.began));if(!m_cleanup())rc=EIO;return rc;
+-out:printf("SWEET MODEM: %s run end error=%d elapsed_ms=%llu\n",m.data_session?"data session":"offline",rc,(unsigned long long)(m_now()-m.began));if(!m_cleanup())rc=EIO;return rc;
 -}
-+out:printf("SWEET MODEM: offline run end error=%d elapsed_ms=%llu\n",rc,(unsigned long long)(m_now()-m.began));if(!m_cleanup())rc=EIO;if(!ipa_cleanup(m.stop_verified))rc=EIO;return rc;
++out:printf("SWEET MODEM: %s run end error=%d elapsed_ms=%llu\n",m.data_session?"data session":"offline",rc,(unsigned long long)(m_now()-m.began));if(!m_cleanup())rc=EIO;if(!ipa_cleanup(m.stop_verified))rc=EIO;return rc;
 +}
 diff --git a/bsd/dev/modem/IpaSmmu.h b/bsd/dev/modem/IpaSmmu.h
 new file mode 100644

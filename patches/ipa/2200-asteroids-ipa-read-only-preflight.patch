@@ -27,13 +27,13 @@ diff --git a/bsd/dev/sweet_modem.c b/bsd/dev/sweet_modem.c
 diff --git a/bsd/dev/modem/ModemRuntime.inc b/bsd/dev/modem/ModemRuntime.inc
 --- a/bsd/dev/modem/ModemRuntime.inc
 +++ b/bsd/dev/modem/ModemRuntime.inc
-@@ -514,6 +514,7 @@
+@@ -551,6 +551,7 @@
  }
  #include "ModemGate.h"
  static bool m_gate(const char *name){return modem_gate(PE_boot_args(),name)!=0;}
 +#include "IpaProbe.inc"
  static int modem_run(const struct wl_fat *f,const uint8_t *mdt,uint32_t size){
-     memset(&m,0,sizeof(m));m.master=-1;m.glink=m_gate("sweetmglink");m.rmtfs=m_gate("sweetmrmtfs");m.pdm=m_gate("sweetmpdm");m.uim=m_gate("sweetmuim");m.uim_ready_poll=m_gate("sweetmready");m.sysmon=m_gate("sweetmstop");m.bcm_probe=m_gate("sweetmbcm");m.handover_release=m_gate("sweetmho");m.bandwidth=m_gate("sweetmbw");m.bandwidth_irq=m_gate("sweetmbwi");
+     memset(&m,0,sizeof(m));m.master=-1;m.glink=m_gate("sweetmglink");m.rmtfs=m_gate("sweetmrmtfs");m.pdm=m_gate("sweetmpdm");m.uim=m_gate("sweetmuim");m.uim_ready_poll=m_gate("sweetmready");m.data_session=m_gate("sweetmsession");m.sysmon=m_gate("sweetmstop");m.bcm_probe=m_gate("sweetmbcm");m.handover_release=m_gate("sweetmho");m.bandwidth=m_gate("sweetmbw");m.bandwidth_irq=m_gate("sweetmbwi");
      if((m.rmtfs || m.pdm || m.uim || m.sysmon) && !m.glink){printf("SWEET MODEM: refused missing GLINK dependency\n");return EINVAL;}
 diff --git a/bsd/dev/modem/IpaFirmware.h b/bsd/dev/modem/IpaFirmware.h
 new file mode 100644

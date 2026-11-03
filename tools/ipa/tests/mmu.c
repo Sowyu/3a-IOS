@@ -3,7 +3,7 @@
 #include <string.h>
 #include "IpaMmu.h"
 static uint32_t reg[0x100000/4],original[0x100000/4];
-static unsigned writes,fail_at;static bool stalled;
+static unsigned writes,fail_at;static bool stalled;static uint32_t reset_ctl;
 static uint32_t rd(void *c,unsigned a){(void)c;assert(a<0x100000);if(stalled && (a&4095)==0x7f4)return 1;return reg[a/4];}
 static void wr(void *c,unsigned a,uint32_t v){(void)c;assert(a<0x100000);writes++;if(writes!=fail_at)reg[a/4]=v;}
 static void w64(void *c,unsigned a,uint64_t v){wr(c,a,(uint32_t)v);wr(c,a+4,(uint32_t)(v>>32));}
@@ -12,18 +12,22 @@ static IpaMmu reset(void){
  memset(reg,0,sizeof(reg));reg[0x20/4]=0x4c017e72;reg[0x24/4]=0x60000048;reg[0x28/4]=0x5111;
  reg[0x800/4]=0x80001c00;reg[0xc00/4]=0;reg[0x80000/4]=1;
  /* Inherited disabled descriptors and unused bank attributes must be restored. */
- reg[0x804/4]=0x1234;reg[0xc04/4]=1<<16;reg[0x1004/4]=0xf300;
+ reg[0x804/4]=0x1234;reg[0xc04/4]=1<<16;reg[0x1004/4]=0;
+ for(unsigned i=1;i<72;i++){
+  reg[ipa_cb(i)/4]=reset_ctl;
+  if(reset_ctl)for(unsigned j=1;j<9;j++)reg[(ipa_cb(i)+ipa_mmu_regs[j])/4]=0x9137a2c0u+i*0x1234+j;
+ }
  memcpy(original,reg,sizeof(reg));writes=0;fail_at=0;stalled=false;
  return (IpaMmu){.io={0,rd,wr,w64,delay1}};
 }
-int main(void){
+static void run(void){
  const uint64_t pa[]={0x8c1000000ull,0x8c1010000ull};
  IpaMmu m=reset();assert(ipa_mmu_install(&m,pa));assert(m.context[0].bank==1 && m.context[1].bank==2);
  assert(reg[(ipa_cb(m.context[0].bank)+0x10)/4]==((7u<<15)|1));
  assert((reg[(ipa_cb(m.context[0].bank)+0x30)/4]&63)==28);
  unsigned installed_writes=writes;
  assert(ipa_mmu_restore(&m,true));assert(!memcmp(original,reg,0x800));assert(reg[0x800/4]==original[0x800/4]);
- for(unsigned n=0;n<2;n++){IpaMmuContext *p=&m.context[n];assert(reg[(0x800+4*p->slot)/4]==p->smr);assert(reg[ipa_cb(p->bank)/4]==0);assert(reg[(ipa_cb(p->bank)+0x20)/4]==0);}
+ for(unsigned n=0;n<2;n++){IpaMmuContext *p=&m.context[n];assert(reg[(0x800+4*p->slot)/4]==p->smr);assert(reg[ipa_cb(p->bank)/4]==reset_ctl);assert(reg[(ipa_cb(p->bank)+0x20)/4]==p->saved[2]);}
  m=reset();const uint64_t oversized[]={1ull<<36,0x8c1010000ull};assert(!ipa_mmu_install(&m,oversized) && !writes);
  m=reset();reg[0x808/4]=0x800004a0;assert(!ipa_mmu_install(&m,pa));assert(writes==0);
  m=reset();reg[0x24/4]^=1;assert(!ipa_mmu_install(&m,pa));assert(writes==0);
@@ -47,3 +51,9 @@ int main(void){
  m=reset();assert(ipa_mmu_install(&m,pa));writes=0;fail_at=7;assert(!ipa_mmu_restore(&m,true));assert(m.retained);
  puts("IPA SMMU ownership, stop gate, restoration and write-fault tests PASS");
 }
+
+int main(void){reset_ctl=0;run();reset_ctl=0x3ec9850c;run();reset_ctl=0x3ed0030c;run();
+ const uint64_t pa[]={0x8c1000000ull,0x8c1010000ull};
+ for(unsigned bit=0;bit<32;bit++)if((1u<<bit)&0xe1){IpaMmu m=reset();for(unsigned i=1;i<72;i++)reg[ipa_cb(i)/4]=reset_ctl|(1u<<bit);assert(!ipa_mmu_install(&m,pa) && !writes);}
+ for(unsigned k=0;k<3;k++){IpaMmu m=reset();for(unsigned i=1;i<72;i++)reg[(k==0?ipa_cb(i)+0x58:k==1?0x1000+4*i:0x1800+4*i)/4]=1;assert(!ipa_mmu_install(&m,pa) && !writes);}
+ puts("Measured nonzero reset fields, active/configured/faulted rejection and exact restore PASS");return 0;}

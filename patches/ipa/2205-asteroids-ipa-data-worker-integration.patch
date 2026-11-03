@@ -1,0 +1,278 @@
+diff --git a/bsd/dev/modem/ModemRuntime.inc b/bsd/dev/modem/ModemRuntime.inc
+--- a/bsd/dev/modem/ModemRuntime.inc
++++ b/bsd/dev/modem/ModemRuntime.inc
+@@ -19,6 +19,7 @@
+ #include "ModemUim.h"
+ #include "ModemBcm.h"
+ #include "../data/sweet_data.h"
++#include "../data/sweet_data_ipa.h"
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, unsigned int);
+ extern void ml_io_unmap(vm_offset_t, vm_size_t);
+@@ -44,7 +45,7 @@
+     uint32_t qhead,qcount,rxoff,rxbytes;
+     uint32_t rail_addr[2],rail_index[2],xo_addr,state,services;
+     bool xo_pinned, pas_owed, started, votes_owed, vote_uncertain, qmp_owed, shared_owed, fatal;
+-    bool data_session,data_attached,data_stopping, uim_ready_poll, uim_ready, uim_pending[2], uim, glink, rmtfs, pdm, qr_started, stop_verified, failed;
++    bool data_session,data_attached,data_stopping,data_ipa_bound, uim_ready_poll, uim_ready, uim_pending[2], uim, glink, rmtfs, pdm, qr_started, stop_verified, failed;
+     bool bandwidth_irq, bandwidth, bandwidth_pinned, handover_release, bcm_probe, sysmon, shutdown_sent, shutdown_response, shutdown_ind;
+     uint32_t shutdown_node, shutdown_port;
+     uint32_t uim_node,uim_port,uim_done,uim_tries[2];
+@@ -242,6 +243,8 @@
+ static bool ipa_full;
+ static int ipa_smp_index=-1;
+ static void ipa_clock_poll(void);
++static void ipa_transport_sync(void);
++static bool ipa_data_quiesce(void);
+ static int ipa_qrtr_attach(QcomQrtr *);
+ static void m_smp_poll(void){
+     ipa_clock_poll();
+@@ -364,16 +367,17 @@
+     (void)ctx;(void)ch;
+     m_uim_refresh();
+     if(m.uim_port)(void)m_uim_endpoint_valid();
+-    if(qcom_qrtr_receive(&m.qr,data,len)){printf("SWEET MODEM: invalid QRTR packet\n");return;}
++    ipa_transport_sync();
++    if(qcom_qrtr_receive(&m.qr,data,len)){ipa_transport_sync();printf("SWEET MODEM: invalid QRTR packet\n");return;}
+     if(m.uim_port)(void)m_uim_endpoint_valid();
+-    /* IPA readiness must also be current before this hook can advance setup. */
++    ipa_transport_sync();
+     if(m.data_attached)sweet_data_discovery(&m.qr);
+     if(len>=52 && le32(data+4)==QCOM_QRTR_NEW_LOOKUP)
+         printf("SWEET MODEM: QRTR NEW_LOOKUP service=%#x\n",le32(data+36));
+     if(len>=52 && le32(data+4)==QCOM_QRTR_NEW_SERVER && le32(data+20)>=20)
+         printf("SWEET MODEM: QRTR NEW_SERVER service=%#x instance=%#x node=%u port=%u\n",le32(data+36),le32(data+40),le32(data+44),le32(data+48));
+ }
+-static void m_gstate(void *ctx,QcomGlinkChannel *ch,int up){(void)ctx;(void)ch;printf("SWEET MODEM: GLINK mpss/IPCRTR up=%d\n",up);if(!up){m.failed=true;m_uim_readiness(false);}}
++static void m_gstate(void *ctx,QcomGlinkChannel *ch,int up){(void)ctx;(void)ch;printf("SWEET MODEM: GLINK mpss/IPCRTR up=%d\n",up);if(!up){m.failed=true;m_uim_readiness(false);ipa_transport_sync();}}
+ static int m_glink_prepare(void){
+     uint32_t desc,tx,bytes;
+     if(m_alloc(478,16,&desc) || m_alloc(479,M_FIFO,&tx))return EIO;
+@@ -475,18 +479,19 @@
+ }
+ /* Teardown runs on the transport owner. Pump replies while Stop Network waits. */
+ static bool m_data_stop(void){
+-    if(!m.data_attached)return true;
+-    m.data_stopping=true;m_uim_readiness(false);sweet_data_stop();uint64_t end=m_now()+5000;bool idle=false;
++    if(!m.data_attached){bool quiet=ipa_data_quiesce();if(!quiet)m.failed=true;return quiet;}
++    m.data_stopping=true;m_uim_readiness(false);ipa_transport_sync();sweet_data_stop();uint64_t end=m_now()+5000;bool idle=false;
+     do{
+         if(m.started)m_smp_poll();
+         if(m.channel && m.glink)m_ipc_poll();
+-        sweet_data_poll(&m.qr,m_now());
++        ipa_transport_sync();sweet_data_poll(&m.qr,m_now());
+         if(sweet_data_idle()){idle=true;break;}
+         m_sleep(2);
+     }while(m_now()<end);
+     m_uim_readiness(false);
+-    /* IPA integration must quiesce its channels here before detach/SSCTL. */
++    /* Stop AP DMA before detach; backing remains until verified MPSS stop. */
+     int cleanup=sweet_data_cleanup();
++    if(!ipa_data_quiesce())cleanup=EIO;
+     sweet_data_detach();m.data_attached=false;
+     bool clean=idle && cleanup==0;if(!clean)m.failed=true;
+     printf("SWEET MODEM: data stop idle=%u cleanup=%d bounded_ms=5000\n",idle,cleanup);
+@@ -562,6 +567,17 @@
+ #include "IpaHardware.inc"
+ #include "IpaData.inc"
+ #include "IpaSession.inc"
++static void ipa_transport_sync(void){
++    if(!ipa_full)return;
++    if(m.failed || m.fatal || m.data_stopping || !iph.ready || iph.gsi.failed || !ipa_qmi_peer_current(&iph.qmi,&m.qr))ipa_data_revoke();
++    if(m.data_attached && m.data_ipa_bound)sweet_data_ipa_refresh();
++}
++static bool ipa_data_quiesce(void){
++    if(!ipa_full)return true;
++    ipa_data_revoke();ipa_transport_sync();
++    if(ipa_hardware_quiesce())return true;
++    ipa.retained=true;return false;
++}
+ static int modem_run(const struct wl_fat *f,const uint8_t *mdt,uint32_t size){
+     memset(&m,0,sizeof(m));m.master=-1;m.glink=m_gate("sweetmglink");m.rmtfs=m_gate("sweetmrmtfs");m.pdm=m_gate("sweetmpdm");m.uim=m_gate("sweetmuim");m.uim_ready_poll=m_gate("sweetmready");m.data_session=m_gate("sweetmsession");m.sysmon=m_gate("sweetmstop");m.bcm_probe=m_gate("sweetmbcm");m.handover_release=m_gate("sweetmho");m.bandwidth=m_gate("sweetmbw");m.bandwidth_irq=m_gate("sweetmbwi");
+     memset(&ipa,0,sizeof(ipa));ipa_full=m_gate("sweetipa");ipa_smp_index=-1;ipa_qmi_logged=0;
+@@ -572,6 +588,7 @@
+     if(ipa.enabled && (!m.bandwidth || !m.bandwidth_irq || !m_gate("sweetmpss"))){printf("SWEET IPA: requires strict sweetmpss, sweetmbw and sweetmbwi gates\n");return EINVAL;}
+     if((m.rmtfs || m.pdm || m.uim || m.sysmon) && !m.glink){printf("SWEET MODEM: refused missing GLINK dependency\n");return EINVAL;}
+     if(m.uim_ready_poll && !m.uim){printf("SWEET MODEM: readiness polling requires UIM\n");return EINVAL;}
++    if(m_gate("sweetdata") && !ipa_full)return EINVAL;
+     bool data_requested=m_gate("sweetdata") || m_gate("sweetqmiraw");
+     if(data_requested!=m.data_session || (m.data_session &&
+         (!m_gate("sweetmpss") || !m.uim || !m.uim_ready_poll || !m.glink || !m.rmtfs || !m.pdm || !m.sysmon || !m.handover_release ||
+@@ -608,7 +625,7 @@
+         if(ipa_smp_index<0){rc=EIO;goto out;}
+         if((rc=ipa_hardware_setup()))goto out;
+     }
+-    /* IPA must install its immutable TX hook before this attach. */
++    if(m_gate("sweetdata")){if((rc=sweet_data_ipa_bind()))goto out;m.data_ipa_bound=true;}
+     if(m.data_session){m.data_attached=true;if((rc=sweet_data_attach(&m.qr)))goto out;}
+     if((rc=m_load(f,mdt,size)))goto out;
+     if((rc=m_pas(5,1,0,0)))goto out;m.started=true;
+@@ -618,11 +635,12 @@
+         if(m.glink)m_ipc_poll();
+         m_uim_refresh();
+         if((rc=ipa_session_poll()))m.failed=true;
++        ipa_transport_sync();
+         if(m.data_attached)sweet_data_poll(&m.qr,m_now());
+         if(m.fatal || m.failed){rc=EIO;break;}
+         if(!(m.state&2) && m_now()>ready_deadline){rc=ETIMEDOUT;break;}m_sleep(2);}
+     if(!m.fatal && !m.failed && (m.state&6)==6 && (!ipa_full || iph.logged))rc=0;else if(!rc)rc=ETIMEDOUT;
+-out:printf("SWEET MODEM: %s run end error=%d elapsed_ms=%llu\n",m.data_session?"data session":"offline",rc,(unsigned long long)(m_now()-m.began));if(ipa_full)ipa_data_ready(false);
++out:printf("SWEET MODEM: %s run end error=%d elapsed_ms=%llu\n",m.data_session?"data session":"offline",rc,(unsigned long long)(m_now()-m.began));if(ipa_full)ipa_data_revoke();ipa_transport_sync();
+     if(!m_cleanup())rc=EIO;
+     if(ipa_full && m.stop_verified && !ipa_hardware_stop()){ipa.retained=true;rc=EIO;}
+     if(!ipa_cleanup(m.stop_verified))rc=EIO;return rc;
+diff --git a/bsd/dev/modem/IpaData.inc b/bsd/dev/modem/IpaData.inc
+--- a/bsd/dev/modem/IpaData.inc
++++ b/bsd/dev/modem/IpaData.inc
+@@ -5,6 +5,7 @@
+ static LCK_GRP_DECLARE(ipa_queue_group,"ipa_queue");
+ static LCK_MTX_DECLARE(ipa_queue_lock,&ipa_queue_group);
+ static IpaTxQueue ipa_txq;
++static bool ipa_data_terminal;
+ static sweet_ipa_rx_fn ipa_receive;
+ static void *ipa_receive_ctx;
+ int sweet_ipa_transmit(const void *data,size_t bytes){
+@@ -18,17 +19,20 @@
+ }
+ bool sweet_ipa_ready(void){lck_mtx_lock(&ipa_queue_lock);bool ready=ipa_txq.ready;lck_mtx_unlock(&ipa_queue_lock);return ready;}
+ static void ipa_data_ready(bool ready){
+-    lck_mtx_lock(&ipa_queue_lock);if(ready)ipa_txq.ready=true;else ipa_tx_drop_all(&ipa_txq);lck_mtx_unlock(&ipa_queue_lock);
++    lck_mtx_lock(&ipa_queue_lock);if(ready && !ipa_data_terminal)ipa_txq.ready=true;else ipa_tx_drop_all(&ipa_txq);lck_mtx_unlock(&ipa_queue_lock);
++}
++static bool ipa_data_revoke(void){
++    lck_mtx_lock(&ipa_queue_lock);ipa_data_terminal=true;ipa_tx_drop_all(&ipa_txq);lck_mtx_unlock(&ipa_queue_lock);return false;
+ }
+ static bool ipa_data_poll(void){
+-    if(!iph.ready || iph.gsi.failed)return false;
++    if(!iph.ready || iph.gsi.failed)return ipa_data_revoke();
+     for(unsigned i=1;i<4;i++)for(unsigned work=0;work<64;work++){
+-        unsigned offset,bytes;int rc=ipa_gsi_event(&iph.gsi,i,&offset,&bytes);if(!rc)break;if(rc<0)return false;
++        unsigned offset,bytes;int rc=ipa_gsi_event(&iph.gsi,i,&offset,&bytes);if(!rc)break;if(rc<0)return ipa_data_revoke();
+         if(!iph.gsi.ch[i].tx){
+             sweet_ipa_rx_fn receive;void *context;
+             lck_mtx_lock(&ipa_queue_lock);receive=ipa_receive;context=ipa_receive_ctx;bool ready=ipa_txq.ready;lck_mtx_unlock(&ipa_queue_lock);
+             if(i==3 && ready && receive && bytes)receive(context,(void *)(ipa.dma+PAGE_SIZE+offset),bytes);
+-            if(!ipa_gsi_post(&iph.gsi,i,8192,0,0))return false;
++            if(!ipa_gsi_post(&iph.gsi,i,8192,0,0))return ipa_data_revoke();
+         }
+     }
+     /* Copy queue data under lock to a worker-local buffer. The receiver can
+@@ -41,7 +45,7 @@
+             ipa_txq.head=(ipa_txq.head+1)%IPA_TX_QUEUE_COUNT;ipa_txq.count--;
+         }
+         lck_mtx_unlock(&ipa_queue_lock);if(!bytes)break;
+-        if(!ipa_gsi_post(&iph.gsi,2,(uint16_t)bytes,packet,bytes))return false;
++        if(!ipa_gsi_post(&iph.gsi,2,(uint16_t)bytes,packet,bytes))return ipa_data_revoke();
+     }
+     return true;
+ }
+diff --git a/bsd/dev/modem/IpaSession.inc b/bsd/dev/modem/IpaSession.inc
+--- a/bsd/dev/modem/IpaSession.inc
++++ b/bsd/dev/modem/IpaSession.inc
+@@ -19,14 +19,15 @@
+ }
+ static int ipa_session_poll(void){
+     if(!ipa_full)return 0;
+-    if(!ipa_data_poll())return EIO;
++    if(m.failed || m.fatal || m.data_stopping){ipa_data_revoke();return EIO;}
+     if(!m.qr_started)return 0;
+     int rc=ipa_qmi_poll(&iph.qmi,&m.qr,m_now(),iph.ready);
+     unsigned state=iph.qmi.sent|(iph.qmi.accepted<<1)|(iph.qmi.registered<<2)|(iph.qmi.uc_done<<3)|(iph.qmi.indicated<<4);
+     if(state!=ipa_qmi_logged){ipa_qmi_logged=state;
+         printf("SWEET IPA: QMI node=%u port=%u sent=%u accepted=%u registered=%u uc_done=%u indicated=%u queued=%u\n",
+             iph.qmi.node,iph.qmi.port,iph.qmi.sent,iph.qmi.accepted,iph.qmi.registered,iph.qmi.uc_done,iph.qmi.indicated,m.qcount);sweet_log_sync();}
+-    if(rc<0)return EIO;
++    if(rc<0){ipa_data_revoke();return EIO;}
++    if(!ipa_data_poll()){ipa_data_revoke();return EIO;}
+     if(rc==1 && !m.qcount && !m.failed && !m.fatal && !iph.logged){
+         ipa_data_ready(true);iph.logged=true;
+         printf("SWEET IPA: I3 handshake complete; AP endpoints active; QMAPv1; no ONLINE request\n");sweet_log_sync();
+diff --git a/bsd/dev/modem/IpaHardware.inc b/bsd/dev/modem/IpaHardware.inc
+--- a/bsd/dev/modem/IpaHardware.inc
++++ b/bsd/dev/modem/IpaHardware.inc
+@@ -92,6 +92,9 @@
+        !ipa_hconfig(0x4ac,14|(1u<<7)|(14u<<8)|(24u<<16),~0u) ||
+        !ipa_hconfig(0x4b4,3|(4u<<3)|(5u<<6)|(5u<<9),0xfff) ||
+        !ipa_hconfig(0x4b0,191,~0u) || !ipa_hconfig(0x4b0,0x80000000u|191,~0u) || !ipa_resources())return EIO;
++    /* No AP or modem channel is live yet. All four statistic engines share
++     * the zeroed FNR region; modem-owned counter indices are advertised later. */
++    for(unsigned i=0;i<4;i++)if(!ipa_hconfig(0x700+4*i,iph.offset+0x1cd0,~0u))return EIO;
+     if(!ipa_gsi_setup(&iph.gsi,io,(void *)(ipa.dma+PAGE_SIZE),IPA_DMA_IOVA))return EIO;
+     for(unsigned i=0;i<4;i++)if(!ipa_endpoint_program(&iph.gsi.ch[i]))return EIO;
+     if(!ipa_hconfig(0x38,11|(11u<<8)|(1u<<26)|(1u<<27),0x1fffffff))return EIO;
+@@ -105,14 +108,18 @@
+     iph.qmi.mem_offset=iph.offset;iph.qmi.mem_size=iph.bytes;iph.qmi.smem_size=ipa.smem_bytes;iph.ready=true;
+     printf("SWEET IPA: AP endpoints 9/ch6 11/ch7 2/ch5 18/ch9 ready QMAPv1 RX8192 aggr6144/16/500us\n");sweet_log_sync();return 0;
+ }
+-static bool ipa_hardware_stop(void){
++static bool ipa_hardware_quiesce(void){
+     iph.ready=false;
+     if(!ipa.block || !iph.touched)return true;
+     if(iph.gsi.claimed){
+         uint32_t rx=(1u<<11)|(1u<<18);ipa_hw(0x6b0,rx);
+         unsigned tries;for(tries=0;tries<1000;tries++){if(!(ipa_hr(0x100)&rx))break;delay(100);}
+-        if(tries==1000 || !ipa_gsi_stop(&iph.gsi))return false;
++        if(tries==1000 || !ipa_gsi_quiesce(&iph.gsi))return false;
+     }
++    return true;
++}
++static bool ipa_hardware_stop(void){
++    if(!ipa_hardware_quiesce() || !ipa_gsi_stop(&iph.gsi))return false;
+     while(iph.count){unsigned i=iph.count-1;ipa_hw(iph.saved[i].off,iph.saved[i].old);
+         if((ipa_hr(iph.saved[i].off)&iph.saved[i].mask)!=(iph.saved[i].old&iph.saved[i].mask))return false;iph.count--;}
+     iph.touched=false;return true;
+diff --git a/bsd/dev/modem/IpaGsi.h b/bsd/dev/modem/IpaGsi.h
+--- a/bsd/dev/modem/IpaGsi.h
++++ b/bsd/dev/modem/IpaGsi.h
+@@ -115,13 +115,18 @@
+ }
+ /* Stop all channels before freeing any ring, then reset/deallocate. A command
+  * timeout cannot be repaired by freeing memory or blindly issuing another one. */
+-static inline bool ipa_gsi_stop(IpaGsi *s){
++static inline bool ipa_gsi_quiesce(IpaGsi *s){
+     if(s->uncertain)return false;
+     for(unsigned i=0;i<4;i++){
+         IpaGsiChannel *ch=&s->ch[i];if(!ch->channel_owned)continue;unsigned state=ipa_gstate(s,ch,false);
+         if(state==2){if(!ipa_gcmd(s,ch,false,2,3))return false;ch->started=false;}
+         else if(state!=1 && state!=3)return false;
+     }
++    return true;
++}
++/* Final release only after the modem producer is verified stopped. */
++static inline bool ipa_gsi_stop(IpaGsi *s){
++    if(!ipa_gsi_quiesce(s))return false;
+     for(unsigned i=0;i<4;i++){
+         IpaGsiChannel *ch=&s->ch[i];
+         if(ch->channel_owned){s->io.wait_us(s->io.ctx,1000);if(!ipa_gcmd(s,ch,false,9,1) || !ipa_gcmd(s,ch,false,10,0))return false;ch->channel_owned=false;}
+diff --git a/bsd/dev/modem/IpaQmi.h b/bsd/dev/modem/IpaQmi.h
+--- a/bsd/dev/modem/IpaQmi.h
++++ b/bsd/dev/modem/IpaQmi.h
+@@ -54,16 +54,21 @@
+     uint8_t out[14]={0};out[0]=type;ipa_put16(out+1,txn);ipa_put16(out+3,msg);ipa_put16(out+5,7);out[7]=2;out[8]=4;
+     return qcom_qrtr_send_data(qr,from,node,port,out,sizeof(out));
+ }
++static inline bool ipa_qmi_peer_current(IpaQmi *s,const QcomQrtr *qr){
++    if(s->failed)return false;
++    if(s->bound){
++        unsigned matches=0;
++        for(unsigned i=0;i<qr->remote_count;i++)if(qr->remote[i].service==0x31 && qr->remote[i].instance==0x201){
++            if(qr->remote[i].node!=s->node || qr->remote[i].port!=s->port){s->failed=true;return false;}matches++;
++        }
++        if(matches!=1){s->failed=true;return false;}
++    }
++    return true;
++}
+ static inline void ipa_qmi_receive(void *ctx,QcomQrtr *qr,uint32_t local,uint32_t node,uint32_t port,const uint8_t *data,uint32_t len){
+     IpaQmi *s=ctx;QcomQmiMessage msg;
+     if(s->failed)return;
+-    if(s->bound){
+-        unsigned matches=0;
+-        for(unsigned i=0;i<qr->remote_count;i++)if(qr->remote[i].service==0x31 && qr->remote[i].instance==0x201){
+-            if(qr->remote[i].node!=s->node || qr->remote[i].port!=s->port){s->failed=true;return;}matches++;
+-        }
+-        if(matches!=1){s->failed=true;return;}
+-    }
++    if(!ipa_qmi_peer_current(s,qr))return;
+     if(local==IPA_QMI_CLIENT){
+         if(!s->bound || node!=s->node || !s->sent || port!=s->port || len<5 || data[0]!=QCOM_QMI_RESPONSE ||
+            ipa_le16(data+3)!=0x21 || ipa_le16(data+1)!=s->transaction || s->response_seen)return;
