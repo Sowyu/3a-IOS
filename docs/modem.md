@@ -460,3 +460,6 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 **Code.** IPA2210 clears only the optional ASIDPNE request and keeps exact readback and private VMID isolation. It is now in the APN/auth combined tree.
 
 **Measured, host.** The safe build and lifecycle regressions pass, all56 source files reconstruct and all10 packed segments match. The replacement kernel hash isce5eb6768b314c0d0f7c72a7d0e443d8eed5d05b72b61f1b0f2087bc56de348e and data image hash is9e71563d91d32b976f0a1bad8b66b07df168791925863390a26aabcca404f582. Its77-artifact manifest remains unapproved pending the hardware prerequisites and final exact-image review.
+
+
+**Measured, SMMU prerequisite passed.** ast174 completed the2210 SMMU-only trial normally in214seconds. Setup completed at log7734, private contexts were parked and backing released at7940, final_error0 appeared at7942 and DONE at11129. The fresh nonce matched, root before/after was clean and stale=false. No firmware, PAS15 or GSI ran. The phone returned to recovery and ownership was released. PAS15-only and offline IPA handshake trials remain before ONLINE.
