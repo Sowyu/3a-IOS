@@ -452,3 +452,6 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 
 
 **Measured, recovery.** The separate benign clean-root run ast172 ended normally after214seconds. It replayed the journal, returned a clean root with stale=false and logged no IPA or modem worker activity. IPA accepted the capture and released ownership. The SMMU-only checker still needs its corrected review before that prerequisite can run.
+
+
+**Measured, SMMU-only trial.** ast173 ended normally after211seconds with a fresh nonce, clean root and stale=false. Setup failed exact SCTLR readback before PAS or GSI, and retained its backing without a panic. The requested optional ASIDPNE hint did not read back. IPA owns the additive correction and another reviewed SMMU-only trial. ONLINE remains blocked.
