@@ -10,7 +10,10 @@ static void wr(void *c,unsigned a,uint32_t v){(void)c;assert(a<0x100000);writes+
   if(off==0x618){assert((reg[(0x1000+4*bank)/4]&255)!=0);assert(!reg[ipa_cb(bank)/4]);}
   /* Ast171 observed TBI0/1 set. Model that device behavior, not reserved bits. */
   if(off==0x10 && force_tbi)v|=0x60;
-  if(off==0)assert(v==0 || v==(1|2|4|0x20|0x1000|(3u<<22))); /* No UNKNOWN SCTLR replay. */
+  if(off==0){
+   assert(v==0 || v==(1|2|4|0x20|0x1000|(3u<<22)) || v==(1|2|4|0x20|(3u<<22)));
+   v&=~0x1000u; /* ast173: ASIDPNE reads zero. Old request fails install. */
+  }
  }
  if(a>=0xc00 && a<0xdc8 && ((v>>16)&3)==1)assert(!(reg[(a-0xc00+0x800)/4]>>31));
  reg[a/4]=v;

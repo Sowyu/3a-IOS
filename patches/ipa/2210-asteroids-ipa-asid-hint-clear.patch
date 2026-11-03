@@ -1,0 +1,15 @@
+diff --git a/bsd/dev/modem/IpaMmu.h b/bsd/dev/modem/IpaMmu.h
+--- a/bsd/dev/modem/IpaMmu.h
++++ b/bsd/dev/modem/IpaMmu.h
+@@ -114,7 +114,10 @@
+         io->write(c,b+0x618,0); /* Invalidate this leased VMID before enabling. */
+         if(!ipa_mmu_sync(s,b))return false;
+         /* Terminate faults, never stall. No IRQ without an installed handler. */
+-        uint32_t ctl=1|2|4|0x20|0x1000|(3u<<22);
++        /* ast173 reads ASIDPNE=0. ARM16.5.29 defines it as an optional
++         * broadcast-invalidation hint. Distinct VMIDs and nG descriptors
++         * provide our isolation without relying on that hint. */
++        uint32_t ctl=1|2|4|0x20|(3u<<22);
+         io->write(c,b,ctl);if(io->read(c,b)!=ctl)return false;
+         io->write(c,0xc00+4*p->slot,p->bank|(3u<<8));
+         /* Publication last: only exact IPA SID can reach this table. */
