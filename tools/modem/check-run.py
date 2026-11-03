@@ -3,6 +3,10 @@
 from pathlib import Path
 import json,re,sys
 p=Path(sys.argv[1]);mode=sys.argv[2];assert mode in ('offline','uim')
+nonce=Path(sys.argv[3]).read_text().strip();assert re.fullmatch(r'[a-f0-9]{32}',nonce)
+marker=(p/('modem-'+mode+'-complete.txt')).read_text()
+assert 'nonce='+nonce+' phase=body-complete shot=0' in marker
+assert (p/'frames'/('01-modem_'+mode+'.png')).stat().st_size>0
 r=json.loads((p/'result.json').read_text());text=p.with_suffix('.txt').read_text(errors='replace')
 assert r['result']=='selftest-done' and r['root_state']=='clean' and not r['stale']
 assert not re.search(r'SELFTEST: (FAIL|SKIP)|panic\(cpu|deadman:.*(?:reboot|reset)|STOP UNVERIFIED|cleanup=INCOMPLETE',text)
