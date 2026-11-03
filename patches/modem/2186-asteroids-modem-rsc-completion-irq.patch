@@ -1,0 +1,75 @@
+--- a/bsd/dev/modem/ModemRuntime.inc
++++ b/bsd/dev/modem/ModemRuntime.inc
+@@ -35,7 +35,7 @@
+ #define M_RX_SIZE 0x4400u
+ #define M_TX_COUNT 32u
+ static struct {
+-    vm_offset_t smem, mutex, ipcc, qmpmem, rsc, db, metadata, args, firmware, shared;
++    vm_offset_t gic, smem, mutex, ipcc, qmpmem, rsc, db, metadata, args, firmware, shared;
+     QcomSmem sm; QcomSmemPartition part; QcomSmp2p sp; QcomQmp qp;
+     QcomGlink gl; QcomGlinkChannel *channel; QcomQrtr qr; ModemRmtfs fs;
+     uint8_t rx[M_RX_SIZE*8];
+@@ -44,7 +44,7 @@
+     uint32_t rail_addr[2],rail_index[2],xo_addr,state,services;
+     bool xo_pinned, pas_owed, started, votes_owed, vote_uncertain, qmp_owed, shared_owed, fatal;
+     bool uim, glink, rmtfs, pdm, qr_started, stop_verified, failed;
+-    bool bandwidth, bandwidth_pinned, handover_release, bcm_probe, sysmon, shutdown_sent, shutdown_response, shutdown_ind;
++    bool bandwidth_irq, bandwidth, bandwidth_pinned, handover_release, bcm_probe, sysmon, shutdown_sent, shutdown_response, shutdown_ind;
+     uint32_t shutdown_node, shutdown_port;
+     uint32_t uim_node,uim_port,uim_done,uim_tries[2];
+     uint16_t uim_txn[2];
+@@ -121,6 +121,18 @@
+     for(unsigned i=0;i<sizeof(dbcopy);i+=4){uint32_t v=m_rd(m.db,i);memcpy(dbcopy+i,&v,4);}
+     ModemBcmCommand cmd[MODEM_BCM_COUNT];
+     if(modem_bcm_prepare(dbcopy,sizeof(dbcopy),cmd,MODEM_BCM_COUNT)){m.failed=true;return EINVAL;}
++    if(m.bandwidth_irq){
++        /* DT apps-RSC DRV2 is SPI5, GIC interrupt37. Poll only while delivery
++         * to the nonsecure CPU is disabled. This path never writes the GIC. */
++        m.gic=ml_io_map(0x17100000,0x1000);
++        if(!m.gic){m.failed=true;return ENOMEM;}
++        uint32_t group=m_rd(m.gic,0x84),enable=m_rd(m.gic,0x104),active=m_rd(m.gic,0x304),bit=1u<<5;
++        /* IGROUPR is RAZ to nonsecure software with security enabled. Secure
++         * priority fields are also RAZ; a nonzero priority proves NS access. */
++        uint32_t priority=(m_rd(m.gic,0x424)>>8)&255;
++        printf("SWEET MODEM: RSC IRQ37 group1=%u priority=%#x enabled=%u active=%u read_only=1\n",!!(group&bit),priority,!!(enable&bit),!!(active&bit));
++        if((!(group&bit) && !priority) || (enable&bit) || (active&bit)){m.failed=true;return EBUSY;}
++    }
+     sweet_apps_rsc_lock();int chosen=-1,rc=ENODEV;unsigned base=0;
+     for(unsigned i=0;i<3;i++){
+         unsigned t=0xd00+i*0x2a0;
+@@ -128,7 +140,13 @@
+     }
+     if(chosen<0)goto out;
+     uint32_t bit=1u<<chosen,irq=m_rd(m.rsc,0xd00),wait=0,mask=(1u<<MODEM_BCM_COUNT)-1;
+-    m_wr(m.rsc,0xd00,irq&~bit);
++    /* Clear only the idle owned TCS before enabling status reporting, then
++     * prove it is clear unmasked so an old hidden completion cannot pass. */
++    if(m.bandwidth_irq)m_wr(m.rsc,0xd08,bit);
++    m_wr(m.rsc,0xd00,m.bandwidth_irq?(irq|bit):(irq&~bit));
++    if(m.bandwidth_irq && (m_rd(m.rsc,0xd04)&bit)){
++        m_wr(m.rsc,0xd00,(m_rd(m.rsc,0xd00)&~bit)|(irq&bit));rc=EIO;goto out;
++    }
+     for(unsigned i=0;i<MODEM_BCM_COUNT;i++){
+         wait|=cmd[i].wait<<i;
+         m_wr(m.rsc,base+0x34+i*24,0x10108);
+@@ -143,6 +161,11 @@
+         bool done=(m_rd(m.rsc,0xd04)&bit) && m_rd(m.rsc,base+0x28);
+         for(unsigned i=0;i<MODEM_BCM_COUNT;i++)done &= (m_rd(m.rsc,base+0x40+i*24)&0x10100)==0x10100;
+         if(done){rc=0;break;}delay(1);
++    }
++    if(rc){
++        printf("SWEET MODEM: bandwidth timeout irq=%#x enable=%#x idle=%#x wait=%#x cmds=%#x\n",m_rd(m.rsc,0xd04),m_rd(m.rsc,0xd00),m_rd(m.rsc,base+0x28),m_rd(m.rsc,base+0x20),m_rd(m.rsc,base+0x2c));
++        for(unsigned i=0;i<MODEM_BCM_COUNT;i++)printf("SWEET MODEM: bandwidth command=%u address=%#x data=%#x status=%#x\n",i,cmd[i].address,cmd[i].data,m_rd(m.rsc,base+0x40+i*24));
++        if(m.bandwidth_irq)m_wr(m.rsc,0xd00,m_rd(m.rsc,0xd00)&~bit);
+     }
+     if(!rc){m.bandwidth_pinned=true;m_wr(m.rsc,base+0x24,0);m_wr(m.rsc,base+0x2c,0);m_wr(m.rsc,base+0x20,0);m_wr(m.rsc,0xd08,bit);m_wr(m.rsc,0xd00,(m_rd(m.rsc,0xd00)&~bit)|(irq&bit));}
+     else m.vote_uncertain=true; /* Retain the TCS and backing until reset. */
+@@ -462,7 +485,7 @@
+ #include "ModemGate.h"
+ static bool m_gate(const char *name){return modem_gate(PE_boot_args(),name)!=0;}
+ static int modem_run(const struct wl_fat *f,const uint8_t *mdt,uint32_t size){
+-    memset(&m,0,sizeof(m));m.master=-1;m.glink=m_gate("sweetmglink");m.rmtfs=m_gate("sweetmrmtfs");m.pdm=m_gate("sweetmpdm");m.uim=m_gate("sweetmuim");m.sysmon=m_gate("sweetmstop");m.bcm_probe=m_gate("sweetmbcm");m.handover_release=m_gate("sweetmho");m.bandwidth=m_gate("sweetmbw");
++    memset(&m,0,sizeof(m));m.master=-1;m.glink=m_gate("sweetmglink");m.rmtfs=m_gate("sweetmrmtfs");m.pdm=m_gate("sweetmpdm");m.uim=m_gate("sweetmuim");m.sysmon=m_gate("sweetmstop");m.bcm_probe=m_gate("sweetmbcm");m.handover_release=m_gate("sweetmho");m.bandwidth=m_gate("sweetmbw");m.bandwidth_irq=m_gate("sweetmbwi");
+     if((m.rmtfs || m.pdm || m.uim || m.sysmon) && !m.glink){printf("SWEET MODEM: refused missing GLINK dependency\n");return EINVAL;}
+     m_sleep(30000);m.began=m_now();int rc=EIO;
+     m.smem=ml_io_map(M_SMEM,M_SM_SIZE);m.mutex=ml_io_map(0x1f43000,0x1000);m.ipcc=ml_io_map(0x405000,0x1000);

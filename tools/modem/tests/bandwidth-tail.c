@@ -30,5 +30,14 @@ int main(void){
  const char *off[]={"","sweetmbw","sweetmbw=0","sweetmbw=01","sweetmbw=1 sweetmbw=1"};
  for(unsigned i=0;i<sizeof(off)/sizeof(off[0]);i++){init();boot_args=off[i];assert(!at_bcm("SN3"));assert((effective_sn3&0x0fffffff)==0x4001);}
  init();boot_args="sweetmbw=1";assert(!at_bcm("IP0"));assert(!effective_sn3 && reg[0xd3c/4]==0x60004001);
- puts("PASS: measured BCM map, VCD grouping, saturation, actual RSC fresh completion, timeout retention, all TCS choices default off and both real touch/modem vote orders");
+ init();mode=4;assert(m_bandwidth_vote()==ETIMEDOUT); /* Masked status model. */
+ init();mode=4;m.bandwidth_irq=true;assert(!m_bandwidth_vote() && m.bandwidth_pinned && !m.vote_uncertain);
+ init();mode=4;m.bandwidth_irq=true;gic_group=0;assert(m_bandwidth_vote()==EBUSY && !writes);
+ init();mode=4;m.bandwidth_irq=true;gic_enable=1u<<5;assert(m_bandwidth_vote()==EBUSY && !writes);
+ init();mode=4;m.bandwidth_irq=true;gic_active=1u<<5;assert(m_bandwidth_vote()==EBUSY && !writes);
+ init();mode=4;m.bandwidth_irq=true;gic_group=0;gic_priority=0x80;assert(!m_bandwidth_vote() && m.bandwidth_pinned);
+ init();mode=5;m.bandwidth_irq=true;assert(m_bandwidth_vote()==ENOMEM && !writes);
+ init();mode=4;m.bandwidth_irq=true;reg[0xd00/4]=4;raw_irq=1;no_new_irq=true;
+ assert(m_bandwidth_vote()==ETIMEDOUT && m.vote_uncertain && !m.bandwidth_pinned && reg[0xd00/4]==4);
+ puts("PASS: measured BCM map, VCD grouping, saturation, actual RSC fresh completion, timeout retention, all TCS choices default off and touch order plus guarded unmasked completion");
 }

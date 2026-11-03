@@ -282,3 +282,27 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 **Code, proposed diagnostic scope.** The next UIM image omits sweetmbw. Its modem power sequence therefore matches the measured2182 run, including MSS proxy handover and shared CX/XO retention. PAS shutdown remains mandatory on all exits. An unsuccessful secure stop retains backing and reports failure until the guarded reset. Reading SIM status under that known limitation requires an explicit fresh Sol review. It would measure M3 independently and would not claim M2 or approve ONLINE.
 
 **Missing.** Fresh Sol approval and actual UIM phone evidence. Bandwidth completion needs its own diagnosis before that stage can be used again.
+
+
+## 2186 RSC completion reporting candidate
+
+**Code.** Patch2186 adds strict default-off sweetmbwi=1, effective only with sweetmbw=1. It enables reporting for one owned active TCS while polling its fresh completion, following the vendor RSC driver. Before enabling it, the worker reads DT SPI5/INTID37 at GICD0x17100000 and requires positive nonsecure evidence plus disabled and inactive delivery. It never writes the GIC. A zero group and priority refuses the operation as unknown. The existing shared touch/modem RSC lock remains held through the bounded transaction.
+
+**Code.** The worker clears only the selected idle TCS completion before unmasking it, checks that it is clear after unmasking, then retains the existing fresh IRQ, idle and all-command acknowledgment checks. A timeout logs the IRQ state and all seven command statuses, masks its own report and retains the programmed transaction. No MPSS starts after a failed vote. No UFS write path was added.
+
+**Measured, host.** The real transaction and touch code pass sanitizer checks with both raw and IRQ-enable-masked completion models. Tests reject active/enabled/unknown GIC state, mapping failure, stale hidden completion, absent fresh completion and partial acknowledgments. They also check nonzero NS priority with a read-as-zero group register. This model test does not identify ast160's hardware cause.
+
+**Inferred.** Arm IHI0069 section4.8.1 makes secure interrupt priority fields read zero to nonsecure software. A nonzero priority therefore supplies evidence that group-register zero alone cannot supply. See [Arm GIC specification](https://documentation-service.arm.com/static/67eaa4d098aa3c3b6eea7351). No other driver in this test kernel is intended to enable INTID37.
+
+**Missing.** Full build completion, fresh Sol GO and a phone result. The successful UIM2185 image remains frozen and does not contain this change.
+
+
+## M3 measured in ast161
+
+**Measured.** ast161-modem-uim-2185 completed the separately approved offline SIM diagnostic in363 seconds. Local log ast161-modem-uim-2185.txt:10764 reports a present card in logical slot1. Line10765 identifies its USIM application, type2, state1, detected, with PIN1 disabled. Line10770 reports ICCID suffix0660. This completes M3, SIM seen. It does not establish USIM state7 readiness or mobile data.
+
+**Measured.** PAS authentication succeeded at7968, ready plus handover at7973, MSS proxy release at7977 and GLINK at7981. pd-mapper and rmtfs reads progressed at7996 through8012. SSCTL response, indication and fresh shutdown acknowledgment were accepted at11784. All50 PAS shutdown attempts still returned raw-3145800. Lines11847 and11848 retain backing and report final_error5. The full shutdown window has no transport/fatal error or subsequent ownership reclaim/power drop.
+
+**Measured.** Selftest DONE is at12577, after worker completion. The completion marker matches the frozen script nonce, one checked frame exists, stale=false and root before/after is clean. The phone returned to OrangeFox recovery. Root changes are the inert selftest hook, completion markers and frame archives. No firmware or modem executable was pushed. Acceptance follows the explicit2185 diagnostic audit; the strict M2 checker still fails the known PAS condition and has not been weakened.
+
+**Missing.** M2 still needs verified PAS shutdown. M4 needs a ready USIM, completed IPA setup and a fresh integrated audit before ONLINE. The next UIM change will poll card status and preserve the primary GW provisioning index. HakiOS found an unprovisioned index0xffff can leave an application detected until a provisioning session is activated. That state-changing request is not part of this read-only result.

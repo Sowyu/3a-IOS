@@ -5,15 +5,19 @@
 #include <assert.h>
 #include <errno.h>
 #include "ModemBcm.h"
-static struct {bool bandwidth,bandwidth_pinned,vote_uncertain,failed;uintptr_t rsc,db;}m;
+static struct {bool bandwidth_irq,bandwidth,bandwidth_pinned,vote_uncertain,failed;uintptr_t gic,rsc,db;}m;
 static uint8_t db[0x20000];
 static uint32_t reg[0x4000/4];
-static uint32_t effective_sn3;
+static uint32_t effective_sn3,raw_irq,gic_group,gic_enable,gic_active,gic_priority;
+static bool no_new_irq;
 static unsigned mode,locked,triggers,reads,writes,delays;
 static void sweet_apps_rsc_lock(void){assert(!locked);locked=1;}
 static void sweet_apps_rsc_unlock(void){assert(locked);locked=0;}
 static uint32_t get32(const uint8_t *p){return (uint32_t)p[0]|(uint32_t)p[1]<<8|(uint32_t)p[2]<<16|(uint32_t)p[3]<<24;}
+static uintptr_t ml_io_map(uint64_t p,size_t n){assert(p==0x17100000 && n==0x1000);return mode==5?0:3;}
 static uint32_t m_rd(uintptr_t p,unsigned o){
+ if(p==3){if(o==0x424)return gic_priority<<8;if(o==0x84)return gic_group;if(o==0x104)return gic_enable;assert(o==0x304);return gic_active;}
+ if(p==1 && o==0xd04 && mode==4)return raw_irq&reg[0xd00/4];
  reads++;
  if(p==2){assert(o<=sizeof(db)-4);return get32(db+o);}
  assert(p==1 && o<sizeof(reg));if(o!=0xc)assert(locked);
@@ -21,7 +25,7 @@ static uint32_t m_rd(uintptr_t p,unsigned o){
 }
 static void m_wr(uintptr_t p,unsigned o,uint32_t v){
  assert(p==1 && locked && o<sizeof(reg));writes++;
- if(o==0xd08){reg[0xd04/4]&=~v;return;}
+ if(o==0xd08){reg[0xd04/4]&=~v;raw_irq&=~v;return;}
  reg[o/4]=v;
  for(unsigned t=0;t<3;t++){
   unsigned b=0xd00+t*0x2a0;
@@ -29,7 +33,7 @@ static void m_wr(uintptr_t p,unsigned o,uint32_t v){
    triggers++;uint32_t mask=reg[(b+0x2c)/4];assert(mask==1 || mask==0x7f);
    assert(reg[(b+0x20)/4]==(mask==1?1:0x75));
    for(unsigned i=0;i<7;i++)if((mask&(1u<<i)) && reg[(b+0x38+i*24)/4]==0x5001c)effective_sn3=reg[(b+0x3c+i*24)/4];
-   if(mode!=1)reg[0xd04/4]|=1u<<t;
+   if(mode!=1 && !no_new_irq){reg[0xd04/4]|=1u<<t;raw_irq|=1u<<t;}
    for(unsigned i=0;i<7;i++)reg[(b+0x40+i*24)/4]=(mode==2 && i==3)?0x100:0x10100;
   }
  }
@@ -40,6 +44,7 @@ static void w16(uint8_t *p,unsigned v){p[0]=v;p[1]=v>>8;}
 static void w32(uint8_t *p,uint32_t v){w16(p,v);w16(p+2,v>>16);}
 static void init(void){
  memset(&m,0,sizeof(m));memset(db,0,sizeof(db));memset(reg,0,sizeof(reg));mode=locked=triggers=reads=writes=delays=effective_sn3=0;
+ raw_irq=gic_enable=gic_active=gic_priority=0;gic_group=1u<<5;no_new_irq=false;
  m.bandwidth=true;m.rsc=1;m.db=2;reg[0xc/4]=16u<<27;reg[0xd00/4]=5;
  for(unsigned t=0;t<3;t++)reg[(0xd00+t*0x2a0+0x28)/4]=1;
  static const uint32_t addr[]={0x50034,0x5001c,0x50010,0x50008,0x50004,0x50000,0x50068};
@@ -51,3 +56,4 @@ static void init(void){
   w32(a,units[i]);w16(a+4,widths[i]);a[6]=vcds[i];
  }
 }
+
