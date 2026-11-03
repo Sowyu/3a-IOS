@@ -521,3 +521,8 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 **Code.** Combined2217 adds bounded GSI producer/completion refusal diagnostics, preserving validation and lifecycle rules.
 **Measured, host.** The safe build, actual datapath checks,56-file reconstruction and ten packed segments pass.
 **Missing.** ast180 ended with clean recovery but failed before tables/MPSS. I3 and the single final combined source/image review remain before ONLINE.
+
+
+**Code.** Combined2218 requires measured completion type0x23 on the command channel and retains0x22 on data channels, preserving other validation and lifecycle rules.
+**Measured, host.** The exact ast181 event and256 types across four channels, actual hardware/worker checks,56-file reconstruction, safe build and ten packed segments pass.
+**Missing.** I3 and the single final combined source/image review still precede ONLINE; no phone operation or review ran for this integration.
