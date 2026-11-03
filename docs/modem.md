@@ -1,6 +1,6 @@
 # Modem and SIM: desk findings (2026-11-03)
 
-The read-only firmware preflight passed on the phone in ast146. Patch 2173 is the first offline MPSS start candidate and has passed host checks and a full kernel build. Sol review is pending. M1 remains incomplete until review findings are resolved. No modem start or SIM detection has been measured.
+The read-only firmware preflight passed on the phone in ast146. Patch 2173 is the first offline MPSS start candidate and has passed host checks and a full kernel build. Sol approved exact patches 2170 through 2174 for one bounded offline phone test. M1 has code and host checks. No modem start or SIM detection has been measured.
 
 Labels as in `docs/input.md`: **Measured**, **Code**, **Inferred**, **Missing**.
 
@@ -96,3 +96,13 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 **Measured, host only.** `sh tools/modem/check-start.sh` passes sanitizer-backed QRTR/QMI, rmtfs, gate, QMP, SMP2P and command-db checks. It extracts the actual SCM retry and cleanup functions from the patch for fault tests, including failed shutdown and failed memory reclamation. `check.sh` and `check-protocol.sh` still pass. Full 2173 kernel build and final remake completed with exit 0. Local evidence is `plans/modem/logs/start-check.txt:1-10` and `plans/modem/logs/build-2173-final.txt`.
 
 **Missing.** Sol approval for this candidate is pending. The inherited XO state and shared power votes require review. TFTP will be added if requested by the modem. UIM is staged separately and has not run. The ast146 preflight is still the only modem-related phone evidence.
+
+## 2174, reviewed first-start candidate
+
+**Code.** `2174-asteroids-modem-xo-and-glink-completion.patch` fixes the two blocking 2173 review findings. GLINK keeps a delivered intent busy until its completion can enter TX. It retries after backpressure without delivering the packet twice. XO is explicitly requested with enable mask 3 before PAS. CX/MSS use their highest supported cmd-db indices. Cleanup releases only MSS after verified PAS shutdown. Shared XO/CX floors remain until reset, preserving inherited dependencies. This is a bounded bring-up policy, not suspend support.
+
+**Measured, review and host.** `docs/modem-2173-audit.md` records the original NO-GO. `docs/modem-2174-audit.md` gives GO for one guarded offline test of exact 2170 through 2174. The final full build passed at local `plans/modem/logs/build-2174-final.txt:5774`. Host tests cover both GLINK completion modes and the actual vote function's XO acknowledgment, MSS-only release, IRQ preservation and timeout retention. No UIM, online-mode or TFTP approval is included.
+
+**Code.** The first-start image has 599 bytes of arguments, the four reviewed stage gates, sweetfbarm=1, sweetselftest=1 and sweetdeadman=600. The selftest waits 240 seconds and takes one frame before normal recovery. A phone result must show ready, handover, QRTR services and verified PAS shutdown. Intentional XO/CX floors are distinct from an uncertain or incomplete cleanup.
+
+**Missing.** The first offline test is in progress. UIM remains a separate staged change. USB v5 SSH can help later NAS/WDS iteration. A root-only QMI request interface would need bounded buffers, request/reply matching, timeouts, a default-off gate and a fresh audit before use. It is deferred until it saves more time than a controlled rebuild.

@@ -1,0 +1,116 @@
+diff --git a/bsd/dev/modem/ModemRuntime.inc b/bsd/dev/modem/ModemRuntime.inc
+--- a/bsd/dev/modem/ModemRuntime.inc
++++ b/bsd/dev/modem/ModemRuntime.inc
+@@ -39,8 +39,8 @@
+     uint8_t rx[M_RX_SIZE*8];
+     struct {uint32_t len;uint8_t data[512];} queue[M_TX_COUNT];
+     uint32_t qhead,qcount,rxoff,rxbytes;
+-    uint32_t rail_addr[2],rail_index[2],state,services;
+-    bool pas_owed, started, votes_owed, vote_uncertain, qmp_owed, shared_owed, fatal;
++    uint32_t rail_addr[2],rail_index[2],xo_addr,state,services;
++    bool xo_pinned, pas_owed, started, votes_owed, vote_uncertain, qmp_owed, shared_owed, fatal;
+     bool glink, rmtfs, pdm, qr_started, stop_verified, failed;
+     int master;
+     uint64_t began;
+@@ -100,13 +100,27 @@
+     if(chosen<0)goto out;
+     if(on)m.votes_owed=true;
+     uint32_t bit=1u<<chosen,irq=m_rd(m.rsc,0xd00);m_wr(m.rsc,0xd00,irq&~bit);
+-    for(unsigned i=0;i<2;i++){
+-        m_wr(m.rsc,base+0x34+i*24,0x10108);m_wr(m.rsc,base+0x38+i*24,m.rail_addr[i]);m_wr(m.rsc,base+0x3c+i*24,on?m.rail_index[i]:0);
+-    }
+-    m_wr(m.rsc,base+0x20,3);m_wr(m.rsc,base+0x2c,3);m_wr(m.rsc,base+0x24,1u<<16);m_wr(m.rsc,base+0x24,(1u<<16)|(1u<<24));
++    unsigned count=on?3:1,mask=(1u<<count)-1;
++    for(unsigned i=0;i<count;i++){
++        unsigned rail=on?i:1; /* only the modem-specific MSS vote can go to zero */
++        uint32_t addr=rail==2?m.xo_addr:m.rail_addr[rail];
++        uint32_t value=rail==2?3:(on?m.rail_index[rail]:0);
++        m_wr(m.rsc,base+0x34+i*24,0x10108);m_wr(m.rsc,base+0x38+i*24,addr);m_wr(m.rsc,base+0x3c+i*24,value);
++    }
++    /* xo.lvl uses the enable mask 3, not the voltage-level index table.
++     * Keep this shared clock requested for this bounded kernel's remaining lifetime.
++     * Never lower an inherited APPS XO vote. Touch writes only other VRM/BCM resources.
++     * A future XO/suspend client must use one shared vote aggregator before removing
++     * this conservative floor. CX also keeps its highest supported floor, as in
++     * sweet_rpmh_arc_vote: dropping ABL's APPS CX vote can kill UFS/display.
++     * The devloop reset ends this bring-up kernel. */
++    if(on)m.xo_pinned=true;
++    m_wr(m.rsc,base+0x20,mask);m_wr(m.rsc,base+0x2c,mask);m_wr(m.rsc,base+0x24,1u<<16);m_wr(m.rsc,base+0x24,(1u<<16)|(1u<<24));
+     rc=ETIMEDOUT;
+     for(unsigned us=0;us<100000;us++){
+-        if(m_rd(m.rsc,base+0x28) && (m_rd(m.rsc,base+0x40)&0x10100)==0x10100 && (m_rd(m.rsc,base+0x58)&0x10100)==0x10100){rc=0;break;}delay(1);
++        bool done=m_rd(m.rsc,base+0x28)!=0;
++        for(unsigned i=0;i<count;i++)done &= (m_rd(m.rsc,base+0x40+i*24)&0x10100)==0x10100;
++        if(done){rc=0;break;}delay(1);
+     }
+     if(!rc){m_wr(m.rsc,base+0x24,0);m_wr(m.rsc,base+0x2c,0);m_wr(m.rsc,base+0x20,0);m_wr(m.rsc,0xd08,bit);m_wr(m.rsc,0xd00,(m_rd(m.rsc,0xd00)&~bit)|(irq&bit));}
+     if(rc==ETIMEDOUT)m.vote_uncertain=true;
+@@ -242,6 +256,7 @@
+     if(m.qmp_owed && m_qsend(false))clean=false;
+     if(m.votes_owed && !m.vote_uncertain && m_vote(false))clean=false;
+     printf("SWEET MODEM: STOP %s; cleanup=%s ready=%u handover=%u services=%u\n",m.pas_owed?"verified PAS":"no PAS activity",clean?"ok":"INCOMPLETE",!!(m.state&2),!!(m.state&4),m.qr.remote_count);
++    if(m.xo_pinned)printf("SWEET MODEM: shared XO enable=3 and CX floor retained until devloop reset; never voted off\n");
+     if(clean){
+         if(m.firmware)ml_io_unmap(m.firmware,MPSS_SIZE);if(m.metadata)ml_io_unmap(m.metadata,META_MAX);
+         if(m.shared)ml_io_unmap(m.shared,M_RMT_SIZE);if(m.args)ml_io_unmap(m.args,PAGE_SIZE);
+@@ -263,7 +278,11 @@
+     if(((m_rd(m.rsc,0)>>16)&255)!=3){rc=ENOTSUP;goto out;}
+     static uint8_t dbcopy[0x20000];for(unsigned i=0;i<sizeof(dbcopy);i+=4){uint32_t v=m_rd(m.db,i);memcpy(dbcopy+i,&v,4);}
+     static const char *const rails[]={"cx.lvl","mss.lvl"};for(unsigned i=0;i<2;i++){QcomRpmhResource r;
+-        if(qcom_cmd_db_find(dbcopy,sizeof(dbcopy),rails[i],&r) || !r.level_count || r.levels[r.level_count-1]<384 || qcom_rpmh_level_index(&r,384,&m.rail_index[i])){rc=EINVAL;goto out;}m.rail_addr[i]=r.address;}
++        if(qcom_cmd_db_find(dbcopy,sizeof(dbcopy),rails[i],&r) || !r.level_count || r.levels[r.level_count-1]<384 || qcom_rpmh_level_index(&r,384,&m.rail_index[i])){rc=EINVAL;goto out;}m.rail_addr[i]=r.address;m.rail_index[i]=r.level_count-1;}
++    QcomRpmhResource xo;
++    if(qcom_cmd_db_find(dbcopy,sizeof(dbcopy),"xo.lvl",&xo) || !xo.address){rc=EINVAL;goto out;}
++    m.xo_addr=xo.address;
++    if(m.xo_addr==m.rail_addr[0] || m.xo_addr==m.rail_addr[1]){rc=EINVAL;goto out;}
+     uint32_t prior_off,prior_size;
+     if(!m_item(435,QCOM_SMP2P_ITEM_BYTES,&prior_off,&prior_size)){
+         QcomSmp2p prior={0};prior.in=(volatile uint32_t *)(m.smem+prior_off);prior.local_pid=0;prior.remote_pid=1;
+diff --git a/bsd/dev/modem/QcomGlink.c b/bsd/dev/modem/QcomGlink.c
+--- a/bsd/dev/modem/QcomGlink.c
++++ b/bsd/dev/modem/QcomGlink.c
+@@ -193,9 +193,19 @@
+             c->up = 1;
+             if (c->client.state) c->client.state(c->context, c, 1);
+         }
+-        if (c->up)
+-            for (unsigned k = 0; k < c->intent_count; ++k)
+-                if (!c->local[k].advertised && !c->local[k].busy && advertise(g, c, k)) return;
++        if (c->up) {
++            for (unsigned k = 0; k < c->intent_count; ++k) {
++                /* busy means delivered once, completion still owed. Do not reuse early. */
++                if (c->local[k].busy) {
++                    const int reuse = (g->features & QCOM_GLINK_FEATURE_INTENT_REUSE) != 0;
++                    if (command(g, reuse ? QCOM_GLINK_RX_DONE_W_REUSE : QCOM_GLINK_RX_DONE, c->lcid, k + 1)) return;
++                    c->local[k].busy = 0;
++                    c->local[k].fill = 0;
++                    if (!reuse) c->local[k].advertised = 0;
++                }
++                if (!c->local[k].advertised && advertise(g, c, k)) return;
++            }
++        }
+     }
+ }
+ 
+@@ -212,6 +222,7 @@
+     if (!c || !liid || index >= c->intent_count || !c->local[index].advertised) {
+         g->dropped++;
+     } else {
++        if (c->local[index].busy) return QcomGlinkCorrupt;
+         uint32_t fill = cmd == QCOM_GLINK_TX_DATA ? 0 : c->local[index].fill;
+         if ((uint64_t)fill + chunk + left > c->intent_size) {
+             g->dropped++;
+@@ -223,12 +234,8 @@
+                 c->local[index].busy = 1;
+                 g->rx_data++;
+                 if (c->client.receive) c->client.receive(c->context, c, c->storage + (size_t)index * c->intent_size, fill);
+-                c->local[index].busy = 0;
++                /* progress retries RX_DONE after FIFO backpressure. The client was called once. */
+                 fill = 0;
+-                /* The intent is ours again once the remote knows it is done; with reuse it stays advertised. */
+-                const int reuse = (g->features & QCOM_GLINK_FEATURE_INTENT_REUSE) != 0;
+-                if (command(g, reuse ? QCOM_GLINK_RX_DONE_W_REUSE : QCOM_GLINK_RX_DONE, c->lcid, liid) == QcomGlinkOk && !reuse)
+-                    c->local[index].advertised = 0;
+             }
+         }
+         c->local[index].fill = fill;

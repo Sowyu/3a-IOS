@@ -20,9 +20,12 @@ root,out=map(Path,sys.argv[1:])
 s=(out/'ModemRuntime.inc').read_text()
 def function(start,end): return s[s.index(start):s.index(end)]
 (out/'lifecycle.c').write_text((root/'tests/lifecycle-prefix.c').read_text()+function('static int m_scm(','static int m_pas(')+function('static bool m_cleanup(','#include "ModemGate.h"')+(root/'tests/lifecycle-tail.c').read_text())
+(out/'vote.c').write_text((root/'tests/vote-prefix.c').read_text()+function('static int m_vote(', 'static int m_qwait(')+(root/'tests/vote-tail.c').read_text())
 PY
 cc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -I"$out" "$out/lifecycle.c" -o "$out/check-lifecycle"
 "$out/check-lifecycle"
+cc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined "$out/vote.c" -o "$out/check-vote"
+"$out/check-vote"
 python3 - "$out" <<'PYCHK'
 from pathlib import Path
 import re,sys
