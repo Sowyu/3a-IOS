@@ -561,3 +561,14 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 
 
 **Code, approval.** The second exact-image review grants one supervised trial with the bounded automatic ONLINE, LOW_POWER, ONLINE sequence. All155 admission pins match. The reviewed runner has started the attempt. Unknown profile changes still refuse restoration without writing, and retained DMA backing remains required after unverified PAS4 shutdown. Results are pending.
+
+
+## Second combined ONLINE trial, ast184
+
+**Measured.** The reviewed audit10 image ended normally in784seconds with clean roots, stale=false and a fresh completion nonce and nonblank frame. I3 completed at raw7962. DMS reported mode3 at10596, then rejected both ONLINE and LOW_POWER with QMI error60 at10597/10598. No second ONLINE request, registration, WDS or packet helper ran. Optional reason/restriction fields default to zero when absent, so their zero log values do not establish an explicit unrestricted response.
+
+**Measured.** AP channels quiesced at15212 before detach15213, data cleanup0 at15214 and SSCTL15215. Unverified PAS4 retained modem and IPA backing at15285/15286. DONE appeared at15904. No GSI fault or panic was found. The runner restored the exact original network profile, verified clean recovery and released ownership by23:35:59, under20minutes. Only normal selftest, log, frame and completion-marker artifacts remain. The packet helper was never installed.
+
+**Inferred.** The current runtime never advertises TFTP service4096. Missing requests therefore do not establish that firmware files are unnecessary. HakiOS's local MPSS source describes carrier configuration and shared-object reads before ONLINE. This is a startup-service hypothesis, not a proven cause of error60 on this phone.
+
+**Missing.** The next proposed offline-only request probe needs a new source/image review before boot. It would announce4096 and return fixed errors, without opening files, accepting file data or issuing ONLINE. No reset or persistent modem write is added. NAS, WDS and cellular packets remain unmeasured.
