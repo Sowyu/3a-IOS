@@ -1,0 +1,135 @@
+diff --git a/bsd/dev/sweet_modem.c b/bsd/dev/sweet_modem.c
+--- a/bsd/dev/sweet_modem.c
++++ b/bsd/dev/sweet_modem.c
+@@ -343,6 +343,13 @@
+     uint8_t *mdt = NULL;
+     int err = sweet_ufs_part_size("modem_a", &lun, &modem_partition_bytes);
+     if (!err) err = fat_mount(&f, "modem_a");
++#ifndef MODEM_HOST_TEST
++    if (!err && m_gate("sweetipaprobe")) {
++        err=ipa_preflight(&f);
++        printf("SWEET IPA: read-only worker final_error=%d\n",err);
++        sweet_log_sync();thread_terminate(current_thread());return;
++    }
++#endif
+     if (!err) err = fat_open(&f, "image/modem.mdt", &cl, &size);
+     if (!err && (size < 52 || size > META_MAX)) err = EFBIG;
+     if (!err) {
+@@ -368,7 +375,7 @@
+ {
+     char level[4] = {0};
+ #ifndef MODEM_HOST_TEST
+-    bool pas=m_gate("sweetmpss") || m_gate("sweetmprobe");
++    bool pas=m_gate("sweetmpss") || m_gate("sweetmprobe") || m_gate("sweetipaprobe");
+     if (!pas && (!PE_parse_boot_arg_str("sweetmodem",level,sizeof(level)) || !strcmp(level,"0"))) return;
+     if (pas) {level[0]='1';level[1]=0;}
+ #else
+diff --git a/bsd/dev/modem/ModemRuntime.inc b/bsd/dev/modem/ModemRuntime.inc
+--- a/bsd/dev/modem/ModemRuntime.inc
++++ b/bsd/dev/modem/ModemRuntime.inc
+@@ -419,6 +419,7 @@
+ }
+ #include "ModemGate.h"
+ static bool m_gate(const char *name){return modem_gate(PE_boot_args(),name)!=0;}
++#include "IpaProbe.inc"
+ static int modem_run(const struct wl_fat *f,const uint8_t *mdt,uint32_t size){
+     memset(&m,0,sizeof(m));m.master=-1;m.glink=m_gate("sweetmglink");m.rmtfs=m_gate("sweetmrmtfs");m.pdm=m_gate("sweetmpdm");m.uim=m_gate("sweetmuim");m.sysmon=m_gate("sweetmstop");m.bcm_probe=m_gate("sweetmbcm");m.handover_release=m_gate("sweetmho");
+     if((m.rmtfs || m.pdm || m.uim || m.sysmon) && !m.glink){printf("SWEET MODEM: refused missing GLINK dependency\n");return EINVAL;}
+diff --git a/bsd/dev/modem/IpaFirmware.h b/bsd/dev/modem/IpaFirmware.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/modem/IpaFirmware.h
+@@ -0,0 +1,49 @@
++#ifndef IPA_FIRMWARE_H
++#define IPA_FIRMWARE_H
++#include <stdint.h>
++#include <stddef.h>
++#define IPA_FW_BASE 0x9ea90000ull
++#define IPA_FW_SIZE 0xa000u
++#define IPA_FW_METADATA_MAX 65536u
++#define IPA_FW_SEGMENTS 16u
++typedef struct {uint32_t index, offset, file_bytes, memory_bytes;} IpaLoad;
++typedef struct {uint32_t span, count, file_bytes; IpaLoad loads[IPA_FW_SEGMENTS];} IpaFirmware;
++static inline uint32_t ipa_le16(const uint8_t *p){return p[0]|(uint32_t)p[1]<<8;}
++static inline uint32_t ipa_le32(const uint8_t *p){return ipa_le16(p)|ipa_le16(p+2)<<16;}
++/* No pointers into the MDT survive this function. All destination spans fit GSI RAM. */
++static inline int ipa_firmware_parse(const uint8_t *b,size_t len,IpaFirmware *fw){
++    *fw=(IpaFirmware){0};
++    if(!b || len<52 || len>IPA_FW_METADATA_MAX || b[0]!=127 || b[1]!='E' || b[2]!='L' || b[3]!='F' ||
++       b[4]!=1 || b[5]!=1 || b[6]!=1 || ipa_le32(b+20)!=1 || ipa_le16(b+16)!=2 ||
++       ipa_le16(b+40)!=52 || ipa_le16(b+42)!=32)return -1;
++    uint32_t off=ipa_le32(b+28),n=ipa_le16(b+44);
++    if(off<52 || off>len || !n || n>IPA_FW_SEGMENTS || n>(len-off)/32)return -1;
++    uint32_t header=off+32*n,hashes=0;uint64_t low=UINT64_MAX,high=0;
++    const uint8_t *first=b+off;
++    if(ipa_le32(first)!=0 || ipa_le32(first+4)!=0 || ipa_le32(first+16)!=header)return -1;
++    for(uint32_t i=0;i<n;i++){
++        const uint8_t *p=b+off+32*i;uint32_t type=ipa_le32(p),flags=ipa_le32(p+24);
++        uint32_t file=ipa_le32(p+16),mem=ipa_le32(p+20),pa=ipa_le32(p+12);
++        if((flags&0x07000000)==0x02000000){
++            if(type!=0 || !file || file!=len-header || ++hashes!=1)return -1;
++            continue;
++        }
++        if(type!=1)continue;
++        if(!mem){if(file)return -1;continue;}
++        if(!(flags&0x08000000) || file>mem || (uint64_t)pa+mem>0x100000000ull)return -1;
++        for(uint32_t j=0;j<fw->count;j++){
++            IpaLoad *q=&fw->loads[j];
++            if((uint64_t)pa<(uint64_t)q->offset+q->memory_bytes && (uint64_t)q->offset<(uint64_t)pa+mem)return -1;
++        }
++        fw->loads[fw->count++]=(IpaLoad){i,pa,file,mem};
++        if(pa<low)low=pa;if((uint64_t)pa+mem>high)high=(uint64_t)pa+mem;
++        if(file>IPA_FW_SIZE-fw->file_bytes)return -1;fw->file_bytes+=file;
++    }
++    if(hashes!=1 || !fw->count || (low&4095))return -1;
++    uint64_t span=((high+4095)&~4095ull)-low;
++    if(!span || span>IPA_FW_SIZE)return -1;
++    fw->span=(uint32_t)span;
++    for(uint32_t i=0;i<fw->count;i++)fw->loads[i].offset-=(uint32_t)low;
++    return 0;
++}
++#endif
+diff --git a/bsd/dev/modem/IpaProbe.inc b/bsd/dev/modem/IpaProbe.inc
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/modem/IpaProbe.inc
+@@ -0,0 +1,39 @@
++/* 2200: storage and SMMU reads only. No IPA/GSI MMIO or PAS calls. */
++#include "IpaFirmware.h"
++static int ipa_preflight(const struct wl_fat *f){
++    uint32_t cl=0,size=0;int rc=fat_open(f,"image/ipa_fws.mdt",&cl,&size);
++    if(rc)return rc;if(size<52 || size>IPA_FW_METADATA_MAX)return EFBIG;
++    uint8_t *mdt=kalloc_data(size,Z_WAITOK|Z_ZERO);if(!mdt)return ENOMEM;
++    IpaFirmware fw;
++    rc=fat_read_chain(f,cl,0,mdt,size);
++    if(!rc && ipa_firmware_parse(mdt,size,&fw))rc=EINVAL;
++    for(unsigned i=0;!rc && i<fw.count;i++){
++        IpaLoad *p=&fw.loads[i];if(!p->file_bytes)continue;
++        char name[32];uint32_t actual;uint8_t last;
++        snprintf(name,sizeof(name),"image/ipa_fws.b%02u",p->index);
++        rc=fat_open(f,name,&cl,&actual);
++        if(!rc && actual!=p->file_bytes)rc=EINVAL;
++        if(!rc)rc=fat_read_chain(f,cl,actual-1,&last,1);
++    }
++    if(!rc)printf("SWEET IPA: firmware preflight PASS loads=%u bytes=%u span=%#x PAS15 untouched\n",fw.count,fw.file_bytes,fw.span);
++    kfree_data(mdt,size);
++    if(rc)return rc;
++    vm_offset_t smmu=ml_io_map(0x15000000,0x100000);if(!smmu)return ENOMEM;
++    uint32_t id0=m_rd(smmu,0x20),id1=m_rd(smmu,0x24),id2=m_rd(smmu,0x28);
++    printf("SWEET IPA: SMMU read-only id0=%#x id1=%#x id2=%#x\n",id0,id1,id2);
++    unsigned count=id0&255,banks=id1&255,shift=(id1>>31)?16:12;
++    uint64_t cbbase=(1ull<<(((id1>>28)&7)+1))<<shift;
++    if(!count || count>128 || !banks || cbbase+((uint64_t)banks<<shift)>0x100000)return ENOTSUP;
++    for(unsigned sid=0x4a0;sid<=0x4a2;sid++){
++        unsigned matches=0;
++        for(unsigned i=0;i<count;i++){
++            uint32_t smr=m_rd(smmu,0x800+4*i),mask=(smr>>16)&0x7fff;
++            if(!(smr>>31) || ((smr^sid)&0x7fff&~mask))continue;
++            uint32_t s2cr=m_rd(smmu,0xc00+4*i),cb=s2cr&255,sctlr=~0u;
++            if(((s2cr>>16)&3)==0 && cb<banks)sctlr=m_rd(smmu,(unsigned)(cbbase+((uint64_t)cb<<shift)));
++            printf("SWEET IPA: SID=%#x SMR=%u raw=%#x S2CR=%#x SCTLR=%#x read_only=1\n",sid,i,smr,s2cr,sctlr);matches++;
++        }
++        printf("SWEET IPA: SID=%#x matches=%u\n",sid,matches);
++    }
++    printf("SWEET IPA: preflight complete; no IPA/GSI register access or SMMU writes\n");sweet_log_sync();return 0;
++}

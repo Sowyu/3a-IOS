@@ -2,7 +2,7 @@
 
 ## Checkpoint, 2026-11-03
 
-I1 desk investigation is recorded below. I2 is not implemented. There is no IPA kernel patch, build, boot image, PAS call, register access or ONLINE attempt from this work. Mobile data does not work yet.
+I1 is complete. I2 is in progress: patch 2200 adds a default-off kernel firmware preflight and read-only SMMU survey. The isolated xnu-ipa tree contains the daily series, USB v5 and copied modem 2170 through 2182. Its first full build is running. No IPA firmware, IPA/GSI registers or ONLINE call has run on the phone. Mobile data does not work yet.
 
 Host inspection of the existing extracted ipa_fws.mdt found three relocatable loads, 17824 file bytes and a page-rounded span of 0x7000. This fits the 0xa000 GSI reservation. `tools/ipa/inspect_mdt.py` checks ELF bounds, overlap and relocation span without loading firmware. It does not check split-file contents or authenticate the image. Three synthetic host tests pass, including nine malformed cases. Local evidence is `plans/ipa/logs/host-check.txt` and `plans/ipa/logs/firmware-inventory.json`.
 
@@ -128,6 +128,12 @@ Initialize empty filter/routing entries to valid mapped zero-rule storage with t
 
 The requested build script's first-clone path executes destructive cleanup and checkout operations even before normal compilation. Its make install also uses cleanup commands. I did not run it under the permanent-deletion policy. The existing modem build-safe wrapper is hard-coded to xnu-modem and must not be reused unchanged. A safe xnu-ipa bootstrap remains work to do, not evidence that a build failed.
 
-The immediate hardware blockers are unmeasured AP/uC context ownership, unimplemented isolated mappings and power votes, and no verified PAS15/DMA stop sequence. The modem's documented PAS4 shutdown failure also prevents claiming a clean combined lifecycle. No Sol hardware audit was requested because there is no bootable IPA candidate to review. There is no pending audit or phone wait.
+The immediate hardware blockers are unmeasured AP/uC context ownership, unimplemented isolated mappings and power votes, and no verified PAS15/DMA stop sequence. The modem's documented PAS4 shutdown failure also prevents claiming a clean combined lifecycle. Sol is reviewing 2200 for a read-only sweetipaprobe=1 boot, conditional on an exact full build and image verification. This grants no PAS15 or IPA/GSI register permission. No phone run is queued before that review.
 
 This work took no phone hold or lock, issued no phone command and left no files on the iOS root. The phone's current mode and current root cleanliness were not measured. Other agents may have changed them. The last modem checkpoint available when read was ast155 with clean root and failed PAS4 shutdown. Raw logs, reference downloads and firmware stay outside the public repo.
+
+## 2200 implementation
+
+`sh tools/ipa/check.sh` reconstructs the new parser from the public patch and tests it with ASan/UBSan. The parser validates MDT metadata, rejects overlapping/oversized loads and bounds every relocation to the GSI reservation. Its real extracted MDT result is three loads, 17824 bytes and span 0x7000, recorded locally in plans/ipa/logs/host-2200.txt. The kernel additionally checks split-file FAT chains and exact lengths. sweetipaprobe=1 uses the existing single modem worker, returns before MPSS work, and reads only SMMU identification and matching stream/context registers. Absent, bare, duplicate and nonexact probe arguments cannot enable it.
+
+The tree was freshly cloned without hardlinks from the existing pristine XNU Git repository, then patched in order, using the battery agent’s safe preparation approach. Source trees were read only. The original script’s destructive first-clone branch was not executed. All actual kernel builds use --remake -j6 with per-tree Trash wrappers, preserved make intermediates and corrected config/kextsymboltool cleanup. The 2173 difflib patch needed new-file mode metadata in the apply stream for this Git version; the copied patch bytes were not changed.
