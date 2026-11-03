@@ -543,3 +543,14 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 
 
 **Code, approval.** Sol v2 grants one supervised ONLINE trial through the corrected runner and replacement manifest. All146 final pins match. The approved trial started with the unchanged2218 image. Unknown profile changes must stop restoration without writing; no overwrite exception exists. The runner owns the phone until clean recovery and exact restoration. Results remain pending.
+
+
+## First combined ONLINE trial, ast183
+
+**Measured.** The reviewed2218 image completed normally in784seconds with clean roots, stale=false, a fresh completion nonce and a decoded nonblank frame. I3 passed at raw7628. Data advanced through DPM10236 and WDA10243, then read operating mode3 at10245. The ONLINE reply was rejected at10246 and the data session failed before registration or WDS. The old logger discards whether this was a QMI error or malformed reply. No packet proof was attempted.
+
+**Measured.** AP channels quiesced at16305 before data detach16308 and SSCTL16310. Data cleanup reported idle1/cleanup0 at16309. PAS4 shutdown remained unverified and both modem and IPA backing stayed retained at16378/16379. DONE appeared at16975. No GSI fault or panic was found. The runner restored the original network profile byte for byte from clean recovery and released ownership by23:10:35, within20minutes. The phone is in OrangeFox. Only normal selftest/log/frame artifacts remain from this trial; the packet helper was never installed.
+
+**Code.** Data2220 audit10 logs the numeric refusal and hardware-restricted field, and permits at most ONLINE, LOW_POWER, ONLINE with the existing gate. LOW_POWER must be accepted and freshly read back before the retry. Lost Set replies fail locally. Its stage cutoff has a documented late-read exception under the independent600-second runtime.
+
+**Missing.** The changed data source needs integration, build and a new exact-image GO. The cause of ast183's ONLINE refusal, NAS registration, WDS and data packets remain unmeasured. No automatic reset or persistent modem write is authorized.
