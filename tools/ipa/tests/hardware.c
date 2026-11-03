@@ -68,8 +68,21 @@ static void data_reply(void *ctx,QcomQrtr *qr,uint32_t p,uint32_t node,uint32_t 
 static void word(uint8_t *p,uint32_t v){ipa_put32(p,v);}
 static unsigned received;
 static void rx_callback(void *ctx,const uint8_t *p,size_t n){assert(ctx==&received && !queue_locked);assert(n==8 && p[4]==0x45);received++;assert(!sweet_ipa_transmit(p,n));}
-static void hreset(void){reset();memset(cfg,0,sizeof(cfg));memset(local,0x6a,sizeof(local));ipa.smem_bytes=0xb000;ipa.dma=(uintptr_t)dma-PAGE_SIZE;ipa.block=1;cfg[0x40/4]=(0x800u<<16)|0x800;cfg[0]=24|(12u<<16);cfg_writes=cfg_drop=immediates=fail_immediate=cmd_seen=0;corrupt_read=hold_aggregate=false;}
+static void hreset(void){reset();memset(cfg,0,sizeof(cfg));memset(local,0x6a,sizeof(local));ipa.smem_bytes=0xb000;ipa.dma=(uintptr_t)dma-PAGE_SIZE;ipa.block=1;cfg[0x40/4]=(0x800u<<16)|0x800;cfg[0]=0x0b0f0b1a; /* ast175 measured FLAVOR: TX0..10, RX11..25. */cfg_writes=cfg_drop=immediates=fail_immediate=cmd_seen=0;corrupt_read=hold_aggregate=false;}
 int supplied_hardware_main(void){
+ /* Real ast175 registers must admit the actual command/LAN/WAN endpoints. */
+ hreset();cfg[0x40/4]=0x880;assert(!ipa_hardware_setup());
+ assert(iph.offset==0 && iph.bytes==0x4400 && immediates==7);
+ assert(iph.gsi.ch[0].endpoint==9 && iph.gsi.ch[0].tx);
+ assert(iph.gsi.ch[1].endpoint==11 && !iph.gsi.ch[1].tx);
+ assert(iph.gsi.ch[2].endpoint==2 && iph.gsi.ch[2].tx);
+ assert(iph.gsi.ch[3].endpoint==18 && !iph.gsi.ch[3].tx);
+ assert(ipa_hardware_stop());
+ const uint32_t bad_flavor[]={0,0xffffffff,24|(12u<<16),0x0b0f091a,0x0c0e0b1a,0x0b070b1a,0x090f0b1a,0x0b100b1a};
+ for(unsigned i=0;i<sizeof(bad_flavor)/sizeof(bad_flavor[0]);i++){
+  hreset();cfg[0]=bad_flavor[i];assert(ipa_hardware_setup()==ENOTSUP);assert(!cfg_writes && !writes);
+ }
+
  hreset();assert(!ipa_hardware_setup());assert(immediates==7 && iph.ready);assert(cfg[0x38/4]==(11|(11u<<8)|(3u<<26)));assert(iph.gsi.ch[3].posted==63);assert(cfg[(0x1040+0x80*2)/4]==33 && !cfg[(0x1040+0x80*18)/4]);assert(!(cfg[(0x1008+0x80*18)/4]&0x7f));assert((cfg[(0x1024+0x80*18)/4]>>5&63)==6);
  for(unsigned i=0;i<4;i++)assert(cfg[(0x700+4*i)/4]==0x5cd0);
  for(unsigned i=0;i<0x280;i++)assert(local[0x4000+i]==0x6a);

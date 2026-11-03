@@ -1,0 +1,17 @@
+--- a/bsd/dev/modem/IpaHardware.inc
++++ b/bsd/dev/modem/IpaHardware.inc
+@@ -83,8 +83,12 @@
+ static int ipa_hardware_setup(void){
+     memset(&iph,0,sizeof(iph));
+     if(!ipa_local_bounds(ipa_hr(0x40),&iph.offset,&iph.bytes))return EINVAL;
+-    uint32_t flavor=ipa_hr(0);unsigned pipes=flavor&255,producers=(flavor>>16)&255,first=flavor>>24;
+-    if(pipes<=18 || !producers || first>2 || first+producers<=9)return ENOTSUP;
++    uint32_t flavor=ipa_hr(0);unsigned pipes=flavor&255,tx_count=(flavor>>8)&255;
++    unsigned rx_count=(flavor>>16)&255,rx_base=flavor>>24;
++    /* Hardware consumes AP TX and produces AP RX. FLAVOR's producer
++     * partition therefore contains RX11/18, while TX2/9 start at zero. */
++    if(pipes>32 || tx_count>rx_base || rx_base+rx_count>pipes ||
++       tx_count<=9 || rx_base>11 || rx_base+rx_count<=18)return ENOTSUP;
+     IpaGsiIo io={0,ipa_gread,ipa_gwrite,ipa_gsync,ipa_gwait};
+     if(!ipa_gsi_available(io))return EBUSY;
+     if(!ipa_hconfig(0xc00c,0,~0u) || !ipa_hconfig(0x2c,ipa_hr(0x2c)|(1u<<7)|(1u<<8),~0u) ||

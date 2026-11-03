@@ -2,7 +2,7 @@
 
 ## Checkpoint, 2026-11-03
 
-I1 is complete. The I2 implementation builds with patches2200 through2211, copied modem2189v2, data2220audit8 and adapter2221. I3 and I4 remain unproven. ast175 authenticated and stopped PAS15, but CPU VA cleanup panicked.
+I1 is complete. The I2 implementation builds with patches2200 through2212, copied modem2189v2, data2220audit8 and adapter2221. I3 and I4 remain unproven. ast175 authenticated and stopped PAS15, but CPU VA cleanup panicked.
 
 Read-only surveys ast159 and ast170 passed. SMMU-only ast174 passed setup and parking with clean roots. PAS15-only ast175 measured authentication and shutdown success, then exposed a page-size mismatch in CPU VA teardown. Patch2211 fixes that mismatch and passes its build and host regressions. A separately reviewed benign journal-clean boot must precede the next firmware trial.
 
@@ -320,3 +320,13 @@ The doubled panic at5536 decodes to pmap_remove_options_internal rejecting an ad
 The real runtime test now models native mapping rounding, page-aligned unmap and exact allocation-size matching with PAGE_SIZE16384. Actual old2210 fails that model at the unmap assertion. Corrected2211 passes all lifecycle and datapath sanitizer checks, preserves the firmware tail guards and reproduces all56 integrated files. Its --remake -j6 build exited0. Public patch SHA256 is59a5f8da26864cd9546e959ba842dc9cd2aef57c192e38bf724f0587cbf11d77. Apply it after2210, with the same modem2189v2/dataaudit8/2221 cutoff. No modem source changes are needed.
 
 The run is not accepted A evidence because cleanup panicked, root became dirty and stale=true. The phone returned to recovery and its runner released ownership. The root still has the ordinary2210 firmware selftest hook and logs. A separate benign journal-replay C image is under new review before any further firmware probe. OldA/B/ONLINE candidates stay suspended. I3 and I4 remain unproven. Evidence is ios-asteroids/logs/ast175-ipa-firmware-2210.txt, its result.json, plans/ipa/logs/host-2211-negative-control.txt and build-2211.txt.
+
+##2212, measured endpoint partition
+
+FLAVOR0xb0f0b1a reports26 pipes,11 hardware consumers,15 hardware producers and first producer11. Hardware direction is opposite to the AP client's name. AP TX feeds hardware consumers0 through10. AP RX receives from hardware producers11 through25. This admits AP TX endpoints2/9 and RX11/18, plus the modem peers7/12/16.
+
+Primary definitions are plans/ipa/reference/msm_ipa_ipa_v3_ipahal_ipahal_reg_i.h:803 and reg_ipa_reg-v5.0.c:12. Mainline ipa_endpoint.c:2025 explicitly maps MAX_CONS_PIPES to AP TX and MAX_PROD_PIPES/PROD_LOWEST to AP RX. The old guard interpreted the producer partition as AP TX and would refuse the measured word before GSI setup. Patch2212 validates the right partitions, rejects overlap, unsupported counts and missing selected endpoints before any configuration write.
+
+The maintained hardware regression now uses actual ast175 FLAVOR0xb0f0b1a, and separately shared-memory0x880. The full real hardware_setup model completes seven immediate commands and admits all four AP channels. Eight invalid partition cases refuse before any IPA/GSI write. Actual old2211 fails the measured-word test. The corrected datapath sanitizer suite and56-file reconstruction pass, and --remake -j6 build exited0. No hardware GSI or handshake claim follows from those host tests.
+
+Public patch SHA256 is b12cf3a441d384e41f0a089c3e1ef8b7869b35c6c6af57c7acb0b51f00c7a15c. Apply2200 through2212 numerically after the pinned modem2189v2/dataaudit8/2221 source series. This changes only IpaHardware.inc. Modem/Data owner patches remain byte-identical. The next PAS15-only image will use this final kernel with full hardware setup disabled. Its own fresh review and accepted benign C are still required.
