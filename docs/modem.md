@@ -449,3 +449,6 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 
 
 **Review.** The new exact-image review in `modem-2209-data-image-audit.md` found no new combined kernel or runner defect, but remains NO-GO because the prerequisite SMMU-only checker rejects its own required success line. IPA owns that correction and fresh review. A final data-image decision follows accepted clean-root, SMMU-only, PAS15-only and offline handshake evidence.
+
+
+**Measured, recovery.** The separate benign clean-root run ast172 ended normally after214seconds. It replayed the journal, returned a clean root with stale=false and logged no IPA or modem worker activity. IPA accepted the capture and released ownership. The SMMU-only checker still needs its corrected review before that prerequisite can run.
