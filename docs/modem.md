@@ -1,6 +1,6 @@
 # Modem and SIM: desk findings (2026-11-03)
 
-MPSS boots offline and announces UIM, NAS and WDS services. ast155 also completed the standard sysmon shutdown handshake and flushed rmtfs writes into RAM, but secure PAS shutdown still fails. M2 remains incomplete and no SIM status has been queried. Patches 2180 and 2181 improve failure reporting and add a read-only bandwidth-metadata survey. The next probe has no modem start or power votes.
+MPSS boots offline and announces UIM, NAS and WDS services. ast155 completed sysmon shutdown but PAS shutdown still failed. M2 remains incomplete and UIM requests remain off. ast157 passed the read-only BCM survey. Patch 2182 now releases the modem MSS proxy vote at ready/handover, matching the vendor regulator lifecycle. Its host checks and build pass. Sol review and phone validation are pending.
 
 Labels as in `docs/input.md`: **Measured**, **Code**, **Inferred**, **Missing**.
 
@@ -16,7 +16,7 @@ Labels as in `docs/input.md`: **Measured**, **Code**, **Inferred**, **Missing**.
 
 ## State
 
-- `plans/modem/src/lift/` holds unfinished drafts that do not compile. The dedicated `ios-asteroids/research/xnu-modem` tree now has the requested daily series, USB v5 and modem patches 2170 through 2178. Other kernel trees were not edited.
+- `plans/modem/src/lift/` holds unfinished drafts that do not compile. The dedicated `ios-asteroids/research/xnu-modem` tree now has the requested daily series, USB v5 and modem patches 2170 through 2182. Other kernel trees were not edited.
 - The owner wants mobile data only. Calls, SMS and status-bar changes are excluded. A wired-interface approach may avoid Apple baseband integration for data, but still needs a working modem and IPA path.
 
 ## Patch 2170, read-only preflight
@@ -217,3 +217,31 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 **Code.** 2181 adds `sweetmbcm=1`, default off, to the read-only `sweetmprobe=1` survey. It logs bounded command-db metadata for those seven resources and IPA's IP0. BCM auxiliary data is a little-endian 32-bit unit, 16-bit width, byte VCD and reserved byte. It is not an ARC voltage list. The code copies at most eight bytes after the existing extent checks and issues no BCM vote, PAS start, shared-memory write or new mapping.
 
 **Measured, host.** Start/control, metadata and joined shutdown tests pass in `plans/modem/logs/start-check-2181.txt`. They cover valid metadata, missing resources, truncated auxiliary data, opted-out behavior and unchanged ARC decoding. The full --remake exited0 and the new BCM image's ten rebased segments match kernel SHA256 `93f7555614ce18a9a2077caf92ed0cb282ece47b39eef99e9ad89418338c5f6a`. Image SHA256 is `1dc152b77e3bc705717fbfeb072c96d5f543e40072a3ad123905cdaed32fcfe4`. Sol review is running. **Missing.** Live BCM metadata and an audited interconnect implementation before another modem start.
+
+
+## ast157 BCM survey and 2182 handover candidate
+
+**Measured.** ast157-modem-bcm-probe-2181 completed in 244 seconds with fresh completion nonce, one frame, selftest DONE and clean root. Local log lines 6659 to 6674 contain all eight resource records. Line 6678 reports hardware preflight error 0, line 6680 confirms no PAS activity and cleanup ok, and line 6687 reports final_error 0. No modem start or clock vote ran.
+
+| Resource | Address | Unit | Width | VCD |
+| --- | --- | ---: | ---: | ---: |
+| CE0 | 0x50034 | 7935 | 8 | 6 |
+| SN3 | 0x5001c | 530000 | 8 | 3 |
+| SN0 | 0x50010 | 530000 | 16 | 3 |
+| SH1 | 0x50008 | 4200000 | 32 | 1 |
+| SH0 | 0x50004 | 4200000 | 32 | 1 |
+| MC0 | 0x50000 | 1600000 | 8 | 0 |
+| ACV | 0x50068 | 1 | 0 | 12 |
+| IP0 | 0x50038 | 40 | 8 | 7 |
+
+**Measured.** Every record used slave 5, version 0x1000, eight auxiliary bytes and reserved value zero. ACV has VCD 12. Do not copy the unpublished draft's assumed VCD limit of 10 into a future vote implementation. No BCM write is implemented or approved by this survey.
+
+**Code.** Patch 2182 adds strict default-off sweetmho=1. Once MPSS has started and both ready and handover bits are present, it releases the modem-only MSS vote through the existing serialized RSC path. Shared CX and XO stay pinned. A failed release marks the run failed and retains uncertain TCS ownership. PAS shutdown remains mandatory, and an unverified PAS stop still retains low memory and power until reset.
+
+**Code.** The DT mx-supply phandle 0x77 resolves to mss.lvl. The matching vendor qcom_pas_handover calls disable_regulators, which removes its proxy votes. This supplies the basis for 2182. It does not prove that the retained MSS vote caused the secure shutdown error.
+
+**Measured, host.** The full Trash-safe --remake build exited 0. Sanitizer checks exercise off, incomplete handover, fatal/not-started, successful one-time release and release timeout. The existing joined QRTR/rmtfs/SSCTL/PAS checks pass. The offline and UIM images contain all ten expected kernel segments and have 593-byte and 605-byte argument lines.
+
+**Missing.** Sol GO and phone evidence for 2182. Only the offline image is submitted for review. UIM remains off until verified M2 and a fresh UIM audit.
+
+**Code, integration.** IPA owns 2200 through 2219 and data owns 2220 through 2239. The modem worker is the sole QRTR owner. Ports 0x4004 and 0x4005 are reserved for IPA, which must add two bounded local slots. No userland raw-QMI interface exists in this series. The current API and patch cutoff are in plans/modem/README.md.
