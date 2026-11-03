@@ -540,3 +540,6 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 
 
 **Code, review correction.** The first final2218 review accepted the offline I3 evidence and retained DMA lifecycle but rejected profile restoration that could overwrite an unrecognized change. The runner now restores only an exact match of the pinned temporary profile. It leaves the original alone and retains ownership without writing on any third state. Host tests cover conflicts and failed readback. The source and image are unchanged; a new exact-artifact review is required before launch.
+
+
+**Code, approval.** Sol v2 grants one supervised ONLINE trial through the corrected runner and replacement manifest. All146 final pins match. The approved trial started with the unchanged2218 image. Unknown profile changes must stop restoration without writing; no overwrite exception exists. The runner owns the phone until clean recovery and exact restoration. Results remain pending.
