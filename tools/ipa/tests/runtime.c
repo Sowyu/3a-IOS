@@ -103,5 +103,10 @@ int main(void){
  reset();rsc[0xd04/4]=1;assert(!ipa_prepare(&f));assert(clocks==2 && !rsc[0xd00/4]);assert(ipa_cleanup(true));
  reset();mdt[4]=2;assert(ipa_prepare(&f));assert(!pas_calls[1]);assert(ipa_cleanup(true));assert(freed==allocations);
  reset();assert(!ipa_prepare(&f));*(uint8_t *)ipa.dma=0;assert(!ipa_cleanup(true));assert(!freed && !unmapped);
- reset();puts("IPA runtime PAS15, reservation bounds, allocation failures and retained teardown PASS");
+ reset();ipa.map_probe=true;assert(!ipa_prepare(&f));assert(!clocks);
+ for(unsigned i=0;i<8;i++)assert(!pas_calls[i]);assert(!ipa.firmware && !ipa.metadata && !ipa.block);
+ assert(ipa_cleanup(true) && freed==allocations);for(unsigned i=0;i<8;i++)assert(!pas_calls[i]);
+ reset();ipa.map_probe=true;held=true;assert(ipa_prepare(&f)==EBUSY);held=false;assert(ipa_cleanup(true));
+ reset();puts("IPA SMMU-only probe skips firmware, PAS, IPA registers and IPA power votes PASS");
+ puts("IPA runtime PAS15, reservation bounds, allocation failures and retained teardown PASS");
 }

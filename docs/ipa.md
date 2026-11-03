@@ -260,3 +260,23 @@ Apply 2207 after the frozen 2200 through 2206 series, then 2208. The earlier cut
 
 - 2207 SHA256 `cac60147ce18dacf3b0d6804e93425f35dbf6fe0ffa0cf8fde8ebae35fc21106`.
 - 2208 SHA256 `afc38c0297678892e8e7e1a8410e629903c34867b589fcae11df9d6cda52aacb`.
+
+## ast171 failure and additive 2209
+
+ast171 failed after 63 seconds. The completed host result records reset-unknown, a dirty root and stale pulled root files. The raw kernel log remains valid. Collection returned to recovery and the runner released the IPA hold and lock. No PAS15 call, firmware load, GSI operation or handshake occurred. The iOS root retains the normal selftest hook and prior IPA markers/logs. Its journal must be replayed by a separately reviewed benign boot before another probe can update root files.
+
+At raw log line 7477, TCR2 is 0x38061 after requesting 0x38001. TCR 0x80301c, CBAR 0x1f301 and CBA2R 1 match. The full-register comparison therefore refuses setup before translation enable, TLBI or SMR publication. The later panic follows no-PAS modem cleanup. Its exact faulting instruction is unknown. Normalizing doubled characters reveals the implementation-specific exception, not a usable exception PC.
+
+ARM IHI0062D.c section 16.5.39 identifies bits 5 and 6 as TBI0 and TBI1. They are not reserved bits. Section 9.6.3 decodes the measured ID2 UBS field as a 36-bit upstream bus. TBI affects full 64-bit tagged translation-operation addresses, which this driver never issues. Patch 2209 explicitly programs both TBI bits and still requires exact readback. It does not mask mismatches.
+
+Section 16.5.40 makes the old saved-register replay unsafe. Under AArch64 format, TTBR bits 2:0 must be zero and ASID bits 15:8 must be zero when TCR2.AS is zero. Bank 5's sampled UNKNOWN TTBR0, 0x9191f7ef73bf763b, violates both requirements. Replaying it before restoring the old format is therefore invalid even without proof that this instruction caused the panic. Reordering alone would still replay UNKNOWN controls in another format. The driver now verifies format and translation controls before writing a TTBR and never replays those reset values.
+
+After verified producer stop, 2209 faults each owned stream, disables its context, invalidates the private VMID and waits for synchronization. It zeros both TTBRs in the known AArch64 format and verifies the remaining configuration. It proves the SMR invalid before restoring its dormant S2CR. The disabled bank keeps its private VMID and known format until reset. The generic APPS allocator now skips nonzero CBAR/CBA2R banks, just as IPA does. Backing is released only after those checks and DMA guards pass. A partial install failure retains all backing without further SMMU writes. Any uncertain teardown also retains backing.
+
+The new default-off sweetipamap=1 probe exercises only this setup/cleanup path. It refuses firmware/full-IPA/modem/data combinations, requires the strict mpss/mbw/mbwi gates plus selftest, reset guard and deadman 600, and returns before PAS15 firmware work or MPSS start. It skips IPA clock votes and all IPA/GSI register accesses. It logs each SMMU write before and after the plain-MMIO accessor. This is a different probe from the failed firmware run.
+
+Host ASan/UBSan checks cover the measured UNKNOWN TTBR, explicit TBI programming, dropped writes, private-VMID TLB isolation, parked-bank allocator exclusion, exact probe gates and the actual runtime's no-firmware/no-PAS branch. The full --remake -j6 build passed. Ordered reproduction matches all 56 integrated files. Both images match all ten packed kernel segments.
+
+Apply 2209 after frozen 2200 through 2208. SHA256 is 888ede093e7445a701cb6a6d8f05a2a923f4d859c819cadf26a4ad6f893ac87b. The SMMU-only build retains copied modem2189v2, data2220audit7 410ee41d and2221 4bdc74ce. The newer data2220audit8 f331702b will be copied unchanged before later integrated trials. Reproduction pins owner bytes to commit cf1e583 instead of moving public files. Run `python3 plans/ipa/tools/reproduce-cutoff.py`, the existing IPA host suites, then `python3 3a-IOS/tools/ipa/check-mapprobe.py`.
+
+The new review must separately approve one benign journal-clean boot, then one SMMU-only boot after a clean-root result. The benign image uses the ast170 kernel with every IPA/modem gate absent and makes no root-file push. The SMMU runner refuses automatic replay and requires the accepted clean result. Images and runners are frozen in plans/ipa/frozen-2209, with hashes in plans/ipa/logs/artifacts-2209.json. No phone approval is claimed yet. The old firmware/B/ONLINE candidates are suspended. A successful SMMU-only result still requires a fresh PAS15-only trial and offline handshake review before ONLINE.

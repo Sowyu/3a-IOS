@@ -1,0 +1,199 @@
+diff --git a/bsd/dev/modem/IpaMmu.h b/bsd/dev/modem/IpaMmu.h
+--- a/bsd/dev/modem/IpaMmu.h
++++ b/bsd/dev/modem/IpaMmu.h
+@@ -17,6 +17,12 @@
+     bool touched,published,configured;
+ } IpaMmuContext;
+ typedef struct {IpaMmuIo io;IpaMmuContext context[2];bool retained;} IpaMmu;
++/* ARM IHI0062D.c 16.5.39: TBI applies only to full 64-bit tagged
++ * translation-operation addresses. ID2=0x5111 fixes upstream width at36.
++ * We issue no address-translation operations. Program TBI explicitly and
++ * require exact readback, including both bits observed set in ast171. */
++#define IPA_MMU_TCR2 ((7u<<15)|0x60u|1u)
++#define IPA_MMU_TCR ((1u<<23)|(3u<<12)|28u)
+ static const unsigned ipa_mmu_regs[9]={0,0x10,0x20,0x24,0x30,0x38,0x3c,0x28,0x2c};
+ static inline unsigned ipa_cb(unsigned n){return 0x80000+4096*n;}
+ static inline bool ipa_mmu_sync(IpaMmu *s,unsigned base){
+@@ -89,16 +95,19 @@
+         /* Clear unknown controls before switching context format. M was zero. */
+         io->write(c,b,0);if(io->read(c,b))return false;
+         io->write(c,0x1800+4*p->bank,1); /* 64-bit context */
++        if(io->read(c,0x1800+4*p->bank)!=1)return false;
+         io->write(c,0x1000+4*p->bank,0x1f300|p->vmid); /* stage 1, stage 2 bypass */
++        if(io->read(c,0x1000+4*p->bank)!=(0x1f300|p->vmid))return false;
+         /* SEP=7, PASIZE=1 (36-bit), 36-bit IOVA, EPD1, noncached walks. */
+-        io->write(c,b+0x10,(7u<<15)|1);io->write(c,b+0x30,(1u<<23)|(3u<<12)|28);
++        io->write(c,b+0x10,IPA_MMU_TCR2);io->write(c,b+0x30,IPA_MMU_TCR);
++        if(io->read(c,b+0x10)!=IPA_MMU_TCR2 || io->read(c,b+0x30)!=IPA_MMU_TCR)return false;
+         uint64_t ttbr=table[n]|((uint64_t)(p->bank+1)<<48);
+         io->write64(c,b+0x20,ttbr);io->write64(c,b+0x28,0);
+         io->write(c,b+0x38,0x0444);io->write(c,b+0x3c,0);
+         /* Prove the leased identity and complete table configuration while
+          * disabled. A dropped CBAR write must never invalidate VMID0. */
+         if(io->read(c,b) || io->read(c,b+0x20)!=(uint32_t)ttbr || io->read(c,b+0x24)!=(uint32_t)(ttbr>>32) ||
+-           io->read(c,b+0x30)!=((1u<<23)|(3u<<12)|28) || io->read(c,b+0x10)!=((7u<<15)|1) ||
++           io->read(c,b+0x30)!=(IPA_MMU_TCR) || io->read(c,b+0x10)!=(IPA_MMU_TCR2) ||
+            io->read(c,0x1800+4*p->bank)!=1 || io->read(c,0x1000+4*p->bank)!=(0x1f300|p->vmid) ||
+            io->read(c,b+0x38)!=0x0444 || io->read(c,b+0x3c) || io->read(c,b+0x28) || io->read(c,b+0x2c))return false;
+         p->configured=true;
+@@ -115,32 +124,37 @@
+     return true;
+ }
+ /* Caller must prove both PAS15 and every GSI DMA producer stopped first.
+- * Any failed sync/readback pins page tables and all DMA allocations to reset. */
+-static inline bool ipa_mmu_restore(IpaMmu *s,bool stopped){
++ * Never replay UNKNOWN reset fields in a different translation format.
++ * Leave each leased bank disabled with zero TTBRs and its private VMID.
++ * Its nonzero CBAR prevents reuse by IPA or the generic APPS allocator.
++ * Any uncertain setup or teardown pins all backing until system reset. */
++static inline bool ipa_mmu_release(IpaMmu *s,bool stopped){
+     if(!stopped || s->retained || !ipa_mmu_mode(s)){s->retained=true;return false;}
+     IpaMmuIo *io=&s->io;void *c=io->ctx;
++    /* A partial configuration is not a known format. Do not try to repair it. */
++    for(unsigned n=0;n<2;n++)if(s->context[n].touched && !s->context[n].configured){s->retained=true;return false;}
+     for(unsigned n=0;n<2;n++){
+         IpaMmuContext *p=&s->context[n];if(!p->touched)continue;unsigned b=ipa_cb(p->bank);
++        if(io->read(c,0x1000+4*p->bank)!=(0x1f300|p->vmid) || io->read(c,0x1800+4*p->bank)!=1){s->retained=true;return false;}
+         if(p->published){
+-            if(io->read(c,0x800+4*p->slot)!=(0x80000000u|p->sid)){s->retained=true;return false;}
+-            io->write(c,0xc00+4*p->slot,2u<<16); /* route all owned requests to fault */
++            if(io->read(c,0x800+4*p->slot)!=(0x80000000u|p->sid) || io->read(c,0xc00+4*p->slot)!=(p->bank|(3u<<8))){s->retained=true;return false;}
++            io->write(c,0xc00+4*p->slot,2u<<16); /* route owned requests to fault */
+             if(io->read(c,0xc00+4*p->slot)!=(2u<<16)){s->retained=true;return false;}
+-        }
+-        if(p->configured && (io->read(c,0x1000+4*p->bank)!=(0x1f300|p->vmid) || io->read(c,0x1800+4*p->bank)!=1)){s->retained=true;return false;}
++        }else if(io->read(c,0x800+4*p->slot)!=p->smr || io->read(c,0xc00+4*p->slot)!=p->s2cr){s->retained=true;return false;}
+         io->write(c,b,0);if(io->read(c,b)){s->retained=true;return false;}
+-        /* A partial configuration never enabled translation or published an
+-         * SMR. Invalidate only after the private VMID was proven installed. */
+-        if(p->configured){io->write(c,b+0x618,0);if(!ipa_mmu_sync(s,b))return false;}
+-        io->write(c,0x800+4*p->slot,p->smr);io->write(c,0xc00+4*p->slot,p->s2cr);
+-        io->write64(c,b+0x20,(uint64_t)p->saved[2]|(uint64_t)p->saved[3]<<32);
+-        io->write64(c,b+0x28,(uint64_t)p->saved[7]|(uint64_t)p->saved[8]<<32);
+-        for(unsigned j=1;j<=6;j++)if(j!=2 && j!=3)io->write(c,b+ipa_mmu_regs[j],p->saved[j]);
+-        io->write(c,0x1800+4*p->bank,p->cba2r);io->write(c,0x1000+4*p->bank,p->cbar);
+-        /* Restore the saved disabled control after tables and format. */
+-        io->write(c,b,p->saved[0]);
+-        if(io->read(c,0x800+4*p->slot)!=p->smr || io->read(c,0xc00+4*p->slot)!=p->s2cr){s->retained=true;return false;}
+-        for(unsigned j=0;j<9;j++)if(io->read(c,b+ipa_mmu_regs[j])!=p->saved[j]){s->retained=true;return false;}
+-        if(io->read(c,0x1800+4*p->bank)!=p->cba2r || io->read(c,0x1000+4*p->bank)!=p->cbar){s->retained=true;return false;}
++        io->write(c,b+0x618,0);if(!ipa_mmu_sync(s,b))return false;
++        /* Known AArch64 format remains installed. Zero is a valid disabled
++         * TTBR encoding. Do not write sampled UNKNOWN TTBR/TCR/MAIR/SCTLR. */
++        io->write64(c,b+0x20,0);io->write64(c,b+0x28,0);
++        if(io->read(c,b) || io->read(c,b+0x20) || io->read(c,b+0x24) || io->read(c,b+0x28) || io->read(c,b+0x2c) ||
++           io->read(c,b+0x10)!=IPA_MMU_TCR2 || io->read(c,b+0x30)!=IPA_MMU_TCR ||
++           io->read(c,b+0x38)!=0x0444 || io->read(c,b+0x3c) ||
++           io->read(c,0x1000+4*p->bank)!=(0x1f300|p->vmid) || io->read(c,0x1800+4*p->bank)!=1){s->retained=true;return false;}
++        /* Prove the selector invalid before restoring its dormant route. */
++        io->write(c,0x800+4*p->slot,p->smr);
++        if(io->read(c,0x800+4*p->slot)!=p->smr){s->retained=true;return false;}
++        io->write(c,0xc00+4*p->slot,p->s2cr);
++        if(io->read(c,0xc00+4*p->slot)!=p->s2cr){s->retained=true;return false;}
+         p->touched=false;p->published=false;p->configured=false;
+     }
+     return true;
+diff --git a/bsd/dev/modem/IpaRuntime.inc b/bsd/dev/modem/IpaRuntime.inc
+--- a/bsd/dev/modem/IpaRuntime.inc
++++ b/bsd/dev/modem/IpaRuntime.inc
+@@ -21,11 +21,19 @@
+     uint64_t dma_pa,pt_pa[2],metadata_pa;
+     IpaMmu mmu;
+     uint32_t smem_off,smem_bytes;
+-    bool enabled,pas_owed,started,retained,clock_pinned,mmu_attempted;
++    bool map_probe,enabled,pas_owed,started,retained,clock_pinned,mmu_attempted;
+ } ipa;
+ static uint32_t ipa_mread(void *unused,unsigned off){(void)unused;return ipa_mmio_read32(ipa.smmu,off);}
+-static void ipa_mwrite(void *unused,unsigned off,uint32_t v){(void)unused;ipa_mmio_write32(ipa.smmu,off,v);}
+-static void ipa_mwrite64(void *unused,unsigned off,uint64_t v){(void)unused;ipa_mmio_write64(ipa.smmu,off,v);}
++static void ipa_mwrite(void *unused,unsigned off,uint32_t v){
++    (void)unused;if(ipa.map_probe){printf("SWEET IPA: SMMU write32 begin offset=%#x value=%#x\n",off,v);sweet_log_sync();}
++    ipa_mmio_write32(ipa.smmu,off,v);
++    if(ipa.map_probe){printf("SWEET IPA: SMMU write32 end offset=%#x\n",off);sweet_log_sync();}
++}
++static void ipa_mwrite64(void *unused,unsigned off,uint64_t v){
++    (void)unused;if(ipa.map_probe){printf("SWEET IPA: SMMU write64 begin offset=%#x value=%#llx\n",off,(unsigned long long)v);sweet_log_sync();}
++    ipa_mmio_write64(ipa.smmu,off,v);
++    if(ipa.map_probe){printf("SWEET IPA: SMMU write64 end offset=%#x\n",off);sweet_log_sync();}
++}
+ static void ipa_mdelay(void *unused){(void)unused;delay(1);}
+ static int ipa_alloc(vm_offset_t *va,uint64_t *pa,vm_size_t size){
+     if(kmem_alloc_contig(kernel_map,va,size,PAGE_MASK,0,0,KMA_DATA|KMA_ZERO,VM_KERN_MEMORY_IOKIT)!=KERN_SUCCESS)return ENOMEM;
+@@ -99,6 +107,8 @@
+     if(!sweet_apps_smmu_claim())return EBUSY;
+     ipa.mmu_attempted=true;bool ok=ipa_mmu_install(&ipa.mmu,ipa.pt_pa);sweet_apps_smmu_release();
+     if(!ok){
++        /* A rejected partial format is left alone, including during cleanup. */
++        if(ipa.mmu.context[0].touched || ipa.mmu.context[1].touched)ipa.mmu.retained=true;
+         printf("SWEET IPA: prepare SMMU install refused retained=%u\n",ipa.mmu.retained);
+         for(unsigned i=0;i<2;i++){
+             IpaMmuContext *p=&ipa.mmu.context[i];unsigned b=ipa_cb(p->bank);
+@@ -140,8 +150,10 @@
+     if((rc=ipa_pas(5,1,0,0)))return rc;ipa.started=true;return 0;
+ }
+ static int ipa_prepare(const struct wl_fat *f){
+-    int rc=ipa_vote_extra();if(rc)return rc;
++    int rc=0;
++    if(!ipa.map_probe && (rc=ipa_vote_extra()))return rc;
+     if((rc=ipa_memory_prepare()))return rc;
++    if(ipa.map_probe){printf("SWEET IPA: SMMU-only setup complete; no firmware, PAS start or IPA/GSI access\n");sweet_log_sync();return 0;}
+     if((rc=ipa_load_firmware(f)))return rc;
+     ipa.block=ml_io_map_unmappable(0x3e00000,0x200000,VM_WIMG_IO);if(!ipa.block)return ENOMEM;
+     printf("SWEET IPA: powered read-only flavor=%#x shared_mem=%#x GSI_status=%#x param2=%#x param4=%#x\n",
+@@ -159,7 +171,7 @@
+     if(ipa.retained || ipa.mmu.retained)goto retain;
+     if(ipa.mmu_attempted){
+         if(!sweet_apps_smmu_claim()){ipa.retained=true;goto retain;}
+-        bool ok=ipa_mmu_restore(&ipa.mmu,true);sweet_apps_smmu_release();if(!ok)goto retain;
++        bool ok=ipa_mmu_release(&ipa.mmu,true);sweet_apps_smmu_release();if(!ok)goto retain;
+     }
+     if(ipa.dma){sweet_dma_sync_va((void *)ipa.dma,IPA_DMA_BYTES+2*PAGE_SIZE);
+         for(unsigned i=0;i<PAGE_SIZE;i++)if(*(uint8_t *)(ipa.dma+i)!=0xa5 || *(uint8_t *)(ipa.dma+PAGE_SIZE+IPA_DMA_BYTES+i)!=0x5a){ipa.retained=true;goto retain;}}
+@@ -169,6 +181,6 @@
+     if(ipa.metadata)kmem_free(kernel_map,ipa.metadata,IPA_FW_METADATA_MAX);
+     if(ipa.dma)kmem_free(kernel_map,ipa.dma,IPA_DMA_BYTES+2*PAGE_SIZE);
+     for(unsigned i=0;i<2;i++)if(ipa.pt[i])kmem_free(kernel_map,ipa.pt[i],IPA_PT_BYTES);
+-    printf("SWEET IPA: PAS15 %s; DMA guards intact; SMMU %s; backing released; shared power floors pinned=%u\n",pas_was_owed?"stopped":"not started",mmu_touched?"restored":"untouched",ipa.clock_pinned);sweet_log_sync();return true;
++    printf("SWEET IPA: PAS15 %s; DMA guards intact; SMMU %s; backing released; shared power floors pinned=%u\n",pas_was_owed?"stopped":"not started",mmu_touched?"parked":"untouched",ipa.clock_pinned);sweet_log_sync();return true;
+ retain:printf("SWEET IPA: cleanup UNVERIFIED; retain memory, mappings and power until reset\n");sweet_log_sync();return false;
+ }
+diff --git a/bsd/dev/modem/ModemRuntime.inc b/bsd/dev/modem/ModemRuntime.inc
+--- a/bsd/dev/modem/ModemRuntime.inc
++++ b/bsd/dev/modem/ModemRuntime.inc
+@@ -581,7 +581,13 @@
+ static int modem_run(const struct wl_fat *f,const uint8_t *mdt,uint32_t size){
+     memset(&m,0,sizeof(m));m.master=-1;m.glink=m_gate("sweetmglink");m.rmtfs=m_gate("sweetmrmtfs");m.pdm=m_gate("sweetmpdm");m.uim=m_gate("sweetmuim");m.uim_ready_poll=m_gate("sweetmready");m.data_session=m_gate("sweetmsession");m.sysmon=m_gate("sweetmstop");m.bcm_probe=m_gate("sweetmbcm");m.handover_release=m_gate("sweetmho");m.bandwidth=m_gate("sweetmbw");m.bandwidth_irq=m_gate("sweetmbwi");
+     memset(&ipa,0,sizeof(ipa));ipa_full=m_gate("sweetipa");ipa_smp_index=-1;ipa_qmi_logged=0;
+-    ipa.enabled=ipa_full || m_gate("sweetipafw");
++    ipa.map_probe=m_gate("sweetipamap");
++    ipa.enabled=ipa_full || m_gate("sweetipafw") || ipa.map_probe;
++    if(ipa.map_probe && (ipa_full || m_gate("sweetipafw") || m.glink || m.rmtfs || m.pdm || m.uim || m.sysmon ||
++        m.bcm_probe || m.handover_release || m.data_session || m_gate("sweetdata") || m_gate("sweetqmiraw") ||
++        !m_gate("sweetfbarm") || !m_gate("sweetselftest") || !modem_arg_is(PE_boot_args(),"sweetdeadman","600"))){
++        printf("SWEET IPA: SMMU-only probe conflicts with modem/data or lacks 600s dev guard\n");return EINVAL;
++    }
+     if(ipa_full && (m_gate("sweetipafw") || !m.glink || !m.rmtfs || !m.pdm || !m.sysmon)){
+         printf("SWEET IPA: full mode requires GLINK, RAM rmtfs, pd-mapper and sysmon; firmware probe must be absent\n");return EINVAL;
+     }
+@@ -621,7 +627,7 @@
+     if((rc=m_bandwidth_vote()))goto out;
+     if(ipa.enabled){
+         if((rc=ipa_prepare(f)))goto out;
+-        if(!ipa_full)goto out; /* PAS15-only probe never starts MPSS. */
++        if(!ipa_full)goto out; /* SMMU-only and PAS15-only probes never start MPSS. */
+         if(ipa_smp_index<0){rc=EIO;goto out;}
+         if((rc=ipa_hardware_setup()))goto out;
+     }
+diff --git a/bsd/dev/sweet_smmu.c b/bsd/dev/sweet_smmu.c
+--- a/bsd/dev/sweet_smmu.c
++++ b/bsd/dev/sweet_smmu.c
+@@ -98,7 +98,8 @@
+ 	}
+ 	for (unsigned c = ns2cb; c < ncb && smmu_cb < 0; c++) {
+ 		if (!(used[c / 32] & (1u << (c % 32))) &&
+-		    !(smmu_rd(cb0 + (c << pgshift)) & 1)) {
++		    !(smmu_rd(cb0 + (c << pgshift)) & 1) &&
++		    !smmu_rd(gr1 + 4 * c) && !smmu_rd(gr1 + 0x800 + 4 * c)) {
+ 			smmu_cb = (int)c;
+ 		}
+ 	}

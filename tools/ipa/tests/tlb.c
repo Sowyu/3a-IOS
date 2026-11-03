@@ -46,6 +46,6 @@ int main(void){
  cache[1].global=true;regs[(0x1000+4*m.context[1].bank)/4]=(0x1f300|m.context[0].vmid);
  assert(access(&m.context[1],&pt[1],va)==owned);
  regs[(0x1000+4*m.context[1].bank)/4]=(0x1f300|m.context[1].vmid);cache[1].global=false;
- assert(ipa_mmu_restore(&m,true));assert(cache[0].valid && !cache[1].valid);
+ assert(ipa_mmu_release(&m,true));assert(cache[0].valid && !cache[1].valid);
  puts("PASS: real descriptors/VMID leases isolate AP and empty uC in a shared TLB; stale leases flush, inherited VMID0 survives");
 }
