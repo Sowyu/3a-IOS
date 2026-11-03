@@ -36,6 +36,12 @@ IPA driver (its API: `sweet_ipa_transmit`, `sweet_ipa_register_rx`, `sweet_ipa_r
 - The `sweet_ipa_register_rx` callback calls `sweet_data_ipa_rx(buf, bytes)`.
 - Endpoints for DPM: the modem receives on our TX endpoint 2 and sends on our RX endpoint 18.
 
+Patch 2221 (`patches/data/2221-asteroids-data-ipa-binding.patch`, `bsd/dev/data/sweet_data_ipa.c`) is the adapter between the two sides, so neither agent has to write it. The modem runtime makes two calls:
+- `sweet_data_ipa_bind()` once, after the IPA driver is prepared and before `sweet_data_attach`. It installs the data TX wrapper around `sweet_ipa_transmit` and registers the IPA RX callback with `SweetIpa.h`'s limits.
+- `sweet_data_ipa_refresh()` every worker iteration before `sweet_data_poll`, and on any IPA failure. It copies `sweet_ipa_ready()` to the data side.
+
+The adapter refuses to build unless `SWEET_IPA_QMAP_VERSION` is 1, and it drops receive buffers over 8192 bytes. 2221 needs 2202 and 2220.
+
 The session does nothing that changes modem state until three things hold: the USIM is ready, the IPA is ready, and the transmit hook is set. Losing any of them sends it through cleanup.
 
 ## The iOS-facing interface

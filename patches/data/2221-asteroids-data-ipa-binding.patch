@@ -1,0 +1,72 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -722,3 +722,4 @@
+ bsd/dev/data/CellSession.c standard
+ bsd/dev/data/QmiRaw.c standard
+ bsd/dev/data/sweet_data.c standard
++bsd/dev/data/sweet_data_ipa.c standard
+--- /dev/null
++++ b/bsd/dev/data/sweet_data_ipa.c
+@@ -0,0 +1,47 @@
++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/errno.h>
++#include <libkern/libkern.h>
++#include "../modem/SweetIpa.h"
++#include "sweet_data.h"
++#include "sweet_data_ipa.h"
++
++_Static_assert(SWEET_IPA_QMAP_VERSION == 1, "2220's WDA request and QMAP framing are v1 without checksum offload");
++
++/* sweet_ipa_transmit copies before it returns 0, as sweet_data_set_ipa requires; any errno is a refused frame. */
++static int
++sd_ipa_tx(void *ctx, const uint8_t *buf, uint32_t length)
++{
++	(void)ctx;
++	return sweet_ipa_transmit(buf, length) == 0 ? 0 : -1;
++}
++
++/* One completed aggregate, valid only during the call: deaggregated and copied into mbufs before it returns. */
++static void
++sd_ipa_rx(void *ctx, const uint8_t *qmap, size_t bytes)
++{
++	(void)ctx;
++	if (bytes <= SWEET_IPA_RX_BYTES) {
++		sweet_data_ipa_rx(qmap, (uint32_t)bytes);
++	}
++}
++
++int
++sweet_data_ipa_bind(void)
++{
++	if (sweet_data_set_ipa(sd_ipa_tx, NULL, (int)SWEET_IPA_QMAP_VERSION, SWEET_IPA_RX_BYTES, SWEET_IPA_AGGR_PACKETS) != 0) {
++		return EPERM;
++	}
++	const int rc = sweet_ipa_register_rx(sd_ipa_rx, NULL);
++	if (rc) {
++		printf("SWEET DATA: IPA receive callback refused (%d)\n", rc);
++	}
++	return rc;
++}
++
++void
++sweet_data_ipa_refresh(void)
++{
++	sweet_data_ipa_ready(sweet_ipa_ready());
++}
++#endif
+--- /dev/null
++++ b/bsd/dev/data/sweet_data_ipa.h
+@@ -0,0 +1,12 @@
++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
++/* Binds the IPA driver's data API (bsd/dev/modem/SweetIpa.h, patch 2202) to the data agent's hooks (sweet_data.h, patch 2220). */
++#ifndef SWEET_DATA_IPA_H
++#define SWEET_DATA_IPA_H
++/* Modem worker, once, after the IPA driver is prepared and before sweet_data_attach. Installs the data TX wrapper and the IPA RX
++ * callback with the limits SweetIpa.h fixes (QMAP v1, 8192-byte receive buffers, 16 datagrams). Returns 0, or an errno when either
++ * side refuses (for example sweetdata is off, or another receiver is registered). */
++int sweet_data_ipa_bind(void);
++/* Modem worker, every iteration before sweet_data_poll, and once more on any IPA failure: copies sweet_ipa_ready() into the data side,
++ * so a lost IPA path revokes data readiness before the session does anything else. */
++void sweet_data_ipa_refresh(void);
++#endif
