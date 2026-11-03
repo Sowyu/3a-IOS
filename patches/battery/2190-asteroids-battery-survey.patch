@@ -1,0 +1,676 @@
+--- /dev/null
++++ b/bsd/dev/sweet_battery.c
+@@ -0,0 +1,88 @@
++/* 2190: read-only ADSP resource survey. No PAS calls or outgoing messages.
++ * Protocol helpers copied from xnu-modem after 2178, originally UniXNU.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(BATTERY_HOST_TEST)
++#ifdef BATTERY_HOST_TEST
++#include "battery_host.h"
++#else
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/thread.h>
++#include <kern/clock.h>
++#include <kern/sched_prim.h>
++#include <pexpert/pexpert.h>
++#include <machine/machine_routines.h>
++#endif
++#include "battery/QcomSmem.h"
++#include "battery/QcomSmp2p.h"
++#include "battery/QcomRpmh.h"
++#include "battery/ModemGate.h"
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern void ml_io_unmap(vm_offset_t, vm_size_t);
++extern void sweet_log_sync(void);
++extern kern_return_t thread_terminate(thread_t);
++void sweet_battery_start(void);
++static uint8_t battery_db[0x20000];
++static void battery_probe(void *unused, wait_result_t result)
++{
++    (void)unused; (void)result;
++    uint64_t deadline;
++    clock_interval_to_deadline(30000, NSEC_PER_MSEC, &deadline);
++    assert_wait_deadline(battery_db, THREAD_UNINT, deadline);
++    thread_block(THREAD_CONTINUE_NULL);
++    printf("SWEET BATTERY: B1 read-only survey begin PAS1/PAS36 untouched\n");
++    sweet_log_sync();
++    vm_offset_t sm=ml_io_map(0x81d00000,0x200000);
++    vm_offset_t db=ml_io_map(0x81c60000,0x20000);
++    if (!sm || !db) {
++        printf("SWEET BATTERY: B1 mapping failed\n");
++        goto out;
++    }
++    QcomSmem mem={(volatile uint8_t *)sm,0x200000};
++    QcomSmemPartition part={0};
++    int rc=qcom_smem_partition(&mem,0,2,&part);
++    printf("SWEET BATTERY: B1 ADSP partition rc=%d offset=%#x bytes=%#x\n",rc,part.offset,part.size);
++    if (!rc) {
++        static const uint16_t ids[]={443,429,478,479,480};
++        for (unsigned i=0;i<sizeof(ids)/sizeof(ids[0]);i++) {
++            uint32_t offset=0,bytes=0;
++            int found=qcom_smem_find(&mem,&part,ids[i],&offset,&bytes);
++            printf("SWEET BATTERY: B1 item=%u rc=%d offset=%#x bytes=%u\n",ids[i],found,offset,bytes);
++            if (ids[i]==443 && !found && !(offset&3) && bytes>=QCOM_SMP2P_ITEM_BYTES) {
++                /* Snapshot the complete bounded item before parsing remote state. */
++                uint32_t snapshot[QCOM_SMP2P_ITEM_BYTES/4];
++                for(unsigned j=0;j<sizeof(snapshot)/4;j++)snapshot[j]=qcom_smem_read32(&mem,offset+4*j);
++                QcomSmp2p state={0};state.in=snapshot;state.local_pid=0;state.remote_pid=2;
++                int valid=qcom_smp2p_check_in(snapshot,0,2);
++                int index=valid ? -1 : qcom_smp2p_find_in(&state,"slave-kernel");
++                printf("SWEET BATTERY: B1 SMP2P valid=%d index=%d state=%#x\n",valid,index,qcom_smp2p_in_value(&state,index));
++            }
++        }
++    }
++    for(unsigned i=0;i<sizeof(battery_db);i+=4){
++        uint32_t value=*(volatile uint32_t *)(db+i);
++        memcpy(battery_db+i,&value,4);
++    }
++    static const char *const rails[]={"lcx.lvl","lmx.lvl","xo.lvl"};
++    for(unsigned i=0;i<3;i++) {
++        QcomRpmhResource resource={0};
++        int found=qcom_cmd_db_find(battery_db,sizeof(battery_db),rails[i],&resource);
++        printf("SWEET BATTERY: B1 resource=%s rc=%d address=%#x levels=%u aux=%u\n",rails[i],found,resource.address,resource.level_count,resource.aux_bytes);
++        if(!found)for(unsigned j=0;j<resource.level_count;j++)printf("SWEET BATTERY: B1 level %s %u=%u\n",rails[i],j,resource.levels[j]);
++    }
++    printf("SWEET BATTERY: B1 survey complete channel=PMIC_RTR_ADSP_APPS domain=msm/adsp/charger_pd no hardware writes\n");
++out:
++    if(db)ml_io_unmap(db,0x20000);
++    if(sm)ml_io_unmap(sm,0x200000);
++    sweet_log_sync();
++    thread_terminate(current_thread());
++}
++void sweet_battery_start(void)
++{
++    if(!modem_gate(PE_boot_args(),"sweetbprobe"))return;
++    thread_t thread=THREAD_NULL;
++    kern_return_t rc=kernel_thread_start(battery_probe,NULL,&thread);
++    if(rc==KERN_SUCCESS)thread_deallocate(thread);
++    else printf("SWEET BATTERY: B1 thread failed %d\n",rc);
++}
++#endif
+--- /dev/null
++++ b/bsd/dev/battery/QcomSmem.h
+@@ -0,0 +1,51 @@
++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
++/* Qualcomm shared memory (SMEM): the partition table at the end of the region, the private partitions two processors share, and the
++ * items in them (uncached ones growing up from the partition header, cached ones down from its end). Every access is an aligned 32-bit
++ * one, so the code works on a device mapping. Allocation must run with the hardware mutex held (the caller takes it); nothing here
++ * waits. */
++#ifndef QCOM_SMEM_H
++#define QCOM_SMEM_H
++#include <stdint.h>
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define QCOM_SMEM_HOST_APPS 0u
++#define QCOM_SMEM_HOST_GLOBAL 0xfffeu
++
++typedef struct {
++    volatile uint8_t *base;
++    uint32_t size;
++} QcomSmem;
++
++typedef struct {
++    uint32_t offset, size, cacheline;  /* offset of the partition header from the SMEM base */
++    uint16_t host0, host1;
++} QcomSmemPartition;
++
++enum {
++    QcomSmemOk = 0,
++    QcomSmemNoTable = -1,
++    QcomSmemNoPartition = -2,
++    QcomSmemBadPartition = -3,
++    QcomSmemCorrupt = -4,
++    QcomSmemExists = -5,
++    QcomSmemNoSpace = -6,
++    QcomSmemMissing = -7,
++};
++
++/* The partition shared by the two hosts (QCOM_SMEM_HOST_GLOBAL twice for the global one). */
++int qcom_smem_partition(const QcomSmem *smem, uint16_t host, uint16_t remote, QcomSmemPartition *out);
++/* Offset of the item's data from the SMEM base and its size; QcomSmemMissing when the item is not there. */
++int qcom_smem_find(const QcomSmem *smem, const QcomSmemPartition *part, uint16_t item, uint32_t *offset, uint32_t *size);
++/* Allocates an uncached item of size bytes (rounded up to 8). QcomSmemExists if it is there already (not an error for callers that
++ * only need it to exist). Hardware mutex held by the caller. */
++int qcom_smem_alloc(const QcomSmem *smem, const QcomSmemPartition *part, uint16_t item, uint32_t size);
++
++uint32_t qcom_smem_read32(const QcomSmem *smem, uint32_t offset);
++void qcom_smem_write32(const QcomSmem *smem, uint32_t offset, uint32_t value);
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+--- /dev/null
++++ b/bsd/dev/battery/QcomSmp2p.c
+@@ -0,0 +1,129 @@
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(MODEM_PROTOCOL_HOST_TEST)
++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
++#include "QcomSmp2p.h"
++
++/* Word offsets: 0 magic, 1 version (bits 7:0) and features (31:8), 2 local pid (15:0) and remote pid (31:16), 3 total entries (15:0)
++ * and valid entries (31:16), 4 flags, then 5 words per entry: a 16-byte name and the value. */
++#define W_VERSION 1
++#define W_PIDS 2
++#define W_COUNTS 3
++#define W_FLAGS 4
++#define W_ENTRY(i) (5 + 5 * (i))
++
++static void barrier(void)
++{
++#if defined(__aarch64__) && defined(KERNEL)
++    __asm__ volatile("dmb oshst" ::: "memory");
++#endif
++}
++static int same_name(const volatile uint32_t *entry, const char *name)
++{
++    for (unsigned i = 0; i < 16; ++i) {
++        const char c = (char)(entry[i / 4] >> (8 * (i % 4)));
++        if (c != name[i]) return 0;
++        if (!c) return 1;
++    }
++    return name[16] == 0;
++}
++
++void qcom_smp2p_init_out(QcomSmp2p *s, volatile uint32_t *out, uint16_t local_pid, uint16_t remote_pid)
++{
++    *s = (QcomSmp2p){0};
++    s->out = out;
++    s->local_pid = local_pid;
++    s->remote_pid = remote_pid;
++    for (unsigned i = 0; i < QCOM_SMP2P_ITEM_BYTES / 4; ++i) out[i] = 0;
++    barrier();
++    out[0] = QCOM_SMP2P_MAGIC;
++    out[W_PIDS] = local_pid | (uint32_t)remote_pid << 16;
++    out[W_COUNTS] = QCOM_SMP2P_MAX_ENTRIES;
++    barrier();
++    out[W_VERSION] = QCOM_SMP2P_VERSION | QCOM_SMP2P_FEATURE_SSR_ACK << 8;
++    barrier();
++}
++
++int qcom_smp2p_add_entry(QcomSmp2p *s, const char *name)
++{
++    const uint32_t valid = s->out[W_COUNTS] >> 16;
++    if (valid >= QCOM_SMP2P_MAX_ENTRIES) return -1;
++    uint32_t words[4] = {0};
++    for (unsigned i = 0; i < 16 && name[i]; ++i) words[i / 4] |= (uint32_t)(uint8_t)name[i] << (8 * (i % 4));
++    for (unsigned i = 0; i < 4; ++i) s->out[W_ENTRY(valid) + i] = words[i];
++    s->out[W_ENTRY(valid) + 4] = 0;
++    barrier();
++    s->out[W_COUNTS] = QCOM_SMP2P_MAX_ENTRIES | (valid + 1) << 16;
++    barrier();
++    return (int)valid;
++}
++
++int qcom_smp2p_update(QcomSmp2p *s, int index, uint32_t mask, uint32_t value)
++{
++    if (!s || !s->out || index < 0 || index >= (int)QCOM_SMP2P_MAX_ENTRIES) return 0;
++    volatile uint32_t *v = &s->out[W_ENTRY(index) + 4];
++    const uint32_t old = *v, next = (old & ~mask) | (value & mask);
++    if (next == old) return 0;
++    *v = next;
++    barrier();
++    return 1;
++}
++
++uint32_t qcom_smp2p_out_value(const QcomSmp2p *s, int index) {return s && s->out && index >= 0 && index < (int)QCOM_SMP2P_MAX_ENTRIES ? s->out[W_ENTRY(index) + 4] : 0;}
++
++int qcom_smp2p_check_in(const volatile uint32_t *in, uint16_t local_pid, uint16_t remote_pid)
++{
++    if (!in || in[0] != QCOM_SMP2P_MAGIC) return -1;
++    if ((in[W_VERSION] & 0xff) != QCOM_SMP2P_VERSION) return -2;
++    /* The remote writes its own pid as local. */
++    if (in[W_PIDS] != (remote_pid | (uint32_t)local_pid << 16)) return -3;
++    const uint32_t counts = in[W_COUNTS];
++    if ((counts & 0xffff) > QCOM_SMP2P_MAX_ENTRIES || (counts >> 16) > (counts & 0xffff)) return -4;
++    return 0;
++}
++
++int qcom_smp2p_find_in(const QcomSmp2p *s, const char *name)
++{
++    if (!s->in) return -1;
++    const uint32_t valid = s->in[W_COUNTS] >> 16;
++    for (uint32_t i = 0; i < valid && i < QCOM_SMP2P_MAX_ENTRIES; ++i)
++        if (same_name(&s->in[W_ENTRY(i)], name)) return (int)i;
++    return -1;
++}
++
++uint32_t qcom_smp2p_in_value(const QcomSmp2p *s, int index) {return s && s->in && index >= 0 && index < (int)QCOM_SMP2P_MAX_ENTRIES ? s->in[W_ENTRY(index) + 4] : 0;}
++
++int qcom_smp2p_service(QcomSmp2p *s, const char *entry, uint32_t *value, uint32_t *changed)
++{
++    int ring = 0;
++    *value = 0;
++    *changed = 0;
++    if (qcom_smp2p_check_in(s->in, s->local_pid, s->remote_pid)) return 0;
++    if (!s->negotiated) {
++        const uint32_t ours = s->out[W_VERSION], theirs = s->in[W_VERSION];
++        if ((ours & 0xff) == (theirs & 0xff)) {
++            const uint32_t features = (ours >> 8) & (theirs >> 8);
++            if (features != ours >> 8) {s->out[W_VERSION] = (ours & 0xff) | features << 8; barrier(); ring = 1;}
++            s->ssr_ack_enabled = (features & QCOM_SMP2P_FEATURE_SSR_ACK) != 0;
++            s->negotiated = 1;
++        }
++    }
++    if (s->ssr_ack_enabled) {
++        const uint8_t done = (s->in[W_FLAGS] & QCOM_SMP2P_FLAG_RESTART_DONE) != 0;
++        if (done != s->ssr_acked) {
++            s->ssr_acked = done;
++            const uint32_t flags = s->out[W_FLAGS];
++            s->out[W_FLAGS] = done ? flags | QCOM_SMP2P_FLAG_RESTART_ACK : flags & ~QCOM_SMP2P_FLAG_RESTART_ACK;
++            barrier();
++            ring = 1;
++        }
++    }
++    const int index = qcom_smp2p_find_in(s, entry);
++    if (index >= 0) {
++        const uint32_t now = qcom_smp2p_in_value(s, index);
++        *value = now;
++        *changed = now ^ s->last[index];
++        s->last[index] = now;
++    }
++    return ring;
++}
++
++#endif
+--- /dev/null
++++ b/bsd/dev/battery/QcomRpmh.c
+@@ -0,0 +1,99 @@
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(MODEM_PROTOCOL_HOST_TEST)
++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
++/* From UniXNU-sheng package/QcomRpmh.c (BSD-2-Clause-Patent), unchanged; asteroids uses it for the touch rails. */
++#include "QcomRpmh.h"
++
++static uint16_t le16(const uint8_t *p) {return (uint16_t)(p[0] | (uint16_t)p[1] << 8);}
++static uint32_t le32(const uint8_t *p) {return (uint32_t)le16(p) | (uint32_t)le16(p + 2) << 16;}
++static int fits(size_t at, size_t length, size_t size) {return at <= size && length <= size - at;}
++
++/* Header: u32 version, u32 magic, 8 slave records of 16 bytes (u16 id, header offset, data offset, entry count, version, reserved[3]),
++ * u32 checksum, u32 reserved, then the data area the offsets count from (byte 144). Entries are 24 bytes: an 8-byte id, two u32
++ * priorities, u32 address, u16 aux length, u16 aux offset. */
++int qcom_cmd_db_find(const uint8_t *db, size_t bytes, const char *name, QcomRpmhResource *out)
++{
++    if (!db || !name || !out) return QcomRpmhArgument;
++    if (bytes < 144 || le32(db + 4) != QCOM_CMD_DB_MAGIC) return QcomRpmhNoDb;
++    char id[8] = {0};
++    for (unsigned i = 0; i < 8 && name[i]; ++i) id[i] = name[i];
++    for (unsigned s = 0; s < 8; ++s) {
++        const uint8_t *slave = db + 8 + 16 * s;
++        if (!le16(slave)) break;
++        const size_t heads = 144u + le16(slave + 2), data = 144u + le16(slave + 4), count = le16(slave + 6);
++        if (!fits(heads, count * 24, bytes)) return QcomRpmhCorrupt;
++        for (size_t e = 0; e < count; ++e) {
++            const uint8_t *entry = db + heads + 24 * e;
++            unsigned same = 1;
++            for (unsigned i = 0; i < 8 && same; ++i) same = entry[i] == (uint8_t)id[i];
++            if (!same) continue;
++            QcomRpmhResource r = {0};
++            r.address = le32(entry + 16);
++            const size_t length = le16(entry + 20), at = data + le16(entry + 22);
++            if (!r.address || !fits(at, length, bytes)) return QcomRpmhCorrupt;
++            r.aux_bytes = (unsigned)length;
++            for (size_t l = 0; l + 1 < length && r.level_count < QCOM_RPMH_MAX_LEVELS; l += 2) {
++                const uint16_t level = le16(db + at + l);
++                if (r.level_count && !level) break;  /* the list is zero padded */
++                r.levels[r.level_count++] = level;
++            }
++            *out = r;
++            return QcomRpmhOk;
++        }
++    }
++    return QcomRpmhMissing;
++}
++
++int qcom_rpmh_level_index(const QcomRpmhResource *r, uint32_t level, uint32_t *index)
++{
++    if (!r->level_count) return QcomRpmhNoLevel;
++    if (!level) {*index = 0; return QcomRpmhOk;}
++    for (unsigned i = 0; i < r->level_count; ++i)
++        if (r->levels[i] >= level) {*index = i; return QcomRpmhOk;}
++    *index = r->level_count - 1;
++    return QcomRpmhOk;
++}
++
++QcomRscLayout qcom_rsc_layout(uint32_t drv_id)
++{
++    if (((drv_id >> 16) & 0xff) >= 3) return (QcomRscLayout){672, 24, 0x04, 0x08, 0x20, 0x24, 0x28, 0x2c, 0x34, 0x38, 0x3c};
++    return (QcomRscLayout){672, 20, 0x04, 0x08, 0x10, 0x14, 0x18, 0x1c, 0x30, 0x34, 0x38};
++}
++
++#define MSGID_WRITE_RESPONSE (8u | 1u << 8 | 1u << 16)  /* 4-byte payload code, response requested, write */
++#define CONTROL_ACTIVE_MODE (1u << 16)
++#define CONTROL_TRIGGER (1u << 24)
++
++unsigned qcom_rpmh_active_request(const QcomRscLayout *l, unsigned tcs, const uint32_t *addresses, const uint32_t *values, unsigned count,
++                                  QcomRpmhWrite *w, unsigned capacity)
++{
++    if (!count || count > 4 || capacity < 3 * count + 6) return 0;
++    const uint32_t base = l->tcs_stride * tcs;
++    unsigned n = 0;
++    /* The control register is cleared before the TCS is reprogrammed, then set to active mode and only after that triggered. */
++    w[n++] = (QcomRpmhWrite){base + l->control, 0};
++    w[n++] = (QcomRpmhWrite){l->irq_clear, 1u << tcs};
++    for (unsigned c = 0; c < count; ++c) {
++        const uint32_t cmd = base + l->cmd_stride * c;
++        w[n++] = (QcomRpmhWrite){cmd + l->cmd_msgid, MSGID_WRITE_RESPONSE};
++        w[n++] = (QcomRpmhWrite){cmd + l->cmd_addr, addresses[c]};
++        w[n++] = (QcomRpmhWrite){cmd + l->cmd_data, values[c]};
++    }
++    const uint32_t mask = (1u << count) - 1;
++    w[n++] = (QcomRpmhWrite){base + l->wait_for_cmpl, mask};
++    w[n++] = (QcomRpmhWrite){base + l->cmd_enable, mask};
++    w[n++] = (QcomRpmhWrite){base + l->control, CONTROL_ACTIVE_MODE};
++    w[n++] = (QcomRpmhWrite){base + l->control, CONTROL_ACTIVE_MODE | CONTROL_TRIGGER};
++    return n;
++}
++
++unsigned qcom_rpmh_finish(const QcomRscLayout *l, unsigned tcs, QcomRpmhWrite *w, unsigned capacity)
++{
++    if (capacity < 3) return 0;
++    const uint32_t base = l->tcs_stride * tcs;
++    w[0] = (QcomRpmhWrite){l->irq_clear, 1u << tcs};
++    w[1] = (QcomRpmhWrite){base + l->control, 0};
++    w[2] = (QcomRpmhWrite){base + l->cmd_enable, 0};
++    return 3;
++}
++
++#endif
+--- /dev/null
++++ b/bsd/dev/battery/QcomSmem.c
+@@ -0,0 +1,141 @@
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(MODEM_PROTOCOL_HOST_TEST)
++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
++#include "QcomSmem.h"
++
++#define TOC_MAGIC 0x434f5424u   /* "$TOC" */
++#define PART_MAGIC 0x54525024u  /* "$PRT" */
++#define CANARY 0xa5a5u
++#define TOC_HEADER 32u
++#define TOC_ENTRY 48u
++#define PART_HEADER 32u
++#define ENTRY 16u
++
++uint32_t qcom_smem_read32(const QcomSmem *smem, uint32_t offset)
++{
++    if (!smem || !smem->base || ((uintptr_t)smem->base & 3) || smem->size < 4 || (offset & 3) || offset > smem->size - 4) return 0;
++    return *(volatile uint32_t *)(smem->base + offset);
++}
++void qcom_smem_write32(const QcomSmem *smem, uint32_t offset, uint32_t value)
++{
++    if (!smem || !smem->base || ((uintptr_t)smem->base & 3) || smem->size < 4 || (offset & 3) || offset > smem->size - 4) return;
++    *(volatile uint32_t *)(smem->base + offset) = value;
++#if defined(__aarch64__) && defined(KERNEL)
++    __asm__ volatile("dmb oshst" ::: "memory");
++#endif
++}
++static uint32_t rd(const QcomSmem *s, uint32_t at) {return qcom_smem_read32(s, at);}
++static int fits(uint64_t at, uint64_t length, uint64_t size) {return at <= size && length <= size - at;}
++static uint32_t align_up(uint32_t value, uint32_t to) {return (value + to - 1) & ~(to - 1);}
++
++int qcom_smem_partition(const QcomSmem *smem, uint16_t host, uint16_t remote, QcomSmemPartition *out)
++{
++    if (!out || !smem || !smem->base || smem->size < 0x2000 || (smem->size & 0xfff)) return QcomSmemNoTable;
++    const uint32_t toc = smem->size - 0x1000;
++    if (rd(smem, toc) != TOC_MAGIC || rd(smem, toc + 4) != 1) return QcomSmemNoTable;
++    const uint32_t count = rd(smem, toc + 8);
++    if (count > (0x1000 - TOC_HEADER) / TOC_ENTRY) return QcomSmemNoTable;
++    for (uint32_t i = 0; i < count; ++i) {
++        const uint32_t e = toc + TOC_HEADER + i * TOC_ENTRY;
++        const uint32_t offset = rd(smem, e), size = rd(smem, e + 4), hosts = rd(smem, e + 12), cacheline = rd(smem, e + 16);
++        const uint16_t h0 = (uint16_t)hosts, h1 = (uint16_t)(hosts >> 16);
++        if (!offset || !size) continue;
++        if (!((h0 == host && h1 == remote) || (h0 == remote && h1 == host))) continue;
++        if (!fits(offset, size, toc) || size < PART_HEADER + 2 * ENTRY || (offset & 7)) return QcomSmemBadPartition;
++        if (cacheline && ((cacheline & (cacheline - 1)) || cacheline < 8 || cacheline > size)) return QcomSmemBadPartition;
++        if (rd(smem, offset) != PART_MAGIC || rd(smem, offset + 4) != hosts || rd(smem, offset + 8) != size) return QcomSmemBadPartition;
++        const uint32_t free_uncached = rd(smem, offset + 12), free_cached = rd(smem, offset + 16);
++        if (free_uncached < PART_HEADER || free_uncached > free_cached || free_cached > size || ((free_uncached | free_cached) & 7)) return QcomSmemBadPartition;
++        *out = (QcomSmemPartition){offset, size, cacheline ? cacheline : 8u, h0, h1};
++        return QcomSmemOk;
++    }
++    return QcomSmemNoPartition;
++}
++
++/* A remote may change free markers after partition discovery. Recheck every walk. */
++static int valid_part(const QcomSmem *s, const QcomSmemPartition *p)
++{
++    if (!s || !s->base || !p || s->size < 0x2000 || (p->offset & 7) ||
++        !fits(p->offset, p->size, s->size - 0x1000) || p->size < PART_HEADER + 2 * ENTRY ||
++        p->cacheline < 8 || p->cacheline > p->size || (p->cacheline & (p->cacheline - 1))) return 0;
++    if (rd(s,p->offset) != PART_MAGIC || rd(s,p->offset+8) != p->size ||
++        rd(s,p->offset+4) != ((uint32_t)p->host0 | (uint32_t)p->host1 << 16)) return 0;
++    const uint32_t u=rd(s,p->offset+12), c=rd(s,p->offset+16);
++    return u >= PART_HEADER && u <= c && c <= p->size && !((u | c) & 7);
++}
++
++/* Walks the uncached list; returns the offset (relative to the partition) where it ends, or the item's entry when found. */
++static int walk_uncached(const QcomSmem *smem, const QcomSmemPartition *p, uint16_t item, uint32_t *at_out, int *found)
++{
++    if (!valid_part(smem,p)) return QcomSmemCorrupt;
++    const uint32_t end = rd(smem, p->offset + 12);
++    if (end < PART_HEADER || end > p->size || (end & 7)) return QcomSmemCorrupt;
++    uint32_t at = PART_HEADER;
++    *found = 0;
++    while (at < end) {
++        if (!fits(at, ENTRY, end)) return QcomSmemCorrupt;
++        const uint32_t w0 = rd(smem, p->offset + at), size = rd(smem, p->offset + at + 4), pads = rd(smem, p->offset + at + 8);
++        if ((w0 & 0xffff) != CANARY) return QcomSmemCorrupt;
++        const uint32_t padding_header = pads >> 16;
++        if (((padding_header | size) & 7) || (uint64_t)at + ENTRY + padding_header + size > end) return QcomSmemCorrupt;
++        if ((w0 >> 16) == item) {*found = 1; *at_out = at; return QcomSmemOk;}
++        at += ENTRY + padding_header + size;
++    }
++    if (at != end) return QcomSmemCorrupt;
++    *at_out = at;
++    return QcomSmemOk;
++}
++
++int qcom_smem_find(const QcomSmem *smem, const QcomSmemPartition *p, uint16_t item, uint32_t *offset, uint32_t *size)
++{
++    if (!valid_part(smem,p)) return QcomSmemCorrupt;
++    uint32_t at;
++    int found, rc = walk_uncached(smem, p, item, &at, &found);
++    if (rc) return rc;
++    if (!offset || !size) return QcomSmemCorrupt;
++    if (found) {
++        const uint32_t bytes = rd(smem, p->offset + at + 4), pads = rd(smem, p->offset + at + 8);
++        if ((pads & 0xffff) > bytes) return QcomSmemCorrupt;
++        *offset = p->offset + at + ENTRY + (pads >> 16);
++        *size = bytes - (pads & 0xffff);
++        return QcomSmemOk;
++    }
++    /* Cached items: each entry sits at the end of its cache line slot, its data right below it. */
++    const uint32_t header = align_up(ENTRY, p->cacheline), last = rd(smem, p->offset + 16);
++    if (p->size < header || last < PART_HEADER || last > p->size || (last & 7)) return QcomSmemCorrupt;
++    uint32_t e = p->size - header;
++    while (e > last) {
++        const uint32_t w0 = rd(smem, p->offset + e), bytes = rd(smem, p->offset + e + 4), pads = rd(smem, p->offset + e + 8);
++        if ((w0 & 0xffff) != CANARY || (bytes & 7) || bytes > e - last || (pads & 0xffff) > bytes) return QcomSmemCorrupt;
++        if ((w0 >> 16) == item) {*offset = p->offset + e - bytes; *size = bytes - (pads & 0xffff); return QcomSmemOk;}
++        if (e < bytes + header) return QcomSmemCorrupt;
++        e -= bytes + header;
++    }
++    return QcomSmemMissing;
++}
++
++int qcom_smem_alloc(const QcomSmem *smem, const QcomSmemPartition *p, uint16_t item, uint32_t size)
++{
++    if (!valid_part(smem,p)) return QcomSmemCorrupt;
++    uint32_t at;
++    int found, rc = walk_uncached(smem, p, item, &at, &found);
++    if (rc) return rc;
++    if (found) return QcomSmemExists;
++    uint32_t offset, bytes;
++    rc = qcom_smem_find(smem, p, item, &offset, &bytes);
++    if (rc == QcomSmemOk) return QcomSmemExists;
++    if (rc != QcomSmemMissing) return rc;
++    const uint32_t aligned = align_up(size, 8), need = ENTRY + aligned;
++    const uint32_t limit = rd(smem, p->offset + 16);
++    if (limit > p->size || limit < at || (limit & 7)) return QcomSmemCorrupt;
++    if (!size || aligned < size || (uint64_t)at + ENTRY + aligned > limit) return QcomSmemNoSpace;
++    qcom_smem_write32(smem, p->offset + at, CANARY | (uint32_t)item << 16);
++    qcom_smem_write32(smem, p->offset + at + 4, aligned);
++    qcom_smem_write32(smem, p->offset + at + 8, aligned - size);  /* padding_data, padding_header 0 */
++    qcom_smem_write32(smem, p->offset + at + 12, 0);
++    for (uint32_t i = 0; i < aligned; i += 4) qcom_smem_write32(smem, p->offset + at + ENTRY + i, 0);
++    /* The entry is complete before the free mark moves over it. */
++    qcom_smem_write32(smem, p->offset + 12, at + need);
++    return QcomSmemOk;
++}
++
++#endif
+--- /dev/null
++++ b/bsd/dev/battery/QcomRpmh.h
+@@ -0,0 +1,52 @@
++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
++/* From UniXNU-sheng package/QcomRpmh.h (BSD-2-Clause-Patent), unchanged. */
++/* RPMh for a remote processor's proxy votes: find a resource in the AOP command database (cmd-db) and turn a level into the index the
++ * ARC resource takes, and describe the register writes of one active-only request in a TCS of the application processor's RSC, for
++ * both register layouts (the RSC's major version 3 moved the TCS registers). Nothing here touches hardware: the owner applies the
++ * writes and waits for the TCS done interrupt. */
++#ifndef QCOM_RPMH_H
++#define QCOM_RPMH_H
++#include <stddef.h>
++#include <stdint.h>
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define QCOM_CMD_DB_MAGIC 0x0c0330dbu
++#define QCOM_RPMH_MAX_LEVELS 16u
++
++typedef struct {
++    uint32_t address;
++    uint16_t levels[QCOM_RPMH_MAX_LEVELS];
++    unsigned level_count;
++    unsigned aux_bytes; /* complete source length, so callers can reject truncation */
++} QcomRpmhResource;
++
++enum {QcomRpmhOk = 0, QcomRpmhNoDb = -1, QcomRpmhMissing = -2, QcomRpmhCorrupt = -3, QcomRpmhNoLevel = -4, QcomRpmhArgument = -5};
++
++/* Looks name (up to 8 characters) up in a copy of the command database; levels are the ARC's voltage levels (aux data) when it has
++ * them. */
++int qcom_cmd_db_find(const uint8_t *db, size_t bytes, const char *name, QcomRpmhResource *out);
++/* The ARC level index for a request of at least level (the highest index when level is above all of them; 0 turns the vote off). */
++int qcom_rpmh_level_index(const QcomRpmhResource *r, uint32_t level, uint32_t *index);
++
++typedef struct {uint32_t offset, value;} QcomRpmhWrite;
++
++/* The register layout of an RSC DRV; offsets are relative to the TCS block (DRV base + tcs-offset). */
++typedef struct {
++    uint32_t tcs_stride, cmd_stride, irq_status, irq_clear, wait_for_cmpl, control, status, cmd_enable, cmd_msgid, cmd_addr, cmd_data;
++} QcomRscLayout;
++
++/* The layout for a DRV whose id register reads drv_id (major version in bits 23:16). */
++QcomRscLayout qcom_rsc_layout(uint32_t drv_id);
++/* The writes of an active request of count (<= 4) data commands in TCS tcs, in order, ending with the trigger. Returns the number of
++ * writes, 0 on bad arguments. */
++unsigned qcom_rpmh_active_request(const QcomRscLayout *l, unsigned tcs, const uint32_t *addresses, const uint32_t *values, unsigned count,
++                                  QcomRpmhWrite *writes, unsigned capacity);
++/* The writes that return the TCS to idle after its done interrupt. */
++unsigned qcom_rpmh_finish(const QcomRscLayout *l, unsigned tcs, QcomRpmhWrite *writes, unsigned capacity);
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+--- /dev/null
++++ b/bsd/dev/battery/ModemGate.h
+@@ -0,0 +1,15 @@
++#ifndef MODEM_GATE_H
++#define MODEM_GATE_H
++#include <stddef.h>
++/* Exact, single name=1 token. Bare, duplicate, malformed and numeric aliases fail closed. */
++static inline int modem_gate(const char *args,const char *name){
++    size_t n=0;while(name[n])n++;unsigned found=0;int enabled=0;
++    while(args && *args){
++        while(*args==' ' || *args=='\t')args++;
++        const char *end=args;while(*end && *end!=' ' && *end!='\t')end++;
++        size_t len=(size_t)(end-args),i=0;while(i<n && i<len && args[i]==name[i])i++;
++        if(i==n && (len==n || args[n]=='=')){found++;enabled=len==n+2 && args[n]=='=' && args[n+1]=='1';}
++        args=end;
++    }return found==1 && enabled;
++}
++#endif
+--- /dev/null
++++ b/bsd/dev/battery/QcomSmp2p.h
+@@ -0,0 +1,51 @@
++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
++/* Shared memory point-to-point state (SMP2P): each side owns one SMEM item holding named 32-bit entries the other side watches; a change
++ * is signalled with a doorbell. This is the item layout and the bookkeeping for both directions: our outbound item (entries we set bits
++ * in) and the remote's inbound item (entries whose bit changes become events). Doorbells and SMEM placement belong to the caller. */
++#ifndef QCOM_SMP2P_H
++#define QCOM_SMP2P_H
++#include <stdint.h>
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define QCOM_SMP2P_MAGIC 0x504d5324u  /* "$SMP" */
++#define QCOM_SMP2P_VERSION 1u
++#define QCOM_SMP2P_FEATURE_SSR_ACK 1u
++#define QCOM_SMP2P_FLAG_RESTART_DONE 1u
++#define QCOM_SMP2P_FLAG_RESTART_ACK 2u
++#define QCOM_SMP2P_MAX_ENTRIES 16u
++#define QCOM_SMP2P_ITEM_BYTES (20u + 20u * QCOM_SMP2P_MAX_ENTRIES)
++
++/* The two items' storage: 32-bit aligned, possibly device memory. */
++typedef struct {
++    volatile uint32_t *out, *in;  /* in may be null until the remote has made it */
++    uint16_t local_pid, remote_pid;
++    uint8_t negotiated, ssr_ack_enabled, ssr_acked;
++    uint32_t last[QCOM_SMP2P_MAX_ENTRIES];  /* inbound values last seen, by inbound entry index */
++    uint32_t seen_entries;
++} QcomSmp2p;
++
++/* Writes a fresh outbound item (zeroes, header, then the version word last so the remote never sees a half-made item). */
++void qcom_smp2p_init_out(QcomSmp2p *s, volatile uint32_t *out, uint16_t local_pid, uint16_t remote_pid);
++/* Adds a named outbound entry and returns its index, or -1 when full. */
++int qcom_smp2p_add_entry(QcomSmp2p *s, const char *name);
++/* Sets the bits in mask of outbound entry index to value; returns 1 when the value changed (ring the doorbell). */
++int qcom_smp2p_update(QcomSmp2p *s, int index, uint32_t mask, uint32_t value);
++uint32_t qcom_smp2p_out_value(const QcomSmp2p *s, int index);
++
++/* Validates an inbound item (magic, version, the pids seen from the other side); 0 when usable. */
++int qcom_smp2p_check_in(const volatile uint32_t *in, uint16_t local_pid, uint16_t remote_pid);
++/* Index of the named inbound entry, -1 when the remote has not added it. */
++int qcom_smp2p_find_in(const QcomSmp2p *s, const char *name);
++uint32_t qcom_smp2p_in_value(const QcomSmp2p *s, int index);
++
++/* Called on every doorbell from the remote. Agrees on the features once, answers a restart with the restart ack flag, and reports the
++ * bits of the named inbound entry that changed since the last call (changed) and its current value (value). Returns 1 when our item
++ * changed so the remote has to be rung. */
++int qcom_smp2p_service(QcomSmp2p *s, const char *entry, uint32_t *value, uint32_t *changed);
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -706,3 +706,8 @@
+ bsd/skywalk/packet/pbufpool.c			optional skywalk bound-checks
+ bsd/skywalk/packet/pbufpool_kern.c		optional skywalk bound-checks
+ bsd/dev/cpu_copy_in_cksum_gen.c			optional skywalk bound-checks
++
++bsd/dev/sweet_battery.c standard
++bsd/dev/battery/QcomSmem.c standard
++bsd/dev/battery/QcomSmp2p.c standard
++bsd/dev/battery/QcomRpmh.c standard
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -1,3 +1,4 @@
++extern void sweet_battery_start(void);
+ /*
+  * SWEET internal UFS root device.
+  *
+@@ -1325,6 +1326,7 @@
+ 		sweet_thermal_start();
+ 		/* read-only PMIC survey (sweet_power_survey.c, boot-arg sweetpowersurvey=1, default off) */
+ 		sweet_power_survey_start();
++		sweet_battery_start();
+ 		printf("SWEET UFS: Nothing Phone (3a): no SM7150/SDM845 drivers (USB, charger, GPU, Wi-Fi)\n");
+ 		return 0;
+ 	}

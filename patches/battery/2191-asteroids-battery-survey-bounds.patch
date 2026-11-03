@@ -1,0 +1,97 @@
+--- a/bsd/dev/sweet_battery.c
++++ b/bsd/dev/sweet_battery.c
+@@ -12,12 +12,13 @@
+ #include <kern/sched_prim.h>
+ #include <pexpert/pexpert.h>
+ #include <machine/machine_routines.h>
++#include <vm/pmap.h>
+ #endif
+ #include "battery/QcomSmem.h"
+ #include "battery/QcomSmp2p.h"
+ #include "battery/QcomRpmh.h"
+ #include "battery/ModemGate.h"
+-extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, unsigned int);
+ extern void ml_io_unmap(vm_offset_t, vm_size_t);
+ extern void sweet_log_sync(void);
+ extern kern_return_t thread_terminate(thread_t);
+@@ -32,8 +33,8 @@
+     thread_block(THREAD_CONTINUE_NULL);
+     printf("SWEET BATTERY: B1 read-only survey begin PAS1/PAS36 untouched\n");
+     sweet_log_sync();
+-    vm_offset_t sm=ml_io_map(0x81d00000,0x200000);
+-    vm_offset_t db=ml_io_map(0x81c60000,0x20000);
++    vm_offset_t sm=ml_io_map_unmappable(0x81d00000,0x200000,VM_WIMG_IO);
++    vm_offset_t db=ml_io_map_unmappable(0x81c60000,0x20000,VM_WIMG_IO);
+     if (!sm || !db) {
+         printf("SWEET BATTERY: B1 mapping failed\n");
+         goto out;
+@@ -48,7 +49,9 @@
+             uint32_t offset=0,bytes=0;
+             int found=qcom_smem_find(&mem,&part,ids[i],&offset,&bytes);
+             printf("SWEET BATTERY: B1 item=%u rc=%d offset=%#x bytes=%u\n",ids[i],found,offset,bytes);
+-            if (ids[i]==443 && !found && !(offset&3) && bytes>=QCOM_SMP2P_ITEM_BYTES) {
++            if (ids[i]==443 && !found && !(offset&3) && bytes>=QCOM_SMP2P_ITEM_BYTES &&
++                offset>=part.offset && offset-part.offset<=part.size &&
++                bytes<=part.size-(offset-part.offset)) {
+                 /* Snapshot the complete bounded item before parsing remote state. */
+                 uint32_t snapshot[QCOM_SMP2P_ITEM_BYTES/4];
+                 for(unsigned j=0;j<sizeof(snapshot)/4;j++)snapshot[j]=qcom_smem_read32(&mem,offset+4*j);
+--- a/bsd/dev/battery/QcomSmem.c
++++ b/bsd/dev/battery/QcomSmem.c
+@@ -64,7 +64,7 @@
+ }
+ 
+ /* Walks the uncached list; returns the offset (relative to the partition) where it ends, or the item's entry when found. */
+-static int walk_uncached(const QcomSmem *smem, const QcomSmemPartition *p, uint16_t item, uint32_t *at_out, int *found)
++static int walk_uncached(const QcomSmem *smem, const QcomSmemPartition *p, uint16_t item, uint32_t *at_out, int *found, uint32_t *data_out, uint32_t *bytes_out)
+ {
+     if (!valid_part(smem,p)) return QcomSmemCorrupt;
+     const uint32_t end = rd(smem, p->offset + 12);
+@@ -76,8 +76,13 @@
+         const uint32_t w0 = rd(smem, p->offset + at), size = rd(smem, p->offset + at + 4), pads = rd(smem, p->offset + at + 8);
+         if ((w0 & 0xffff) != CANARY) return QcomSmemCorrupt;
+         const uint32_t padding_header = pads >> 16;
+-        if (((padding_header | size) & 7) || (uint64_t)at + ENTRY + padding_header + size > end) return QcomSmemCorrupt;
+-        if ((w0 >> 16) == item) {*found = 1; *at_out = at; return QcomSmemOk;}
++        if ((pads & 0xffff) > size || ((padding_header | size) & 7) || (uint64_t)at + ENTRY + padding_header + size > end) return QcomSmemCorrupt;
++        if ((w0 >> 16) == item) {
++            *found = 1; *at_out = at;
++            if (data_out) *data_out = at + ENTRY + padding_header;
++            if (bytes_out) *bytes_out = size - (pads & 0xffff);
++            return QcomSmemOk;
++        }
+         at += ENTRY + padding_header + size;
+     }
+     if (at != end) return QcomSmemCorrupt;
+@@ -88,15 +93,15 @@
+ int qcom_smem_find(const QcomSmem *smem, const QcomSmemPartition *p, uint16_t item, uint32_t *offset, uint32_t *size)
+ {
+     if (!valid_part(smem,p)) return QcomSmemCorrupt;
+-    uint32_t at;
+-    int found, rc = walk_uncached(smem, p, item, &at, &found);
++    uint32_t at, data, bytes;
++    int found, rc = walk_uncached(smem, p, item, &at, &found, &data, &bytes);
+     if (rc) return rc;
+     if (!offset || !size) return QcomSmemCorrupt;
+     if (found) {
+-        const uint32_t bytes = rd(smem, p->offset + at + 4), pads = rd(smem, p->offset + at + 8);
+-        if ((pads & 0xffff) > bytes) return QcomSmemCorrupt;
+-        *offset = p->offset + at + ENTRY + (pads >> 16);
+-        *size = bytes - (pads & 0xffff);
++        /* Use the metadata validated by the walk, never reread remote extents. */
++        if (!fits(data, bytes, p->size)) return QcomSmemCorrupt;
++        *offset = p->offset + data;
++        *size = bytes;
+         return QcomSmemOk;
+     }
+     /* Cached items: each entry sits at the end of its cache line slot, its data right below it. */
+@@ -117,7 +122,7 @@
+ {
+     if (!valid_part(smem,p)) return QcomSmemCorrupt;
+     uint32_t at;
+-    int found, rc = walk_uncached(smem, p, item, &at, &found);
++    int found, rc = walk_uncached(smem, p, item, &at, &found, 0, 0);
+     if (rc) return rc;
+     if (found) return QcomSmemExists;
+     uint32_t offset, bytes;
