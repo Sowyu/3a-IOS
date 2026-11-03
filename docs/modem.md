@@ -516,3 +516,8 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 **Code, review correction.** Sol rejected2215 because a fault arriving during the final context scan could lose its raw log to initialization, although the postwrite check prevented allocation. Additive2216 checks global/general status again after that scan and preserves detected faults without initializing. The remaining last-read/store interval is explicit; postwrite health still blocks allocation on a later latched fault.
 
 **Measured, host.** Final-survey fault injections preserve both fault classes with zero initialization writes and zero commands. The combined datapath suite,56-file reconstruction, safe build and ten-segment verification pass. Kernel SHA256 is716b6670679d4597ee521b678bd6d13423fbcdac4b480ec6689be7169e03ec4b. The replacement data manifest remains unapproved pending corrected offline review and accepted I3 evidence.
+
+
+**Code.** Combined2217 adds bounded GSI producer/completion refusal diagnostics, preserving validation and lifecycle rules.
+**Measured, host.** The safe build, actual datapath checks,56-file reconstruction and ten packed segments pass.
+**Missing.** ast180 ended with clean recovery but failed before tables/MPSS. I3 and the single final combined source/image review remain before ONLINE.
