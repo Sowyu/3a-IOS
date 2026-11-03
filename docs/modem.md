@@ -580,3 +580,12 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 
 
 **Code, approval.** Sol grants one supervised offline2270 probe including its first TFTP advertisement, with fixed denial replies only. The exact image and source passed independent review at the default service tier. Live admission requires clean recovery and exact original profile, and the runner retains ownership on uncertain post-run state. The attempt is being prepared through that runner. No file serving, ONLINE or persistent write is approved.
+
+
+## Offline TFTP request probe, ast185
+
+**Measured.** The reviewed2270 image bound service4096 at raw5323. The modem sent eight valid WRQs for `/readwrite/server_check.txt` at7752 through10810. Each received a fixed15-byte error reply. This establishes demand for a writable temporary TFTP file. It does not prove that the missing service caused OFFLINE.
+
+**Measured.** The run completed normally in367seconds with clean roots, stale=false, a fresh nonce and decoded nonblank frame. Known PAS4 retention occurred at11723, final error5 at11724 and DONE at12291. There were no IPA, data or panic records. The original network profile stayed byte-identical, the phone returned to OrangeFox and claims were released by00:01:57. Only normal selftest/log/frame/marker artifacts remain.
+
+**Missing.** The next proposed step is a separately gated, bounded RAM-only implementation of the measured server check. It must never write a partition or serve unapproved firmware data, and requires a new source/image review. IPA and the data source remain frozen. NAS, WDS and cellular packets remain unmeasured.
