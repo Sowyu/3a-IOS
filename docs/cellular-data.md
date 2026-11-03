@@ -63,6 +63,22 @@ The session does nothing that changes modem state until three things hold: the U
 
 **Missing.** A first proof uses the USB link to the Mac as the uplink, with the same configd path (DHCP from the Mac's Internet Sharing on `ue0`). It is a check of the presentation layer only and does not block the modem path.
 
+## en2 proof procedure (desk-ready, not run)
+
+The proof must not be able to pass through `ue0` or the Mac.
+1. Make the boot preferences with `tools/data/phone/en2-prefs.py ORIGINAL OUT`. It refuses any input but the root's original `preferences.plist` (SHA-256 e8d0685f...f368, kept in `plans/data/backup`). Its output adds a DHCP service for `en2`, first in the service order, and keeps `ue0` for SSH with no router, no DNS and only an IPv6 link-local address. `--check OUT` verifies a built file. Push it with `dev.py` as in ast167.
+2. Internet Sharing stays off for the whole run, with no `bridge100`. Without it the Mac forwards nothing, so `ue0` has no uplink even by accident.
+3. On the phone, first run `/usr/local/bin/sweetnetcfg -d`, so the boot job's 192.168.7.1 state cannot compete.
+4. Evidence to record:
+   - `sweetdhcp state` names `en2` as the primary interface.
+   - `netstat -rn` has its default route on `en2` and none on `ue0`.
+   - `ifconfig en2` shows the DHCP address from `CellLink.c`.
+   - `ifconfig en2` and `ifconfig ue0` byte counters before and after a Safari page load show the page bytes on `en2`.
+   - The kernel log has `SWEET DATA` call-up lines.
+5. Put the original `preferences.plist` back byte for byte and check its hash before ending the session.
+
+**Missing.** A tool that fetches over a socket bound to `en2`, with monotonic timing, is not built.
+
 ## Raw QMI from userland
 
 **Code, plan.** `sysctl kern.sweet_qmi`, present only with `sweetqmiraw=1` and only for root. One sysctl call sends a QMI request (service, client 0 or 1, timeout up to 10 s) and returns the matching response. Transactions 0x8000 and up belong to the raw tool, so they never collide with the session. An allow list (`plans/data/src/QmiRaw.c`) refuses anything that returns a full identifier, touches PINs or SIM files, resets or reflashes the modem, or persists past a modem restart. A boot with this gate on needs a Sol GO, like any boot that can change modem state.
