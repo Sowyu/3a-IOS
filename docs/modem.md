@@ -484,3 +484,6 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 
 
 **Measured, root restored.** The separate benign cleanup ast176 completed normally in214seconds. Its raw log shows journal replay at384 and DONE at12627, with no IPA or modem worker output. The accepted capture hashes match, root_state is clean and stale=false. IPA released ownership in recovery before its separately reviewed2212 firmware trial.
+
+
+**Measured, PAS15 prerequisite passed.** ast177 completed the2212 firmware-only trial normally in214seconds, with clean roots before/after, a fresh nonce and stale=false. PAS15 init/memory/authentication returned0 at6628/6630/6631, powered register reads appeared at6632 and shutdown returned0 at6639. DMA guards were intact, private SMMU contexts parked and backing released at6649, final_error0 at6652 and DONE at12610. The exact checker and accepted result/log/marker hashes independently pass. No MPSS, full GSI or ONLINE ran. The offline IPA/GSI/QMI handshake remains before the final data-image review.
