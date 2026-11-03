@@ -352,3 +352,6 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 
 
 **Code, revision2.** Sol rejected2188 revision1 because the real TX queue marked acknowledgment backpressure fatal. Revision2 keeps retry-owned RESUME_TX pending without poisoning the worker and preserves failure on ordinary reply loss. The regression now includes the real queue callback and five consecutive GLINK refusals, followed by exactly one delivered response and acknowledgment. Full build and host checks pass. Image21881 needs fresh review. The rejected image must not boot.
+
+
+**Code, reviewed scope.** Sol approved one frozen21881 offline flow/readiness diagnostic after DATA and IPA release ownership. The reviewed runner is waiting for the reservation and lock to clear. This extends the limited known-PAS-retention exception for this measurement only. It requires more than10 fresh UIM replies, sustained selected readiness, healthy flow counters and normal guarded return with clean root. It does not establish M2 or approve ONLINE. See `modem-2188-reaudit.md`.
