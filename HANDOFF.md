@@ -22,6 +22,12 @@ Updated 2026-11-02, about 22:20 AEDT. Update this file whenever the state change
 - **Freeform:** the compositor fix (2130 v4) works; ast111 with the owner drawing finished cleanly with 0 recoveries, but logged no GPU drawing jobs. The owner's report of what the stroke did is pending.
 - Overnight control: queues paused with SIGSTOP and resumed with SIGCONT, waiting on pids only. A 20-minute heartbeat found nothing stuck all night.
 
+## Morning 2026-11-03 (written 12:00)
+
+- **Owner trial of combo-ub** (UBWC + pool + 2144, RAM boot, nothing flashed): "feels steadier when it is steady but it jumps often". The jumps come mostly while a finger is down, and every tap feels delayed. The root now has the `next-luma-ub` driver (`plans/lag/owner-ub.sh`; `--restore` puts `next-luma` back).
+- **Touch measured, ast139:** the controller reports at about 252 per second with 0 missed reports, and the kernel sends each one 1.1 to 1.5 ms after noticing it. The delay is in iOS or the display path. Frames/s with the owner's finger was 33, against 41 to 44 scripted. Details in `docs/input.md`.
+- **In progress:** 2154 adds absolute touch-down and lift times to the stats line, so `tools/input/tapdelay.py` can split each tap's delay into iOS (touch to frame start) and render plus display (frame start to latch). The next owner run is 5 minutes of taps on `touch-taps`, with the UBWC trace driver.
+
 ## What works
 
 - Cold boot, and OrangeFox from the fastboot menu's Recovery mode
@@ -70,6 +76,7 @@ Updated 2026-11-02, about 22:20 AEDT. Update this file whenever the state change
 4. `recovery_a` has no kernel, so ABL borrows `boot_a`'s. Our shim detects recovery mode from the DTB and initrd size, bootconfig and a ramdisk hash, then jumps to the stock kernel it carries. Any doubt boots iOS. Proven on the phone in both directions with the probe image. See `docs/recovery.md` and `tools/recovery/`.
 5. **ABL takes one retry** per power-on, hard reset and menu START, and none for Power + Volume Down, `fastboot boot` or recovery. A flash resets to 7 and clears `successful`. Nothing in ABL ever sets `successful`. See `docs/bootslot.md`.
 6. `fastboot reboot recovery` is often ignored. Use the menu, or send it again.
+7. **Always pass `--remake` to `tools/xnu-local-build.sh` for an existing tree.** Without it the script runs `rm -rf xnu` and reclones with only the stock patches through 2120. It wiped `research/xnu-combined` once (2026-11-03). The rebuild order is in `docs/input.md`.
 
 ## Danger
 

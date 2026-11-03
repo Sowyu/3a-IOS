@@ -161,3 +161,20 @@ Not prepared:
 2. The touch controller's report rate, and whether its IRQ pulses for every report while a finger is still. The 2151 stats line answers both, and the 12 ms fallback covers the second.
 3. Whether `sweetpanel=1` panel commands coexist with the asteroids flip and hardware scale. The `in-panel` run answers this.
 4. Whether CoreAnimation at 120 Hz notifications helps or hurts at 30 frames/s.
+
+## Owner touch measurement (2026-11-03)
+
+The owner tried UBWC + pool + 2144 (`combo-ub`) by hand and said it "feels steadier when it is steady but it jumps often". The jumps are mostly while a finger is on the screen, and every tap feels delayed. Animations without a finger are mostly smooth.
+
+**Measured, ast139** (`plans/input/out/touch-owner-boot.img`: combo-ub's args with `sweettouchirq=7`, kernel-daily2). 37 touches of drags, flicks and taps:
+
+- The FocalTech controller reports at 250 to 264 per second, about every 4 ms, while touched.
+- 0 fallback reads in every touch, so no report was missed.
+- Noticed to sent is 1.06 to 1.49 ms.
+- Frames/s during the owner's 5 minutes was 33.2, against 41 to 44 in the scripted runs. 2437 of 10225 flips were dropped.
+
+So the kernel's touch path is not where the delay or the unevenness comes from. iOS is still told the default 10 ms report interval (`sweethid_touch_us` unset). Whether that matters is untested.
+
+**Next, 2154** (`patches/input/2154-asteroids-touch-stats-times.patch`). The stats line now ends with `down D up U`, absolute microseconds on the frame trace's clock, and covers the first 100 touches. `tools/input/tapdelay.py RUNDIR` joins those times to the trace's frames. For each touch from idle, it reports the time to the first frame CoreAnimation starts and the time to its latch on the panel, both after touch-down and after lift. The owner run uses the UBWC trace driver (`plans/lag/arms/lumaub`) and `tools/input/touch-owner.sh`, a 5-minute window with no scripted touches.
+
+**Tree note.** Running `tools/xnu-local-build.sh` without `--remake` deletes `dxb/xnu` and reclones it with only the stock patches through 2120. That happened to `research/xnu-combined` on 2026-11-03. The tree was rebuilt from the saved patches in this order: 2130 v4, 2140 to 2144, 2150, 2151, 2153, 2152 v4, 2154. Always pass `--remake` for an existing tree.
