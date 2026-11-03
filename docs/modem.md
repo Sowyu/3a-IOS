@@ -558,3 +558,6 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 
 **Code.** The second data candidate includes exact2220 audit10, with only CellSession.c/h changed and IPA still2218. The retained0,1,0 mode budget is subject to a new integrated-image review.
 **Measured, host.** The safe --remake build, actual production data and IPA worker tests,56-file reconstruction and ten packed segments pass. Kernel SHA256 is403877da7b664e8b7cc6153165c5bc08f545d9ecc93be7285b18745a6516f5b2. The154-artifact manifest remains unapproved while Sol reviews source and image together.
+
+
+**Code, approval.** The second exact-image review grants one supervised trial with the bounded automatic ONLINE, LOW_POWER, ONLINE sequence. All155 admission pins match. The reviewed runner has started the attempt. Unknown profile changes still refuse restoration without writing, and retained DMA backing remains required after unverified PAS4 shutdown. Results are pending.
