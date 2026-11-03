@@ -5,7 +5,10 @@
 static uint32_t reg[0x100000/4],original[0x100000/4];
 static unsigned writes,fail_at;static bool stalled;static uint32_t reset_ctl;
 static uint32_t rd(void *c,unsigned a){(void)c;assert(a<0x100000);if(stalled && (a&4095)==0x7f4)return 1;return reg[a/4];}
-static void wr(void *c,unsigned a,uint32_t v){(void)c;assert(a<0x100000);writes++;if(writes!=fail_at)reg[a/4]=v;}
+static void wr(void *c,unsigned a,uint32_t v){(void)c;assert(a<0x100000);writes++;if(writes!=fail_at){
+ if(a>=0x80000 && (a&4095)==0x618){unsigned bank=(a-0x80000)/4096;assert((reg[(0x1000+4*bank)/4]&255)!=0);assert(!(reg[ipa_cb(bank)/4]&1));}
+ reg[a/4]=v;
+}}
 static void w64(void *c,unsigned a,uint64_t v){wr(c,a,(uint32_t)v);wr(c,a+4,(uint32_t)(v>>32));}
 static void delay1(void *c){(void)c;}
 static IpaMmu reset(void){
@@ -56,4 +59,12 @@ int main(void){reset_ctl=0;run();reset_ctl=0x3ec9850c;run();reset_ctl=0x3ed0030c
  const uint64_t pa[]={0x8c1000000ull,0x8c1010000ull};
  for(unsigned bit=0;bit<32;bit++)if((1u<<bit)&0xe1){IpaMmu m=reset();for(unsigned i=1;i<72;i++)reg[ipa_cb(i)/4]=reset_ctl|(1u<<bit);assert(!ipa_mmu_install(&m,pa) && !writes);}
  for(unsigned k=0;k<3;k++){IpaMmu m=reset();for(unsigned i=1;i<72;i++)reg[(k==0?ipa_cb(i)+0x58:k==1?0x1000+4*i:0x1800+4*i)/4]=1;assert(!ipa_mmu_install(&m,pa) && !writes);}
+ IpaMmu m=reset();reg[0]=1u<<3;assert(!ipa_mmu_install(&m,pa) && !writes);
+ m=reset();reg[0x1000/4]=(3u<<16)|(1u<<8);assert(ipa_mmu_install(&m,pa));assert(m.context[0].bank==2 && m.context[1].bank==3);assert(ipa_mmu_restore(&m,true));
+ m=reset();reg[0x1000/4]=(3u<<16)|(72u<<8);assert(!ipa_mmu_install(&m,pa) && !writes);
+ m=reset();reg[0x1000/4]=(3u<<16)|(1u<<8);reg[0x1004/4]=1u<<16;assert(!ipa_mmu_install(&m,pa) && !writes);
+ for(unsigned mode=0;mode<2;mode++){m=reset();reg[0]=mode?1u<<31:1;assert(!ipa_mmu_install(&m,pa) && !writes);}
+ m=reset();reg[0x1000/4]=0x1f301;reg[(0x1000+4*10)/4]=0x1f302;assert(ipa_mmu_install(&m,pa));assert(m.context[0].vmid==3 && m.context[1].vmid==4);assert(ipa_mmu_restore(&m,true));
+ m=reset();assert(ipa_mmu_install(&m,pa));reg[0]=1u<<31;writes=0;assert(!ipa_mmu_restore(&m,true) && !writes && m.retained);
+ puts("Extended StreamID refusal and indirect stage2 ownership PASS");
  puts("Measured nonzero reset fields, active/configured/faulted rejection and exact restore PASS");return 0;}

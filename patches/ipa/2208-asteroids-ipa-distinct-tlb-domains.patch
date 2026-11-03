@@ -1,0 +1,146 @@
+diff --git a/bsd/dev/modem/IpaSmmu.h b/bsd/dev/modem/IpaSmmu.h
+--- a/bsd/dev/modem/IpaSmmu.h
++++ b/bsd/dev/modem/IpaSmmu.h
+@@ -34,8 +34,8 @@
+            ipa_pt_next(t,l2,(unsigned)(v>>21)&511,&l3))return -1;
+         uint64_t *e=&t->words[l3*512+((v>>12)&511)];
+         if(*e)return -1; /* Refuse duplicate/overlapping mappings, even identical. */
+-        /* AF, inner-shareable, unprivileged RW, Normal NC attr0, UXN/PXN. */
+-        *e=(pa+at)|3|((uint64_t)attr<<2)|(1ull<<10)|(3ull<<8)|(1ull<<6)|(3ull<<53);
++        /* Non-global, AF, inner-shareable, unprivileged RW, NC attr0, UXN/PXN. */
++        *e=(pa+at)|3|((uint64_t)attr<<2)|(1ull<<11)|(1ull<<10)|(3ull<<8)|(1ull<<6)|(3ull<<53);
+     }
+     return 0;
+ }
+diff --git a/bsd/dev/modem/IpaMmu.h b/bsd/dev/modem/IpaMmu.h
+--- a/bsd/dev/modem/IpaMmu.h
++++ b/bsd/dev/modem/IpaMmu.h
+@@ -12,9 +12,9 @@
+     void (*delay)(void *);
+ } IpaMmuIo;
+ typedef struct {
+-    unsigned slot,bank,sid;
++    unsigned slot,bank,sid,vmid;
+     uint32_t smr,s2cr,cbar,cba2r,saved[9];
+-    bool touched,published;
++    bool touched,published,configured;
+ } IpaMmuContext;
+ typedef struct {IpaMmuIo io;IpaMmuContext context[2];bool retained;} IpaMmu;
+ static const unsigned ipa_mmu_regs[9]={0,0x10,0x20,0x24,0x30,0x38,0x3c,0x28,0x2c};
+@@ -24,11 +24,22 @@
+     for(unsigned n=0;n<100000;n++){if(!(s->io.read(s->io.ctx,base+0x7f4)&1))return true;s->io.delay(s->io.ctx);}
+     s->retained=true;return false;
+ }
++/* Other APPS users create VMID0 contexts or reuse an existing context.
++ * Lease two nonzero VMIDs absent from every bank, even disabled banks.
++ * The shared allocator claim covers selection through publication. */
++static inline bool ipa_mmu_mode(IpaMmu *s){
++    return !(s->io.read(s->io.ctx,0)&((1u<<31)|(1u<<3)|1u));
++}
++static inline bool ipa_mmu_vmid_free(IpaMmu *s,unsigned vmid){
++    if(!vmid || vmid>255 || !ipa_mmu_mode(s))return false;
++    for(unsigned i=0;i<72;i++)if((s->io.read(s->io.ctx,0x1000+4*i)&255)==vmid)return false;
++    return true;
++}
+ static inline bool ipa_mmu_choose(IpaMmu *s){
+     IpaMmuIo *io=&s->io;void *c=io->ctx;
+     /* Geometry measured in ast159. A different boot firmware is a new probe. */
+     if(io->read(c,0x20)!=0x4c017e72 || io->read(c,0x24)!=0x60000048 || io->read(c,0x28)!=0x5111)return false;
+-    if(io->read(c,0)&(1u<<3))return false; /* Extended StreamIDs need a separate allocator. */
++    if(!ipa_mmu_mode(s))return false; /* Require translation, 8-bit VMIDs and ordinary stream IDs. */
+     bool used[72]={0};unsigned slots[2],ns=0;
+     for(unsigned i=0;i<114;i++){
+         uint32_t smr=io->read(c,0x800+4*i),s2=io->read(c,0xc00+4*i);
+@@ -43,6 +54,10 @@
+         if(((cbar>>16)&3)==3){unsigned second=(cbar>>8)&255;if(second>=72 || ((io->read(c,0x1000+4*second)>>16)&3)!=0)return false;used[second]=true;}
+     }
+     if(ns!=2)return false;
++    bool vmids[256]={0};vmids[0]=true;unsigned chosen[2],nv=0;
++    for(unsigned i=0;i<72;i++)vmids[io->read(c,0x1000+4*i)&255]=true;
++    for(unsigned i=1;i<256 && nv<2;i++)if(!vmids[i])chosen[nv++]=i;
++    if(nv!=2)return false;
+     unsigned nb=0;
+     for(unsigned i=0;i<72 && nb<2;i++){
+         unsigned b=ipa_cb(i);
+@@ -52,7 +67,7 @@
+          * CFRE/CFIE/CFCFG must also be clear, as measured on banks5..71. */
+         if(used[i] || (io->read(c,b)&0xe1) || io->read(c,b+0x58) ||
+            io->read(c,0x1000+4*i) || io->read(c,0x1800+4*i))continue;
+-        IpaMmuContext *p=&s->context[nb];p->slot=slots[nb];p->bank=i;p->sid=nb?0x4a2:0x4a0;
++        IpaMmuContext *p=&s->context[nb];p->slot=slots[nb];p->bank=i;p->sid=nb?0x4a2:0x4a0;p->vmid=chosen[nb];
+         p->smr=io->read(c,0x800+4*p->slot);p->s2cr=io->read(c,0xc00+4*p->slot);
+         p->cbar=io->read(c,0x1000+4*i);p->cba2r=io->read(c,0x1800+4*i);
+         for(unsigned j=0;j<9;j++)p->saved[j]=io->read(c,b+ipa_mmu_regs[j]);nb++;
+@@ -65,7 +80,8 @@
+     for(unsigned n=0;n<2;n++)if((table[n]&4095) || table[n]>(1ull<<36)-0x10000)return false;
+     for(unsigned n=0;n<2;n++){
+         IpaMmuContext *p=&s->context[n];unsigned b=ipa_cb(p->bank);
+-        /* Recheck ownership immediately before touching each reserved slot. */
++        /* Recheck the VMID lease and ownership before touching each bank. */
++        if(!ipa_mmu_vmid_free(s,p->vmid))return false;
+         if(io->read(c,0x800+4*p->slot)!=p->smr || io->read(c,0xc00+4*p->slot)!=p->s2cr || io->read(c,b)!=p->saved[0])return false;
+         if(io->read(c,0x1000+4*p->bank)!=p->cbar || io->read(c,0x1800+4*p->bank)!=p->cba2r || io->read(c,b+0x58))return false;
+         for(unsigned j=1;j<9;j++)if(io->read(c,b+ipa_mmu_regs[j])!=p->saved[j])return false;
+@@ -73,20 +89,24 @@
+         /* Clear unknown controls before switching context format. M was zero. */
+         io->write(c,b,0);if(io->read(c,b))return false;
+         io->write(c,0x1800+4*p->bank,1); /* 64-bit context */
+-        io->write(c,0x1000+4*p->bank,0x1f300); /* stage 1, stage 2 bypass */
++        io->write(c,0x1000+4*p->bank,0x1f300|p->vmid); /* stage 1, stage 2 bypass */
+         /* SEP=7, PASIZE=1 (36-bit), 36-bit IOVA, EPD1, noncached walks. */
+         io->write(c,b+0x10,(7u<<15)|1);io->write(c,b+0x30,(1u<<23)|(3u<<12)|28);
+         uint64_t ttbr=table[n]|((uint64_t)(p->bank+1)<<48);
+         io->write64(c,b+0x20,ttbr);io->write64(c,b+0x28,0);
+         io->write(c,b+0x38,0x0444);io->write(c,b+0x3c,0);
+-        io->write(c,b+0x618,0);
++        /* Prove the leased identity and complete table configuration while
++         * disabled. A dropped CBAR write must never invalidate VMID0. */
++        if(io->read(c,b) || io->read(c,b+0x20)!=(uint32_t)ttbr || io->read(c,b+0x24)!=(uint32_t)(ttbr>>32) ||
++           io->read(c,b+0x30)!=((1u<<23)|(3u<<12)|28) || io->read(c,b+0x10)!=((7u<<15)|1) ||
++           io->read(c,0x1800+4*p->bank)!=1 || io->read(c,0x1000+4*p->bank)!=(0x1f300|p->vmid) ||
++           io->read(c,b+0x38)!=0x0444 || io->read(c,b+0x3c) || io->read(c,b+0x28) || io->read(c,b+0x2c))return false;
++        p->configured=true;
++        io->write(c,b+0x618,0); /* Invalidate this leased VMID before enabling. */
+         if(!ipa_mmu_sync(s,b))return false;
+         /* Terminate faults, never stall. No IRQ without an installed handler. */
+         uint32_t ctl=1|2|4|0x20|0x1000|(3u<<22);
+-        io->write(c,b,ctl);
+-        if(io->read(c,b)!=ctl || io->read(c,b+0x20)!=(uint32_t)ttbr || io->read(c,b+0x24)!=(uint32_t)(ttbr>>32) || io->read(c,b+0x30)!=((1u<<23)|(3u<<12)|28) || io->read(c,b+0x10)!=((7u<<15)|1))return false;
+-        if(io->read(c,0x1800+4*p->bank)!=1 || io->read(c,0x1000+4*p->bank)!=0x1f300 ||
+-           io->read(c,b+0x38)!=0x0444 || io->read(c,b+0x3c) || io->read(c,b+0x28) || io->read(c,b+0x2c))return false;
++        io->write(c,b,ctl);if(io->read(c,b)!=ctl)return false;
+         io->write(c,0xc00+4*p->slot,p->bank|(3u<<8));
+         /* Publication last: only exact IPA SID can reach this table. */
+         p->published=true;io->write(c,0x800+4*p->slot,0x80000000u|p->sid);
+@@ -97,7 +117,7 @@
+ /* Caller must prove both PAS15 and every GSI DMA producer stopped first.
+  * Any failed sync/readback pins page tables and all DMA allocations to reset. */
+ static inline bool ipa_mmu_restore(IpaMmu *s,bool stopped){
+-    if(!stopped || s->retained){s->retained=true;return false;}
++    if(!stopped || s->retained || !ipa_mmu_mode(s)){s->retained=true;return false;}
+     IpaMmuIo *io=&s->io;void *c=io->ctx;
+     for(unsigned n=0;n<2;n++){
+         IpaMmuContext *p=&s->context[n];if(!p->touched)continue;unsigned b=ipa_cb(p->bank);
+@@ -106,8 +126,11 @@
+             io->write(c,0xc00+4*p->slot,2u<<16); /* route all owned requests to fault */
+             if(io->read(c,0xc00+4*p->slot)!=(2u<<16)){s->retained=true;return false;}
+         }
+-        io->write(c,b,0);io->write(c,b+0x618,0);if(!ipa_mmu_sync(s,b))return false;
+-        if(io->read(c,b)){s->retained=true;return false;}
++        if(p->configured && (io->read(c,0x1000+4*p->bank)!=(0x1f300|p->vmid) || io->read(c,0x1800+4*p->bank)!=1)){s->retained=true;return false;}
++        io->write(c,b,0);if(io->read(c,b)){s->retained=true;return false;}
++        /* A partial configuration never enabled translation or published an
++         * SMR. Invalidate only after the private VMID was proven installed. */
++        if(p->configured){io->write(c,b+0x618,0);if(!ipa_mmu_sync(s,b))return false;}
+         io->write(c,0x800+4*p->slot,p->smr);io->write(c,0xc00+4*p->slot,p->s2cr);
+         io->write64(c,b+0x20,(uint64_t)p->saved[2]|(uint64_t)p->saved[3]<<32);
+         io->write64(c,b+0x28,(uint64_t)p->saved[7]|(uint64_t)p->saved[8]<<32);
+@@ -118,7 +141,7 @@
+         if(io->read(c,0x800+4*p->slot)!=p->smr || io->read(c,0xc00+4*p->slot)!=p->s2cr){s->retained=true;return false;}
+         for(unsigned j=0;j<9;j++)if(io->read(c,b+ipa_mmu_regs[j])!=p->saved[j]){s->retained=true;return false;}
+         if(io->read(c,0x1800+4*p->bank)!=p->cba2r || io->read(c,0x1000+4*p->bank)!=p->cbar){s->retained=true;return false;}
+-        p->touched=false;p->published=false;
++        p->touched=false;p->published=false;p->configured=false;
+     }
+     return true;
+ }

@@ -69,7 +69,7 @@ static void word(uint8_t *p,uint32_t v){ipa_put32(p,v);}
 static unsigned received;
 static void rx_callback(void *ctx,const uint8_t *p,size_t n){assert(ctx==&received && !queue_locked);assert(n==8 && p[4]==0x45);received++;assert(!sweet_ipa_transmit(p,n));}
 static void hreset(void){reset();memset(cfg,0,sizeof(cfg));memset(local,0x6a,sizeof(local));ipa.smem_bytes=0xb000;ipa.dma=(uintptr_t)dma-PAGE_SIZE;ipa.block=1;cfg[0x40/4]=(0x800u<<16)|0x800;cfg[0]=24|(12u<<16);cfg_writes=cfg_drop=immediates=fail_immediate=cmd_seen=0;corrupt_read=hold_aggregate=false;}
-int main(void){
+int supplied_hardware_main(void){
  hreset();assert(!ipa_hardware_setup());assert(immediates==7 && iph.ready);assert(cfg[0x38/4]==(11|(11u<<8)|(3u<<26)));assert(iph.gsi.ch[3].posted==63);assert(cfg[(0x1040+0x80*2)/4]==33 && !cfg[(0x1040+0x80*18)/4]);assert(!(cfg[(0x1008+0x80*18)/4]&0x7f));assert((cfg[(0x1024+0x80*18)/4]>>5&63)==6);
  for(unsigned i=0;i<4;i++)assert(cfg[(0x700+4*i)/4]==0x5cd0);
  for(unsigned i=0;i<0x280;i++)assert(local[0x4000+i]==0x6a);
@@ -130,4 +130,34 @@ int main(void){
  for(unsigned i=0;i<4;i++)assert(!iph.gsi.ch[i].started && iph.gsi.ch[i].channel_owned && iph.gsi.ch[i].event_owned);
  ipa_data_ready(true);assert(!sweet_ipa_ready());assert(ipa_hardware_stop());
  puts("IPA hardware, immediate commands, SRAM readback and teardown faults PASS");return 0;
+}
+
+static void good_handshake(void){
+ hreset();assert(!ipa_hardware_setup());ipa_data_terminal=false;ipa_full=true;
+ memset(&m,0,sizeof(m));qcom_qrtr_init(&m.qr,1,qsend,0);assert(!ipa_qrtr_attach(&m.qr));
+ m.qr.hello_received=1;m.qr.remote_node=0;m.qr.remote_count=1;
+ m.qr.remote[0].service=0x31;m.qr.remote[0].instance=0x201;m.qr.remote[0].node=0;m.qr.remote[0].port=28;
+ m.qr_started=m.data_attached=m.data_ipa_bound=true;
+ assert(!ipa_session_poll());qreceive(0x20);qreceive(0x35);qreceive(0x21);
+ assert(!ipa_session_poll());assert(!sweet_ipa_ready());m.qcount=0;
+ assert(!ipa_session_poll());ipa_transport_sync();assert(sweet_ipa_ready() && data_ready);
+}
+int main(void){
+ supplied_hardware_main();
+ good_handshake();unsigned before=received;uint8_t packet[8]={0,1,0,4,0x45,1,2,3};
+ assert(!sweet_ipa_transmit(packet,8));
+ emit(&iph.gsi,1,IPA_DMA_IOVA+iph.gsi.ch[1].ring+16,8,2);
+ emit(&iph.gsi,3,IPA_DMA_IOVA+iph.gsi.ch[3].ring,8,2);
+ assert(ipa_session_poll()==EIO);assert(!sweet_ipa_ready() && !ipa_txq.count && received==before);
+ m.failed=true;ipa_transport_sync();assert(!data_ready);ipa_data_ready(true);assert(!sweet_ipa_ready());
+ assert(ipa_data_quiesce());assert(ipa_hardware_stop());
+ good_handshake();assert(!sweet_ipa_transmit(packet,8));before=received;
+ memcpy(dma+iph.gsi.ch[3].buffer,packet,8);
+ emit(&iph.gsi,3,IPA_DMA_IOVA+iph.gsi.ch[3].ring,8,2);
+ cfg[0x100/4]=(1u<<11)|(1u<<18);m.data_stopping=true;ipa_transport_sync();
+ assert(!data_ready && !sweet_ipa_ready() && !ipa_txq.count);
+ assert(ipa_data_quiesce());assert(!cfg[0x100/4] && received==before);
+ for(unsigned i=0;i<4;i++)assert(!iph.gsi.ch[i].started && iph.gsi.ch[i].channel_owned && iph.gsi.ch[i].event_owned);
+ ipa_data_ready(true);assert(!sweet_ipa_ready());assert(ipa_hardware_stop());
+ puts("PASS: real handshake then GSI failure, and stop with queued TX and pending active RX");return 0;
 }

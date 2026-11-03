@@ -207,7 +207,7 @@ Local evidence is ios-asteroids/logs/ast169-ipa-memory-2203.txt, its result.json
 
 The published2202 through2204 code establishes that initial true transition, but its error-path revocation has the gap identified in data2221's audit. The private integration draft makes revocation terminal for this boot, clears copied TX on GSI/QMI/transport failure or stop, and publishes false before later QRTR/data callbacks. It also quiesces AP channels before data detach while retaining PAS15 and backing until verified PAS4 stop. Those changes have host coverage but are not yet in a phone candidate. Adapter2221 must wait for the audited integrated revision before a live data trial.
 
-## Integration2205 desk status
+## Historical integration2205 desk status before publication
 
 Public2204 is only the plain-MMIO correction. The next integration patch is2205. The working draft in plans/ipa/draft2205 implements all three IPA obligations from data2221's audit: terminal readiness revocation, the real2221 bind/refresh calls, and AP channel quiescence before data detach. It uses modem2189revision2 SHA9b4b570d and data2220audit6 SHA8a0b901c, with adapter2221 SHA4bdc74ce. Modem source approval does not approve this integration or an image.
 
@@ -215,7 +215,7 @@ The worker binds exactly once for sweetdata, after IPA preparation and before at
 
 After bounded WDS cleanup, the worker closes RX aggregation and stops owned AP GSI channels before data detach. It keeps channel/event ownership, mappings and power until verified PAS4 stop permits final GSI/PAS15 teardown. An uncertain stop remains an error and retains backing. Host sanitizer fixtures exercise the actual merged receive/stop code, real2221 partial-bind failure, successful handshake followed by service/GSI failure, DEL_SERVER followed by a data reply, and all four channel-stop failures.
 
-This is private desk work while the reviewed2204 survey runs. It is not yet a public frozen2205 cutoff, full integrated build or phone GO. The data agent is checking one further readiness-before-service-sync edge before the combined review.
+Historical status before publication: this was private desk work while the reviewed2204 survey ran. It is not yet a public frozen2205 cutoff, full integrated build or phone GO. The data agent is checking one further readiness-before-service-sync edge before the combined review.
 
 ## ast170 and frozen integration cutoff
 
@@ -245,3 +245,18 @@ Frozen source hashes follow. No phone image is approved by this cutoff.
 - `2204-asteroids-ipa-plain-mmio.patch` `15b52570e717c5537435e490a1477fd97af632bac31298cdc8e2b43eb76e28b3`
 - `2205-asteroids-ipa-data-worker-integration.patch` `479f4c1df57b857745b75262b8f4e9895d44e8d22e643c9fa6ef81beaf067590`
 - `2206-asteroids-ipa-unused-context-reset.patch` `0e2795df6d0bd53aa9bd790eba558d261b8a098bd91cd893d08f6629811d9425`
+
+## 2207 source audit and 2208 correction
+
+The full 2206 integrated build and incremental 2207 remake passed. Both 2207 images matched all ten kernel segments. They must not boot. Sol's fresh source review, plans/ipa/sol-2207-source-audit.md, found that the old global page descriptors and shared VMID0 allow an architecture-permitted TLB hit across AP and uC despite separate ASIDs. No phone operation followed that NO-GO.
+
+Patch 2208 allocates two distinct nonzero 8-bit VMIDs absent from every inherited context bank, including disabled banks. It rechecks each lease under the shared allocator claim, rejects CLIENTPD, extended StreamIDs and 16-bit VMID mode, and leaves global controls unchanged. The existing generic APPS allocator uses VMID0; touch and USB reuse inherited contexts. The dedicated GPU SMMU has a separate TLB namespace. IPA leaves now set nG as well.
+
+The driver verifies the complete private translation configuration while disabled, before invalidating that VMID or enabling the bank. This also prevents a dropped CBAR write from causing maintenance under inherited VMID0. Cleanup verifies the installed private identity and disables translation before maintenance. Partial setup that never enabled a bank skips maintenance. All old fields still require exact restoration before freeing backing. Accepted plain-MMIO maintenance writes are a hardware assumption. A zero TLBSTATUS does not independently prove acceptance of a silently dropped write-only command, and the architecture permits over-invalidation.
+
+The maintained shared-TLB regression uses actual descriptors and VMID allocation. It seeds an inherited global entry and a stale entry in the new lease, fills the AP translation, and proves that the empty uC domain faults for the same IOVA. Its negative control reproduces the old global/shared-VMID cross-domain hit. Fault-injection tests assert that no maintenance command targets VMID0. Mode-change retention and inherited-VMID collision checks pass. The maintained hardware suite now includes the additional good-handshake/GSI-failure and queued-TX/pending-active-RX stop cases from data's 2221 re-audit.
+
+Apply 2207 after the frozen 2200 through 2206 series, then 2208. The earlier cutoff remains byte-for-byte unchanged. Ordered reproduction now checks all 56 integrated modem, data and IPA files. Use `python3 plans/ipa/tools/reproduce-cutoff.py` from the project root. No IPA or ONLINE image has phone approval yet. A fresh Sol review must inspect the corrected source and exact rebuilt image.
+
+- 2207 SHA256 `cac60147ce18dacf3b0d6804e93425f35dbf6fe0ffa0cf8fde8ebae35fc21106`.
+- 2208 SHA256 `afc38c0297678892e8e7e1a8410e629903c34867b589fcae11df9d6cda52aacb`.

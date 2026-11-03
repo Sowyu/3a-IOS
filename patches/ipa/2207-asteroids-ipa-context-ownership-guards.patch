@@ -1,0 +1,23 @@
+diff --git a/bsd/dev/modem/IpaMmu.h b/bsd/dev/modem/IpaMmu.h
+--- a/bsd/dev/modem/IpaMmu.h
++++ b/bsd/dev/modem/IpaMmu.h
+@@ -28,6 +28,7 @@
+     IpaMmuIo *io=&s->io;void *c=io->ctx;
+     /* Geometry measured in ast159. A different boot firmware is a new probe. */
+     if(io->read(c,0x20)!=0x4c017e72 || io->read(c,0x24)!=0x60000048 || io->read(c,0x28)!=0x5111)return false;
++    if(io->read(c,0)&(1u<<3))return false; /* Extended StreamIDs need a separate allocator. */
+     bool used[72]={0};unsigned slots[2],ns=0;
+     for(unsigned i=0;i<114;i++){
+         uint32_t smr=io->read(c,0x800+4*i),s2=io->read(c,0xc00+4*i);
+@@ -35,6 +36,11 @@
+         uint32_t mask=(smr>>16)&0x7fff;
+         if(!((smr^0x4a0)&~mask&0x7fff) || !((smr^0x4a2)&~mask&0x7fff))return false;
+         if(((s2>>16)&3)==0){if((s2&255)>=72)return false;used[s2&255]=true;}
++    }
++    /* A chained stage2 bank is owned even without its own stream selector. */
++    for(unsigned i=0;i<72;i++)if(used[i]){
++        uint32_t cbar=io->read(c,0x1000+4*i);
++        if(((cbar>>16)&3)==3){unsigned second=(cbar>>8)&255;if(second>=72 || ((io->read(c,0x1000+4*second)>>16)&3)!=0)return false;used[second]=true;}
+     }
+     if(ns!=2)return false;
+     unsigned nb=0;
