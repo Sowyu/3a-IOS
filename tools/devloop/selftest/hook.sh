@@ -33,14 +33,18 @@ if [ "$st_run" = 1 ]; then
 	finish() {
 		say "DONE"
 		sync
-		sleep 1
+		sleep "${st_finish_delay:-1}"
 		timeout 30 sweetreboot fastboot
 		say "FAIL sweetreboot came back, waiting for sweetdeadman"
 		sleep 100000
 		exit 1
 	}
-	rm -rf "$ST_OUT"
-	mkdir -p "$ST_OUT"
+	# Retain earlier evidence without permanent deletion.
+	if [ -e "$ST_OUT" ]; then
+		st_saved="$ST_OUT.saved.$(date +%s).$$"
+		[ ! -e "$st_saved" ] && mv "$ST_OUT" "$st_saved" || { say "FAIL preserve frames"; exit 1; }
+	fi
+	mkdir -p "$ST_OUT" || { say "FAIL create frames"; exit 1; }
 	say "start"
 	n=0
 	until timeout 30 sweetopen com.apple.Preferences > /dev/null 2>&1; do

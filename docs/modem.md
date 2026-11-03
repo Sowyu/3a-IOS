@@ -128,3 +128,14 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 **Measured, host.** The actual power inspector passes the maximum-320 regression and rejects oversized, odd, short and descending tables. The UIM suite now explicitly rejects a matching response before its first request. The combined USB/modem full build and final remake passed. Every rebased kernel segment in the three prepared stage images matches the built kernel. Their command lines contain 553, 591 and 603 bytes.
 
 **Missing.** Fresh 2177 Sol review and the live read-only power probe precede another PAS attempt. The previous audit is `docs/modem-2175-2176-audit.md`; its staged approvals do not cover an unreviewed power change. The owner has lifted the time reservation, but every run still requires fastboot or OrangeFox and no active dev.py.
+
+
+## Power probe, ast149
+
+**Measured.** The combined 2170 to 2177 and USB v5 build passed Sol review in `docs/modem-2177-audit.md`. ast149 confirmed live command-db resource lookups and complete active maps. MSS ends at 320, so the old minimum-384 guard caused the earlier refusal. Local log `ios-asteroids/logs/ast149-modem-power-probe.txt:6620` shows the bounded selection. Line 6632 reports hardware preflight error 0. Line 6634 reports no PAS activity and cleanup ok.
+
+**Measured, limit.** The loop returned after 230 seconds with a clean root, but its persistent console lacks the final selftest marker. The verdict is reset-unknown. A screenshot and a clean filesystem do not prove the termination path. SSH over USB worked and logged USB counters had no stale or lost TX. No modem was started.
+
+**Code.** The next read-only probe keeps the exact kernel and image. Its selftest preserves previous frames, checks screenshot success, writes a fresh completion token and waits 15 seconds after DONE before reboot. This fixes evidence collection without widening the modem gates.
+
+**Missing.** Recorded clean probe completion still gates the offline PAS run. No M2 or SIM evidence exists yet.
