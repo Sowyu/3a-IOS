@@ -73,7 +73,9 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 
 ### M7, iOS interface
 
-**Inferred.** A wired Ethernet presentation is a practical first option. The existing `iokit/Kernel/arm/SweetNetwork.cpp` publishes an IOKit Ethernet facade so configd adopts the USB BSD ifnet. Reuse that pattern for a distinct modem ifnet after M6, keeping USB separate.
+**Code.** `iokit/Kernel/arm/SweetNetwork.cpp` already exposes `sweet_net_publish(bsd_name, prefix, unit, mac, ip, mask, router, dns1, dns2)`. It publishes the IOKit Ethernet properties that configd uses to adopt the USB BSD ifnet. Its network configuration overrides already accept manual IPv4, router and DNS values.
+
+**Inferred.** Reuse that facade for a distinct modem ifnet after M6, supplying the measured WDS configuration. This is the smallest first test of the owner's wired-Ethernet idea. DHCP is a fallback if configd will not adopt the WDS settings directly. Keep USB separate and verify interface withdrawal or reconfiguration when the call ends or its address changes.
 
 **Missing.** IPA carries IP/QMAP, not Ethernet. The adapter must translate Ethernet/ARP or provide a private routed Ethernet link with DHCP and a matching gateway; IPv6 needs its own routing/RA design. A virtual Ethernet label alone does not configure the WDS address or DNS. Test configd adoption, route selection, DNS and app traffic on this iOS build. CommCenter emulation is not planned. No status-bar sysctl is planned.
 
