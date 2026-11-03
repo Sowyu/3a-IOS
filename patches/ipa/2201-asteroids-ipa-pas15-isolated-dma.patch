@@ -44,19 +44,19 @@ diff --git a/bsd/dev/sweet_touch_asteroids.c b/bsd/dev/sweet_touch_asteroids.c
 diff --git a/bsd/dev/modem/ModemRuntime.inc b/bsd/dev/modem/ModemRuntime.inc
 --- a/bsd/dev/modem/ModemRuntime.inc
 +++ b/bsd/dev/modem/ModemRuntime.inc
-@@ -485,8 +485,11 @@
+@@ -508,8 +508,11 @@
  #include "ModemGate.h"
  static bool m_gate(const char *name){return modem_gate(PE_boot_args(),name)!=0;}
  #include "IpaProbe.inc"
 +#include "IpaRuntime.inc"
  static int modem_run(const struct wl_fat *f,const uint8_t *mdt,uint32_t size){
-     memset(&m,0,sizeof(m));m.master=-1;m.glink=m_gate("sweetmglink");m.rmtfs=m_gate("sweetmrmtfs");m.pdm=m_gate("sweetmpdm");m.uim=m_gate("sweetmuim");m.sysmon=m_gate("sweetmstop");m.bcm_probe=m_gate("sweetmbcm");m.handover_release=m_gate("sweetmho");m.bandwidth=m_gate("sweetmbw");m.bandwidth_irq=m_gate("sweetmbwi");
+     memset(&m,0,sizeof(m));m.master=-1;m.glink=m_gate("sweetmglink");m.rmtfs=m_gate("sweetmrmtfs");m.pdm=m_gate("sweetmpdm");m.uim=m_gate("sweetmuim");m.uim_ready_poll=m_gate("sweetmready");m.sysmon=m_gate("sweetmstop");m.bcm_probe=m_gate("sweetmbcm");m.handover_release=m_gate("sweetmho");m.bandwidth=m_gate("sweetmbw");m.bandwidth_irq=m_gate("sweetmbwi");
 +    memset(&ipa,0,sizeof(ipa));ipa.enabled=m_gate("sweetipafw");
 +    if(ipa.enabled && (!m.bandwidth || !m.bandwidth_irq || !m_gate("sweetmpss"))){printf("SWEET IPA: requires strict sweetmpss, sweetmbw and sweetmbwi gates\n");return EINVAL;}
      if((m.rmtfs || m.pdm || m.uim || m.sysmon) && !m.glink){printf("SWEET MODEM: refused missing GLINK dependency\n");return EINVAL;}
+     if(m.uim_ready_poll && !m.uim){printf("SWEET MODEM: readiness polling requires UIM\n");return EINVAL;}
      m_sleep(30000);m.began=m_now();int rc=EIO;
-     m.smem=ml_io_map(M_SMEM,M_SM_SIZE);m.mutex=ml_io_map(0x1f43000,0x1000);m.ipcc=ml_io_map(0x405000,0x1000);
-@@ -512,11 +515,12 @@
+@@ -536,11 +539,12 @@
      m.qmp_owed=true;if((rc=m_qsend(true)))goto out;
      if((rc=m_vote(true)))goto out;
      if((rc=m_bandwidth_vote()))goto out;
@@ -82,12 +82,12 @@ new file mode 100644
 +#include <stddef.h>
 +#define IPA_PT_PAGE 4096u
 +#define IPA_PT_PAGES 16u
-+/* One L1, allocated L2/L3 pages. 4 KiB granule, 39-bit IOVA, 48-bit PA.
++/* One L1, allocated L2/L3 pages. 4 KiB granule, 36-bit IOVA and PA, as measured ID2=0x5111 advertises.
 + * The caller supplies zeroed, physically contiguous tables and synchronizes them
 + * before installing TTBR0. No broad block mappings are emitted. */
 +typedef struct {uint64_t *words,physical;unsigned used;} IpaPageTable;
 +static inline int ipa_pt_init(IpaPageTable *t,uint64_t *words,uint64_t pa){
-+    if(!words || ((uintptr_t)words&7) || (pa&4095) || pa>0x0000ffffffff0000ull)return -1;
++    if(!words || ((uintptr_t)words&7) || (pa&4095) || pa>(1ull<<36)-IPA_PT_PAGES*IPA_PT_PAGE)return -1;
 +    t->words=words;t->physical=pa;t->used=1;
 +    for(unsigned i=0;i<IPA_PT_PAGES*512;i++)words[i]=0;
 +    return 0;
@@ -104,8 +104,8 @@ new file mode 100644
 +}
 +static inline int ipa_pt_map_attr(IpaPageTable *t,uint64_t iova,uint64_t pa,size_t bytes,unsigned attr){
 +    if(attr>1)return -1;
-+    if(!bytes || ((iova|pa|bytes)&4095) || iova>=(1ull<<39) || bytes>(1ull<<39)-iova ||
-+       pa>=(1ull<<48) || bytes>(1ull<<48)-pa)return -1;
++    if(!bytes || ((iova|pa|bytes)&4095) || iova>=(1ull<<36) || bytes>(1ull<<36)-iova ||
++       pa>=(1ull<<36) || bytes>(1ull<<36)-pa)return -1;
 +    for(size_t at=0;at<bytes;at+=4096){
 +        uint64_t v=iova+at;unsigned l2,l3;
 +        if(ipa_pt_next(t,0,(unsigned)(v>>30)&511,&l2) ||
@@ -178,7 +178,7 @@ new file mode 100644
 +static inline bool ipa_mmu_install(IpaMmu *s,const uint64_t table[2]){
 +    IpaMmuIo *io=&s->io;void *c=io->ctx;
 +    if(!ipa_mmu_choose(s))return false;
-+    for(unsigned n=0;n<2;n++)if((table[n]&4095) || table[n]>=(1ull<<48))return false;
++    for(unsigned n=0;n<2;n++)if((table[n]&4095) || table[n]>(1ull<<36)-0x10000)return false;
 +    for(unsigned n=0;n<2;n++){
 +        IpaMmuContext *p=&s->context[n];unsigned b=ipa_cb(p->bank);
 +        /* Recheck ownership immediately before touching each reserved slot. */
@@ -186,8 +186,8 @@ new file mode 100644
 +        p->touched=true;
 +        io->write(c,0x1800+4*p->bank,1); /* 64-bit context */
 +        io->write(c,0x1000+4*p->bank,0x1f300); /* stage 1, stage 2 bypass */
-+        /* SEP=7, PASIZE=5 (48-bit), 39-bit IOVA, EPD1, noncached walks. */
-+        io->write(c,b+0x10,(7u<<15)|5);io->write(c,b+0x30,(1u<<23)|(3u<<12)|25);
++        /* SEP=7, PASIZE=1 (36-bit), 36-bit IOVA, EPD1, noncached walks. */
++        io->write(c,b+0x10,(7u<<15)|1);io->write(c,b+0x30,(1u<<23)|(3u<<12)|28);
 +        uint64_t ttbr=table[n]|((uint64_t)(p->bank+1)<<48);
 +        io->write64(c,b+0x20,ttbr);io->write64(c,b+0x28,0);
 +        io->write(c,b+0x38,0x0444);io->write(c,b+0x3c,0);
@@ -196,7 +196,7 @@ new file mode 100644
 +        /* Terminate faults, never stall. No IRQ without an installed handler. */
 +        uint32_t ctl=1|2|4|0x20|0x1000|(3u<<22);
 +        io->write(c,b,ctl);
-+        if(io->read(c,b)!=ctl || io->read(c,b+0x20)!=(uint32_t)ttbr || io->read(c,b+0x24)!=(uint32_t)(ttbr>>32) || io->read(c,b+0x30)!=((1u<<23)|(3u<<12)|25) || io->read(c,b+0x10)!=((7u<<15)|5))return false;
++        if(io->read(c,b)!=ctl || io->read(c,b+0x20)!=(uint32_t)ttbr || io->read(c,b+0x24)!=(uint32_t)(ttbr>>32) || io->read(c,b+0x30)!=((1u<<23)|(3u<<12)|28) || io->read(c,b+0x10)!=((7u<<15)|1))return false;
 +        if(io->read(c,0x1800+4*p->bank)!=1 || io->read(c,0x1000+4*p->bank)!=0x1f300 ||
 +           io->read(c,b+0x38)!=0x0444 || io->read(c,b+0x3c) || io->read(c,b+0x28) || io->read(c,b+0x2c))return false;
 +        io->write(c,0xc00+4*p->slot,p->bank|(3u<<8));
@@ -299,7 +299,7 @@ new file mode 100644
 +static int ipa_alloc(vm_offset_t *va,uint64_t *pa,vm_size_t size){
 +    if(kmem_alloc_contig(kernel_map,va,size,PAGE_MASK,0,0,KMA_DATA|KMA_ZERO,VM_KERN_MEMORY_IOKIT)!=KERN_SUCCESS)return ENOMEM;
 +    *pa=ptoa_64(pmap_find_phys(kernel_pmap,(addr64_t)*va));
-+    if(!*pa || *pa>=(1ull<<48) || size>(1ull<<48)-*pa)return EINVAL;
++    if(!*pa || *pa>=(1ull<<36) || size>(1ull<<36)-*pa)return EINVAL;
 +    for(vm_size_t off=0;off<size;off+=PAGE_SIZE)if(ptoa_64(pmap_find_phys(kernel_pmap,(addr64_t)(*va+off)))!=*pa+off)return EINVAL;
 +    return 0;
 +}

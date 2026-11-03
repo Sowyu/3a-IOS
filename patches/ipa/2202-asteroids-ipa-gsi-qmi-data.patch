@@ -1,0 +1,632 @@
+diff --git a/bsd/dev/modem/ModemRuntime.inc b/bsd/dev/modem/ModemRuntime.inc
+--- a/bsd/dev/modem/ModemRuntime.inc
++++ b/bsd/dev/modem/ModemRuntime.inc
+@@ -238,7 +238,12 @@
+     int rc=qcom_smem_alloc(&m.sm,&m.part,id,bytes);m_wr(m.mutex,0,0);
+     uint32_t actual=0;return rc!=QcomSmemOk && rc!=QcomSmemExists?EIO:m_item(id,bytes,off,&actual);
+ }
++static bool ipa_full;
++static int ipa_smp_index=-1;
++static void ipa_clock_poll(void);
++static int ipa_qrtr_attach(QcomQrtr *);
+ static void m_smp_poll(void){
++    ipa_clock_poll();
+     uint32_t off,bytes;
+     if(m_item(435,QCOM_SMP2P_ITEM_BYTES,&off,&bytes))return;
+     m.sp.in=(volatile uint32_t *)(m.smem+off);
+@@ -355,6 +360,7 @@
+     static const QcomGlinkClient client={m_gstate,m_greceive};
+     m.channel=qcom_glink_channel(&m.gl,"IPCRTR",M_RX_SIZE,8,m.rx,&client,0,1);
+     qcom_qrtr_init(&m.qr,1,m_qsend_packet,0);
++    if(ipa_qrtr_attach(&m.qr))return EIO;
+     if(m.rmtfs && qcom_qrtr_add_service(&m.qr,14,1,0x4000,m_rmtfs_receive,0))return EIO;
+     if(m.sysmon && qcom_qrtr_add_service(&m.qr,0,0,0x4003,m_shutdown_receive,0))return EIO;
+     if(m.uim && qcom_qrtr_add_service(&m.qr,0,0,0x4002,m_uim_receive,0))return EIO;
+@@ -509,9 +515,16 @@
+ static bool m_gate(const char *name){return modem_gate(PE_boot_args(),name)!=0;}
+ #include "IpaProbe.inc"
+ #include "IpaRuntime.inc"
++#include "IpaHardware.inc"
++#include "IpaData.inc"
++#include "IpaSession.inc"
+ static int modem_run(const struct wl_fat *f,const uint8_t *mdt,uint32_t size){
+     memset(&m,0,sizeof(m));m.master=-1;m.glink=m_gate("sweetmglink");m.rmtfs=m_gate("sweetmrmtfs");m.pdm=m_gate("sweetmpdm");m.uim=m_gate("sweetmuim");m.uim_ready_poll=m_gate("sweetmready");m.sysmon=m_gate("sweetmstop");m.bcm_probe=m_gate("sweetmbcm");m.handover_release=m_gate("sweetmho");m.bandwidth=m_gate("sweetmbw");m.bandwidth_irq=m_gate("sweetmbwi");
+-    memset(&ipa,0,sizeof(ipa));ipa.enabled=m_gate("sweetipafw");
++    memset(&ipa,0,sizeof(ipa));ipa_full=m_gate("sweetipa");ipa_smp_index=-1;ipa_qmi_logged=0;
++    ipa.enabled=ipa_full || m_gate("sweetipafw");
++    if(ipa_full && (m_gate("sweetipafw") || !m.glink || !m.rmtfs || !m.pdm || !m.sysmon)){
++        printf("SWEET IPA: full mode requires GLINK, RAM rmtfs, pd-mapper and sysmon; firmware probe must be absent\n");return EINVAL;
++    }
+     if(ipa.enabled && (!m.bandwidth || !m.bandwidth_irq || !m_gate("sweetmpss"))){printf("SWEET IPA: requires strict sweetmpss, sweetmbw and sweetmbwi gates\n");return EINVAL;}
+     if((m.rmtfs || m.pdm || m.uim || m.sysmon) && !m.glink){printf("SWEET MODEM: refused missing GLINK dependency\n");return EINVAL;}
+     if(m.uim_ready_poll && !m.uim){printf("SWEET MODEM: readiness polling requires UIM\n");return EINVAL;}
+@@ -532,19 +545,27 @@
+             if(old&2){rc=EBUSY;goto out;}}
+     }
+     uint32_t outoff;if(m_alloc(428,QCOM_SMP2P_ITEM_BYTES,&outoff)){rc=EIO;goto out;}
+-    qcom_smp2p_init_out(&m.sp,(volatile uint32_t *)(m.smem+outoff),0,1);m.master=qcom_smp2p_add_entry(&m.sp,"master-kernel");qcom_smp2p_add_entry(&m.sp,"ipa");m_ring(2,2);
++    qcom_smp2p_init_out(&m.sp,(volatile uint32_t *)(m.smem+outoff),0,1);m.master=qcom_smp2p_add_entry(&m.sp,"master-kernel");ipa_smp_index=qcom_smp2p_add_entry(&m.sp,"ipa");m_ring(2,2);
+     if(m.glink && (rc=m_glink_prepare()))goto out;
+     if(m.rmtfs && (rc=m_shadow_prepare()))goto out;
+     qcom_qmp_init(&m.qp,(volatile uint32_t *)m.qmpmem,0x400,m_qkick,0);if((rc=m_qwait(3000)))goto out;
+     m.qmp_owed=true;if((rc=m_qsend(true)))goto out;
+     if((rc=m_vote(true)))goto out;
+     if((rc=m_bandwidth_vote()))goto out;
+-    if(ipa.enabled){rc=ipa_prepare(f);goto out;} /* PAS15-only probe stops before MPSS authentication. */
++    if(ipa.enabled){
++        if((rc=ipa_prepare(f)))goto out;
++        if(!ipa_full)goto out; /* PAS15-only probe never starts MPSS. */
++        if(ipa_smp_index<0){rc=EIO;goto out;}
++        if((rc=ipa_hardware_setup()))goto out;
++    }
+     if((rc=m_load(f,mdt,size)))goto out;
+     if((rc=m_pas(5,1,0,0)))goto out;m.started=true;
+     uint64_t end=m_now()+120000,ready_deadline=m_now()+10000;
+-    while(m_now()<end){m_smp_poll();if((rc=m_handover()))break;if(m.glink)m_ipc_poll();if(m.uim && (m.state&6)==6)m_uim_poll();if(m.fatal || m.failed){rc=EIO;break;}
++    while(m_now()<end){m_smp_poll();if((rc=m_handover()))break;if(m.glink)m_ipc_poll();if(m.uim && (m.state&6)==6)m_uim_poll();if((rc=ipa_session_poll())){m.failed=true;break;}if(m.fatal || m.failed){rc=EIO;break;}
+         if(!(m.state&2) && m_now()>ready_deadline){rc=ETIMEDOUT;break;}m_sleep(2);}
+-    if(!m.fatal && !m.failed && (m.state&6)==6)rc=0;else if(!rc)rc=ETIMEDOUT;
+-out:printf("SWEET MODEM: offline run end error=%d elapsed_ms=%llu\n",rc,(unsigned long long)(m_now()-m.began));if(!m_cleanup())rc=EIO;if(!ipa_cleanup(m.stop_verified))rc=EIO;return rc;
+-}
++    if(!m.fatal && !m.failed && (m.state&6)==6 && (!ipa_full || iph.logged))rc=0;else if(!rc)rc=ETIMEDOUT;
++out:printf("SWEET MODEM: offline run end error=%d elapsed_ms=%llu\n",rc,(unsigned long long)(m_now()-m.began));if(ipa_full)ipa_data_ready(false);
++    if(!m_cleanup())rc=EIO;
++    if(ipa_full && m.stop_verified && !ipa_hardware_stop()){ipa.retained=true;rc=EIO;}
++    if(!ipa_cleanup(m.stop_verified))rc=EIO;return rc;
++}
+diff --git a/bsd/dev/modem/SweetIpa.h b/bsd/dev/modem/SweetIpa.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/modem/SweetIpa.h
+@@ -0,0 +1,22 @@
++#ifndef SWEET_IPA_H
++#define SWEET_IPA_H
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++#define SWEET_IPA_QMAP_VERSION 1u
++#define SWEET_IPA_RX_BYTES 8192u
++#define SWEET_IPA_AGGR_BYTES 6144u
++#define SWEET_IPA_AGGR_PACKETS 16u
++#define SWEET_IPA_AGGR_USEC 500u
++#define SWEET_IPA_TX_BYTES 2048u
++#define SWEET_IPA_TX_ENDPOINT 2u
++#define SWEET_IPA_RX_ENDPOINT 18u
++/* Called outside interrupt context. One complete QMAPv1 frame, copied before
++ * success returns. 0 accepted; ENETDOWN, EAGAIN, EMSGSIZE or EINVAL otherwise. */
++int sweet_ipa_transmit(const void *qmap,size_t bytes);
++typedef void (*sweet_ipa_rx_fn)(void *context,const uint8_t *qmap,size_t bytes);
++/* One built-in, kernel-lifetime callback. Runs from the IPA/modem worker,
++ * without the TX queue lock. The received aggregate expires on return. */
++int sweet_ipa_register_rx(sweet_ipa_rx_fn receive,void *context);
++bool sweet_ipa_ready(void);
++#endif
+diff --git a/bsd/dev/modem/IpaGsi.h b/bsd/dev/modem/IpaGsi.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/modem/IpaGsi.h
+@@ -0,0 +1,137 @@
++#ifndef IPA_GSI_H
++#define IPA_GSI_H
++#include <stdint.h>
++#include <stdbool.h>
++#include <string.h>
++/* GSI5.2 uses the 5.0 register map, not SC7280's 2.11 layout. */
++typedef struct {
++    void *ctx;uint32_t (*read)(void *,unsigned);void (*write)(void *,unsigned,uint32_t);
++    void (*sync)(void *,unsigned,unsigned);void (*wait_us)(void *,unsigned);
++} IpaGsiIo;
++typedef struct {uint64_t address;uint16_t length,reserved;uint32_t flags;} IpaTre;
++typedef struct {uint64_t transfer;uint16_t length;uint8_t reserved,code;uint16_t reserved2;uint8_t type,channel;} IpaEvent;
++_Static_assert(sizeof(IpaTre)==16 && sizeof(IpaEvent)==16,"GSI element size");
++typedef struct {
++    unsigned channel,event,endpoint,slots,tlv,buffer_size,buffer,ring,events;
++    uint32_t posted,completed,consumed;
++    bool tx,command,event_owned,channel_owned,started;
++} IpaGsiChannel;
++typedef struct {IpaGsiIo io;uint8_t *dma;uint32_t base;IpaGsiChannel ch[4];bool claimed,failed,uncertain;uint32_t irq_saved[5];} IpaGsi;
++static inline unsigned ipa_gch(unsigned c,unsigned n){return 0x14000+0x80*c+4*n;}
++static inline unsigned ipa_gev(unsigned e,unsigned n){return 0x1c000+0x80*e+4*n;}
++static inline uint32_t ipa_gr(IpaGsi *s,unsigned r){return s->io.read(s->io.ctx,r);}
++static inline void ipa_gw(IpaGsi *s,unsigned r,uint32_t v){s->io.write(s->io.ctx,r,v);}
++static inline unsigned ipa_gstate(IpaGsi *s,IpaGsiChannel *ch,bool ev){return (ipa_gr(s,ev?ipa_gev(ch->event,0):ipa_gch(ch->channel,0))>>20)&15;}
++static inline bool ipa_gcmd(IpaGsi *s,IpaGsiChannel *ch,bool ev,unsigned opcode,unsigned expected){
++    unsigned id=ev?ch->event:ch->channel,src=ev?0x2509c:0x25090,clr=ev?0x250a4:0x25098;
++    uint32_t bit=1u<<id;ipa_gw(s,clr,bit);
++    if(ipa_gr(s,src)&bit){s->failed=s->uncertain=true;return false;}
++    ipa_gw(s,ev?0x25010:0x25008,id|(opcode<<24));
++    for(unsigned us=0;us<50000;us+=10){
++        if((ipa_gr(s,src)&bit) && ipa_gstate(s,ch,ev)==expected){ipa_gw(s,clr,bit);return true;}
++        if(ipa_gr(s,0x25240) || ipa_gr(s,0x2520c))break;s->io.wait_us(s->io.ctx,10);
++    }
++    s->failed=s->uncertain=true;return false;
++}
++static inline bool ipa_gwrite_checked(IpaGsi *s,unsigned r,uint32_t v,uint32_t mask){
++    ipa_gw(s,r,v);if((ipa_gr(s,r)&mask)!=(v&mask)){s->failed=true;return false;}return true;
++}
++/* Read-only ownership survey, usable before any IPA configuration write. */
++static inline bool ipa_gsi_available(IpaGsiIo io){
++    IpaGsi probe={.io=io};IpaGsi *s=&probe;
++    unsigned channels=ipa_gr(s,0x25040)&255,events=ipa_gr(s,0x25050)&255;
++    if(!(ipa_gr(s,0x25000)&1) || channels<10 || channels>128 || events<4 || events>128 || ipa_gr(s,0x25240) || ipa_gr(s,0x2520c))return false;
++    /* Never take over an EE with live channels or rings, including unowned IDs. */
++    for(unsigned i=0;i<channels;i++)if((ipa_gr(s,ipa_gch(i,0))>>20)&15)return false;
++    for(unsigned i=0;i<events;i++)if((ipa_gr(s,ipa_gev(i,0))>>20)&15)return false;
++    return true;
++}
++static inline bool ipa_gsi_setup(IpaGsi *s,IpaGsiIo io,uint8_t *dma,uint32_t base){
++    memset(s,0,sizeof(*s));s->io=io;s->dma=dma;s->base=base;
++    if(!dma || ((uintptr_t)dma&7) || (base&4095) || base>0xfff00000u)return false;
++    s->ch[0]=(IpaGsiChannel){.channel=6,.event=0,.endpoint=9,.slots=32,.tlv=20,.buffer_size=64,.buffer=0x1000,.tx=true,.command=true};
++    s->ch[1]=(IpaGsiChannel){.channel=7,.event=1,.endpoint=11,.slots=16,.tlv=9,.buffer_size=8192,.buffer=0x10000};
++    s->ch[2]=(IpaGsiChannel){.channel=5,.event=2,.endpoint=2,.slots=32,.tlv=25,.buffer_size=2048,.buffer=0x30000,.tx=true};
++    s->ch[3]=(IpaGsiChannel){.channel=9,.event=3,.endpoint=18,.slots=64,.tlv=9,.buffer_size=8192,.buffer=0x40000};
++    if(!ipa_gsi_available(io))return false;
++    static const unsigned irq[]={0x25088,0x25094,0x250a0,0x250ac,0x25220};
++    for(unsigned i=0;i<5;i++)s->irq_saved[i]=ipa_gr(s,irq[i]);s->claimed=true;
++    /* Poll completion sources. Top-level interrupt output stays masked. */
++    if(!ipa_gwrite_checked(s,0x25088,0,~0u) || !ipa_gwrite_checked(s,0x25094,0x2e0,~0u) ||
++       !ipa_gwrite_checked(s,0x250a0,15,~0u) || !ipa_gwrite_checked(s,0x250ac,0,~0u) || !ipa_gwrite_checked(s,0x25220,1,1))return false;
++    for(unsigned i=0;i<4;i++){
++        IpaGsiChannel *ch=&s->ch[i];ch->ring=0x2000+0x2000*i;ch->events=ch->ring+0x1000;
++        memset(dma+ch->ring,0,0x2000);io.sync(io.ctx,ch->ring,0x2000);
++        ch->event_owned=true;if(!ipa_gcmd(s,ch,true,0,1))return false;
++        if(!ipa_gwrite_checked(s,ipa_gev(ch->event,0),2|(1u<<7)|(16u<<24),0xff0000ff) ||
++           !ipa_gwrite_checked(s,ipa_gev(ch->event,1),ch->slots*16,0xffffff) ||
++           !ipa_gwrite_checked(s,ipa_gev(ch->event,2),base+ch->events,~0u) ||
++           !ipa_gwrite_checked(s,ipa_gev(ch->event,3),0,~0u))return false;
++        ipa_gw(s,ipa_gev(ch->event,8),32|(1u<<16));
++        for(unsigned n=9;n<=13;n++)if(!ipa_gwrite_checked(s,ipa_gev(ch->event,n),0,~0u))return false;
++        ipa_gw(s,0x24804+8*ch->event,0);ipa_gw(s,0x24800+8*ch->event,base+ch->events+(ch->slots-1)*16);
++        ch->channel_owned=true;if(!ipa_gcmd(s,ch,false,0,1))return false;
++        if(!ipa_gwrite_checked(s,ipa_gch(ch->channel,0),2|(ch->tx?1u<<7:0)|(16u<<24),0xff0000ff) ||
++           !ipa_gwrite_checked(s,ipa_gch(ch->channel,1),ch->slots*16|(ch->event<<24),~0u) ||
++           !ipa_gwrite_checked(s,ipa_gch(ch->channel,2),base+ch->ring,~0u) ||
++           !ipa_gwrite_checked(s,ipa_gch(ch->channel,3),0,~0u) ||
++           !ipa_gwrite_checked(s,0x14048+0x80*ch->channel,(ch->command?15:1u<<10)|(1u<<24),0x01003f0f))return false;
++        /* GPI scratch has reserved first 64 bits. Outstanding limits live in
++         * words 2/3, unlike the older HakiOS implementation. */
++        ipa_gw(s,0x1404c+0x80*ch->channel,0);ipa_gw(s,0x14050+0x80*ch->channel,0);
++        ipa_gw(s,0x14054+0x80*ch->channel,(ch->tlv*16)<<16);
++        ipa_gw(s,0x14058+0x80*ch->channel,(ipa_gr(s,0x14058+0x80*ch->channel)&0xffff)|(32u<<16));
++    }
++    return true;
++}
++static inline bool ipa_gsi_start(IpaGsi *s,unsigned i){
++    if(i>=4 || s->failed || !s->ch[i].channel_owned)return false;
++    if(!ipa_gcmd(s,&s->ch[i],false,1,2))return false;s->ch[i].started=true;return true;
++}
++static inline bool ipa_gsi_post(IpaGsi *s,unsigned i,uint16_t length,const void *data,unsigned bytes){
++    if(i>=4 || s->failed)return false;IpaGsiChannel *ch=&s->ch[i];
++    if(!ch->started || ch->posted-ch->completed>=ch->slots-1 || bytes>ch->buffer_size || (!ch->command && length>ch->buffer_size))return false;
++    unsigned slot=ch->posted%ch->slots,buf=ch->buffer+slot*ch->buffer_size,at=ch->ring+slot*16;
++    if(ch->tx){if(!data || !bytes)return false;memcpy(s->dma+buf,data,bytes);}
++    s->io.sync(s->io.ctx,buf,ch->buffer_size);
++    IpaTre tre={s->base+buf,length,0,(ch->command?3u:2u)<<16 | (1u<<9)|(1u<<10)};
++    memcpy(s->dma+at,&tre,16);s->io.sync(s->io.ctx,at,16);ch->posted++;
++    ipa_gw(s,0x24004+8*ch->channel,0);ipa_gw(s,0x24000+8*ch->channel,s->base+ch->ring+(ch->posted%ch->slots)*16);return true;
++}
++/* One event per TRE. Bad pointers/codes never release or repost DMA buffers. */
++static inline int ipa_gsi_event(IpaGsi *s,unsigned i,unsigned *buffer,unsigned *bytes){
++    if(i>=4 || s->failed)return -1;IpaGsiChannel *ch=&s->ch[i];
++    uint32_t base=s->base+ch->events,producer=ipa_gr(s,ipa_gev(ch->event,4));
++    if(producer<base || producer-base>=ch->slots*16 || ((producer-base)&15)){s->failed=true;return -1;}
++    if((producer-base)/16==ch->consumed%ch->slots)return 0;
++    unsigned at=ch->events+(ch->consumed%ch->slots)*16;s->io.sync(s->io.ctx,at,16);IpaEvent ev;memcpy(&ev,s->dma+at,16);
++    if(ch->completed==ch->posted || ev.transfer!=s->base+ch->ring+(ch->completed%ch->slots)*16 ||
++       ev.channel!=ch->channel || ev.type!=0x22 || (ev.code!=1 && ev.code!=2 && ev.code!=4) || (!ch->tx && ev.length>ch->buffer_size)){
++        s->failed=true;return -1;
++    }
++    *buffer=ch->buffer+(ch->completed%ch->slots)*ch->buffer_size;*bytes=ev.length;
++    if(!ch->tx)s->io.sync(s->io.ctx,*buffer,ch->buffer_size);
++    ch->completed++;ch->consumed++;ipa_gw(s,0x24800+8*ch->event,base+((ch->consumed-1)%ch->slots)*16);return 1;
++}
++/* Stop all channels before freeing any ring, then reset/deallocate. A command
++ * timeout cannot be repaired by freeing memory or blindly issuing another one. */
++static inline bool ipa_gsi_stop(IpaGsi *s){
++    if(s->uncertain)return false;
++    for(unsigned i=0;i<4;i++){
++        IpaGsiChannel *ch=&s->ch[i];if(!ch->channel_owned)continue;unsigned state=ipa_gstate(s,ch,false);
++        if(state==2){if(!ipa_gcmd(s,ch,false,2,3))return false;ch->started=false;}
++        else if(state!=1 && state!=3)return false;
++    }
++    for(unsigned i=0;i<4;i++){
++        IpaGsiChannel *ch=&s->ch[i];
++        if(ch->channel_owned){s->io.wait_us(s->io.ctx,1000);if(!ipa_gcmd(s,ch,false,9,1) || !ipa_gcmd(s,ch,false,10,0))return false;ch->channel_owned=false;}
++        if(ch->event_owned){if(!ipa_gcmd(s,ch,true,9,1) || !ipa_gcmd(s,ch,true,10,0))return false;ch->event_owned=false;}
++    }
++    if(s->claimed){static const unsigned irq[]={0x25088,0x25094,0x250a0,0x250ac,0x25220};
++        ipa_gw(s,0x250b0,15); /* Clear only our event notifications before output is restored. */
++        for(unsigned i=1;i<5;i++)if(!ipa_gwrite_checked(s,irq[i],s->irq_saved[i],~0u))return false;
++        if((ipa_gr(s,0x25090)&0x2e0) || (ipa_gr(s,0x2509c)&15) || (ipa_gr(s,0x250a8)&15))return false;
++        if(!ipa_gwrite_checked(s,irq[0],s->irq_saved[0],~0u))return false;s->claimed=false;}
++    return true;
++}
++#endif
+diff --git a/bsd/dev/modem/IpaLayout.h b/bsd/dev/modem/IpaLayout.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/modem/IpaLayout.h
+@@ -0,0 +1,36 @@
++#ifndef IPA_LAYOUT_H
++#define IPA_LAYOUT_H
++#include <stdint.h>
++#include <stdbool.h>
++#include <string.h>
++#define IPA_LOCAL_END 0x3fe8u
++/* All local offsets include MEM_BADDR only at the command/QMI boundary. */
++static inline bool ipa_local_bounds(uint32_t shared,uint32_t *offset,uint32_t *bytes){
++    *offset=8*(shared>>16);*bytes=8*(shared&0xffff);
++    return *bytes>=IPA_LOCAL_END && *offset<=0xffff && *bytes<=0x10000-*offset;
++}
++static inline unsigned ipa_layout_sram(uint8_t out[0x4000]){
++    memset(out,0,0x4000);
++    static const unsigned canary[]={0x288,0x308,0x388,0x408,0x488,0x528,0x5c8,0x668,0x708,0xb40,0x1868,0x2898,0x3ee8};
++    for(unsigned i=0;i<sizeof(canary)/sizeof(canary[0]);i++){
++        uint32_t v=0xdeadbeef;memcpy(out+canary[i]-8,&v,4);memcpy(out+canary[i]-4,&v,4);
++    }
++    return sizeof(canary)/sizeof(canary[0]);
++}
++static inline bool ipa_layout_tables(uint8_t *out,size_t bytes,uint64_t zero_iova){
++    if(bytes<21*8 || (zero_iova&7))return false;
++    uint64_t v=0;memcpy(out,&v,8);v=(1ull<<2)|(1ull<<7)|(1ull<<10);memcpy(out+8,&v,8);
++    /* IPA5.0 removed the global-filter bit: do not shift the bitmap. */
++    for(unsigned n=0;n<19;n++)memcpy(out+16+n*8,&zero_iova,8);return true;
++}
++static inline bool ipa_layout_table_cmd(uint8_t out[24],uint64_t source,uint32_t size,uint32_t base,uint32_t hash,uint32_t plain){
++    if(!size || size>0xfff || base>0xffff || hash>0xffff-base || plain>0xffff-base ||
++       hash>IPA_LOCAL_END || plain>IPA_LOCAL_END || size>IPA_LOCAL_END-hash || size>IPA_LOCAL_END-plain)return false;
++    uint64_t flags=size|((uint64_t)(base+hash)<<12)|((uint64_t)size<<28)|((uint64_t)(base+plain)<<40);
++    memcpy(out,&source,8);memcpy(out+8,&flags,8);memcpy(out+16,&source,8);return true;
++}
++static inline bool ipa_layout_dma_cmd(uint8_t out[16],uint64_t source,uint32_t base,uint32_t offset,uint32_t size,bool read){
++    if(!size || offset>IPA_LOCAL_END || size>IPA_LOCAL_END-offset || base>0xffff || offset>0xffff-base || size>0x10000-base-offset)return false;
++    uint16_t words[4]={0,(uint16_t)size,(uint16_t)(base+offset),read?1:0};memcpy(out,words,8);memcpy(out+8,&source,8);return true;
++}
++#endif
+diff --git a/bsd/dev/modem/IpaQmi.h b/bsd/dev/modem/IpaQmi.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/modem/IpaQmi.h
+@@ -0,0 +1,102 @@
++#ifndef IPA_QMI_H
++#define IPA_QMI_H
++#include <stdint.h>
++#include <stdbool.h>
++#include <string.h>
++#include "QcomQrtr.h"
++#include "IpaFirmware.h"
++#define IPA_QMI_SERVER 0x4004u
++#define IPA_QMI_CLIENT 0x4005u
++typedef struct {
++    uint32_t node,port,peer_node,peer_port,mem_offset,mem_size;
++    uint16_t transaction;
++    bool bound,peer_bound,sent,response_seen,accepted,registered,uc_done,indicated,failed;
++    uint64_t deadline;
++} IpaQmi;
++static inline void ipa_put16(uint8_t *p,uint16_t v){p[0]=(uint8_t)v;p[1]=(uint8_t)(v>>8);}
++static inline void ipa_put32(uint8_t *p,uint32_t v){ipa_put16(p,(uint16_t)v);ipa_put16(p+2,(uint16_t)(v>>16));}
++static inline unsigned ipa_tlv32(uint8_t *out,unsigned at,uint8_t type,uint32_t a){
++    out[at]=type;ipa_put16(out+at+1,4);ipa_put32(out+at+3,a);return at+7;
++}
++static inline unsigned ipa_tlv_pair(uint8_t *out,unsigned at,uint8_t type,uint32_t a,uint32_t b){
++    out[at]=type;ipa_put16(out+at+1,8);ipa_put32(out+at+3,a);ipa_put32(out+at+7,b);return at+11;
++}
++static inline unsigned ipa_qmi_init_request(uint8_t out[256],uint16_t transaction,uint32_t base,uint32_t size){
++    if(size<0x3fe8 || base>0xffff || size>0x10000-base)return 0;
++    memset(out,0,256);out[0]=QCOM_QMI_REQUEST;ipa_put16(out+1,transaction);ipa_put16(out+3,0x21);
++    unsigned n=7;
++    n=ipa_tlv32(out,n,0x10,3); /* MSM Android */
++    n=ipa_tlv_pair(out,n,0x11,base+0x708,base+0x947);
++    n=ipa_tlv_pair(out,n,0x12,base+0x528,10);
++    n=ipa_tlv_pair(out,n,0x13,base+0x668,10);
++    n=ipa_tlv32(out,n,0x14,base+0x308);n=ipa_tlv32(out,n,0x15,base+0x408);
++    n=ipa_tlv_pair(out,n,0x16,base+0x2898,0xd48);n=ipa_tlv32(out,n,0x17,18);
++    out[n++]=0x18;out[n++]=1;out[n++]=0;out[n++]=0; /* first boot: load uC */
++    n=ipa_tlv_pair(out,n,0x19,base+0xb40,base+0x165f);
++    n=ipa_tlv_pair(out,n,0x1b,base+0x488,10);n=ipa_tlv_pair(out,n,0x1c,base+0x5c8,10);
++    n=ipa_tlv32(out,n,0x1d,base+0x288);n=ipa_tlv32(out,n,0x1e,base+0x388);
++    n=ipa_tlv32(out,n,0x1f,base+0x1868);n=ipa_tlv32(out,n,0x20,0x60);
++    n=ipa_tlv32(out,n,0x21,base+0x2870);n=ipa_tlv32(out,n,0x22,0x20);
++    ipa_put16(out+5,(uint16_t)(n-7));return n;
++}
++static inline bool ipa_qmi_unique(const QcomQmiMessage *m){
++    uint8_t seen[256]={0};unsigned at=0;
++    while(at<m->length){unsigned n=ipa_le16(m->tlvs+at+1);uint8_t t=m->tlvs[at];if(seen[t])return false;seen[t]=1;at+=3+n;}
++    return true; /* qcom_qmi_parse has already bounded every TLV. */
++}
++static inline int ipa_qmi_result(QcomQrtr *qr,uint32_t from,uint32_t node,uint32_t port,uint8_t type,uint16_t txn,uint16_t msg){
++    uint8_t out[14]={0};out[0]=type;ipa_put16(out+1,txn);ipa_put16(out+3,msg);ipa_put16(out+5,7);out[7]=2;out[8]=4;
++    return qcom_qrtr_send_data(qr,from,node,port,out,sizeof(out));
++}
++static inline void ipa_qmi_receive(void *ctx,QcomQrtr *qr,uint32_t local,uint32_t node,uint32_t port,const uint8_t *data,uint32_t len){
++    IpaQmi *s=ctx;QcomQmiMessage msg;
++    if(s->failed)return;
++    if(s->bound){
++        unsigned matches=0;
++        for(unsigned i=0;i<qr->remote_count;i++)if(qr->remote[i].service==0x31 && qr->remote[i].instance==0x201){
++            if(qr->remote[i].node!=s->node || qr->remote[i].port!=s->port){s->failed=true;return;}matches++;
++        }
++        if(matches!=1){s->failed=true;return;}
++    }
++    if(local==IPA_QMI_CLIENT){
++        if(!s->bound || node!=s->node || !s->sent || port!=s->port || len<5 || data[0]!=QCOM_QMI_RESPONSE ||
++           ipa_le16(data+3)!=0x21 || ipa_le16(data+1)!=s->transaction || s->response_seen)return;
++        s->response_seen=true;
++        if(qcom_qmi_parse(data,len,&msg) || !ipa_qmi_unique(&msg)){s->failed=true;return;}
++        uint32_t n=0;const uint8_t *p=qcom_qmi_tlv(&msg,2,&n);
++        if(!p || n!=4 || ipa_le16(p) || ipa_le16(p+2))s->failed=true;else s->accepted=true;
++        return;
++    }
++    if(qcom_qmi_parse(data,len,&msg) || !ipa_qmi_unique(&msg))return;
++    if(local!=IPA_QMI_SERVER || msg.type!=QCOM_QMI_REQUEST || (msg.message!=0x20 && msg.message!=0x35))return;
++    /* The modem client may register before its server announcement arrives. */
++    if(!qr->hello_received || node!=qr->remote_node || (s->bound && node!=s->node))return;
++    if(s->peer_bound && (node!=s->peer_node || port!=s->peer_port))return;
++    uint32_t n=0;const uint8_t *p=qcom_qmi_tlv(&msg,msg.message==0x20?0x10:1,&n);
++    if(!p || n!=1 || p[0]!=1)return;
++    if(ipa_qmi_result(qr,local,node,port,QCOM_QMI_RESPONSE,msg.transaction,msg.message)){s->failed=true;return;}
++    s->peer_node=node;s->peer_port=port;s->peer_bound=true;
++    if(msg.message==0x20)s->registered=true;else s->uc_done=true;
++}
++static inline int ipa_qmi_poll(IpaQmi *s,QcomQrtr *qr,uint64_t now,bool hardware_ready){
++    if(s->failed)return -1;
++    if(!hardware_ready)return 0;
++    int found=-1;
++    for(unsigned i=0;i<qr->remote_count;i++)if(qr->remote[i].service==0x31 && qr->remote[i].instance==0x201){if(found>=0){s->failed=true;return -1;}found=(int)i;}
++    if(found<0){if(s->bound)s->failed=true;return s->failed?-1:0;}
++    uint32_t node=qr->remote[found].node,port=qr->remote[found].port;
++    if((s->peer_bound && node!=s->peer_node) || (s->bound && (node!=s->node || port!=s->port))){s->failed=true;return -1;}
++    s->bound=true;s->node=node;s->port=port;
++    if(!s->sent){uint8_t out[256];s->transaction=1;
++        unsigned n=ipa_qmi_init_request(out,s->transaction,s->mem_offset,s->mem_size);
++        if(!n || qcom_qrtr_send_data(qr,IPA_QMI_CLIENT,node,port,out,n)){s->failed=true;return -1;}
++        s->sent=true;s->deadline=now+60000;
++    }
++    if(s->accepted && s->uc_done && s->registered && !s->indicated){
++        if(ipa_qmi_result(qr,IPA_QMI_SERVER,s->node,s->peer_port,QCOM_QMI_INDICATION,0,0x22)){s->failed=true;return -1;}
++        s->indicated=true;
++    }
++    if(s->accepted && s->uc_done && s->indicated)return 1;
++    if(now>=s->deadline){s->failed=true;return -1;}return 0;
++}
++#endif
+diff --git a/bsd/dev/modem/IpaHardware.inc b/bsd/dev/modem/IpaHardware.inc
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/modem/IpaHardware.inc
+@@ -0,0 +1,118 @@
++#include "IpaGsi.h"
++#include "IpaLayout.h"
++#include "IpaQmi.h"
++#include "SweetIpa.h"
++static struct {
++    IpaGsi gsi;IpaQmi qmi;uint32_t offset,bytes;
++    struct {unsigned off;uint32_t old,mask;} saved[128];unsigned count;
++    bool touched,ready,failed,logged;
++} iph;
++static uint32_t ipa_gread(void *unused,unsigned o){(void)unused;return m_rd(ipa.block,0x4000+o);}
++static void ipa_gwrite(void *unused,unsigned o,uint32_t v){(void)unused;m_wr(ipa.block,0x4000+o,v);}
++static void ipa_gsync(void *unused,unsigned o,unsigned n){(void)unused;sweet_dma_sync_va((void *)(ipa.dma+PAGE_SIZE+o),n);}
++static void ipa_gwait(void *unused,unsigned us){(void)unused;delay(us);}
++static uint32_t ipa_hr(unsigned o){return m_rd(ipa.block,0x140000+o);}
++static void ipa_hw(unsigned o,uint32_t v){m_wr(ipa.block,0x140000+o,v);}
++static bool ipa_hconfig(unsigned o,uint32_t v,uint32_t mask){
++    if(iph.count==128)return false;
++    bool saved=false;for(unsigned i=0;i<iph.count;i++)if(iph.saved[i].off==o){saved=true;break;}
++    if(!saved){iph.saved[iph.count].off=o;iph.saved[iph.count].old=ipa_hr(o);iph.saved[iph.count++].mask=mask;}
++    iph.touched=true;ipa_hw(o,v);return (ipa_hr(o)&mask)==(v&mask);
++}
++static bool ipa_endpoint_program(IpaGsiChannel *ch){
++    unsigned b=0x1000+0x80*ch->endpoint;bool qmap=ch->endpoint==2 || ch->endpoint==18;uint32_t hdr=0,ext=0,aggr=0;
++    if(qmap){hdr=4|(1u<<6);ext=1;if(!ch->tx){hdr|=(1u<<7)|(1u<<19)|(2u<<20);ext|=2|8;}}
++    if(!ch->tx){aggr=1|(4u<<2)|(6u<<5)|(5u<<12)|(16u<<17);if(qmap)aggr|=1u<<23;}
++    else if(qmap)aggr=2|(6u<<2);
++    if(!ipa_hconfig(b+8,0,0x17f) || !ipa_hconfig(b+0x10,hdr,~0u) || !ipa_hconfig(b+0x14,ext,~0u) ||
++       !ipa_hconfig(b+0x24,aggr,0x0dffffff) || !ipa_hconfig(b+0x38,ch->endpoint==18?1:0,7) || !ipa_hconfig(b+0x40,ch->endpoint==2?1|(16u<<1):ch->endpoint==11?1:0,0x3ff))return false;
++    if(ch->tx)return ipa_hconfig(b+0xc,0,3) && ipa_hconfig(b+0x20,ch->command?3|(11u<<4):0,~0u) &&
++        ipa_hconfig(b+0x34,0,~0u) && ipa_hconfig(b+0x3c,ch->command?0:4,0xff);
++    return ipa_hconfig(b+0x18,qmap?0xff000000u:0,~0u) && ipa_hconfig(b+0x2c,0,1);
++}
++static bool ipa_resources(void){
++    static const uint8_t src[5][6]={{1,7,1,7,0,5},{8,8,8,8,8,8},{10,10,12,12,12,12},{0,63,0,63,0,63},{15,15,15,15,12,12}};
++    static const uint8_t dst[3][8]={{3,3,3,3,0,0,23,23},{1,2,1,2,0,0,0,0},{1,63,1,63,0,0,0,0}};
++    for(unsigned i=0;i<5;i++)for(unsigned pair=0;pair<2;pair++){
++        unsigned j=pair*4;uint32_t v=src[i][j]|src[i][j+1]<<8;if(!pair)v|=(uint32_t)src[i][2]<<16|(uint32_t)src[i][3]<<24;
++        if(!ipa_hconfig(0x500+0x20*i+4*pair,v,0x3f3f3f3f))return false;
++    }
++    for(unsigned i=0;i<3;i++)for(unsigned pair=0;pair<2;pair++){
++        unsigned j=pair*4;uint32_t v=dst[i][j]|dst[i][j+1]<<8|(uint32_t)dst[i][j+2]<<16|(uint32_t)dst[i][j+3]<<24;
++        if(!ipa_hconfig(0x600+0x20*i+4*pair,v,0x3f3f3f3f))return false;
++    }
++    return true;
++}
++static bool ipa_immediate(unsigned opcode,const void *payload,unsigned bytes){
++    IpaGsi *g=&iph.gsi;if(!ipa_gsi_post(g,0,(uint16_t)opcode,payload,bytes))return false;
++    unsigned off,n;
++    for(unsigned us=0;us<200000;us+=100){
++        int rc=ipa_gsi_event(g,0,&off,&n);if(rc>0)return true;if(rc<0)return false;delay(100);
++    }
++    g->failed=true;printf("SWEET IPA: immediate opcode=%#x timed out\n",opcode);return false;
++}
++static bool ipa_tables_setup(void){
++    uint8_t *dma=(void *)(ipa.dma+PAGE_SIZE);uint8_t command[24];
++    ipa_layout_sram(dma+0xa000);ipa_gsync(0,0xa000,0x4000);
++    if(!ipa_layout_dma_cmd(command,IPA_DMA_IOVA+0xa280,iph.offset,0x280,IPA_LOCAL_END-0x280,false) || !ipa_immediate(0x13,command,16))return false;
++    if(!ipa_layout_tables(dma,4096,IPA_DMA_IOVA))return false;ipa_gsync(0,0,4096);
++    const unsigned hash[]={0x488,0x5c8,0x288,0x388},plain[]={0x528,0x668,0x308,0x408},op[]={7,8,3,4};
++    for(unsigned i=0;i<4;i++)if(!ipa_layout_table_cmd(command,IPA_DMA_IOVA+(i<2?16:8),i<2?19*8:4*8,iph.offset,hash[i],plain[i]) || !ipa_immediate(op[i],command,24))return false;
++    struct {uint64_t address;uint32_t flags,reserved;} header={IPA_DMA_IOVA+0xa708,0x420|((iph.offset+0x708)<<12),0};
++    if(!ipa_immediate(9,&header,sizeof(header)) || !ipa_hconfig(0x478,iph.offset+0xb40,0x3ffff))return false;
++    /* Read back all canaries and every initial table pointer before the
++     * modem sees an initialized IPA service. */
++    memset(dma+0xa000,0,0x4000);ipa_gsync(0,0xa000,0x4000);
++    if(!ipa_layout_dma_cmd(command,IPA_DMA_IOVA+0xa280,iph.offset,0x280,IPA_LOCAL_END-0x280,true) || !ipa_immediate(0x13,command,16))return false;
++    ipa_gsync(0,0xa000,0x4000);
++    static const unsigned canaries[]={0x288,0x308,0x388,0x408,0x488,0x528,0x5c8,0x668,0x708,0xb40,0x1868,0x2898,0x3ee8};
++    for(unsigned i=0;i<sizeof(canaries)/sizeof(canaries[0]);i++)for(unsigned word=1;word<=2;word++){
++        uint32_t value;memcpy(&value,dma+0xa000+canaries[i]-4*word,4);if(value!=0xdeadbeef)return false;
++    }
++    for(unsigned i=0;i<4;i++)for(unsigned hashed=0;hashed<2;hashed++){
++        unsigned at=hashed?hash[i]:plain[i];uint64_t value;
++        if(i>=2){memcpy(&value,dma+0xa000+at,8);if(value!=((1ull<<2)|(1ull<<7)|(1ull<<10)))return false;at+=8;}
++        for(unsigned n=0;n<(i<2?19u:3u);n++){
++            memcpy(&value,dma+0xa000+at+n*8,8);if(value!=IPA_DMA_IOVA)return false;
++        }
++    }
++    ipa_hw(0x404,0x11); /* IPA5.0 cache flush bits0/4, not pre5.0 0x1111. */
++    printf("SWEET IPA: immediate tables and SRAM readback PASS base=%#x bytes=%#x\n",iph.offset,iph.bytes);sweet_log_sync();return true;
++}
++static int ipa_hardware_setup(void){
++    memset(&iph,0,sizeof(iph));
++    if(!ipa_local_bounds(ipa_hr(0x40),&iph.offset,&iph.bytes))return EINVAL;
++    uint32_t flavor=ipa_hr(0);unsigned pipes=flavor&255,producers=(flavor>>16)&255,first=flavor>>24;
++    if(pipes<=18 || !producers || first>2 || first+producers<=9)return ENOTSUP;
++    IpaGsiIo io={0,ipa_gread,ipa_gwrite,ipa_gsync,ipa_gwait};
++    if(!ipa_gsi_available(io))return EBUSY;
++    if(!ipa_hconfig(0xc00c,0,~0u) || !ipa_hconfig(0x2c,ipa_hr(0x2c)|(1u<<7)|(1u<<8),~0u) ||
++       !ipa_hconfig(0x54,13,0xff) || !ipa_hconfig(0x58,13,~0u) || !ipa_hconfig(0x4b0,0,~0u) ||
++       !ipa_hconfig(0x4ac,14|(1u<<7)|(14u<<8)|(24u<<16),~0u) ||
++       !ipa_hconfig(0x4b4,3|(4u<<3)|(5u<<6)|(5u<<9),0xfff) ||
++       !ipa_hconfig(0x4b0,191,~0u) || !ipa_hconfig(0x4b0,0x80000000u|191,~0u) || !ipa_resources())return EIO;
++    if(!ipa_gsi_setup(&iph.gsi,io,(void *)(ipa.dma+PAGE_SIZE),IPA_DMA_IOVA))return EIO;
++    for(unsigned i=0;i<4;i++)if(!ipa_endpoint_program(&iph.gsi.ch[i]))return EIO;
++    if(!ipa_hconfig(0x38,11|(11u<<8)|(1u<<26)|(1u<<27),0x1fffffff))return EIO;
++    for(unsigned i=0;i<19;i++)if(!ipa_hconfig(0x1070+0x80*i,0,0x7f))return EIO;
++    if(!ipa_hconfig(0x105c+0x80*2,0,0x7f))return EIO;
++    for(unsigned i=0;i<4;i++){
++        if(!ipa_gsi_start(&iph.gsi,i))return EIO;
++        if(!iph.gsi.ch[i].tx)for(unsigned n=0;n<iph.gsi.ch[i].slots-1;n++)if(!ipa_gsi_post(&iph.gsi,i,8192,0,0))return EIO;
++    }
++    if(!ipa_tables_setup())return EIO;
++    iph.qmi.mem_offset=iph.offset;iph.qmi.mem_size=iph.bytes;iph.ready=true;
++    printf("SWEET IPA: AP endpoints 9/ch6 11/ch7 2/ch5 18/ch9 ready QMAPv1 RX8192 aggr6144/16/500us\n");sweet_log_sync();return 0;
++}
++static bool ipa_hardware_stop(void){
++    iph.ready=false;
++    if(!ipa.block || !iph.touched)return true;
++    if(iph.gsi.claimed){
++        uint32_t rx=(1u<<11)|(1u<<18);ipa_hw(0x6b0,rx);
++        unsigned tries;for(tries=0;tries<1000;tries++){if(!(ipa_hr(0x100)&rx))break;delay(100);}
++        if(tries==1000 || !ipa_gsi_stop(&iph.gsi))return false;
++    }
++    while(iph.count){unsigned i=iph.count-1;ipa_hw(iph.saved[i].off,iph.saved[i].old);
++        if((ipa_hr(iph.saved[i].off)&iph.saved[i].mask)!=(iph.saved[i].old&iph.saved[i].mask))return false;iph.count--;}
++    iph.touched=false;return true;
++}
+diff --git a/bsd/dev/modem/IpaTxQueue.h b/bsd/dev/modem/IpaTxQueue.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/modem/IpaTxQueue.h
+@@ -0,0 +1,19 @@
++#ifndef IPA_TX_QUEUE_H
++#define IPA_TX_QUEUE_H
++#include <stdint.h>
++#include <stdbool.h>
++#include <string.h>
++#define IPA_TX_QUEUE_COUNT 32u
++#define IPA_TX_QUEUE_BYTES 2048u
++/* Caller holds the same mutex for producer and consumer operations. */
++typedef struct {unsigned head,count;bool ready;struct {uint16_t bytes;uint8_t data[IPA_TX_QUEUE_BYTES];} packet[IPA_TX_QUEUE_COUNT];} IpaTxQueue;
++static inline int ipa_tx_copy(IpaTxQueue *q,const void *data,size_t bytes){
++    if(!q->ready)return 1;
++    if(!data || bytes<4)return 2;
++    if(bytes>IPA_TX_QUEUE_BYTES)return 3;
++    if(q->count==IPA_TX_QUEUE_COUNT)return 4;
++    unsigned at=(q->head+q->count)%IPA_TX_QUEUE_COUNT;
++    memcpy(q->packet[at].data,data,bytes);q->packet[at].bytes=(uint16_t)bytes;q->count++;return 0;
++}
++static inline void ipa_tx_drop_all(IpaTxQueue *q){q->ready=false;q->head=q->count=0;}
++#endif
+diff --git a/bsd/dev/modem/IpaData.inc b/bsd/dev/modem/IpaData.inc
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/modem/IpaData.inc
+@@ -0,0 +1,47 @@
++#ifndef IPA_HOST_TEST
++#include <kern/locks.h>
++#endif
++#include "IpaTxQueue.h"
++static LCK_GRP_DECLARE(ipa_queue_group,"ipa_queue");
++static LCK_MTX_DECLARE(ipa_queue_lock,&ipa_queue_group);
++static IpaTxQueue ipa_txq;
++static sweet_ipa_rx_fn ipa_receive;
++static void *ipa_receive_ctx;
++int sweet_ipa_transmit(const void *data,size_t bytes){
++    lck_mtx_lock(&ipa_queue_lock);int rc=ipa_tx_copy(&ipa_txq,data,bytes);lck_mtx_unlock(&ipa_queue_lock);
++    static const int errors[]={0,ENETDOWN,EINVAL,EMSGSIZE,EAGAIN};return errors[rc];
++}
++int sweet_ipa_register_rx(sweet_ipa_rx_fn receive,void *context){
++    if(!receive)return EINVAL;int rc=0;lck_mtx_lock(&ipa_queue_lock);
++    if(ipa_receive && (ipa_receive!=receive || ipa_receive_ctx!=context))rc=EBUSY;
++    else{ipa_receive=receive;ipa_receive_ctx=context;}lck_mtx_unlock(&ipa_queue_lock);return rc;
++}
++bool sweet_ipa_ready(void){lck_mtx_lock(&ipa_queue_lock);bool ready=ipa_txq.ready;lck_mtx_unlock(&ipa_queue_lock);return ready;}
++static void ipa_data_ready(bool ready){
++    lck_mtx_lock(&ipa_queue_lock);if(ready)ipa_txq.ready=true;else ipa_tx_drop_all(&ipa_txq);lck_mtx_unlock(&ipa_queue_lock);
++}
++static bool ipa_data_poll(void){
++    if(!iph.ready || iph.gsi.failed)return false;
++    for(unsigned i=1;i<4;i++)for(unsigned work=0;work<64;work++){
++        unsigned offset,bytes;int rc=ipa_gsi_event(&iph.gsi,i,&offset,&bytes);if(!rc)break;if(rc<0)return false;
++        if(!iph.gsi.ch[i].tx){
++            sweet_ipa_rx_fn receive;void *context;
++            lck_mtx_lock(&ipa_queue_lock);receive=ipa_receive;context=ipa_receive_ctx;bool ready=ipa_txq.ready;lck_mtx_unlock(&ipa_queue_lock);
++            if(i==3 && ready && receive && bytes)receive(context,(void *)(ipa.dma+PAGE_SIZE+offset),bytes);
++            if(!ipa_gsi_post(&iph.gsi,i,8192,0,0))return false;
++        }
++    }
++    /* Copy queue data under lock to a worker-local buffer. The receiver can
++     * enqueue a reply without lock recursion. No network callback runs here. */
++    for(unsigned work=0;work<IPA_TX_QUEUE_COUNT;work++){
++        uint8_t packet[IPA_TX_QUEUE_BYTES];unsigned bytes=0;
++        lck_mtx_lock(&ipa_queue_lock);
++        if(ipa_txq.ready && ipa_txq.count && iph.gsi.ch[2].posted-iph.gsi.ch[2].completed<iph.gsi.ch[2].slots-1){
++            bytes=ipa_txq.packet[ipa_txq.head].bytes;memcpy(packet,ipa_txq.packet[ipa_txq.head].data,bytes);
++            ipa_txq.head=(ipa_txq.head+1)%IPA_TX_QUEUE_COUNT;ipa_txq.count--;
++        }
++        lck_mtx_unlock(&ipa_queue_lock);if(!bytes)break;
++        if(!ipa_gsi_post(&iph.gsi,2,(uint16_t)bytes,packet,bytes))return false;
++    }
++    return true;
++}
+diff --git a/bsd/dev/modem/IpaSession.inc b/bsd/dev/modem/IpaSession.inc
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/modem/IpaSession.inc
+@@ -0,0 +1,35 @@
++/* All entry points here run on the existing modem worker. */
++static unsigned ipa_qmi_logged;
++static int ipa_qrtr_attach(QcomQrtr *qr){
++    if(!ipa_full)return 0;
++    if(qcom_qrtr_add_service(qr,0x31,0x101,IPA_QMI_SERVER,ipa_qmi_receive,&iph.qmi) ||
++       qcom_qrtr_add_service(qr,0,0,IPA_QMI_CLIENT,ipa_qmi_receive,&iph.qmi))return EIO;
++    return 0;
++}
++static void ipa_clock_poll(void){
++    if(!ipa_full || ipa_smp_index<0 || !m.sp.out || !m.sp.in)return;
++    uint32_t value,changed;bool ring=qcom_smp2p_service(&m.sp,"ipa",&value,&changed)!=0;
++    if((changed&1) && ipa.clock_pinned){
++        /* Nothing vendor bit0=response valid, bit1=clock on. The owned
++         * clock vote stays pinned through shutdown and retained failures. */
++        ring|=qcom_smp2p_update(&m.sp,ipa_smp_index,3,3)!=0;
++        printf("SWEET IPA: SMP2P power query=%#x clock_on=1 valid=1\n",value);sweet_log_sync();
++    }
++    if(ring)m_ring(2,2);
++}
++static int ipa_session_poll(void){
++    if(!ipa_full)return 0;
++    if(!ipa_data_poll())return EIO;
++    if(!m.qr_started)return 0;
++    int rc=ipa_qmi_poll(&iph.qmi,&m.qr,m_now(),iph.ready);
++    unsigned state=iph.qmi.sent|(iph.qmi.accepted<<1)|(iph.qmi.registered<<2)|(iph.qmi.uc_done<<3)|(iph.qmi.indicated<<4);
++    if(state!=ipa_qmi_logged){ipa_qmi_logged=state;
++        printf("SWEET IPA: QMI node=%u port=%u sent=%u accepted=%u registered=%u uc_done=%u indicated=%u queued=%u\n",
++            iph.qmi.node,iph.qmi.port,iph.qmi.sent,iph.qmi.accepted,iph.qmi.registered,iph.qmi.uc_done,iph.qmi.indicated,m.qcount);sweet_log_sync();}
++    if(rc<0)return EIO;
++    if(rc==1 && !m.qcount && !m.failed && !m.fatal && !iph.logged){
++        ipa_data_ready(true);iph.logged=true;
++        printf("SWEET IPA: I3 handshake complete; AP endpoints active; QMAPv1; no ONLINE request\n");sweet_log_sync();
++    }
++    return 0;
++}

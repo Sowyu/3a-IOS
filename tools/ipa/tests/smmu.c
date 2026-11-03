@@ -18,8 +18,13 @@ int main(void){
     assert(resolve(&t,0x14684fff)==0x14684fff);assert(!resolve(&t,0x14685000));
     assert(ipa_pt_map(&t,0x20000000,0x8c2000000ull,4096));
     assert(ipa_pt_map(&t,0x30000001,0x8c2000000ull,4096));
-    assert(ipa_pt_map(&t,(1ull<<39)-4096,0,8192));
-    assert(ipa_pt_map(&t,0x30000000,(1ull<<48)-4096,8192));
+    assert(ipa_pt_map(&t,(1ull<<36)-4096,0,8192));
+    assert(ipa_pt_map(&t,0x30000000,(1ull<<36)-4096,8192));
+    assert(ipa_pt_init(&t,words,(1ull<<36)-4096));
+    assert(!ipa_pt_init(&t,words,(1ull<<36)-IPA_PT_PAGES*IPA_PT_PAGE));
+    assert(!ipa_pt_map(&t,(1ull<<36)-4096,(1ull<<36)-4096,4096));
+    assert(resolve(&t,(1ull<<36)-1)==(1ull<<36)-1);
+    assert(ipa_pt_map(&t,1ull<<36,0,4096));assert(ipa_pt_map(&t,0,1ull<<36,4096));
     assert(!ipa_pt_init(&t,words,0x8c1000000ull));
     unsigned mapped=0;while(!ipa_pt_map(&t,(uint64_t)mapped<<30,0x8c2000000ull,4096))mapped++;
     assert(mapped==7 && t.used<=IPA_PT_PAGES);

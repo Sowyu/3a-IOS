@@ -19,9 +19,12 @@ static IpaMmu reset(void){
 int main(void){
  const uint64_t pa[]={0x8c1000000ull,0x8c1010000ull};
  IpaMmu m=reset();assert(ipa_mmu_install(&m,pa));assert(m.context[0].bank==1 && m.context[1].bank==2);
+ assert(reg[(ipa_cb(m.context[0].bank)+0x10)/4]==((7u<<15)|1));
+ assert((reg[(ipa_cb(m.context[0].bank)+0x30)/4]&63)==28);
  unsigned installed_writes=writes;
  assert(ipa_mmu_restore(&m,true));assert(!memcmp(original,reg,0x800));assert(reg[0x800/4]==original[0x800/4]);
  for(unsigned n=0;n<2;n++){IpaMmuContext *p=&m.context[n];assert(reg[(0x800+4*p->slot)/4]==p->smr);assert(reg[ipa_cb(p->bank)/4]==0);assert(reg[(ipa_cb(p->bank)+0x20)/4]==0);}
+ m=reset();const uint64_t oversized[]={1ull<<36,0x8c1010000ull};assert(!ipa_mmu_install(&m,oversized) && !writes);
  m=reset();reg[0x808/4]=0x800004a0;assert(!ipa_mmu_install(&m,pa));assert(writes==0);
  m=reset();reg[0x24/4]^=1;assert(!ipa_mmu_install(&m,pa));assert(writes==0);
  m=reset();assert(ipa_mmu_install(&m,pa));unsigned before=writes;assert(!ipa_mmu_restore(&m,false));assert(writes==before && m.retained);

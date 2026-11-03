@@ -2,7 +2,7 @@
 
 ## Checkpoint, 2026-11-03
 
-I1 is complete. I2 is in progress. Patch 2200 passed its audited read-only phone run, ast159. Firmware bounds and the APPS SMMU survey passed, with no IPA/GSI MMIO or PAS15 call. The isolated xnu-ipa tree now carries copied modem patches 2170 through 2186. Mobile data does not work yet.
+I1 is complete. I2 is in progress. Patch 2200 passed its audited read-only phone run, ast159. Firmware bounds and the APPS SMMU survey passed, with no IPA/GSI MMIO or PAS15 call. The isolated xnu-ipa tree now carries copied modem patches 2170 through 2187 revision 2. Mobile data does not work yet.
 
 Host inspection of the existing extracted ipa_fws.mdt found three relocatable loads, 17824 file bytes and a page-rounded span of 0x7000. This fits the 0xa000 GSI reservation. `tools/ipa/inspect_mdt.py` checks ELF bounds, overlap and relocation span without loading firmware. It does not check split-file contents or authenticate the image. Three synthetic host tests pass, including nine malformed cases. Local evidence is `plans/ipa/logs/host-check.txt` and `plans/ipa/logs/firmware-inventory.json`.
 
@@ -120,9 +120,9 @@ Initialize empty filter/routing entries to valid mapped zero-rule storage with t
 
 ## Remaining implementation and release gates
 
-1. Obtain fresh Sol approval for the 2201 RSC completion correction and run one bounded PAS15-only probe.
-2. Finish GSI rings, immediate commands, IPA tables and the bidirectional modem QMI handshake in 2202, with fault tests.
-3. Build the combined modem/IPA source, obtain a separate Sol GO and prove I3 on the phone.
+1. Obtain fresh Sol approval for the 36-bit SMMU correction and run one bounded PAS15-only probe.
+2. Review the built 2202 GSI, tables and bidirectional QMI implementation.
+3. After verified probe cleanup and explicit 2202 approval, prove I3 on the phone.
 4. Coordinate the first ONLINE call with the modem agent after another Sol GO, then prove I4.
 
 The isolated tree and Trash-safe build path are complete. Every build uses --remake -j6. PAS4 teardown remains the modem agent's responsibility. The combined driver must retain IPA backing and power if modem shutdown cannot be verified.
@@ -151,7 +151,7 @@ Decided on 2026-11-03. These are implementation choices, not live I3 evidence. T
 4. `typedef void (*sweet_ipa_rx_fn)(void *context, const uint8_t *qmap, size_t bytes);` and `int sweet_ipa_register_rx(sweet_ipa_rx_fn receive, void *context)` register one kernel-lifetime receiver. Registration returns EBUSY if a different receiver is already registered. The callback runs in the modem/IPA worker, outside interrupt context and without the TX queue lock held. It receives one completed aggregate, at most 8192 bytes. Its pointer is valid only during the callback. The data agent copies any data it keeps. GSI repost happens after the callback returns. Registration is intended for a built-in driver, not an unloadable module.
 5. The SM7635 DT/vendor and Linux 5.2 endpoint plan is AP WAN producer endpoint 2, GSI channel 5, and AP WAN consumer endpoint 18, GSI channel 9. AP command endpoint 9 uses channel 6. AP LAN exception consumer endpoint 11 uses channel 7. All are EE0. Planned AP event rings are 0, 1, 2, 3, allocated only after hardware reports them free. Modem WAN producer is endpoint 7, EE1 channel 0. Modem WAN consumer is endpoint 16, EE1 channel 7. No EE1 register is programmed by this driver.
 
-`bool sweet_ipa_ready(void)` will report true only after hardware setup and the IPA QMI handshake complete. It is not proof of NAS registration or a WDS data session. Patch 2220 must own those states. Endpoint IDs above are source-derived until an audited live GSI setup verifies them. No API is linked into the current 2201 probe image yet.
+`bool sweet_ipa_ready(void)` will report true only after hardware setup and the IPA QMI handshake complete. It is not proof of NAS registration or a WDS data session. Patch 2220 must own those states. Endpoint IDs above are source-derived until an audited live GSI setup verifies them. The 2202 kernel exports this API. Firmware-only mode keeps it unavailable.
 
 ## 2201 lifecycle candidate
 
@@ -159,6 +159,20 @@ The default-off PAS15-only probe now requires strict sweetmpss=1, sweetmbw=1, sw
 
 Cleanup verifies every saved SMMU context field before freeing backing. Any uncertain PAS shutdown, TLB completion, restoration or DMA guard retains memory and power until reset. Copied modem2184 preserves the shared SN3 floor across late touch votes. Copied2186 permits polled RSC completion only while GIC IRQ37 delivery is disabled. IPA CN0/IP0 transactions use the same guarded completion path. IP0 requests the vendor's initial 120 MHz rate.
 
-Host checks reconstruct the public patch and exercise the actual lifecycle with ASan/UBSan. They cover every allocation failure, PAS failures, shutdown retention, dropped restore writes, guarded GIC state, masked RSC status, dropped enable/clear writes and stale completion. Run `sh tools/ipa/check-lifecycle.sh` from 3a-IOS. The full remake passed and all ten kernel segments match the replacement image. No firmware phone run has occurred yet. The earlier Sol GO is superseded by the RSC correction and a fresh audit is pending.
+Host checks reconstruct the public patch and exercise the actual lifecycle with ASan/UBSan. They cover every allocation failure, PAS failures, shutdown retention, dropped restore writes, guarded GIC state, masked RSC status, dropped enable/clear writes and stale completion. Run `sh tools/ipa/check-lifecycle.sh` from 3a-IOS. The full remake passed and all ten kernel segments match the replacement image. No firmware phone run has occurred yet. The RSC review approved an earlier image. That approval is now superseded by the 36-bit correction described below.
 
-Local evidence is plans/ipa/logs/host-2201-irq.txt, build-2201-irq.txt and verify-2201-irq.txt. The kernel SHA256 is e80b6e1c224b5830d38f42e1ca2ee444a6da9ee1afbd11c76b59e5815211ea67. The image SHA256 is 1299ced60e52df0aeaea3536435cf5297c2ec9ed896bfe3cc6f2681fd6d39f72.
+Obsolete image evidence is plans/ipa/logs/host-2201-irq.txt, build-2201-irq.txt and verify-2201-irq.txt. The kernel SHA256 is e80b6e1c224b5830d38f42e1ca2ee444a6da9ee1afbd11c76b59e5815211ea67. The image SHA256 is 1299ced60e52df0aeaea3536435cf5297c2ec9ed896bfe3cc6f2681fd6d39f72.
+
+## 2202 candidate and SMMU width correction
+
+The GSI/table/QMI implementation and the public TX/RX API now compile in the isolated kernel. `sh tools/ipa/check-datapath.sh` reconstructs the public source and tests ring wrap, completion validation, command timeouts, SRAM/table readback, retained teardown, copied TX buffers, reentrant RX callbacks, SMP2P power responses and QMI readiness after transport flush. These are host results, not live endpoint measurements.
+
+Before the first firmware boot, I found that ast159 ID2=0x5111 advertises 36-bit input, output and upstream addresses. The earlier 39-bit IOVA and 48-bit PA configuration exceeded that geometry. The queued probe was cancelled before phone access, and its hold was released. The corrected tables and allocator enforce 36 bits, with TCR2 PASIZE=1 and TCR T0SZ=28. Boundary tests reject a table or mapping crossing 64 GiB. A fresh audit is required. No IPA firmware has been loaded yet.
+
+Modem2187 revision2 is copied unchanged with SHA256 f1dd3d1fd6406fca105bf001123ecf0f2850ba3c51013e4684c0bd3a6db8790f. It supplies eight QRTR slots. IPA registers server/client ports 0x4004/0x4005 during GLINK preparation, before QRTR starts. Future data binding must call sweet_data_set_ipa and register the RX callback after IPA preparation, before sweet_data_attach adds ports 0x4010/0x4011. The data setter refuses changes after attach. The 2202 candidate contains no data attach or ONLINE call.
+
+Full mode requires sweetipa=1 plus strict modem, bandwidth, guarded completion, GLINK, RAM-rmtfs, pd-mapper and sysmon gates. Firmware-only sweetipafw and full mode are mutually exclusive. Full mode builds the AP-owned channels and tables before MPSS authentication. On exit it revokes software readiness first. Failed PAS4 shutdown retains every IPA mapping, ring, firmware allocation and power vote. A verified modem stop permits GSI teardown, then PAS15 shutdown, then verified SMMU restoration and backing release.
+
+The previous firmware image is obsolete and must not boot. The current common kernel SHA256 is 9967fa32fb1242ca523dae10306a0585120badf1ad7a8049a844e93295ab543e. The firmware-only image is 39e08eecd19009f5fccc027ec2cba78d06b551f0d4127fa4df467531ddfb57a3. The handshake image is dc92356124af17ed81fb8bffbefd4f3d921bafd5a5ced76de7681ef1470c4ca8. Both passed all ten segment checks. Neither is approved for a phone run yet. The runner permits one boot attempt and forbids replay boots.
+
+The ordered public series now reproduces all 18 IPA-touched files exactly from pristine XNU and the specified prerequisites. Local evidence is plans/ipa/logs/series-check.txt. Current parser, lifecycle and datapath sanitizer checks all pass. A fresh staged Sol review covers the firmware-only probe and the subsequent offline handshake, with separate approval decisions. Neither runner has started.
