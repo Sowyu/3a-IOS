@@ -43,7 +43,7 @@ Patch 2221 (`patches/data/2221-asteroids-data-ipa-binding.patch`, `bsd/dev/data/
 
 The adapter refuses to build unless `SWEET_IPA_QMAP_VERSION` is 1, and it drops receive buffers over 8192 bytes. 2221 needs 2202 and 2220.
 
-Sol's 2221 audit (`docs/data-2221-audit.md`) passed the adapter itself: types, bounds, copy lifetimes and lock order. It is NO-GO for a trial until three things land in the IPA agent's integration draft (`plans/ipa/draft2204`):
+Sol's 2221 re-audit with the IPA agent's frozen 2205 (`docs/data-2221-reaudit.md`) gives a GO for bounded source integration. All three earlier blockers are fixed, and all five host suites pass. That covers 2220 at 410ee41d and 2221 at 4bdc74ce on the cutoff in `plans/ipa/cutoff-2206.txt`. IPA hardware writes and any phone boot still need their own image approval. The first audit, for the record: Sol's 2221 audit (`docs/data-2221-audit.md`) passed the adapter itself: types, bounds, copy lifetimes and lock order. It is NO-GO for a trial until three things land in the IPA agent's integration draft (`plans/ipa/draft2204`):
 - The IPA driver clears its ready latch the moment it detects a failure.
 - The worker calls bind and refresh.
 - The worker quiesces the AP packet channels before detach.
@@ -165,7 +165,7 @@ Sol's delta check (`docs/data-2220-audit5.md`) confirms N1 is fixed and the GO c
 
 **Measured, compile.** All six kernel files compile against the xnu-12377 headers with the modem tree's exact flags. The only remaining warnings come from XNU's own macros. There is no full kernel build or link yet.
 
-**Missing.** The modem agent's hooks and lifetime approval, the IPA data path, then one integrated, Sol-approved trial over real mobile data on en2.
+**Missing.** A Sol image approval for the integrated kernel (modem 2189, data 2220/2221, IPA 2200 to 2206), working IPA hardware (PAS15, SMMU, GSI), then one bounded trial with `sweetdata=1 sweetdataonline=1` and the en2 proof procedure below.
 
 ## USB proof of the presentation path
 
