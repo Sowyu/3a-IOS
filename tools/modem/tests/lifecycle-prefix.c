@@ -7,11 +7,12 @@
 #include <errno.h>
 #include "QcomSmp2p.h"
 #include "QcomScm.h"
+#include "QcomQrtr.h"
 #define MPSS_SIZE 0xe600000u
 #define META_MAX 65536u
 #define M_RMT_SIZE 0x280000u
 #define PAGE_SIZE 16384u
-static struct {bool failed,fatal,xo_pinned,pas_owed,started,shared_owed,qmp_owed,votes_owed,vote_uncertain,stop_verified;QcomSmp2p sp;int master;uint32_t state;struct{uint32_t remote_count;}qr;uintptr_t firmware,metadata,shared,args;struct{void *image[4];uint32_t bytes[4];}fs;}m;
+static struct {bool failed,fatal,xo_pinned,pas_owed,started,shared_owed,qmp_owed,votes_owed,vote_uncertain,stop_verified;QcomSmp2p sp;int master;uint32_t state;QcomQrtr qr;uintptr_t firmware,metadata,shared,args;struct{void *image[4];uint32_t bytes[4];}fs;}m;
 static unsigned rawcalls,mode,shutdowns,reclaims,poweroffs,qmpoffs,unmaps,frees,sleeps;
 static int shut_result,shut_status,reclaim_result;static uint64_t now;
 static unsigned stop_updates,transient_failures;static bool stop_asserted,no_ack,graceful;

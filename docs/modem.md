@@ -1,6 +1,6 @@
 # Modem and SIM: desk findings (2026-11-03)
 
-MPSS boots offline and announces UIM, NAS and WDS services. PAS shutdown remains unresolved. ast160's bandwidth test timed out before starting MPSS and retained its uncertain transaction. The root is clean. Patch 2185 hardens UIM reply parsing. A separate offline SIM diagnostic will use the previously measured power sequence with the bandwidth stage disabled, only after a fresh Sol approval. It cannot establish M2 if PAS shutdown fails.
+M3 passed in ast161. ast165 also measured the selected USIM at READY, app state7. Replies stopped after ten UIM responses and readiness expired. Patch2188 corrects QRTR receive-flow acknowledgments; host tests and the full kernel build pass, phone validation is pending. PAS shutdown still fails and retains backing until guarded reset, so M2 remains incomplete. ONLINE remains off.
 
 Labels as in `docs/input.md`: **Measured**, **Code**, **Inferred**, **Missing**.
 
@@ -334,3 +334,18 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 
 
 **Code.** Sol approved the corrected2187 source and frozen21871 image for one bounded offline readiness diagnostic after data releases the phone. The runner now explicitly limits devloop to one boot attempt and verifies the frozen artifacts after waiting. This does not approve provisioning or ONLINE and does not resolve M2. See `modem-2187-reaudit.md`.
+
+
+## ast165 readiness and patch2188 flow control
+
+**Measured.** `ast165-modem-uim-21871.txt:10619` reports primaryGW0 ready1, with slot1/app0 USIM state7 on line10621. Eight fresh READY responses followed the initial detected response. The separate slot query reported ICCID suffix0660 at line10552. After nine card responses and one slot response, subsequent requests got no reply. Readiness expired at line11384. No provisioning is needed to reach READY.
+
+**Measured.** SSCTL returned success and fresh shutdown_ack at line11686. All50 PAS4 shutdown calls failed with raw -3145800. Line11743 retains memory and power, line11744 reports final_error5. Normal selftest DONE is at line12413. The365-second run had a fresh completion nonce, clean root before and after, and returned to recovery. The strict M2 checker must still fail. The only pushed file was the selftest hook.
+
+**Code.** Patch2188 sends RESUME_TX from the receiving local client to the actual remote sender and puts the local client node/port in its payload. This matches [Linux qrtr_send_resume_tx](https://github.com/torvalds/linux/blob/master/net/qrtr/af_qrtr.c). The previous code used control ports and named the remote sender in the payload. Pending acknowledgments survive transmit-queue backpressure in a bounded16-flow table. Exhausting that table fails the worker. A worker poll retries after draining TX and teardown logs the counters.
+
+**Inferred.** The wrong acknowledgment explains the ten-response stall. This remains a hypothesis until a phone run receives more than ten fresh replies with2188.
+
+**Measured, host.** Sanitizer tests cover60 replies through a ten-packet peer window, exact header/payload fields, backpressure, duplicate confirms, queue capacity, bad destinations and truncated packets. An extracted real worker test checks drain-before-retry and failure propagation. The existing storage check permits only sweet_ufs_read_part and sweet_ufs_part_size. No partition write API is added. Full Trash-safe kernel build passed and the image matches all ten kernel segments.
+
+**Missing.** Fresh Sol approval and phone confirmation for2188. Data worker integration moves to2189 and is not in this image. IPA, data sessions, provisioning and ONLINE remain absent.

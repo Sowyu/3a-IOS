@@ -1,0 +1,110 @@
+diff --git a/bsd/dev/modem/QcomQrtr.c b/bsd/dev/modem/QcomQrtr.c
+--- a/bsd/dev/modem/QcomQrtr.c
++++ b/bsd/dev/modem/QcomQrtr.c
+@@ -47,6 +47,29 @@
+     return emit(q, command, QCOM_QRTR_PORT_CTRL, q->remote_node, QCOM_QRTR_PORT_CTRL, pkt, sizeof pkt);
+ }
+ 
++/* Linux qrtr_send_resume_tx reverses the packet endpoints and identifies the
++ * receiving client in the payload. A control-port broadcast cannot unblock it. */
++int qcom_qrtr_poll(QcomQrtr *q)
++{
++    if(q->resume_failed)return -1;
++    while(q->resume_count){
++        uint8_t data[CTRL_BYTES]={0};
++        put32(data,QCOM_QRTR_RESUME_TX);put32(data+4,q->local_node);put32(data+8,q->resume[0].local_port);
++        if(emit(q,QCOM_QRTR_RESUME_TX,q->resume[0].local_port,q->resume[0].node,q->resume[0].port,data,sizeof(data)))break;
++        q->resumes_sent++;q->resume[0]=q->resume[--q->resume_count];
++    }
++    return 0;
++}
++static int resume_tx(QcomQrtr *q,uint32_t node,uint32_t port,uint32_t local_port)
++{
++    for(unsigned i=0;i<q->resume_count;i++)
++        if(q->resume[i].node==node && q->resume[i].port==port && q->resume[i].local_port==local_port)return qcom_qrtr_poll(q);
++    if(q->resume_count==QCOM_QRTR_MAX_RESUMES){q->resume_failed=1;return -1;}
++    unsigned i=q->resume_count++;
++    q->resume[i].node=node;q->resume[i].port=port;q->resume[i].local_port=local_port;
++    return qcom_qrtr_poll(q);
++}
++
+ static void announce(QcomQrtr *q, unsigned i)
+ {
+     if (!q->local[i].service) return; /* client-only port, never announce a server */
+@@ -100,15 +123,13 @@
+     const uint8_t *data = packet + QCOM_QRTR_HEADER;
+     q->rx_packets++;
+     if (type == QCOM_QRTR_DATA) {
++        if(le32(packet+24)!=q->local_node){q->rx_bad++;return -1;}
+         q->rx_data++;
+         unsigned i = 0;
+         while (i < q->local_count && q->local[i].port != dst_port) ++i;
+         if (i < q->local_count) q->local[i].receive(q->local[i].context, q, dst_port, src_node, src_port, data, size);
+         else q->rx_unrouted++;
+-        if (confirm) {  /* the sender waits for this before it sends more to the port */
+-            const uint32_t words[4] = {src_node, src_port, 0, 0};
+-            if (!control(q, QCOM_QRTR_RESUME_TX, words)) q->resumes_sent++;
+-        }
++        if(confirm && resume_tx(q,src_node,src_port,dst_port))return -1;
+         return 0;
+     }
+     /* control packets carry their command again in the payload */
+@@ -125,6 +146,7 @@
+         if (size >= CTRL_BYTES) remote_server(q, data + 4, type == QCOM_QRTR_NEW_SERVER);
+         break;
+     case QCOM_QRTR_BYE:
++        q->resume_count = 0;
+         q->remote_count = 0;
+         q->hello_received = 0;
+         break;
+diff --git a/bsd/dev/modem/QcomQrtr.h b/bsd/dev/modem/QcomQrtr.h
+--- a/bsd/dev/modem/QcomQrtr.h
++++ b/bsd/dev/modem/QcomQrtr.h
+@@ -15,6 +15,7 @@
+ #define QCOM_QRTR_NODE_BROADCAST 0xffffffffu
+ #define QCOM_QRTR_MAX_LOCAL 8u
+ #define QCOM_QRTR_MAX_REMOTE 128u
++#define QCOM_QRTR_MAX_RESUMES 16u
+ 
+ enum {
+     QCOM_QRTR_DATA = 1, QCOM_QRTR_HELLO = 2, QCOM_QRTR_BYE = 3, QCOM_QRTR_NEW_SERVER = 4, QCOM_QRTR_DEL_SERVER = 5,
+@@ -38,6 +39,10 @@
+     uint32_t local_count;
+     struct {uint32_t service, instance, node, port;} remote[QCOM_QRTR_MAX_REMOTE];
+     uint32_t remote_count;
++    /* Backpressured acknowledgments remain owned until the send queue accepts them. */
++    struct {uint32_t node,port,local_port;} resume[QCOM_QRTR_MAX_RESUMES];
++    uint32_t resume_count;
++    uint8_t resume_failed;
+     /* counters for the log */
+     uint32_t rx_packets, rx_data, rx_bad, rx_unrouted, tx_packets, tx_refused, resumes_sent;
+ };
+@@ -48,6 +53,8 @@
+ int qcom_qrtr_add_service(QcomQrtr *q, uint32_t service, uint32_t instance, uint32_t port, QcomQrtrReceive receive, void *context);
+ /* The link is up: says hello. */
+ void qcom_qrtr_start(QcomQrtr *q);
++/* Owner polls after draining its transmit queue. -1 means acknowledgment capacity was lost. */
++int qcom_qrtr_poll(QcomQrtr *q);
+ /* One received packet. Returns 0, or -1 when it was not a valid packet. */
+ int qcom_qrtr_receive(QcomQrtr *q, const uint8_t *packet, uint32_t length);
+ /* A data packet from our port to the remote's node:port. capacity bounds the packet built on the stack. Returns 0 when queued. */
+diff --git a/bsd/dev/modem/ModemRuntime.inc b/bsd/dev/modem/ModemRuntime.inc
+--- a/bsd/dev/modem/ModemRuntime.inc
++++ b/bsd/dev/modem/ModemRuntime.inc
+@@ -370,7 +370,7 @@
+         int rc=qcom_glink_send(&m.gl,m.channel,m.queue[m.qhead].data,m.queue[m.qhead].len);
+         if(rc==QcomGlinkAgain)break;if(rc){m.failed=true;break;}m.qhead=(m.qhead+1)%M_TX_COUNT;m.qcount--;
+     }
+-    if(m.gl.broken)m.failed=true;
++    if(m.gl.broken || qcom_qrtr_poll(&m.qr))m.failed=true;
+ }
+ static bool m_shutdown_request(void){
+     if(!m.sysmon || !m.started || !m.qr_started || m.fatal || m.failed)return false;
+@@ -447,6 +447,7 @@
+ static bool m_cleanup(void){
+     bool stopped=!m.pas_owed;
+     bool graceful=m_shutdown_request();
++    printf("SWEET MODEM: QRTR flow resumes=%u pending=%u failed=%u rx=%u tx=%u refused=%u\n",m.qr.resumes_sent,m.qr.resume_count,m.qr.resume_failed,m.qr.rx_data,m.qr.tx_packets,m.qr.tx_refused);
+     if(m.started && m.sp.out && !graceful){qcom_smp2p_update(&m.sp,m.master,1,1);m_ring(2,2);uint64_t end=m_now()+3000;
+         while(m_now()<end){m_smp_poll();if(m.state&8)break;m_sleep(10);}
+         /* qcom_q6v5_request_stop clears the request after ack or timeout. */

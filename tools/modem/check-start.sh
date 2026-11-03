@@ -7,7 +7,7 @@ export TMPDIR="$out/tmp"
 for file in ModemBcm.h ModemRuntime.inc ModemGate.h ModemRmtfs.c ModemRmtfs.h QcomQrtr.c QcomQrtr.h QcomSmp2p.c QcomSmp2p.h QcomScm.h QcomQmp.c QcomQmp.h QcomRpmh.c QcomRpmh.h; do
  python3 "$root/extract.py" "$root/../../patches/modem" "$out/$file" "bsd/dev/modem/$file"
 done
-for pair in 'qrtr' 'rmtfs'; do
+for pair in 'qrtr' 'qrtr-flow' 'rmtfs'; do
  set -- $pair
  cc -save-temps=obj -std=c11 -Wall -Wextra -Werror -DMODEM_PROTOCOL_HOST_TEST -fsanitize=address,undefined -I"$out" "$root/tests/$1.c" "$out/ModemRmtfs.c" "$out/QcomQrtr.c" -o "$out/check-$1"
  "$out/check-$1"
@@ -48,3 +48,5 @@ PYCHK
 python3 "$root/check-shutdown-joined.py"
 
 python3 "$root/check-bandwidth.py"
+
+python3 "$root/check-qrtr-worker.py"
