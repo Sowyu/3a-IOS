@@ -498,3 +498,6 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 
 
 **Measured, offline trial refused.** ast178 completed normally in365seconds with clean roots and stale=false. The initial GSI availability guard returned EBUSY16 at6239 before IPA configuration/GSI programming or PAS4. PAS15 shutdown succeeded at6248, contexts parked and backing released at6249, final_error16 appeared at6251 and DONE at12653. I3 was not reached. IPA owns read-only refusal diagnostics in2214. The ownership guard stays intact and ONLINE remains blocked.
+
+
+**Code.** Combined2214 adds bounded read-only GSI refusal diagnostics, preserving the ownership guard and lifecycle. Its56-file reproduction, datapath sanitizer checks, safe build and ten-segment image comparison pass. The data candidate remains unapproved until the hardware refusal is understood and the offline handshake passes.
