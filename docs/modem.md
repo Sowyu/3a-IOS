@@ -526,3 +526,14 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 **Code.** Combined2218 requires measured completion type0x23 on the command channel and retains0x22 on data channels, preserving other validation and lifecycle rules.
 **Measured, host.** The exact ast181 event and256 types across four channels, actual hardware/worker checks,56-file reconstruction, safe build and ten packed segments pass.
 **Missing.** I3 and the single final combined source/image review still precede ONLINE; no phone operation or review ran for this integration.
+
+
+## Offline handshake accepted, combined ONLINE review
+
+**Measured.** ast182 passed the exact IPA handshake checker. Tables and SRAM passed at raw8150, endpoints became ready at8151, PAS4 authentication succeeded at9149 and all four QMI flags were set at9458. I3 completed after queue drain at9461. The run ended normally in363seconds with clean roots and stale=false. AP channels quiesced at12177 before SSCTL at12178. PAS4 shutdown remained unverified, so modem and IPA backing stayed retained at12235/12236 until reset. DONE appeared at12722.
+
+**Code.** The combined2218 source and image already passed the safe build, actual hardware/worker checks,56-file reconstruction and ten packed-segment comparison. A fresh review covers this exact ONLINE candidate, its root profile restoration and its en2-bound packet proof.
+
+**Inferred.** The offline retain path supports a bounded ONLINE teardown only if WDS cleanup is attempted and AP DMA is quiesced before detach. An unresolved WDS start or handle remains a cleanup failure. Unverified PAS4 must prevent final GSI deallocation, PAS15 shutdown, SMMU parking and backing reuse until guarded reset. This does not complete M2.
+
+**Missing.** The combined ONLINE image still needs Sol's GO. NAS registration, a WDS call and data packets remain unmeasured. Command completion type0x23 is measured; data completion stays strict0x22. No data profile or packet-proof helper has been installed.
