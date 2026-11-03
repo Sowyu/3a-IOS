@@ -399,3 +399,12 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 **Measured, host.** `python3 tools/modem/check-en2.py` passes localhost tests of the actual bound socket, fragmented/malformed/truncated status, absent interface and total timeout under ASAN/UBSAN. `sh tools/modem/build-en2.sh` builds and signs the arm64e phone executable, with PAC stripped for this kernel. The binary stays outside the public repository.
 
 **Missing.** No phone run yet. This tool proves an interface-bound exchange when it passes. It does not prove DNS, TLS, Safari or configd primary-route selection. Those need the data agent's en2 DHCP profile and route evidence. USB Internet Sharing cannot carry the socket because XNU IP_BOUND_IF restricts its outgoing interface.
+
+
+## Combined IPA source
+
+**Code.** The modem tree now includes data2220 audit7, adapter2221 and IPA2200 through2206. The worker binds IPA after preparation and before data attach, refreshes its readiness at receive/discovery/poll boundaries and quiesces AP channels before detach. An uncertain modem stop retains IPA backing and power. These changes are in IPA2205. The exact application order and hashes are recorded in the workspace's modem README and IPA cutoff manifest.
+
+**Measured, host.** Independent ordered reconstruction matches all19 IPA-touched files in xnu-modem. Isolated firmware, lifecycle, datapath and compiled MMIO checks pass, including the actual worker and real2221 adapter. A combined full build is running.
+
+**Missing.** Additive IPA2207 will guard indirect stage2 references and extended StreamID validity after the frozen build completes. The final image needs a new Sol GO. PAS15, the IPA handshake and ONLINE remain unmeasured. ast170 proved the read-only context survey and showed why the earlier zero-only context selector refused preparation.
