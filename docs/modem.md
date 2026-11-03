@@ -390,3 +390,12 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 **Code, reviewed.** Sol closed both findings and approved the source wiring and guarded600-second lifetime in `docs/modem-2189-reaudit.md`. Fresh isolated host checks passed and35 reconstructed source files match production.
 
 **Missing.** The final combined build and IPA readiness/quiescence approval. No2189 phone image is approved. PAS4 retention remains the owner-accepted bounded-trial policy, with M2 incomplete. M3 and sustained USIM READY are measured in ast168.
+
+
+## Interface-bound packet proof
+
+**Code.** `tools/modem/sweeten2.c` makes one IPv4 HTTP HEAD exchange to1.1.1.1 through en2. It requires an up en2 address, sets and reads back IP_BOUND_IF, binds that source address and verifies the connected source. There is no DNS lookup, interface fallback or routing change. One monotonic10-second deadline covers connection, send and receive. Output contains only the interface/index, HTTP status and elapsed time. It does not print response bodies or modem identifiers.
+
+**Measured, host.** `python3 tools/modem/check-en2.py` passes localhost tests of the actual bound socket, fragmented/malformed/truncated status, absent interface and total timeout under ASAN/UBSAN. `sh tools/modem/build-en2.sh` builds and signs the arm64e phone executable, with PAC stripped for this kernel. The binary stays outside the public repository.
+
+**Missing.** No phone run yet. This tool proves an interface-bound exchange when it passes. It does not prove DNS, TLS, Safari or configd primary-route selection. Those need the data agent's en2 DHCP profile and route evidence. USB Internet Sharing cannot carry the socket because XNU IP_BOUND_IF restricts its outgoing interface.
