@@ -23,7 +23,7 @@ args = [x for x in match[1].split() if x.split('=')[0] not in
         ('keepsyms', 'sweetkeys_ms', 'sweettouchirq', 'sweetsyserr', 'sweetthermal', 'sweetmodem', 'sweetcpufreq_little', 'sweetfb_hz', 'sweetfetchsync', 'sweetcpufreq', 'debug', '-noprogress', 'sweetgpufast')]
 args += ['sweetthermal=3', 'sweetfetchsync=1', 'sweetsb=1', 'sweetfb_ast_hw=1',
          'sweetfb_keep=1', 'sweetfb_astwait=1', 'sweettu=sysmem,nocb,nolrz',
-         'sweetdeadman=600', 'sweetselftest=1', 'sweetmpss=1', 'sweetmglink=1', 'sweetmrmtfs=1', 'sweetmpdm=1', 'sweetmstop=1', 'sweetmho=1', 'sweetusb=4', 'sweetmuim=1']
+         'sweetdeadman=600', 'sweetselftest=1', 'sweetmpss=1', 'sweetmglink=1', 'sweetmrmtfs=1', 'sweetmpdm=1', 'sweetmstop=1', 'sweetmho=1', 'sweetusb=4', 'sweetmuim=1', 'sweetmready=1']
 cmdline = ' '.join(args)
 assert len(cmdline.encode()) <= 607
 assert 'sweetfbarm=1' in args

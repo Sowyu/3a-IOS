@@ -315,3 +315,16 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 **Measured.** SSCTL completed at11711. PAS shutdown still returned raw-3145800 fifty times. Lines11778 and11779 retain backing and report final_error5. DONE is12623. No shutdown-time fatal/transport failure or post-retention reclamation was logged. The bandwidth fix did not resolve secure shutdown, so M2 remains incomplete. No UIM or IPA ran in this test.
 
 **Missing.** The secure error still needs diagnosis. The known proxy-vote and bandwidth discrepancies are now corrected but neither changed it. Repeating these same settings will not answer the remaining question. The data agent has the next reserved phone slot; modem work continues at the desk.
+
+
+## 2187 selected USIM readiness and eight ports
+
+**Code.** 2187 raises QCOM_QRTR_MAX_LOCAL to8 for rmtfs, pd-mapper, UIM, SSCTL, two IPA ports and two data ports. Service-zero clients already remain unannounced, including HELLO replay. A new regression checks all eight registrations, table-full refusal and the exact server-only announcement count.
+
+**Code.** Exact sweetmready=1 requires sweetmuim=1 and refreshes GetCardStatus every5 seconds within the existing120-second worker. It records the primary GW application index. Readiness requires that index to select a present card and a type2 USIM at appstate7. Index0xffff, absent/error cards, other app types and non-ready states cannot signal readiness. Slot status/ICCID still stops after its first successful reply. The absolute card-query cap is180 for the later bounded data session; this120-second probe cannot reach that cap.
+
+**Code.** The client consumes each matching response once, rejects stale transactions and duplicate replies, revokes readiness after15 seconds without fresh card status, and fails on a discovered UIM endpoint changing or disappearing. No PIN, provisioning, slot-switch or online request was added. Data's sweet_data_usim hook will consume this state in the separate integration patch.
+
+**Measured, host/build.** Parser, actual sender/receiver and eight-port tests pass with ASAN/UBSAN. Tests cover detected-to-ready transitions, stale/duplicate replies, readiness expiry, service loss and the request cap. The full Trash-safe remake exited0. The prepared UIM image contains all ten expected kernel segments and600bytes of arguments. It omits sweetmbw and sweetmbwi and keeps the previously approved2185 power sequence, known failed-PAS retention and guarded reset.
+
+**Missing.** Fresh Sol approval and a readiness phone measurement. The data agent has the current owner-approved15minute reservation. No modem run may start until phone-data-wants and phone.lock are both gone, no devloop is active and recovery is verified clean. 2188 data hooks remain a desk draft and are absent from2187.

@@ -33,4 +33,12 @@ int main(void){
  assert(!modem_uim_slots(msg,n+3,7,&slots)); /* Unknown optional TLV is allowed. */
  char suffix[5];uint8_t bad[]={0xaa};assert(modem_uim_suffix(bad,1,suffix)==-1 && !suffix[0]);
  puts("PASS: UIM card/app status, absent/error, transaction/length checks and ICCID suffix-only BCD parsing");
+ ModemUimStatus ready={0};ready.count=1;ready.card[0].state=1;ready.card[0].apps=1;
+ ready.card[0].app[0].type=2;ready.card[0].app[0].state=7;assert(modem_uim_ready(&ready));
+ ready.primary_gw=0xffff;assert(!modem_uim_ready(&ready));ready.primary_gw=1;assert(!modem_uim_ready(&ready));
+ ready.primary_gw=0;ready.card[0].app[0].state=1;assert(!modem_uim_ready(&ready));
+ ready.card[0].app[0].state=7;ready.card[0].app[0].type=5;assert(!modem_uim_ready(&ready));
+ ready.card[0].app[0].type=2;ready.card[0].state=0;assert(!modem_uim_ready(&ready));
+ ready.card[0].state=1;ready.count=0;assert(!modem_uim_ready(&ready));
+ puts("PASS: selected primary GW USIM requires present card and app state7");
 }

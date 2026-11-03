@@ -1,0 +1,138 @@
+--- a/bsd/dev/modem/ModemRuntime.inc
++++ b/bsd/dev/modem/ModemRuntime.inc
+@@ -43,12 +43,12 @@
+     uint32_t qhead,qcount,rxoff,rxbytes;
+     uint32_t rail_addr[2],rail_index[2],xo_addr,state,services;
+     bool xo_pinned, pas_owed, started, votes_owed, vote_uncertain, qmp_owed, shared_owed, fatal;
+-    bool uim, glink, rmtfs, pdm, qr_started, stop_verified, failed;
++    bool uim_ready_poll, uim_ready, uim_pending[2], uim, glink, rmtfs, pdm, qr_started, stop_verified, failed;
+     bool bandwidth_irq, bandwidth, bandwidth_pinned, handover_release, bcm_probe, sysmon, shutdown_sent, shutdown_response, shutdown_ind;
+     uint32_t shutdown_node, shutdown_port;
+     uint32_t uim_node,uim_port,uim_done,uim_tries[2];
+     uint16_t uim_txn[2];
+-    uint64_t uim_next;
++    uint64_t uim_next,uim_seen;
+     int master;
+     uint64_t began;
+ } m;
+@@ -281,19 +281,21 @@
+ static void m_uim_receive(void *ctx,QcomQrtr *qr,uint32_t port,uint32_t node,uint32_t from,const uint8_t *data,uint32_t len){
+     (void)ctx;(void)qr;(void)port;
+     if(node!=m.uim_node || from!=m.uim_port || len<7)return;
+-    if(le16(data+3)==0x2f && m.uim_tries[0]){
++    if(le16(data+3)==0x2f && m.uim_pending[0] && le16(data+1)==m.uim_txn[0]){
+         ModemUimStatus status;int rc=modem_uim_status(data,len,m.uim_txn[0],&status);
+         printf("SWEET MODEM: UIM card-status error=%d slots=%u\n",rc,status.count);
+-        if(rc)return;m.uim_done|=1;
++        if(rc){m.uim_ready=false;return;}m.uim_pending[0]=false;m.uim_done|=1;
++        m.uim_seen=m_now();m.uim_ready=m.uim_ready_poll && modem_uim_ready(&status);
++        if(m.uim_ready_poll)printf("SWEET MODEM: UIM primary_GW=%#x USIM_ready=%u\n",status.primary_gw,m.uim_ready);
+         for(unsigned i=0;i<status.count;i++){
+             ModemUimCard *c=&status.card[i];
+             printf("SWEET MODEM: UIM slot=%u card=%s error=%u apps=%u\n",i+1,c->state==0?"ABSENT":c->state==1?"PRESENT":"ERROR",c->error,c->apps);
+             for(unsigned j=0;j<c->apps;j++)printf("SWEET MODEM: UIM slot=%u app=%u type=%u state=%u PIN1=%u\n",i+1,j,c->app[j].type,c->app[j].state,c->app[j].pin1);
+         }
+-    }else if(le16(data+3)==0x47 && m.uim_tries[1]){
++    }else if(le16(data+3)==0x47 && m.uim_pending[1] && le16(data+1)==m.uim_txn[1]){
+         ModemUimSlots slots;int rc=modem_uim_slots(data,len,m.uim_txn[1],&slots);
+         printf("SWEET MODEM: UIM slot-status error=%d slots=%u\n",rc,slots.count);
+-        if(rc)return;m.uim_done|=2;
++        if(rc)return;m.uim_pending[1]=false;m.uim_done|=2;
+         for(unsigned i=0;i<slots.count;i++){
+             ModemUimSlot *s=&slots.slot[i];
+             printf("SWEET MODEM: UIM physical=%u card=%u active=%u logical=%u ICCID_suffix4=%s\n",i+1,s->card,s->active,s->logical,s->suffix[0]?s->suffix:"unavailable");
+@@ -302,16 +304,23 @@
+     sweet_log_sync();
+ }
+ static void m_uim_poll(void){
+-    if(!m.uim || !m.qr_started || m.uim_done==3 || m_now()<m.uim_next)return;
+-    int index=qcom_qrtr_find_remote(&m.qr,11);if(index<0)return;
++    if(!m.uim || !m.qr_started)return;
++    if(m.uim_ready && m_now()-m.uim_seen>=15000){
++        m.uim_ready=false;printf("SWEET MODEM: UIM readiness expired; no fresh card status\n");
++    }
++    if((!m.uim_ready_poll && m.uim_done==3) || m_now()<m.uim_next)return;
++    int index=qcom_qrtr_find_remote(&m.qr,11);
++    if(index<0){if(m.uim_port){m.uim_ready=false;m.failed=true;}return;}
+     uint32_t node=m.qr.remote[index].node,port=m.qr.remote[index].port;
+-    if(m.uim_port && (m.uim_node!=node || m.uim_port!=port)){m.failed=true;return;}
++    if(m.uim_port && (m.uim_node!=node || m.uim_port!=port)){m.uim_ready=false;m.failed=true;return;}
+     m.uim_node=node;m.uim_port=port;
+-    for(unsigned i=0;i<2;i++)if(!(m.uim_done&(1u<<i)) && m.uim_tries[i]<3){
++    for(unsigned i=0;i<2;i++){
++        bool monitor=i==0 && m.uim_ready_poll;
++        if((!monitor && (m.uim_done&(1u<<i))) || m.uim_tries[i]>=(monitor?180u:3u))continue;
+         uint16_t txn=(uint16_t)(1+i+2*m.uim_tries[i]);uint8_t req[7]={0,(uint8_t)txn,(uint8_t)(txn>>8),i?0x47:0x2f,0,0,0};
+-        if(!qcom_qrtr_send_data(&m.qr,0x4002,node,port,req,sizeof(req))){m.uim_txn[i]=txn;m.uim_tries[i]++;printf("SWEET MODEM: UIM read request msg=%#x transaction=%u\n",req[3],txn);}
+-    }
+-    m.uim_next=m_now()+10000;
++        if(!qcom_qrtr_send_data(&m.qr,0x4002,node,port,req,sizeof(req))){m.uim_txn[i]=txn;m.uim_tries[i]++;m.uim_pending[i]=true;printf("SWEET MODEM: UIM read request msg=%#x transaction=%u\n",req[3],txn);}
++    }
++    m.uim_next=m_now()+(m.uim_ready_poll?5000:10000);
+ }
+ 
+ static void m_greceive(void *ctx,QcomGlinkChannel *ch,const uint8_t *data,uint32_t len){
+@@ -485,8 +494,9 @@
+ #include "ModemGate.h"
+ static bool m_gate(const char *name){return modem_gate(PE_boot_args(),name)!=0;}
+ static int modem_run(const struct wl_fat *f,const uint8_t *mdt,uint32_t size){
+-    memset(&m,0,sizeof(m));m.master=-1;m.glink=m_gate("sweetmglink");m.rmtfs=m_gate("sweetmrmtfs");m.pdm=m_gate("sweetmpdm");m.uim=m_gate("sweetmuim");m.sysmon=m_gate("sweetmstop");m.bcm_probe=m_gate("sweetmbcm");m.handover_release=m_gate("sweetmho");m.bandwidth=m_gate("sweetmbw");m.bandwidth_irq=m_gate("sweetmbwi");
++    memset(&m,0,sizeof(m));m.master=-1;m.glink=m_gate("sweetmglink");m.rmtfs=m_gate("sweetmrmtfs");m.pdm=m_gate("sweetmpdm");m.uim=m_gate("sweetmuim");m.uim_ready_poll=m_gate("sweetmready");m.sysmon=m_gate("sweetmstop");m.bcm_probe=m_gate("sweetmbcm");m.handover_release=m_gate("sweetmho");m.bandwidth=m_gate("sweetmbw");m.bandwidth_irq=m_gate("sweetmbwi");
+     if((m.rmtfs || m.pdm || m.uim || m.sysmon) && !m.glink){printf("SWEET MODEM: refused missing GLINK dependency\n");return EINVAL;}
++    if(m.uim_ready_poll && !m.uim){printf("SWEET MODEM: readiness polling requires UIM\n");return EINVAL;}
+     m_sleep(30000);m.began=m_now();int rc=EIO;
+     m.smem=ml_io_map(M_SMEM,M_SM_SIZE);m.mutex=ml_io_map(0x1f43000,0x1000);m.ipcc=ml_io_map(0x405000,0x1000);
+     m.qmpmem=ml_io_map(0xc300000,0x400);m.rsc=ml_io_map(0x17a20000,0x4000);m.db=ml_io_map(0x81c60000,0x20000);
+--- a/bsd/dev/modem/ModemUim.c
++++ b/bsd/dev/modem/ModemUim.c
+@@ -26,7 +26,7 @@
+  *out=(ModemUimStatus){0};QcomQmiMessage m;int rc=response(p,n,txn,0x2f,&m);if(rc)return rc;
+  uint32_t len=0;const uint8_t *v=unique_tlv(&m,0x10,&len);
+  if(!v || len<9 || v[8]>MODEM_UIM_CARDS)return -1;
+- ModemUimStatus s={0};s.count=v[8];uint32_t at=9;
++ ModemUimStatus s={0};s.primary_gw=v[0]|v[1]<<8;s.count=v[8];uint32_t at=9;
+  for(unsigned i=0;i<s.count;i++){
+   if(len-at<6)return -1;
+   ModemUimCard *c=&s.card[i];c->state=v[at];c->error=v[at+4];c->apps=v[at+5];at+=6;
+@@ -38,6 +38,14 @@
+   }
+  }
+  if(at!=len)return -1;*out=s;return 0;
++}
++/* The high byte selects the card, the low byte its primary GW application.
++ * An unprovisioned index (ffff), another app type, or a locked SIM is not ready. */
++int modem_uim_ready(const ModemUimStatus *s){
++ unsigned card=s->primary_gw>>8,app=s->primary_gw&255;
++ return card<s->count && card<MODEM_UIM_CARDS && s->card[card].state==1 &&
++     app<s->card[card].apps && app<MODEM_UIM_APPS &&
++     s->card[card].app[app].type==2 && s->card[card].app[app].state==7;
+ }
+ int modem_uim_suffix(const uint8_t *p,uint32_t n,char out[5]){
+  for(unsigned i=0;i<5;i++)out[i]=0;
+--- a/bsd/dev/modem/ModemUim.h
++++ b/bsd/dev/modem/ModemUim.h
+@@ -7,11 +7,12 @@
+  uint8_t state, error, apps;
+  struct {uint8_t type,state,pin1;} app[MODEM_UIM_APPS];
+ } ModemUimCard;
+-typedef struct {uint8_t count;ModemUimCard card[MODEM_UIM_CARDS];} ModemUimStatus;
++typedef struct {uint16_t primary_gw;uint8_t count;ModemUimCard card[MODEM_UIM_CARDS];} ModemUimStatus;
+ typedef struct {uint32_t card,active;uint8_t logical;char suffix[5];} ModemUimSlot;
+ typedef struct {uint8_t count;ModemUimSlot slot[MODEM_UIM_CARDS];} ModemUimSlots;
+ /* Return 0 on complete success, positive QMI error, -1 malformed/wrong response.
+  * No raw identifier is copied into output. No requests change SIM state. */
++int modem_uim_ready(const ModemUimStatus *);
+ int modem_uim_status(const uint8_t *,uint32_t,uint16_t,ModemUimStatus *);
+ int modem_uim_slots(const uint8_t *,uint32_t,uint16_t,ModemUimSlots *);
+ int modem_uim_suffix(const uint8_t *,uint32_t,char[5]);
+--- a/bsd/dev/modem/QcomQrtr.h
++++ b/bsd/dev/modem/QcomQrtr.h
+@@ -13,7 +13,7 @@
+ #define QCOM_QRTR_HEADER 32u
+ #define QCOM_QRTR_PORT_CTRL 0xfffffffeu
+ #define QCOM_QRTR_NODE_BROADCAST 0xffffffffu
+-#define QCOM_QRTR_MAX_LOCAL 4u
++#define QCOM_QRTR_MAX_LOCAL 8u
+ #define QCOM_QRTR_MAX_REMOTE 128u
+ 
+ enum {

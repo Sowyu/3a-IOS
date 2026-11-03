@@ -5,7 +5,7 @@
 #include <string.h>
 #include "ModemUim.h"
 #include "QcomQrtr.h"
-static struct {bool uim,qr_started,failed;uint32_t uim_node,uim_port,uim_done,uim_tries[2];uint16_t uim_txn[2];uint64_t uim_next;QcomQrtr qr;}m;
+static struct {bool uim_ready_poll,uim_ready,uim_pending[2],uim,qr_started,failed;uint32_t uim_node,uim_port,uim_done,uim_tries[2];uint16_t uim_txn[2];uint64_t uim_next,uim_seen;QcomQrtr qr;}m;
 static uint64_t now;
 static unsigned sent;
 static uint16_t le16(const uint8_t *p){return p[0]|p[1]<<8;}
