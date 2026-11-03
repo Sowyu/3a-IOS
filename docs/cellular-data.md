@@ -132,7 +132,7 @@ Its remaining open finding, N1, blocked sessions long enough to exhaust transact
 - Every response must carry exactly one result TLV.
 - The cleanup comment now covers disconnected indications.
 
-Sol's delta check (`docs/data-2220-audit5.md`) confirms N1 is fixed and the GO carries over to patch hash adda4660. Lifting the data session's 120 s cap now depends only on the modem runtime's own lifetime approval. Every other audit4 condition stays. Still open, and not blocking: raw responses and modem text are exported as they come (N5), and the shape checks on settings TLVs are partial.
+Sol's delta check (`docs/data-2220-audit5.md`) confirms N1 is fixed and the GO carries over to patch hash adda4660. The service-cache fix for the modem 2189 audit's finding 1 (patch hash 8a0b901c) also keeps the GO (`docs/data-2220-audit6.md`), on the condition that the modem runtime calls `sweet_data_discovery()` after every QRTR control packet. Lifting the data session's 120 s cap now depends only on the modem runtime's own lifetime approval. Every other audit4 condition stays. Still open, and not blocking: raw responses and modem text are exported as they come (N5), and the shape checks on settings TLVs are partial.
 
 **Measured, host.** `tools/data/check.sh` rebuilds the source from the public patches and passes under AddressSanitizer and UndefinedBehaviorSanitizer. The session tests cover:
 - Nothing beyond read-only queries before the barrier.
