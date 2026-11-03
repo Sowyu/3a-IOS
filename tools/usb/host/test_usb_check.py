@@ -50,9 +50,11 @@ en9: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
 class Phone:
     """Plays the Mac's tools for one scenario."""
     def __init__(self, bcd=0x104, leaves_after=None, ll=True, ssh_ok=True, checksum_ok=True, configured_after=1,
-                 blocked=False):
+                 blocked=False, stall_after=None, down_bad=False, idle_dead=False):
         self.bcd, self.leaves_after, self.ll, self.ssh_ok, self.checksum_ok = bcd, leaves_after, ll, ssh_ok, checksum_ok
         self.configured_after, self.blocked = configured_after, blocked
+        self.stall_after, self.down_bad, self.idle_dead = stall_after, down_bad, idle_dead   # soak scenarios
+        self.uploads, self.slept = 0, 0
         self.ioreg_calls, self.iface_calls, self.cmds = 0, 0, []
 
     def run(self, argv, timeout, data=None):
@@ -87,23 +89,35 @@ class Phone:
             assert argv[argv.index('-i') + 1].endswith('id_ed25519')
             if not self.ssh_ok:
                 return 255, 'root@fe80::5eff:fe77:ee02%en9: Permission denied (publickey).'
+            if self.stall_after is not None and self.uploads > self.stall_after or self.idle_dead and self.slept:
+                return 124, 'timeout after 60 s'          # ast145: TX frozen, nothing comes back
+            if argv[-1].startswith('dd if=/dev/zero'):
+                n = 65536 * int(re.search(r'count=(\d+)', argv[-1])[1])
+                return 0, ('\0' * (n - 1) + 'x') if self.down_bad else '\0' * n
+            if argv[-1] == 'echo PROBE-OK':
+                return 0, 'PROBE-OK\n'
             if data is None:
                 return 0, 'Darwin iPhone 25.0.0\nuid=0(root)\nSSH-OK\n'
+            self.uploads += 1
             s = hashlib.sha256(data).hexdigest()
             return 0, (s if self.checksum_ok else '0' * 64) + '  -\n'
         raise AssertionError(argv)
 
 
-def scenario(level, phone, wait=10):
+def scenario(level, phone, wait=10, extra=()):
     uc.run = phone.run
     clock = [0.0]
     uc.time.monotonic = lambda: clock[0]
-    uc.time.sleep = lambda s: clock.__setitem__(0, clock[0] + s)
+
+    def sleep(s):
+        phone.slept += s >= 60          # the soak's idle gap
+        clock[0] += s
+    uc.time.sleep = sleep
     uc.KEY = pathlib.Path(tempfile.gettempdir()) / 'id_ed25519'
     uc.KEY.write_text('mock key, never used\n')
     uc.SSH_OPTS[-1] = str(uc.KEY)
     out = pathlib.Path(tempfile.mkdtemp(prefix='usbcheck-')) / 'r.txt'
-    sys.argv = ['usb-check.py', str(level), str(out), '--wait', str(wait)]
+    sys.argv = ['usb-check.py', str(level), str(out), '--wait', str(wait), *extra]
     try:
         uc.main()
         code = 0
@@ -140,6 +154,17 @@ expect('L4 no link-local on the Mac', scenario(4, Phone(ll=False)), 1, r'L4 FAIL
 expect('L4 key refused', scenario(4, Phone(ssh_ok=False)), 1, r'L4 FAIL ssh: rc 255')
 expect('L4 checksum differs', scenario(4, Phone(checksum_ok=False)), 1, r'L4 FAIL 4 MiB checksum')
 expect('L4 no gadget', scenario(4, Phone(bcd=0x999)), 1, r'L4 FAIL enumerate')
+SOAK = ('--soak', '300', '--idle', '90')
+expect('L4 soak pass, both ways and after idle', scenario(4, Phone(bcd=0x101), extra=SOAK), 0,
+       r'L4 PASS .*soak 300 s: \d+ rounds both ways, [1-9]\d* after 90 s idle')
+expect('L4 soak: TX freezes after the checksum (ast145)', scenario(4, Phone(bcd=0x101, stall_after=3), extra=SOAK), 1,
+       r'L4 FAIL soak: 3 rounds in a row failed, first round \d+')
+expect('L4 soak: download corrupted', scenario(4, Phone(bcd=0x101, down_bad=True), extra=SOAK), 1,
+       r'L4 FAIL soak: .*first round 1: down')
+expect('L4 soak: dead after idle', scenario(4, Phone(bcd=0x101, idle_dead=True), extra=SOAK), 1,
+       r'L4 FAIL soak: .*first round 3 after idle')
+expect('L4 soak too short for an idle round', scenario(4, Phone(bcd=0x101), extra=('--soak', '30', '--idle', '90')), 1,
+       r'too short')
 
 # usb-verdict.py: both halves needed.
 vspec = importlib.util.spec_from_file_location('usbverdict', here / 'usb-verdict.py')
@@ -168,6 +193,33 @@ for name, level, log, check, ok, pat in [
      'ASTEROIDS USB L3: start (sweetusb=3)\nASTEROIDS USB GATE: canary\n' + L3, HOST3, True, r'phone and Mac agree'),
 ]:
     got = uv.verdict(level, log, check)
+    good = got[0] == ok and re.search(pat, got[1])
+    fails += not good
+    print('%-4s %-36s %s' % ('ok' if good else 'FAIL', name, got[1]))
+L4 = '''ASTEROIDS USB L4: start (sweetusb=4)
+ASTEROIDS USB: CmdIOC proof: count 4, first word 0x020201c2, want 0x020001c2 under mask 0x0f00ffff: proven
+ASTEROIDS USB L4: configured by the host at speed 0 after 0 s, 11 setups
+SWEET USB: ue0 fe80::5eff:fe77:ee02 up (attach 0, start 0)
+ASTEROIDS USB L4: up: ue0 192.168.7.2 and fe80::5eff:fe77:ee02, speed 0
+'''
+HOST4 = 'USBCHECK L4 PASS ssh root@fe80::5eff:fe77:ee02%en8 works, 4 MiB checksum matches, speed 3\n'
+A145 = '''ASTEROIDS USB L4: ue0 rx 3676 tx 2207 frames; cfg 1 alt 1 txq 0; resets 1; DSTS 0x00021eb8
+ASTEROIDS USB: stale completion 0x0000c046 on ep3 ignored
+ASTEROIDS USB L4: ue0 rx 3679 tx 2226 frames; cfg 1 alt 1 txq 29; resets 1; DSTS 0x0083d4b8
+ASTEROIDS USB L4: ue0 rx 3683 tx 2226 frames; cfg 1 alt 1 txq 32; resets 1; DSTS 0x008298d0
+ASTEROIDS USB L4: ue0 rx 3686 tx 2226 frames; cfg 1 alt 1 txq 32; resets 1; DSTS 0x0083eec0
+'''
+V5 = '''ASTEROIDS USB L4: ue0 rx 900 tx 800 frames; cfg 1 alt 1 txq 0; resets 1; DSTS 0x00021eb8; stale 0, TX lost 0 ended 0
+ASTEROIDS USB L4: ue0 rx 9000 tx 8000 frames; cfg 1 alt 1 txq 1; resets 1; DSTS 0x00021eb8; stale 0, TX lost 0 ended 2
+'''
+DRAIN = (A145.splitlines()[0] + '\n' + A145.splitlines()[3] + '\n' +
+         'ASTEROIDS USB L4: ue0 rx 3700 tx 2300 frames; cfg 1 alt 1 txq 0; resets 1; DSTS 0x0\n')
+for name, log, ok, pat in [
+    ('verdict L4 ast145: TX frozen, queue full', L4 + A145, False, r'TX frozen at 2226 frames .*txq 32'),
+    ('verdict L4 one full queue that drains', L4 + DRAIN, True, r'agree'),
+    ('verdict L4 v5 status lines', L4 + V5, True, r'agree \(2 status lines; stale 0, TX lost 0, TX ended 2\)'),
+]:
+    got = uv.verdict(4, log, HOST4)
     good = got[0] == ok and re.search(pat, got[1])
     fails += not good
     print('%-4s %-36s %s' % ('ok' if good else 'FAIL', name, got[1]))

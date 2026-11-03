@@ -1,4 +1,110 @@
-# USB gadget for SSH from the Mac: patches 2160 and 2161, v4
+# USB gadget for SSH from the Mac: patches 2160 and 2161, v5
+
+2026-11-03. v5 makes the cable link usable for development sessions of 1 to 2 hours. It answers findings 2 and 3 of Sol's daily-use audit (`docs/usb-gadget-audit4.md`). Daily default use is still off. Sol's audit of v5 (`docs/usb-gadget-audit5.md`) is a GO for a controlled dev-session test boot.
+
+## Why TX froze in ast145
+
+ast145 passed level 4, then TX stopped for good. The log has one `stale completion 0x0000c046 on ep3 ignored` (`ios-asteroids/logs/ast145-usb-l4-v4d.txt:9299`). After it, TX stays at 2226 frames while the queue fills to 32, and RX keeps advancing (`:9551` to `:10450`).
+
+`0xc046` is endpoint 3 (bulk IN), XferComplete, status IOC and LST. That is an ordinary successful completion, and v4 threw it away. The cause is a race between two threads:
+
+1. Network output (`ud_if_output`, then `ud_tx_kick_locked`, then `ud_start_trb`) runs on a network thread under `ud.lock`. It sets `tx_busy`, issues STARTTRANSFER and marks the slot active in `xfer_active[3]` only after the command returns.
+2. The event thread, on another CPU, judged the TX completion in `ua_trb_done()` without that lock.
+3. When the host read the frame before the output thread had marked the slot active, the completion found the slot inactive and was dropped as stale.
+4. `tx_busy` then stayed set, so no later frame ever started.
+
+TX is the only transfer started outside the event thread, which is why only ep3 was hit. The window is a few microseconds wide, so it takes an interrupt or preemption of the output thread inside it. That fits one stale event in 2226 frames, at a moment of heavy boot activity (the touch driver powering up, many execs). The host harness reproduces it: on v4 the race test prints exactly `stale completion 0x0000c046 on ep3 ignored` and TX never moves again. That the phone hit this race is inferred from the code, the event word and the counters. The model reproduces it, but the log alone cannot prove it.
+
+## v5 changes
+
+Only `sweet_usb.c` changes. Line numbers are in `plans/usb/gadget/work/b5/bsd/dev/sweet_usb.c`.
+
+1. The TX completion is judged under `ud.lock` (`ua_event`, `:2085`). The event thread waits until a start in progress is fully recorded.
+2. Bounded TX progress check, `ua_tx_check()` (`:2161`), every 100 event-thread polls. A TX held for 2 s is settled with output admission closed, so nothing is copied into the TX buffer meanwhile. If its TRB is back from the controller (HWO clear), the transfer finished and only its event was lost: it is finished by the same test a completion passes. If the controller still owns it, ENDTRANSFER ends it, verified through GUCTL2's polling mode, and that frame is dropped. Only then is the slot used again. A failed end keeps the slot reserved and stops the gadget, as every other failed end does. Nothing clears `tx_busy`, HWO or `xfer_active` without one of those two proofs.
+3. Every data teardown (alternate 0, `SET_CONFIGURATION(0)`, bus reset, disconnect) drops the queued TX frames after the ends succeed, so none reaches the next host (`ua_data_down`, `:1876`).
+4. The plain-UDP live log is off unless `sweetusblog=1` (`:2534`). The Poco F1 path is unchanged.
+5. The status line every 30000 polls ends with `stale N, TX lost N ended N`.
+
+2160 v5 differs from v4 only in recording each TX start time in `ud_tx_kick_locked`. `plans/usb/gadget/v4-to-v5-delta.patch` is the v4 to v5 diff.
+
+Host side:
+
+- `usb-check.py 4 OUT --soak S --idle I` keeps data moving after the first 4 MiB checksum. Each round sends 1 MiB up with the phone's hash, 1 MiB of zeros down checked on the Mac, and one small command that must answer in 15 s. Some rounds come after I seconds with no traffic. Three failed rounds in a row end it.
+- `usb-verdict.py` fails level 4 when two status lines in a row show TX unchanged with a full queue. It fails the real ast145 log: `TX frozen at 2226 frames with the queue full (txq 32)`.
+
+## v5 desk checks
+
+All ran on 2026-11-03.
+
+1. `python3 -I host/kernel-harness.py b5`: 38 of 38. On b4, the 6 new tests fail. The mock now models lock exclusion and a TX that completes inside its own STARTTRANSFER. New tests: the race, a host that stops reading (TX ended after 2 s, then resumes), a lost TX event (finished by HWO, no end), a failed recovery end (stopped, slot never reused), 50 frames plus 10 s idle with no recovery, no log thread by default, and a reset that drops queued TX.
+2. `python3 -I host/test_usb_check.py`: all pass, with 5 new soak scenarios and 3 new level 4 verdict cases.
+3. `test_gadget.c`: 13741 checks, 0 failed. The header did not change.
+4. Patch proof: on a copy of `research/xnu-combined/dxb/xnu/bsd/dev`, reversing 2161 v4 and 2160 v4 gives `work/a` exactly, and applying 2160 v5 and 2161 v5 then gives `work/b5` byte for byte.
+5. The kernel built from `research/xnu-usb` with `--remake`. That tree now equals `research/xnu-combined` (the daily tree) except `sweet_usb.c`, which is `work/b5`. The kernel is `plans/usb/gadget/kernel-v5/kernel.development.sweet`, SHA256 a1bca511017b253efece8136b82bcf895692e182f823eccae84e5ae27a35375a. Its sweet_usb.c warnings match v4's.
+
+## Sol's audit of v5
+
+`docs/usb-gadget-audit5.md`: GO for one controlled level-4 dev-session test boot on the known Mac. Its two findings do not block the boot:
+
+1. Medium: `dev-v5-test.sh` exited 0 even after a failed test. Fixed before the run: it now refuses a reused note, empties the checker's result file first, and exits 0 only when dev.py, the checker and the verdict all pass.
+2. Low: the soak never leaves bulk IN pending, so the ENDTRANSFER branch of the progress check is tested only in the host model. Proving it on hardware needs a host fixture that stops the Mac's USB driver from reading, which needs more than this Mac allows without sudo. Open.
+
+## Phone test, ast147 (2026-11-03 13:46 to 14:01)
+
+`plans/usb/gadget/dev-v5-test.sh usb-dev-v5a`: image `usb-dev-t`, the dev image with `sweetdeadman=960`, and the Mac checker with `--soak 480 --idle 90`. Logs: `ios-asteroids/logs/ast147-usb-dev-v5a.txt`, Mac result `plans/usb/gadget/runs/usb-dev-v5a.txt`, runner log `/tmp/usb-dev-v5.log`.
+
+Measured:
+
+- The Mac saw the gadget 65 s after the checker started, ping6 worked at 67 s, port 22 at 75 s, ssh at 80 s, and the 4 MiB upload checksum matched at 84 s.
+- The soak passed: 16 rounds both ways, each with 1 MiB up hashed on the phone, 1 MiB down and a small command. 4 rounds came after 90 s with no traffic. Rounds took 2.1 to 2.2 s, except one at 11.7 s (round 2, the small command took 1.0 s).
+- `USBCHECK L4 PASS ... soak 480 s: 16 rounds both ways, 4 after 90 s idle, slowest 11.7 s`.
+- `USBVERDICT L4 PASS phone and Mac agree (19 status lines; stale 0, TX lost 0, TX ended 0)`.
+- The phone sent 23330 TX frames, 10 times as many as ast145 managed before its stall, with 0 stale completions and no recovery needed. The queue never stayed full.
+- The self-test ended by itself at 664 s, the phone went back to fastboot after 695 s, and the root was clean.
+
+dev.py exited 1 with `selftest-no-frames`. The self-test did finish (`SELFTEST: DONE`), but dev.py's classifier wants at least one frame, and the body took none. The body now takes one frame at the end. That is a shell-only change and was not rerun.
+
+What this does not prove: the race is rare, so one clean run shows the fix works under this load but cannot show the race is gone. The 2-hour image `usb-dev` has not run for 2 hours yet.
+
+## Dev session image
+
+`plans/usb/gadget/out-v5/usb-dev-boot.img` (SHA256 d0e31cf5...), from `plans/usb/gadget/build-usb-dev.sh`. It is combo-ub on the v5 kernel: UBWC, keep plus astwait, `sweetthermal=3`, plus `sweetusb=4 sweetdeadman=7200 sweetselftest=1`, 597 of 607 bytes. To fit, it drops `keepsyms=1`, `sweettouchirq=3` (touch is polled) and `sweetkeys_ms=5` (keys at the default poll rate). That was still 611 bytes, so it also leaves out `sweetusblog=0`, which v5 makes the default. The live UDP log is off.
+
+The root needs the same driver as combo-ub (`plans/lag/next-luma-ub`). Nothing is flashed.
+
+How the owner uses it:
+
+1. Put the phone in OrangeFox or fastboot and check no other dev.py run is going: `pgrep -f 'devloop/dev[.]py'`.
+2. Run `python3 plans/devloop/dev.py plans/usb/gadget/out-v5/usb-dev-boot.img --test usbdev --note usb-dev-NAME --key 'ASTEROIDS USB|SWEET USB'`, with a fresh NAME each time.
+3. About 80 s after the boot, connect with `ssh root@fe80::5eff:fe77:ee02%en8`. If en8 is not it, `ifconfig` shows the new Ethernet interface with `status: active`.
+4. To end early, run `ssh root@fe80::5eff:fe77:ee02%en8 touch /private/var/tmp/usbdev.stop`. The phone goes back to fastboot within about 10 s, and dev.py pulls the log. Otherwise the session ends by itself about 115 minutes after boot.
+
+The phone is busy for the whole session, so tell the modem agent first.
+
+## What still blocks daily use
+
+From audit 4, the dev image still has:
+
+- Finding 1: admission needs a running deadman, so every session ends at a fixed time. Daily use needs its own admission policy.
+- Finding 4: root SSH has no phone-side host or lock-state gate, and dropbear listens on every address, IPv4 and IPv6.
+- Finding 5: no handling for physical replug, host suspend, a charger or an endpoint halt. CLEAR_FEATURE(ENDPOINT_HALT) still clears nothing.
+- Finding 6: restart, panic and thermal reset do not quiesce the gadget first.
+- Finding 7: no long-uptime or combined-load qualification, no event-overflow recovery, no independent watchdog.
+
+Also open: the ENDTRANSFER branch of the progress check is unproven on hardware (Sol audit 5 finding 2), and no 2-hour session has run.
+
+## Files (v5)
+
+- `2160-asteroids-usb-gadget-shared-v5.patch` and `2161-asteroids-usb-gadget-levels-v5.patch`, made by `host/make-patches-v5.py` from `work/a`, `work/m5` and `work/b5`. Hashes in `plans/usb/gadget/SHA256SUMS-v5`.
+- `v4-to-v5-delta.patch`, the v4 to v5 diff of `sweet_usb.c`.
+- `build-usb-dev.sh`, `dev-v5-test.sh`, `selftest/usbdev.sh` (dev.py's copy is `plans/devloop/selftest/scripts/usbdev.sh`).
+- `kernel-v5/` and `out-v5/` stay in `plans/usb/gadget`, not in this repo.
+
+---
+
+The rest of this file is the v4 description.
+
+## v4
 
 2026-11-03. Desk work only, no phone. v3, under Sol's level 4 re-audit, is unchanged:
 

@@ -1,0 +1,202 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -428,6 +428,7 @@
+ 	unsigned    txq_head, txq_count;
+ 	bool        tx_busy;
+ 	uint64_t    rx_frames, tx_frames;
++	uint64_t    tx_t;           /* mach_absolute_time of the current TX start (asteroids: the progress check) */
+ 	bool        xfer_active[6]; /* a STARTTRANSFER is outstanding (physical ep) */
+ 	uint8_t     xfer_res[6];    /* its transfer resource index */
+ 	uint32_t    resets;
+@@ -822,6 +823,7 @@
+ 		}
+ 		ud.tx_busy = true;
+ 		ud.tx_frames++;
++		ud.tx_t = mach_absolute_time();
+ 		ud_start_trb(EP_TX, UD_TRB_TX, UD_TX, (uint32_t)len, TRBCTL_NORMAL);
+ 	}
+ }
+@@ -1600,6 +1602,7 @@
+ #define GUCTL2_RST_ACTBITLATER (1u << 14) /* DWC_usb3 >= 3.10a: ENDTRANSFER's CMDACT clears only once it has ended */
+ #define UA_L3_HOLD_S    20              /* level 3: connected this long after SET_CONFIGURATION, then disconnect */
+ #define UA_ENUM_WAIT_S  120             /* level 3 gives up, level 4 logs, without a SET_CONFIGURATION by then */
++#define UA_TX_STALL_MS  2000            /* level 4: a TX the controller holds this long is settled by ua_tx_check() */
+ 
+ /* Register groups no earlier boot has touched this way: each is announced and the log synced before its first use. */
+ enum { UA_M_DEPCMD, UA_M_GUCTL2, UA_M_DEVICE, UA_M_GEVNT, UA_M_QSCRATCH };
+@@ -1620,6 +1623,7 @@
+ 	int         speed;              /* DSTS.CONNECTSPD at connect done */
+ 	uint64_t    t_run, t_cfg;       /* mach_absolute_time of RUN_STOP and of SET_CONFIGURATION(1) */
+ 	uint32_t    setups, connects, stale;
++	uint32_t    tx_lost, tx_ended;      /* ua_tx_check: completions found by the TRB alone, transfers ended */
+ 	bool        up_logged;
+ 	bool        addressed;          /* SET_ADDRESS to a non-zero address since the last reset */
+ } ua = { .speed = UG_SPEED_HS };
+@@ -1650,6 +1654,14 @@
+ 	uint64_t ns;
+ 	absolutetime_to_nanoseconds(mach_absolute_time() - t, &ns);
+ 	return ns / NSEC_PER_SEC;
++}
++
++static uint64_t
++ua_ms_since(uint64_t t)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time() - t, &ns);
++	return ns / NSEC_PER_MSEC;
+ }
+ 
+ /* Both canary pages still hold the pattern. Invalidate first, so a device write is seen, not the cached copy. */
+@@ -1845,6 +1857,7 @@
+ {
+ 	static const unsigned data_eps[] = { EP_RX, EP_TX, EP_INT };
+ 	bool was_up = ud.configured && ud.data_alt == 1;
++	unsigned flushed;
+ 
+ 	/* Close data output admission before any end, so no TX can start or copy bytes while the slots are torn down. */
+ 	lck_mtx_lock(ud.lock);
+@@ -1860,7 +1873,15 @@
+ 	}
+ 	lck_mtx_lock(ud.lock);
+ 	ud.tx_busy = false;             /* the TX slot is ended and admission is closed: nothing can be in flight */
++	flushed = ud.txq_count;         /* frames queued for this host never go to the next one (audit 4 finding 3) */
++	for (; ud.txq_count > 0; ud.txq_count--) {
++		mbuf_freem(ud.txq[ud.txq_head]);
++		ud.txq_head = (ud.txq_head + 1) % UD_TXQ;
++	}
+ 	lck_mtx_unlock(ud.lock);
++	if (flushed) {
++		printf("ASTEROIDS USB: data down, %u queued TX frame(s) dropped\n", flushed);
++	}
+ 	if (unconfigure) {
+ 		dwc_wr(DALEPENA, dwc_rd(DALEPENA) & 3u);
+ 	}
+@@ -2061,6 +2082,26 @@
+ 	unsigned type = (ev >> 6) & 0xf;
+ 	unsigned status = (ev >> 12) & 0xf;
+ 
++	if (type == 1 && ep == EP_TX) {
++		/*
++		 * Network output starts TX under ud.lock and marks the slot active only once STARTTRANSFER has returned. A
++		 * completion judged without that lock can arrive in between, find the slot inactive and be dropped as stale,
++		 * which left tx_busy set for good (ast145: "stale completion 0x0000c046 on ep3", then TX frozen). Judge it
++		 * under the lock, so the start is fully recorded first.
++		 */
++		lck_mtx_lock(ud.lock);
++		if (!ua_trb_done(EP_TX)) {
++			lck_mtx_unlock(ud.lock);
++			ua.stale++;
++			printf("ASTEROIDS USB: stale completion 0x%08x on ep%u ignored\n", ev, ep);
++			return;
++		}
++		ud.xfer_active[EP_TX] = false;
++		ud.tx_busy = false;
++		ud_tx_kick_locked();
++		lck_mtx_unlock(ud.lock);
++		return;
++	}
+ 	if (type == 1) {                /* XferComplete: only for the transfer now in the slot */
+ 		if (!ua_trb_done(ep)) {
+ 			ua.stale++;
+@@ -2079,13 +2120,6 @@
+ 		ud_rx_done();
+ 		return;
+ 	}
+-	if (ep == EP_TX && type == 1) {
+-		lck_mtx_lock(ud.lock);
+-		ud.tx_busy = false;
+-		ud_tx_kick_locked();
+-		lck_mtx_unlock(ud.lock);
+-		return;
+-	}
+ 	if (ep > 1) {
+ 		return;
+ 	}
+@@ -2115,7 +2149,62 @@
+ 	}
+ }
+ 
++/*
++ * TX progress (audit 4 finding 2). A TX the controller has held for UA_TX_STALL_MS is settled with output admission
++ * closed, so nothing is copied into UD_TX meanwhile. If its TRB is back from the controller (HWO clear), the transfer
++ * finished and only its event was lost: it is finished here, by the same test a completion passes. If the controller
++ * still owns it (the host stopped reading), ENDTRANSFER ends it, verified through GUCTL2's polling mode, and its frame
++ * is dropped. Only then is the slot used again. A failed end leaves the slot reserved and the gate stops the gadget,
++ * like every other failed end. Event thread only, so no teardown or completion runs at the same time.
++ */
+ static void
++ua_tx_check(void)
++{
++	volatile uint32_t *t = (volatile uint32_t *)(ud.dma + UD_TRB_TX);
++	uint32_t ctl, size, txq;
++	uint64_t ms = 0;
++	bool back;
++
++	lck_mtx_lock(ud.lock);
++	if (!ud.tx_busy || !ud.xfer_active[EP_TX] || ud.tx_closed || ud.gate != NULL || ud.stopped ||
++	    (ms = ua_ms_since(ud.tx_t)) < UA_TX_STALL_MS) {
++		lck_mtx_unlock(ud.lock);
++		return;
++	}
++	ud.tx_closed = true;
++	ud_sync(UD_TRB_TX, 16);
++	ctl = t[3];
++	size = t[2];
++	txq = ud.txq_count;
++	back = !(ctl & TRB_HWO);
++	if (back) {
++		ud.xfer_active[EP_TX] = false;
++	}
++	lck_mtx_unlock(ud.lock);
++	if (back) {
++		ua.tx_lost++;
++	} else {
++		ua.tx_ended++;
++	}
++	if (ua.tx_lost + ua.tx_ended <= 20 || (ua.tx_lost + ua.tx_ended) % 100 == 0) {
++		printf("ASTEROIDS USB TX: no completion in %llu ms: TRB ctl 0x%08x size 0x%08x, resource %u, DEPCMD 0x%08x, "
++		    "txq %u, stale %u; %s (lost %u, ended %u)\n", ms, ctl, size, ud.xfer_res[EP_TX], dwc_rd(DEPCMD(EP_TX)), txq,
++		    ua.stale, back ? "the TRB is back from the controller: finished" : "the controller still owns it: ending it",
++		    ua.tx_lost, ua.tx_ended);
++	}
++	if (!back && ua_end_transfer(EP_TX) != 0) {
++		return;                 /* the gate stops the gadget; the slot stays reserved */
++	}
++	lck_mtx_lock(ud.lock);
++	ud.tx_busy = false;
++	if (ud.gate == NULL && ud.configured && ud.data_alt == 1) {
++		ud.tx_closed = false;
++		ud_tx_kick_locked();
++	}
++	lck_mtx_unlock(ud.lock);
++}
++
++static void
+ ua_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+ 	uint32_t ticks = 0;
+@@ -2176,9 +2265,13 @@
+ 			printf("ASTEROIDS USB L4: no SET_CONFIGURATION in %d s (%u connects, %u resets), still waiting\n",
+ 			    UA_ENUM_WAIT_S, ua.connects, ud.resets);
+ 		}
++		if (ua.level == UG_LEVEL_ECM && (ticks % 100) == 0) {
++			ua_tx_check();
++		}
+ 		if (ua.level == UG_LEVEL_ECM && (ticks % 30000) == 0) {
+-			printf("ASTEROIDS USB L4: ue0 rx %llu tx %llu frames; cfg %d alt %u txq %u; resets %u; DSTS 0x%08x\n",
+-			    ud.rx_frames, ud.tx_frames, ud.configured, ud.data_alt, ud.txq_count, ud.resets, dwc_rd(DSTS));
++			printf("ASTEROIDS USB L4: ue0 rx %llu tx %llu frames; cfg %d alt %u txq %u; resets %u; DSTS 0x%08x; "
++			    "stale %u, TX lost %u ended %u\n", ud.rx_frames, ud.tx_frames, ud.configured, ud.data_alt, ud.txq_count,
++			    ud.resets, dwc_rd(DSTS), ua.stale, ua.tx_lost, ua.tx_ended);
+ 		}
+ 		ud_sleep_ms(1);
+ 	}
+@@ -2438,7 +2531,7 @@
+ 		return;
+ 	}
+ 	thread_deallocate(thread);
+-	int livelog = 1;
++	int livelog = 0;                /* off unless sweetusblog=1: plain UDP to any host at 192.168.7.1 (audit 4 finding 3) */
+ 	PE_parse_boot_argn("sweetusblog", &livelog, sizeof(livelog));
+ 	if (level == UG_LEVEL_ECM && livelog && ud.ifp != NULL && kernel_thread_start(ud_log_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);

@@ -6,8 +6,14 @@ this one. Use the usb-check file written for this same run.
 
   python3 -I host/usb-verdict.py LEVEL PHONE_LOG [USBCHECK_FILE]
 
+Level 4 also fails when two status lines in a row show TX frozen with the queue full, ast145's signature after its
+passing checksum (audit 4 finding 2), and a PASS names the stale, lost and ended TX counts of v5 kernels.
+
 Prints one line, USBVERDICT L<n> PASS|FAIL <reason>, and exits 0 on PASS."""
 import pathlib, re, sys
+
+STATUS = re.compile(r'ASTEROIDS USB L4: ue0 rx (\d+) tx (\d+) frames; cfg (\d) alt (\d+) txq (\d+)(?:.*?stale (\d+), '
+                    r'TX lost (\d+) ended (\d+))?')
 
 NEED = {
     2: ['ASTEROIDS USB L2: start', 'CmdIOC proof: count 4', ': proven', 'ASTEROIDS USB L2: PASS owned'],
@@ -36,11 +42,20 @@ def verdict(level, log, check):
             return False, 'phone: ' + line.strip()[:160]
     if level == 4 and 'ASTEROIDS USB STOP:' in log:
         return False, 'phone: level 4 stopped: ' + next(l for l in log.splitlines() if 'ASTEROIDS USB STOP:' in l)[:160]
+    counts = ''
+    if level == 4:
+        st = [m for m in STATUS.finditer(log)]
+        for a, b in zip(st, st[1:]):
+            if a[2] == b[2] and int(a[5]) >= 31 and int(b[5]) >= 31:
+                return False, 'phone: TX frozen at %s frames with the queue full (txq %s) while rx went %s -> %s' % (
+                    b[2], b[5], a[1], b[1])
+        if st and st[-1][6] is not None:
+            counts = ' (%d status lines; stale %s, TX lost %s, TX ended %s)' % (len(st), st[-1][6], st[-1][7], st[-1][8])
     if level >= 3:
         last = (check or '').strip().splitlines()[-1:] or ['']
         if not re.match(r'USBCHECK L%d PASS' % level, last[0]):
             return False, 'mac: ' + (last[0] or 'no usb-check result')
-    return True, 'phone and Mac agree' if level >= 3 else 'phone'
+    return True, ('phone and Mac agree' if level >= 3 else 'phone') + counts
 
 
 if __name__ == '__main__':

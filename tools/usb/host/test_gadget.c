@@ -123,8 +123,13 @@ test_descriptors(void)
 			CHECK(n == 18 && out[0] == 18 && out[1] == 1, "device");
 			CHECK(out[7] == (speed == UG_SPEED_SS ? 9 : 64), "bMaxPacketSize0");
 			CHECK((out[2] | out[3] << 8) == (speed == UG_SPEED_SS ? 0x0300 : 0x0200), "bcdUSB");
+#ifdef UG_BCD_DEVICE
+			CHECK((out[12] | out[13] << 8) == UG_BCD_DEVICE, "one bcdDevice at every level (v4)");
+			CHECK(out[4] == 0 && out[5] == 0 && out[6] == 0, "class 0/0/0 at every level (v4)");
+#else
 			CHECK((out[12] | out[13] << 8) == 0x0100 + level, "bcdDevice names the level");
 			CHECK(out[4] == (level == UG_LEVEL_ECM ? 2 : 0), "device class");
+#endif
 			CHECK(ug_descriptor(level, speed, out[15] | 0x0300, out + 18) > 2, "product string exists");
 			n = ug_descriptor(level, speed, 0x0200, out);
 			if (level == UG_LEVEL_ECM && speed == UG_SPEED_FS) {
@@ -163,7 +168,10 @@ req(int level, int speed, bool configured, uint8_t type, uint8_t r, uint16_t val
 {
 	uint8_t st[8] = { type, r, (uint8_t)value, (uint8_t)(value >> 8), (uint8_t)index, (uint8_t)(index >> 8),
 		          (uint8_t)len, (uint8_t)(len >> 8) };
-	struct ug_ctx c = { level, speed, configured, 0 };
+	struct ug_ctx c = { .level = level, .speed = speed, .configured = configured, .data_alt = 0 };
+#ifdef UG_CTX_ADDRESSED
+	c.addressed = true;
+#endif
 	return ug_setup_plan(st, &c, data);
 }
 
@@ -342,6 +350,90 @@ test_v2(void)
 	CHECK(p.stage == UG_STALL, "GET_STATUS to recipient 3 stalls");
 }
 
+/* v3: the whole request shape (re-audit finding 3). These fail on the v2 header. */
+static struct ug_plan
+req_at(int level, bool addressed, bool configured, uint8_t type, uint8_t r, uint16_t value, uint16_t index,
+    uint16_t len, uint8_t *data)
+{
+	uint8_t st[8] = { type, r, (uint8_t)value, (uint8_t)(value >> 8), (uint8_t)index, (uint8_t)(index >> 8),
+		          (uint8_t)len, (uint8_t)(len >> 8) };
+	struct ug_ctx c = { .level = level, .speed = UG_SPEED_HS, .configured = configured, .data_alt = 0 };
+#ifdef UG_CTX_ADDRESSED
+	c.addressed = addressed;
+#else
+	(void)addressed;
+#endif
+	return ug_setup_plan(st, &c, data);
+}
+
+static void
+test_v3(void)
+{
+	uint8_t d[UD_DATA_SIZE];
+	const int E = UG_LEVEL_ECM;
+
+	CHECK(req_at(E, true, false, 0x00, 9, 1, 0, 1, d).stage == UG_STALL, "SET_CONFIGURATION with wLength 1 stalls");
+	CHECK(req_at(E, true, false, 0x00, 9, 1, 0, 1, d).action == UG_ACT_NONE, "... and configures nothing");
+	CHECK(req_at(E, false, false, 0x00, 9, 1, 0, 0, d).stage == UG_STALL, "SET_CONFIGURATION in the Default state");
+	CHECK(req_at(E, true, false, 0x00, 9, 1, 3, 0, d).stage == UG_STALL, "SET_CONFIGURATION with wIndex 3");
+	CHECK(req_at(E, true, false, 0x00, 9, 1, 0, 0, d).action == UG_ACT_CONFIG, "a well-formed SET_CONFIGURATION");
+	CHECK(req_at(E, true, true, 0x01, 11, 1, 1, 2, d).stage == UG_STALL, "SET_INTERFACE with wLength 2");
+	CHECK(req_at(E, true, true, 0x01, 11, 0, 2, 0, d).stage == UG_STALL, "SET_INTERFACE to interface 2");
+	CHECK(req_at(UG_LEVEL_ENUM, true, true, 0x01, 11, 0, 1, 0, d).stage == UG_STALL, "level 3 has no interface 1");
+	CHECK(req_at(E, true, true, 0x81, 10, 0, 5, 1, d).stage == UG_STALL, "GET_INTERFACE of interface 5");
+	CHECK(req_at(E, true, true, 0x81, 10, 0, 1, 1, d).stage == UG_IN, "GET_INTERFACE of interface 1");
+	CHECK(req_at(E, true, false, 0x21, 0x43, 0x0e, 0, 0, d).stage == UG_STALL, "packet filter before configuration");
+	CHECK(req_at(E, true, true, 0xa1, 0x43, 0x0e, 0, 0, d).stage == UG_STALL, "IN class request");
+	CHECK(req_at(E, true, true, 0x20, 0x43, 0x0e, 0, 0, d).stage == UG_STALL, "class request to the device");
+	CHECK(req_at(E, true, true, 0x21, 0x43, 0x0e, 1, 0, d).stage == UG_STALL, "packet filter to the data interface");
+	CHECK(req_at(E, true, true, 0x21, 0x44, 0, 0, 0, d).stage == UG_STALL, "another class request");
+	CHECK(req_at(E, true, true, 0x21, 0x43, 0x0e, 0, 0, d).stage == UG_NODATA, "the packet filter itself");
+	CHECK(req_at(E, true, false, 0x00, 5, 3, 1, 0, d).stage == UG_STALL, "SET_ADDRESS with wIndex 1");
+	CHECK(req_at(E, true, false, 0x80, 0, 0, 0, 4, d).stage == UG_STALL, "GET_STATUS with wLength 4");
+	CHECK(req_at(E, true, false, 0x00, 1, 0, 0, 2, d).stage == UG_STALL, "CLEAR_FEATURE with data");
+	CHECK(req_at(E, true, false, 0x80, 8, 0, 0, 1, d).stage == UG_IN, "GET_CONFIGURATION");
+	CHECK(req_at(E, false, false, 0x80, 8, 0, 0, 1, d).stage == UG_STALL, "GET_CONFIGURATION in the Default state");
+}
+
+/*
+ * v4: the identity a Mac's accessory approval is cached against is the same at levels 3 and 4: the device descriptor
+ * and every string it names. Class 0/0/0 at the device is what AppleUSBHostCompositeDevice matches
+ * (IOUSBHostFamily.kext/.../AppleUSBHostCompositeDevice.kext Info.plist on this Mac), and the ECM interfaces carry the
+ * classes AppleUserECM matches (2/6 and 10/0, AppleUserECM.dext Info.plist). These fail on the v3 header.
+ */
+static void
+test_v4(void)
+{
+	uint8_t a[UD_DATA_SIZE], b[UD_DATA_SIZE], c[UD_DATA_SIZE];
+	for (unsigned s = 0; s < 3; s++) {
+		uint32_t na = ug_descriptor(UG_LEVEL_ENUM, speeds[s], 0x0100, a);
+		uint32_t nb = ug_descriptor(UG_LEVEL_ECM, speeds[s], 0x0100, b);
+		CHECK(na == nb && memcmp(a, b, na) == 0, "the same device descriptor at levels 3 and 4, speed %d", speeds[s]);
+		CHECK(a[4] == 0 && a[5] == 0, "AppleUSBHostCompositeDevice matches bDeviceClass 0, bDeviceSubClass 0");
+		for (unsigned k = 14; k <= 16; k++) {
+			if (a[k] == 0) {
+				continue;
+			}
+			uint32_t sa = ug_descriptor(UG_LEVEL_ENUM, speeds[s], (uint16_t)(0x0300 | a[k]), b);
+			uint32_t sb = ug_descriptor(UG_LEVEL_ECM, speeds[s], (uint16_t)(0x0300 | a[k]), c);
+			CHECK(sa > 2 && sa == sb && memcmp(b, c, sa) == 0, "string %u the same at levels 3 and 4", a[k]);
+		}
+	}
+	uint32_t n = ug_descriptor(UG_LEVEL_ECM, UG_SPEED_HS, 0x0200, a);
+	int comm = 0, data = 0;
+	for (uint32_t i = 0; i < n; i += a[i]) {
+		if (a[i + 1] == 4 && a[i + 5] == 2 && a[i + 6] == 6) {
+			comm++;
+		}
+		if (a[i + 1] == 4 && a[i + 5] == 10 && a[i + 6] == 0 && a[i + 7] == 0) {
+			data++;
+		}
+	}
+	CHECK(comm == 1 && data == 2, "AppleUserECM's interfaces: one 2/6, data 10/0 in both alternates");
+	n = ug_descriptor(UG_LEVEL_ENUM, UG_SPEED_HS, 0x0200, a);
+	CHECK(n == 18 && a[9 + 5] == 0xff && a[9 + 4] == 0, "level 3: one vendor interface, no endpoints");
+}
+
 static void
 test_canary(void)
 {
@@ -374,6 +466,8 @@ main(void)
 	test_events();
 	test_canary();
 	test_v2();
+	test_v3();
+	test_v4();
 	printf("%s: %d checks, %d failed\n", fails ? "FAIL" : "PASS", checks, fails);
 	return fails ? 1 : 0;
 }

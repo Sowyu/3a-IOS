@@ -49,9 +49,44 @@ static vm_offset_t ml_io_map(vm_offset_t pa, vm_size_t size);
 static kern_return_t kmem_alloc_contig(void *map, vm_offset_t *addr, vm_size_t size, vm_offset_t mask, ppnum_t max,
     ppnum_t pnmask, int flags, int tag);
 static ppnum_t pmap_find_phys(void *pmap, addr64_t va);
-static int PE_parse_boot_argn(const char *name, void *out, int size) { (void)name; (void)out; (void)size; return 0; }
-static void lck_mtx_lock(lck_mtx_t *l) { (void)l; }
-static void lck_mtx_unlock(lck_mtx_t *l) { (void)l; }
+static int mock_bootarg_usb;
+static int
+PE_parse_boot_argn(const char *name, void *out, int size)
+{
+	if (strcmp(name, "sweetusb") == 0 && size == sizeof(int)) {
+		*(int *)out = mock_bootarg_usb;
+		return 1;
+	}
+	return 0;
+}
+/* Another thread's turn just before a lock is taken: how the tests interleave network output with teardown. */
+static void (*lock_hook)(int n);
+static int lock_count, in_hook;
+/*
+ * v5: the lock excludes. A simulated event-thread turn (evt_turn) that asks for the lock while the test's own thread
+ * holds it is blocked: the turn is abandoned and redone later, which is what blocking amounts to here.
+ */
+static bool lock_held, in_evt, double_lock;
+static jmp_buf evt_jmp;
+static void
+lck_mtx_lock(lck_mtx_t *l)
+{
+	(void)l;
+	if (in_evt && lock_held) {
+		longjmp(evt_jmp, 1);
+	}
+	lock_count++;
+	if (lock_hook != NULL && !in_hook) {
+		in_hook = 1;
+		lock_hook(lock_count);
+		in_hook = 0;
+	}
+	if (lock_held) {
+		double_lock = true;
+	}
+	lock_held = true;
+}
+static void lck_mtx_unlock(lck_mtx_t *l) { (void)l; lock_held = false; }
 static lck_grp_t *lck_grp_alloc_init(const char *n, void *a) { static lck_grp_t g; (void)n; (void)a; return &g; }
 static lck_mtx_t *lck_mtx_alloc_init(lck_grp_t *g, void *a) { static lck_mtx_t l; (void)g; (void)a; return &l; }
 static kern_return_t kernel_thread_start(void (*fn)(void *, wait_result_t), void *arg, thread_t *t);
@@ -63,13 +98,29 @@ static uint32_t ua_rd(vm_offset_t base, uint32_t off);
 static void ua_wr(vm_offset_t addr, uint32_t v);
 static void ud_link_event(bool up) { (void)up; }
 static void ud_rx_done(void);
-static void ud_tx_kick_locked(void) {}
-static void ud_if_create(void) {}
+#define ETHER_MAX_LEN 1518
+#define ETHER_CRC_LEN 4
+static size_t mbuf_pkthdr_len(mbuf_t mb) { (void)mb; return 100; }
+static int freed;
+static void mbuf_freem(mbuf_t mb) { (void)mb; freed++; }
+static void mbuf_copydata(mbuf_t mb, size_t off, size_t len, void *dst);
+static void ifnet_stat_increment_out(ifnet_t i, uint32_t a, uint32_t b, uint32_t c) { (void)i; (void)a; (void)b; (void)c; }
+static void ud_if_create(void);
 static void ud_net_start(void) {}
 static void ua_if_inet6(void) {}
 static void ud_log_thread(void *a, wait_result_t w) { (void)a; (void)w; }
 
 #include GEN
+
+static int ifp_obj;
+static void ud_if_create(void) { ud.ifp = (ifnet_t)&ifp_obj; }
+#ifdef UA_TX_STALL_MS
+#define TX_LOST ua.tx_lost
+#define TX_ENDED ua.tx_ended
+#else                                   /* v4 and earlier have no progress check: the S2 tests are expected to fail */
+#define TX_LOST 0u
+#define TX_ENDED 0u
+#endif
 
 /* ---- the mock ---- */
 #define DWC         0x0a600000u
@@ -103,6 +154,10 @@ static struct {
 	jmp_buf jmp;
 	uint32_t seen_rd[64], seen_wr[64];
 	int nrd, nwr;
+	int copies, setup_end_hangs;
+	int ends[16];
+	bool race_tx;                   /* the next ep3 STARTTRANSFER completes at once, and the event thread runs then */
+	int race_turns;
 } m;
 
 static void
@@ -221,13 +276,17 @@ emit(uint32_t ev)
 	R(0xc40c) += 4;
 }
 
+static void evt_turn(void);
+
 /* DWC3 registers no earlier boot read (the level 1 probe's list) need an announced, synced marker first. */
 static bool
 proven_read(uint32_t pa)
 {
 	static const uint32_t probe[] = { 0xc120, 0xc110, 0xc118, 0xc140, 0xc144, 0xc14c, 0xc200, 0xc2c0, 0xc700, 0xc704,
 		                          0xc708, 0xc70c, 0xc720, 0xc400, 0xc404, 0xc408, 0xc40c };
-	if ((pa >= SMMU && pa < SMMU + 0x100000) || (pa >= PHY && pa < PHY + 0x154)) {
+	if ((pa >= SMMU && pa < SMMU + 0x100000) || (pa >= PHY && pa < PHY + 0x154) ||
+	    (pa >= 0x00139000u && pa < 0x0013a000u) || (pa >= 0x0c400000u && pa < 0x0c431000u) ||
+	    (pa >= DWC + 0xc100 && pa < DWC + 0xc800)) {          /* the probe's own reads (level 1) */
 		return true;
 	}
 	for (unsigned i = 0; i < sizeof(probe) / sizeof(probe[0]); i++) {
@@ -302,6 +361,12 @@ mmio_rd(uint32_t pa)
 	if (pa >= PHY && pa < PHY + 0x1000) {
 		return 0;
 	}
+	if (pa >= 0x00139000u && pa < 0x0013a000u) {
+		return pa == 0x00139004u ? 0x80000000u : 0;     /* GDSC on, every clock branch on */
+	}
+	if (pa >= 0x0c400000u && pa < 0x0c431000u) {
+		return 0;                                       /* SPMI arbiter: no channels */
+	}
 	violation("read of unknown MMIO 0x%08x", pa);
 	return 0;
 }
@@ -341,9 +406,25 @@ command(unsigned ep, uint32_t v)
 		m.active[ep] = true;
 		m.trb_pa[ep] = pa;
 		R(0xc80c + 16 * ep) = cmd | ((ep + 1) << 16);
+		if (ep == 3 && m.race_tx) {     /* ast145: the host reads it before ud_start_trb has returned */
+			m.race_tx = false;
+			t[2] = 0;
+			t[3] &= ~1u;
+			m.active[3] = false;
+			emit((3u << 1) | (1u << 6) | (0xcu << 12));
+			evt_turn();
+		}
 		break;
 	}
 	case 8:                         /* ENDTRANSFER: without GUCTL2[14] the end completes a little later */
+		m.ends[ep]++;
+		if (m.setup_end_hangs && ep == 0 && m.active[0]) {
+			uint32_t *t = host(m.trb_pa[0], 16);
+			if (t != NULL && ((t[3] >> 4) & 0x3f) == 2) {
+				R(0xc80c + 16 * ep) = v;        /* CMDACT stays set: the end never completes */
+				return;
+			}
+		}
 		m.active[ep] = false;
 		if (!(R(0xc19c) & (1u << 14))) {
 			m.ending[ep] = 3;
@@ -416,6 +497,18 @@ mmio_wr(uint32_t pa, uint32_t v)
 
 static uint32_t dwc_rd(uint32_t off) { return mmio_rd(DWC + off); }
 static void dwc_wr(uint32_t off, uint32_t v) { mmio_wr(DWC + off, v); }
+
+/* The packet copy into UD_TX: the controller must not own the TX slot while its bytes change. */
+static void
+mbuf_copydata(mbuf_t mb, size_t off, size_t len, void *dst)
+{
+	(void)off;
+	if (m.active[3] || m.end_left[3]) {
+		violation("TX packet copied into UD_TX while the controller owns ep3");
+	}
+	m.copies++;
+	memset(dst, (int)(uintptr_t)mb, len);
+}
 static uint32_t ua_rd(vm_offset_t base, uint32_t off) { return mmio_rd((uint32_t)(base + off)); }
 static void ua_wr(vm_offset_t addr, uint32_t v) { mmio_wr((uint32_t)addr, v); }
 static void ud_rx_done(void) { if (ud.configured) { ud_rx_arm(); } }
@@ -426,6 +519,11 @@ reset(void)
 {
 	free(m.area);
 	memset(&m, 0, sizeof(m));
+	lock_hook = NULL;
+	lock_count = 0;
+	lock_held = in_evt = double_lock = false;
+	freed = 0;
+	mock_bootarg_usb = 0;
 	memset(&ud, 0, sizeof(ud));
 	memset(&ua, 0, sizeof(ua));
 	ud.bulk_mps = 512;
@@ -461,6 +559,34 @@ run(long n)
 		return 1;
 	}
 	return r == 1 ? 0 : 2;
+}
+
+/*
+ * The event thread's turn on another CPU, now, in the middle of the test thread's call: one poll of ua_thread. If it
+ * asks for the lock the test thread holds, it blocks: its state is put back and the events stay counted for later.
+ */
+static void
+evt_turn(void)
+{
+	uint32_t pos = ud.evt_pos, events = ud.events;
+	long budget = m.budget;
+	jmp_buf saved;
+
+	memcpy(saved, m.jmp, sizeof(saved));
+	m.race_turns++;
+	in_evt = true;
+	if (setjmp(evt_jmp) == 0) {
+		m.budget = 1;
+		if (setjmp(m.jmp) == 0) {
+			ua_thread(NULL, 0);
+		}
+	} else {
+		ud.evt_pos = pos;
+		ud.events = events;
+	}
+	in_evt = false;
+	m.budget = budget;
+	memcpy(m.jmp, saved, sizeof(saved));
 }
 
 static int
@@ -650,10 +776,15 @@ test_f3(void)
 	reset();
 	gadget(3);
 	enumerate(3);
-	fail_on(8, 0, 1, 1);            /* the stop's ENDTRANSFER of the SETUP transfer fails */
+	uint8_t st[8] = { 0x80, 6, 0, 1, 0, 0, 18, 0 };  /* GET_DESCRIPTOR left in its IN data stage on ep1 */
+	uint32_t *t = host(m.trb_pa[0], 16);
+	memcpy(host(((uint64_t)t[1] << 32) | t[0], 8), st, 8);
+	host_complete(0, 0);
+	run(2);
+	fail_on(8, 1, 1, 1);            /* the stop's ENDTRANSFER of that data stage fails */
 	m.now += 21 * NSEC_PER_SEC;
 	run(5);
-	result("F3 an ENDTRANSFER fails at stop: no L3 PASS", !logged("L3: PASS"));
+	result("F3 an ENDTRANSFER fails at stop: no L3 PASS", m.active[1] && !logged("L3: PASS"));
 }
 
 static void
@@ -781,6 +912,210 @@ test_f8(void)
 	result("F8 every first access to an unread register is announced", l2 && l4);
 }
 
+/* ---- v3: the re-audit's findings ---- */
+static uintptr_t hook_packet;
+static int hook_at;
+static void
+net_output_at(int n)
+{
+	if (n == hook_at) {
+		ud_if_output(NULL, (mbuf_t)hook_packet);
+	}
+}
+
+static void
+test_r1(void)
+{
+	reset();
+	gadget(4);
+	enumerate(4);
+	control(0x01, 11, 0, 1, 0);     /* SET_INTERFACE(1, 0) */
+	int starts = m.starts[3];
+	ud_if_output(NULL, (mbuf_t)0x33);
+	result("R1 alt 0: network output starts no TX", m.starts[3] == starts && !m.active[3] && m.copies == 0 && clean());
+
+	reset();
+	gadget(4);
+	emit(0x101);
+	emit(0x201);
+	R(0xc70c) &= ~7u;
+	run(2);
+	control(0x00, 5, 9, 0, 0);
+	control(0x00, 9, 1, 0, 0);      /* configured, alt still 0 */
+	ud_if_output(NULL, (mbuf_t)0x33);
+	result("R1 configured but alt 0: no TX", m.starts[3] == 0 && m.copies == 0 && clean());
+
+	/*
+	 * Sol's interleave and every other: one network output just before each lock taken while the host's
+	 * SET_INTERFACE(1, 0) is handled (the alt-0 teardown runs inside it).
+	 */
+	bool all = true;
+	for (hook_at = 1; hook_at <= 12; hook_at++) {
+		reset();
+		gadget(4);
+		enumerate(4);
+		lock_count = 0;
+		hook_packet = 0x22;
+		lock_hook = net_output_at;
+		control(0x01, 11, 0, 1, 0);
+		lock_hook = NULL;
+		uint8_t first = *(uint8_t *)(m.area + PAGE_SIZE + UD_TX);
+		ud_if_output(NULL, (mbuf_t)0x77);               /* more traffic after the teardown */
+		bool ok = clean() && !(m.active[3] && *(uint8_t *)(m.area + PAGE_SIZE + UD_TX) != first) && !m.active[3];
+		if (!ok) {
+			fprintf(stdout, "     (output before lock %d: tx active %d, %d violation(s))\n", hook_at, m.active[3],
+			    m.violations);
+		}
+		all &= ok;
+	}
+	result("R1 output interleaved with alt-0 teardown: no copy into a live TX", all);
+
+	reset();
+	gadget(4);
+	enumerate(4);
+	control(0x01, 11, 0, 1, 0);
+	control(0x01, 11, 1, 1, 0);     /* back to alt 1 */
+	ud_if_output(NULL, (mbuf_t)0x44);
+	result("R1 alt 1 again: TX reopens and sends", m.active[3] && m.copies == 1 && clean());
+}
+
+static void
+test_r2(void)
+{
+	reset();
+	m.ready = false;
+	mock_bootarg_usb = 4;
+	sweet_usb_asteroids_probe();
+	result("R2 recovery not armed: the probe makes no access either", m.mmio == 0);
+}
+
+static void
+test_r3(void)
+{
+	reset();
+	gadget(4);
+	emit(0x101);
+	emit(0x201);
+	R(0xc70c) &= ~7u;
+	run(2);
+	control(0x00, 5, 9, 0, 0);
+	control(0x00, 9, 1, 0, 1);      /* SET_CONFIGURATION(1) with wLength 1 */
+	result("R3 malformed SET_CONFIGURATION configures nothing", !ud.configured && m.starts[2] == 0 && clean());
+}
+
+static void
+test_r4(void)
+{
+	reset();
+	m.setup_end_hangs = 1;          /* Linux: ENDTRANSFER on a pending SETUP may not complete */
+	gadget(3);
+	enumerate(3);
+	m.now += 21 * NSEC_PER_SEC;
+	int r = run(5);
+	result("R4 stop with a pending SETUP: halt covers it, stop verified", r == 1 && logged("L3: PASS") && clean());
+}
+
+/* ---- v5: audit 4 ---- */
+static void
+tx_start_frames(int n)
+{
+	for (int i = 0; i < n; i++) {
+		ud_if_output(NULL, (mbuf_t)(uintptr_t)(0x50 + i));
+	}
+}
+
+static void
+test_s2(void)
+{
+	/* Finding 2, the ast145 signature: a TX completion that arrives while ud_start_trb is still inside STARTTRANSFER. */
+	reset();
+	gadget(4);
+	enumerate(4);
+	m.race_tx = true;
+	tx_start_frames(1);
+	tx_start_frames(2);
+	run(5);
+	result("S2 a TX completion during its own start is not lost", m.race_turns == 1 && m.starts[3] >= 2 &&
+	    ua.stale == 0 && !ud.stopped && !double_lock && clean());
+
+	/* The host stops reading: the controller keeps the TRB. After the deadline it is ended, then the slot reused. */
+	reset();
+	gadget(4);
+	enumerate(4);
+	tx_start_frames(4);
+	run(150);
+	bool early = m.ends[3] == 0 && m.starts[3] == 1;
+	m.now += 2100 * NSEC_PER_MSEC;
+	run(150);
+	bool ended = m.ends[3] == 1 && m.starts[3] == 2 && TX_ENDED == 1 && logged("the controller still owns it");
+	host_complete(3, 0);            /* the host reads again */
+	run(3);
+	result("S2 host stops reading: TX ended after 2 s, then resumes", early && ended && m.starts[3] == 3 &&
+	    !ud.stopped && !double_lock && clean());
+
+	/* The TRB came back but its event never did: finished by the TRB alone, no ENDTRANSFER. */
+	reset();
+	gadget(4);
+	enumerate(4);
+	tx_start_frames(2);
+	uint32_t *t = host(m.trb_pa[3], 16);
+	t[2] = 0;
+	t[3] &= ~1u;
+	m.active[3] = false;            /* no event */
+	m.now += 2100 * NSEC_PER_MSEC;
+	run(150);
+	result("S2 lost TX event: finished by HWO, no end, next frame sent", m.ends[3] == 0 && m.starts[3] == 2 &&
+	    TX_LOST == 1 && !ud.stopped && clean());
+
+	/* The recovery's ENDTRANSFER fails: the slot stays reserved and the gadget stops. */
+	reset();
+	gadget(4);
+	enumerate(4);
+	tx_start_frames(2);
+	fail_on(8, 3, 1, 1);
+	m.now += 2100 * NSEC_PER_MSEC;
+	run(150);
+	result("S2 recovery end fails: stopped, the TX slot never reused", ud.stopped && m.starts[3] == 1 &&
+	    m.end_left[3] && m.panics == 0 && m.violations == 0);
+
+	/* Ordinary traffic and idle never trip it. */
+	reset();
+	gadget(4);
+	enumerate(4);
+	for (int i = 0; i < 50; i++) {
+		tx_start_frames(1);
+		run(3);
+		host_complete(3, 0);
+		run(3);
+	}
+	m.now += 10 * NSEC_PER_SEC;
+	run(300);
+	result("S2 completed traffic and 10 s idle: no recovery", m.ends[3] == 0 && TX_LOST == 0 &&
+	    TX_ENDED == 0 && m.starts[3] == 50 && clean());
+}
+
+static void
+test_s3(void)
+{
+	/* Finding 3: no live UDP log thread unless sweetusblog=1. */
+	reset();
+	gadget(4);
+	result("S3 sweetusblog unset: no log thread", m.threads == 1);
+
+	/* Queued frames for one host never go to the next: a reset drops them. */
+	reset();
+	gadget(4);
+	enumerate(4);
+	tx_start_frames(4);             /* one in flight, three queued */
+	emit(0x101);
+	run(3);
+	int copies = m.copies;
+	bool flushed = ud.txq_count == 0 && freed >= 4;
+	enumerate(4);
+	run(3);
+	result("S3 reset drops queued TX; the next host gets none of it", flushed && m.copies == copies && clean());
+}
+
 int
 main(void)
 {
@@ -792,6 +1127,12 @@ main(void)
 	test_f5();
 	test_f6();
 	test_f8();
+	test_r1();
+	test_r2();
+	test_r3();
+	test_r4();
+	test_s2();
+	test_s3();
 	fprintf(stdout, "%s: %d tests, %d failed\n", fails ? "FAIL" : "PASS", total, fails);
 	return fails ? 1 : 0;
 }

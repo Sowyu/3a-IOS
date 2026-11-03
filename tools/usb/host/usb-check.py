@@ -3,12 +3,17 @@
 in the background; it waits for the phone's gadget, tests the level, writes OUT and exits.
 
   python3 -I host/usb-check.py LEVEL OUT [--wait SECONDS]      LEVEL 3 or 4, default wait 2400 s
+  python3 -I host/usb-check.py 4 OUT --soak 420 --idle 90      level 4, then keep data moving both ways for 420 s
 
 Level 3: the USB device 1209:0001 appears (ioreg), macOS configures it (its vendor interface, class 255, shows up as
 an IOUSBHostInterface), and only then does it leave again (the phone's timed soft-disconnect). A device that leaves
 without ever being configured fails. This is the host half: host/usb-verdict.py also needs the kernel's lines. Level 4: bcdDevice 0x0104; the CDC-ECM interface with the host MAC 02:00:5e:77:ee:01 gets its own
 IPv6 link-local address from macOS; ping6 and ssh to the phone's fixed fe80::5eff:fe77:ee02 on that interface;
-a 4 MiB checksum over ssh. Every command has a timeout. The last line of OUT is the verdict:
+a 4 MiB checksum over ssh. With --soak S, level 4 then repeats rounds for S seconds after that first checksum (audit 4
+finding 2: ast145 passed its checksum, then TX froze): 1 MiB up with the phone's hash, 1 MiB of zeros down hashed
+here, and one small command that must answer in 15 s. Every few rounds it sends nothing for --idle seconds and then
+probes again. Three failed rounds in a row end it at once. Every command has a timeout. The last line of OUT is the
+verdict:
   USBCHECK L<n> PASS ...   or   USBCHECK L<n> FAIL <first failed step>
 A device that macOS's accessory security keeps from its drivers (kernel log "blocked by transport restrictions",
 ast108) ends as USBCHECK L<n> FAIL BLOCKED: approve the accessory at the unlocked Mac once, then rerun.
@@ -83,11 +88,32 @@ def interface(base):
     return hit[0], bool(re.search(r'inet6 fe80::', b)), b
 
 
+def probe(target, n=1 << 20):
+    """One round both ways: (ok, detail, seconds). n random bytes up, hashed by the phone; n zero bytes down, checked
+    here; then a small command, which must answer within 15 s."""
+    t = time.monotonic()
+    blob = os.urandom(n)
+    rc, txt = run(['ssh', *SSH_OPTS, 'root@' + target, 'sha256sum 2>/dev/null || shasum -a 256'], 60, blob)
+    got = (re.search(r'\b[0-9a-f]{64}\b', txt) or [None])[0]
+    if got != hashlib.sha256(blob).hexdigest():
+        return False, 'up: rc %d %s' % (rc, txt.strip()[:200]), time.monotonic() - t
+    rc, txt = run(['ssh', *SSH_OPTS, 'root@' + target, 'dd if=/dev/zero bs=65536 count=%d 2>/dev/null' % (n // 65536)], 60)
+    if rc != 0 or txt != '\0' * n:
+        return False, 'down: rc %d, %d bytes, %d not zero' % (rc, len(txt), len(txt.replace('\0', ''))), time.monotonic() - t
+    c = time.monotonic()
+    rc, txt = run(['ssh', *SSH_OPTS, 'root@' + target, 'echo PROBE-OK'], 15)
+    if rc != 0 or 'PROBE-OK' not in txt:
+        return False, 'command: rc %d %s' % (rc, txt.strip()[:200]), time.monotonic() - t
+    return True, 'up and down %d bytes, command %.1f s' % (n, time.monotonic() - c), time.monotonic() - t
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('level', type=int, choices=(3, 4))
     ap.add_argument('out')
     ap.add_argument('--wait', type=int, default=2400, help='how long to wait for the gadget to appear')
+    ap.add_argument('--soak', type=int, default=0, help='level 4: seconds of rounds both ways after the first checksum')
+    ap.add_argument('--idle', type=int, default=90, help='with --soak: seconds without traffic between some rounds')
     a = ap.parse_args()
     base = set(interfaces())          # before the phone boots: anything new later is the gadget
     out = pathlib.Path(a.out)
@@ -183,7 +209,30 @@ def main():
     note('4 MiB checksum', got == want_sum, 'mac %s phone %s' % (want_sum, txt.strip()))
     if got != want_sum:
         finish(False, '4 MiB checksum: phone %s' % (got or txt.strip()[:200]))
-    finish(True, 'ssh root@%s works, 4 MiB checksum matches, speed %s' % (target, dev['speed']))
+    if a.soak <= 0:
+        finish(True, 'ssh root@%s works, 4 MiB checksum matches, speed %s' % (target, dev['speed']))
+    end, k, rounds, idles, worst, bad, first_bad = time.monotonic() + a.soak, 0, 0, 0, 0.0, 0, None
+    while time.monotonic() < end:
+        k += 1
+        after_idle = a.idle > 0 and k % 4 == 3 and time.monotonic() + a.idle < end
+        if after_idle:
+            time.sleep(a.idle)
+        ok, detail, sec = probe(target)
+        rounds += 1
+        idles += after_idle and ok
+        worst = max(worst, sec)
+        note('soak %d%s' % (k, ' after %d s idle' % a.idle if after_idle else ''), ok, '%s (%.1f s)' % (detail, sec))
+        bad = 0 if ok else bad + 1
+        first_bad = first_bad or (None if ok else 'round %d%s: %s' % (k, ' after idle' if after_idle else '', detail))
+        if bad >= 3:
+            finish(False, 'soak: 3 rounds in a row failed, first %s' % first_bad)
+        time.sleep(5)
+    if first_bad:
+        finish(False, 'soak: %s' % first_bad)
+    if a.idle > 0 and idles == 0:
+        finish(False, 'soak: %d s was too short for a round after idle' % a.soak)
+    finish(True, 'ssh root@%s works, 4 MiB checksum matches, speed %s; soak %d s: %d rounds both ways, %d after %d s '
+           'idle, slowest %.1f s' % (target, dev['speed'], a.soak, rounds, idles, a.idle, worst))
 
 
 if __name__ == '__main__':
