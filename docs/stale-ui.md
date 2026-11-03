@@ -71,11 +71,43 @@ The test that splits them: after the stale frame, go home and reopen the app. Co
 | 6 | New: the glyph draw fails on every frame in the post-transition state, through a translation or ordering bug in its pipeline. Vibrant glyphs on glass use the `Bvcm` shaders, which read the destination (fetch), and `sweetfetchsync` changes how those reads are ordered |
 | 7 | New: UIKit's own state never finishes the transition (an animation completion that never arrives), so the glyph is really hidden. It would look exactly like this. Nothing on the driver side tests it directly |
 
+## ast156: keep and astwait off
+
+`stale-0` (no keep, no astwait, no UBWC, no hw scale), same `staleui` body. `kept=0` all boot. dev.py rc 1: a `reset-unknown` at 358 s, after all 34 frames, the end-of-run reset HANDOFF.md already lists. Root clean, 0 recoveries.
+
+**Measured.** The Notes frames match ast154 (zoomed side by side): the "..." glyph on the fresh list, a blank circle with the note open, still blank at 2 s and 7 s after leaving, in all three round trips, after the reopen, and on the new note at 12 s. Calendar's nav bar crops in frames 16 to 26 are pixel-identical to ast154 (`magick compare -fuzz 8%`, 0 differing pixels).
+
+So keep and astwait (2142) are out for the Notes glyph, measured. Hypothesis 1b is closed for the reproduced case. The Calendar blur is still not reproduced on either arm.
+
+## Dev session: pool off and a capture, live
+
+`stale-P0` is replaced by one SSH session, `plans/stale/session/run.sh` (copy in `tools/stale/session/`), on `stale-dev`: `build-stale.sh`'s `ONLY=stale-dev`, the usb-dev args on `plans/usb/gadget/kernel-v5` without `sweetfb_ast_hw=1`, deadman 2100 s, so the session ends itself 1800 s after boot. It takes the phone by `docs/dev-session.md` with `/tmp/phone-stale-wants`. Steps, in `phone.sh`:
+
+1. `setup` saves the daily `bgmtl-inject.dylib` and any `shatter.capture` on the phone.
+2. `base`: Notes list, note, back, reopen, shot at each.
+3. `capon`: the capture build of the inject, `shatter.capture` set to `v2 0 now`, backboardd restarted. The same round trip, with a capture of the list (glyph drawn) and one after leaving (glyph blank).
+4. `pool0`: `bgmtl-bb.texpool` set to 0, backboardd restarted, the round trip again with captures.
+5. `restore`: the daily inject and config back, backboardd restarted, the round trip once more, the inject's SHA256 logged.
+
+backboardd restarts use SIGTERM, 150 s apart. launchd counts only crash signals toward its 3-in-60 s reboot, and the launcher restarts on Metal at once only after a productive launch, 120 s after its first frame. The whole session is about 14 minutes.
+
+**The capture build** (`plans/stale/drv/capnow.patch` on `next-luma-ub`'s `bgmtl.m`, copy in `tools/stale/`). A third word `now` in `shatter.capture` turns off the periodic captures. Each change of `/private/var/tmp/bgmtl.capnow`'s modification time captures the next command buffer that renders a full-screen surface, with every texture its draws sample, under kind 2's limit of 8 a boot. If that command buffer had no full-screen target, the next one is taken. With the word absent, nothing changes. `tools/stale/capnow-check.py` compiles the trigger on the host: no fire on the first look, one per stamp change, the re-arm, no file. It passes.
+
+How to read it:
+
+- Comparing the list capture with the after-leaving capture, the draws around the button's rectangle (x 250 to 360, y 20 to 80 in frame pixels, twice that in the 840x1860 target) separate the cases.
+- If the glyph draw is missing after leaving, CoreAnimation never asked for it. That points at hypothesis 7 (UIKit state) or 2 (a layer CoreAnimation thinks is current).
+- If the glyph draw is there and its sampled texture holds the glyph but the target does not, the draw itself fails: hypothesis 6.
+- If its texture is blank, the source is stale: hypothesis 5, or 2 for a backdrop.
+- If `P-2left` shows the glyph, the texture pool is the cause.
+
+`stale-F0` (fetch sync off) stays a boot, because `sweetfetchsync` is a boot arg the launcher reads once.
+
 ## Next runs
 
 `plans/stale/build-stale.sh` now also builds two arms on `stale-UB`, and `ONLY="name ..."` builds only those:
 
-- `stale-P0` adds `sweetpool=0`, which bgl-launch already reads: Chlorophyll's texture pool off, nothing pushed. Pooled textures come back zeroed and are cleared by their first pass, and an offscreen glyph cache would live in one.
+- `stale-P0` (replaced by the dev session below) adds `sweetpool=0`, which bgl-launch already reads: Chlorophyll's texture pool off, nothing pushed. Pooled textures come back zeroed and are cleared by their first pass, and an offscreen glyph cache would live in one.
 - `stale-F0` sets `sweetfetchsync=0`. Labels may tear in it (`lag.md`), so judge only the glyph.
 
 How to read them: the glyph back in `stale-P0` frames 03, 04 and 11 points at the pool. Back in `stale-F0` points at fetch ordering (hypothesis 6). Still blank in both, with `stale-0` also blank, leaves hypotheses 2, 3, 5 and 7. The next step then is a capture of the frame after the round trip, which needs a `shatter.capture` file on the root (a flash, since dev.py cannot create files), or a capture trigger in the driver.

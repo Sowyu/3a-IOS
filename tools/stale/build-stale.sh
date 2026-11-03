@@ -24,3 +24,10 @@ mk stale-0 "$base $loop"                                                        
 ub="$base $loop sweetfb_keep=1 sweetfb_astwait=1 sweettu=sysmem,nocb,nolrz"
 mk stale-P0 "$ub sweetpool=0"
 mk stale-F0 "${ub/sweetfetchsync=1/sweetfetchsync=0}"
+# SSH dev session without hw scale (docs/dev-session.md): plans/usb/gadget/build-usb-dev.sh's usb-dev args on the v5 kernel minus
+# sweetfb_ast_hw=1, deadman 2100 s, so the usbdev self-test ends the session after about 30 minutes
+if [ "${ONLY:-}" = stale-dev ]; then
+	kernel="$root/plans/usb/gadget/kernel-v5/kernel.development.sweet"
+	a=${args/ keepsyms=1/}
+	mk stale-dev "${a/ sweetsyserr=backboardd,MobileSafari/} sweetthermal=3 sweetfetchsync=1 sweetsb=1 sweetfb_keep=1 sweetfb_astwait=1 sweettu=sysmem,nocb,nolrz sweetusb=4 sweetdeadman=2100 sweetselftest=1"
+fi

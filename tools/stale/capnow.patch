@@ -1,0 +1,63 @@
+--- bgmtl.m.orig	2026-11-03 16:31:37
++++ Chlorophyll/src/bgmtl.m	2026-11-03 16:32:03
+@@ -211,6 +211,20 @@
+ // "v2 0 launch" in shatter.capture: no periodic captures. A capture when a draw first samples a portrait client image (a launch
+ // image, a snapshot), and one after the stripe detector fires on a finished frame. Off without that third word.
+ static unsigned bg_cap_launch, bg_cap_launch_n, bg_cap_force;
++// "v2 0 now" in shatter.capture (stale UI, 3a-IOS/docs/stale-ui.md): no periodic captures. Each time the modification time of
++// /private/var/tmp/bgmtl.capnow changes (touch it over SSH), the next command buffer that renders a full-screen surface is captured
++// with every texture its draws sample. The 8-per-boot cap of bg_cap_claim's kind 2 applies. Off without that third word.
++static unsigned bg_cap_now, bg_cap_now_again;
++static BOOL bg_cap_now_due(void)
++{
++   if (__atomic_exchange_n(&bg_cap_now_again, 0, __ATOMIC_ACQ_REL)) return YES;   // the last one rendered no full-screen surface
++   static long long seen = -1;
++   struct stat st;
++   if (stat("/private/var/tmp/bgmtl.capnow", &st) != 0) return NO;
++   long long m = (long long)st.st_mtimespec.tv_sec * 1000000000LL + st.st_mtimespec.tv_nsec;
++   long long was = __atomic_exchange_n(&seen, m, __ATOMIC_ACQ_REL);
++   return was >= 0 && was != m;   // the first look only learns the stamp, so a stale file never fires at start
++}
+ static unsigned long bg_cap_launch_last;
+ #define BG_CAP_LAUNCH_MAX 8
+ static BOOL bg_cap_launch_take(unsigned long seq, unsigned long gap)
+@@ -258,6 +272,7 @@
+          int got = fscanf(f, "%31s %u %31s", mode, &bg_cap_surface, extra);
+          if (got >= 2 && !strcmp(mode,"v2")) bg_cap_start=1;
+          if (got == 3 && bg_cap_start && !strcmp(extra,"launch")) bg_cap_launch=1;
++         if (got == 3 && bg_cap_start && !strcmp(extra,"now")) bg_cap_now=1;
+          fclose(f);
+       }
+    });
+@@ -1980,7 +1995,8 @@
+    _seq = __atomic_add_fetch(&g_bg_cb_seq, 1, __ATOMIC_RELAXED);
+    bg_cap_config();
+    if (getenv("BGMTL_BB") && bg_cap_start &&
+-       (bg_cap_launch ? __atomic_load_n(&bg_cap_launch_n, __ATOMIC_RELAXED) < BG_CAP_LAUNCH_MAX : (bg_cap_eligible(0,_seq) || bg_cap_eligible(1,_seq))) &&
++       (bg_cap_now ? bg_cap_now_due() :
++        bg_cap_launch ? __atomic_load_n(&bg_cap_launch_n, __ATOMIC_RELAXED) < BG_CAP_LAUNCH_MAX : (bg_cap_eligible(0,_seq) || bg_cap_eligible(1,_seq))) &&
+        !__atomic_exchange_n(&bg_cap_busy, 1, __ATOMIC_ACQ_REL)) {
+       _capture = [[NSMutableString alloc] initWithFormat:@"capture-v2 cb=%lu targetSurface=%u\n", _seq, bg_cap_surface];
+       _captureSources = [NSMutableSet new];
+@@ -2376,6 +2392,7 @@
+       _stripeStaging = NULL;
+    }
+    if (!_capture) return;
++   if (bg_cap_now && !_captureTarget) __atomic_store_n(&bg_cap_now_again, 1, __ATOMIC_RELEASE);
+    BOOL save = ok && _captureTarget && _captureKinds;
+    __block BOOL claimed = NO;
+    if (save) {
+@@ -3837,9 +3854,10 @@
+             BG_LOG("stripe capture cb=%lu\n",_cb->_seq);
+          }
+       }
+-      if(!bg_cap_launch && big && bg_cap_eligible(0,_cb->_seq)) _cb->_captureKinds |= 1;
+-      if(!bg_cap_launch && (icon || mask || label) && bg_cap_eligible(1,_cb->_seq)) _cb->_captureKinds |= 2;
+-      BOOL wanted=bg_cap_launch ? launchHit : big || icon || mask || label || strstr(_pipeline->_names,"Tmua") || _captureDescriptor.colorAttachments[0].level>0;
++      if(bg_cap_now) _cb->_captureKinds |= 4;
++      if(!bg_cap_now && !bg_cap_launch && big && bg_cap_eligible(0,_cb->_seq)) _cb->_captureKinds |= 1;
++      if(!bg_cap_now && !bg_cap_launch && (icon || mask || label) && bg_cap_eligible(1,_cb->_seq)) _cb->_captureKinds |= 2;
++      BOOL wanted=bg_cap_now ? YES : bg_cap_launch ? launchHit : big || icon || mask || label || strstr(_pipeline->_names,"Tmua") || _captureDescriptor.colorAttachments[0].level>0;
+       if(wanted && _cb->_captureKinds) {
+          for(unsigned i=0;i<BG_MAX_TEX;i++) {
+             if (!(_pipeline->_info.textures_used[1] & (1u<<i))) continue;
