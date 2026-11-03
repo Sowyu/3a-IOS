@@ -10,7 +10,15 @@ rm -f /private/var/tmp/usbdev.stop
 say "usbdev open: ends $ud_end s after boot, or at touch /private/var/tmp/usbdev.stop"
 ud_i=0
 while :; do
-	ud_up=$(( $(date +%s) - ud_bt ))
+	# ast163: iOS set the clock from the network mid-session (+11.9e6 s). XNU moves kern.boottime with the clock, so read
+	# it again each pass; if uptime still jumps by more than 2 min between 10 s passes, count the pass as 10 s instead.
+	ud_bt2=$(/var/jb/usr/sbin/sysctl -n kern.boottime 2>/dev/null | sed -n 's/^{ sec = \([0-9]*\),.*/\1/p')
+	ud_now=$(( $(date +%s) - ${ud_bt2:-$ud_bt} ))
+	if [ -n "${ud_up:-}" ] && { [ "$ud_now" -gt $((ud_up + 120)) ] || [ "$ud_now" -lt "$ud_up" ]; }; then
+		ud_up=$((ud_up + 10))
+	else
+		ud_up=$ud_now
+	fi
 	if [ -e /private/var/tmp/usbdev.stop ]; then
 		say "usbdev stop file at $ud_up s"
 		break
