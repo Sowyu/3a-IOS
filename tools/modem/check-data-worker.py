@@ -21,7 +21,7 @@ static void sweet_data_usim(int ready){assert(!ready && !detach);revoke++;}
 static void sweet_data_detach(void){assert(stops && !m.uim_ready && !detach);detach++;}
 static void init(void){memset(&m,0,sizeof(m));stops=ipc=polls=smp=detach=revoke=0;now=0;cleanup=0;finish_after=3;m.data_attached=m.started=m.glink=m.uim_ready=true;m.channel=&m;}
 '''
-helper=s[s.index('static void m_uim_readiness('):s.index('static bool m_uim_endpoint_valid(')]
+helper=s[s.index('static void m_uim_readiness('):s.index('static void m_uim_refresh(')]
 code=s[s.index('static bool m_data_stop('):s.index('static bool m_cleanup(')]
 tail=r'''
 int main(void){

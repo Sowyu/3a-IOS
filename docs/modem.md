@@ -379,3 +379,12 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 **Measured.** PAS authentication succeeded at9086, MSS proxy handover at9129 and GLINK at9131. Offline work ended with error0 at12493. SSCTL response, indication and fresh shutdown_ack were all accepted at12503. The known50 PAS shutdown failures followed, with retained backing at12561 and final_error5 at12562. No ownership reclaim or power drop followed retention. Normal DONE is at13283 after365seconds. The nonce matches the frozen script, one checked frame exists, stale=false and root before/after is clean. The phone returned to recovery and the modem hold was released for IPA.
 
 **Code, next integration.** Sol accepts the600-second lifetime design but found two2189 wiring gaps. Data service removals must reach its cache before a later response in the same receive batch can advance setup. UIM freshness must also revoke unconditionally when ready/handover bits clear and traffic stops. The owners are fixing both with connected host tests. See `modem-2189-audit.md`. No further PAS4-only phone diagnostic is planned.
+
+
+## 2189 data worker revision2
+
+**Code.** The 600-second worker expires USIM evidence before every transport/data step, even if SMP2P ready or handover clears. It calls the data discovery hook after every accepted QRTR packet and UIM endpoint check, preserving removal events before later replies. This requires data2220 revision8a0b901c, reviewed in `docs/data-2220-audit6.md`.
+
+**Measured, host.** The extracted worker and real CellSession pass the cleared-state/no-traffic freshness regression. The actual modem receive and data discovery functions pass DEL_DPM/late-reply and DEL/NEW tests with real QRTR, DataServices and CellSession under ASAN/UBSAN. `tools/modem/check-data-hooks.sh` reproduces these checks. The first2189 revision built successfully. The corrected revision is rebuilding.
+
+**Missing.** Fresh Sol re-review of both fixes, the final combined build and IPA readiness/quiescence approval. No2189 phone image is approved. PAS4 retention remains the owner-accepted bounded-trial policy, with M2 incomplete. M3 and sustained USIM READY are measured in ast168.

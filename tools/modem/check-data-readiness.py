@@ -3,6 +3,7 @@ here=Path(__file__).resolve().parent;d=here/'tests/out'
 s=(d/'ModemRuntime.inc').read_text();tests=here/'tests'
 prefix=(tests/'uim-runtime-prefix.c').read_text()
 prefix+='\n#include "QcomGlink.h"\nstatic uint32_t le32(const uint8_t *p){return p[0]|(uint32_t)p[1]<<8|(uint32_t)p[2]<<16|(uint32_t)p[3]<<24;}\n'
+prefix+='static void sweet_data_discovery(QcomQrtr *qr){assert(qr==&m.qr);}'
 code=s[s.index('static void m_uim_readiness('):s.index('static int m_glink_prepare(')]
 tail=(tests/'uim-runtime-tail.c').read_text().replace('int main(void){','static int original_tests(void){')
 a=tail.rfind('}');tail=tail[:a]+'return 0;\n'+tail[a:]
