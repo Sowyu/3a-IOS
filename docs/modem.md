@@ -511,3 +511,8 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 **Code.** Combined2215 adds guarded initial ERROR_LOG initialization, matching the primary driver sequence. It refuses pending global/general status and nonzero AP context states, rechecks after masking output and verifies the zero write before allocation. It never writes ERROR_LOG_CLR or clears pending status. Active raw/global/general faults remain terminal.
 
 **Measured, host.** Actual initialization/fault regressions, lifecycle/datapath sanitizer suites,56-file reconstruction, the safe build and ten-segment image checks pass. The replacement kernel is71c3a760c9c767ba4fdaf400bd2facfc9ee581429bedfaa5b84020dbbb65e8a2. Its77-artifact data manifest remains unapproved pending the newly reviewed offline trial and accepted I3 evidence.
+
+
+**Code, review correction.** Sol rejected2215 because a fault arriving during the final context scan could lose its raw log to initialization, although the postwrite check prevented allocation. Additive2216 checks global/general status again after that scan and preserves detected faults without initializing. The remaining last-read/store interval is explicit; postwrite health still blocks allocation on a later latched fault.
+
+**Measured, host.** Final-survey fault injections preserve both fault classes with zero initialization writes and zero commands. The combined datapath suite,56-file reconstruction, safe build and ten-segment verification pass. Kernel SHA256 is716b6670679d4597ee521b678bd6d13423fbcdac4b480ec6689be7169e03ec4b. The replacement data manifest remains unapproved pending corrected offline review and accepted I3 evidence.
