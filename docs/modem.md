@@ -331,3 +331,6 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 
 
 2187 first review is NO-GO. Sol found rejected current transactions remained reusable, and service loss was checked only at the send deadline. Revision2 consumes matching responses before parsing, including5/6-byte truncations, and validates current UIM discovery before every poll deadline check and before admitting any matching reply. Loss/change revokes readiness and both pending requests. New regressions cover error/malformed-then-success reuse on both opcodes, short headers, service removal/change before cadence and late replies after removal. The public2187 patch is updated in place because no2187image booted. Rejected image tag2187 remains preserved; corrected artifacts will use tag21871. Currenthardware-testedcutoff remains2186. Data hooks remain a separate deskdraft.
+
+
+**Code.** Sol approved the corrected2187 source and frozen21871 image for one bounded offline readiness diagnostic after data releases the phone. The runner now explicitly limits devloop to one boot attempt and verifies the frozen artifacts after waiting. This does not approve provisioning or ONLINE and does not resolve M2. See `modem-2187-reaudit.md`.
