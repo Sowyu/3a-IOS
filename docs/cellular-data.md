@@ -91,7 +91,17 @@ The second audit (`docs/data-2220-reaudit.md`) found five blockers and six small
 - Settings must carry a usable address of the call's own family.
 - QMAP commands need clear reserved bits.
 
-A third Sol audit is running.
+The third audit (`docs/data-2220-audit3.md`) gave a conditional GO for `sweetqmiraw=1` alone. Both session configurations were still NO-GO on one blocker: a malformed Start Network reply cleared the start's unknown record. That is now fixed:
+- Only a valid success with one handle, or a valid failure result, settles who owns a start. Duplicate or wrong-sized result or handle TLVs count as malformed.
+- A malformed reply keeps the start unresolved. It still blocks new starts, still counts for cleanup, and a later valid answer is still adopted.
+
+Smaller fixes from the same audit:
+- The last 64 session transactions are kept for Stop Network, and no number is ever reused.
+- A family TLV must be exactly one byte, and any present value, zero included, must match the call.
+- Flow-control commands must be exactly 16 bytes.
+- `sweet_data_cleanup()` gives the modem's stop hook a clean or unresolved outcome.
+
+The live 2187 run measured the selected USIM at app state 7 with no provisioning step. A fourth Sol audit is running.
 
 **Measured, host.** `tools/data/check.sh` rebuilds the source from the public patches and passes under AddressSanitizer and UndefinedBehaviorSanitizer. The session tests cover:
 - Nothing beyond read-only queries before the barrier.

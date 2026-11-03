@@ -346,7 +346,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/data/CellSession.c
-@@ -0,0 +1,632 @@
+@@ -0,0 +1,642 @@
 +#if defined(ARM64_BOARD_CONFIG_SWEET) || !defined(KERNEL)
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 +/* Order and retry behaviour follow ModemManager's QMI bearer for the "ipa" net driver and HakiOS hakios.mpss.c, which learned on
@@ -436,14 +436,18 @@
 +    return 0;
 +}
 +
-+/* Transactions are never reused in one session: when the space runs out the session ends (about 45 hours of polling). */
++/* Transactions are never reused in one session. The last CLEANUP_TXNS are kept for Stop Network: setup that reaches them ends the
++ * session through cleanup (after about 45 hours of polling). 0 means none is left and nothing may be sent. */
++#define CLEANUP_TXNS 64u
 +static uint16_t take_txn(CellSession *s)
 +{
 +    const uint16_t t = s->next_txn;
-+    if (t + 1 >= CELL_TXN_RAW) {
-+        if (!s->failing) {s->failing = 1; event(s, CE_ERROR, 0, 0, "transaction space used up");}
-+        if (s->state < CS_STOPPING) {s->state = CS_STOPPING; s->state_since = s->now;}
-+        return t;  /* the last one is spent on cleanup */
++    if (t >= CELL_TXN_RAW) return 0;
++    if (t >= CELL_TXN_RAW - CLEANUP_TXNS && !ending(s)) {
++        s->failing = 1;
++        event(s, CE_ERROR, 0, 0, "transaction space used up");
++        set_state(s, CS_STOPPING);  /* the caller's setup request is not sent: its builder gets no transaction */
++        return 0;
 +    }
 +    s->next_txn = (uint16_t)(t + 1);
 +    return t;
@@ -472,7 +476,7 @@
 +/* Builds with a fresh transaction and sends. */
 +#define SEND(s, client, service, builder, ...) do { \
 +        uint8_t b_[256]; const uint16_t t_ = take_txn(s); \
-+        (void)issue((s), (client), (service), b_, builder(b_, sizeof b_, t_, ##__VA_ARGS__)); \
++        if (t_) (void)issue((s), (client), (service), b_, builder(b_, sizeof b_, t_, ##__VA_ARGS__)); \
 +    } while (0)
 +
 +/* The outstanding request this response answers, freed; null when it answers nothing of ours. */
@@ -581,7 +585,7 @@
 +    const WdsCall call = {cfg->apn, 0, 0, 0, 0xff, cfg->profile, c->family};
 +    uint8_t m[256];
 +    const uint16_t txn = take_txn(s);
-+    if (issue(s, c->client, QMI_SVC_WDS, m, wds_start_network(m, sizeof m, txn, &call))) {
++    if (txn && issue(s, c->client, QMI_SVC_WDS, m, wds_start_network(m, sizeof m, txn, &call))) {
 +        c->start_unknown = 1;
 +        c->start_txn = txn;
 +        c->start_sent = s->now;
@@ -719,7 +723,7 @@
 +
 +static int usable(const CellCall *c, const WdsSettings *w)
 +{
-+    if (w->family && w->family != c->family) return 0;  /* the modem says this is the other family's call */
++    if (w->has_family && w->family != c->family) return 0;  /* the modem says this is another family's call, or none */
 +    if (c->family == WDS_FAMILY_IPV4) {
 +        const uint32_t a = w->v4_addr, top = a >> 24;
 +        return w->has_v4 && top != 0 && top != 127 && top < 224;  /* not this-network, loopback, multicast or broadcast */
@@ -783,7 +787,13 @@
 +    case WDS_START_NETWORK: {
 +        WdsStarted st;
 +        const int rc = wds_parse_start(msg, length, p->txn, &st);
-+        if (p->txn == c->start_txn) c->start_unknown = 0;
++        /* only a valid success with a handle, or a valid failure result, settles who owns the call; a malformed reply keeps the
++         * start unresolved (still blocking new starts and counted by cleanup) and a later valid answer is still adopted */
++        if (rc >= 0 && p->txn == c->start_txn) c->start_unknown = 0;
++        if (rc < 0) {
++            event(s, CE_ERROR, p->message, 0, "malformed start reply: outcome still unknown");
++            break;
++        }
 +        if (rc == 0) {
 +            c->handle = st.handle;  /* in the stop phase too, so STOPPING stops it */
 +            c->settings_tries = 0;
@@ -1101,7 +1111,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/data/Qmap.c
-@@ -0,0 +1,78 @@
+@@ -0,0 +1,79 @@
 +#if defined(ARM64_BOARD_CONFIG_SWEET) || !defined(KERNEL)
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 +#include "Qmap.h"
@@ -1169,7 +1179,8 @@
 +    if (length < 8 || length > MAX_PACKET || capacity < QMAP_HEADER || capacity - QMAP_HEADER < length) return 0;
 +    if ((command[1] & 3) != 0) return 0;  /* an ack or a reply of the modem's own */
 +    if ((command[1] & 0xfc) || command[2] || command[3]) return 0;  /* reserved bits must be clear */
-+    const int known = command[0] == QMAP_CMD_FLOW_DISABLE || command[0] == QMAP_CMD_FLOW_ENABLE;
++    /* flow enable/disable are the 8-byte header plus the 8-byte flow_control block, nothing more; anything else is unsupported */
++    const int known = (command[0] == QMAP_CMD_FLOW_DISABLE || command[0] == QMAP_CMD_FLOW_ENABLE) && length == 16;
 +    if (known) *flow = command[0] == QMAP_CMD_FLOW_ENABLE;
 +    out[0] = QMAP_FLAG_COMMAND;
 +    out[1] = mux;
@@ -1222,9 +1233,9 @@
 + * with no pad and no checksum offload request. Returns the framed length, or 0 when the packet is empty or too long. */
 +uint32_t qmap_frame(QmapVersion version, uint8_t mux, uint8_t *packet, uint32_t length);
 +
-+/* A received command request (struct rmnet_map_control_command: name, type in bits 1..0, 2 reserved bytes, a 4-byte transaction) gets
-+ * the reply Linux rmnet_map_command sends: the same bytes with the type set to ack for flow disable (1) and flow enable (2), and to
-+ * unsupported for any other name. *flow is set to 0 for disable, 1 for enable, -1 otherwise. Returns the reply's length in out, 0 when
++/* A received command request (struct rmnet_map_control_command: name, type in bits 1..0, 2 reserved bytes, a 4-byte transaction, and
++ * for flow control an 8-byte flow_control block) gets the reply Linux rmnet_map_command sends: the same bytes with the type set to ack
++ * for a 16-byte flow disable (1) or flow enable (2), and to unsupported for anything else. *flow is set to 0 for disable, 1 for enable, -1 otherwise. Returns the reply's length in out, 0 when
 + * the command is malformed or not a request (nothing is owed). */
 +enum {QMAP_CMD_FLOW_DISABLE = 1, QMAP_CMD_FLOW_ENABLE = 2};
 +uint32_t qmap_command_reply(uint8_t mux, const uint8_t *command, uint32_t length, uint8_t *out, uint32_t capacity, int *flow);
@@ -1235,7 +1246,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/data/QmiData.c
-@@ -0,0 +1,572 @@
+@@ -0,0 +1,592 @@
 +#if defined(ARM64_BOARD_CONFIG_SWEET) || !defined(KERNEL)
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 +/* Layouts: libqmi data/qmi-service-{dms,nas,wds,wda,dpm}.json. Integers are little-endian, IPv6 words big-endian. A string that is a
@@ -1336,6 +1347,19 @@
 +    if (!v || n < need) return 0;
 +    if (size) *size = n;
 +    return v;
++}
++
++/* How many TLVs of type m carries, and whether every one is exactly size bytes. */
++static unsigned tlv_count(const QcomQmiMessage *m, uint8_t type, uint32_t size, int *sizes_ok)
++{
++    unsigned n = 0;
++    *sizes_ok = 1;
++    for (uint32_t at = 0; at + 3 <= m->length; at += 3u + le16(m->tlvs + at + 1)) {
++        if (m->tlvs[at] != type) continue;
++        n++;
++        if (le16(m->tlvs + at + 1) != size) *sizes_ok = 0;
++    }
++    return n;
 +}
 +
 +/* ---- DMS ---- */
@@ -1690,6 +1714,9 @@
 +    *out = (WdsStarted){0};
 +    int rc = qmi_response(p, n, txn, WDS_START_NETWORK, &m);
 +    if (rc < 0) return rc;
++    /* ownership of a call hangs on this reply: one result and at most one handle, each of its exact size, or it proves nothing */
++    int ok;
++    if (tlv_count(&m, 0x02, 4, &ok) != 1 || !ok || tlv_count(&m, 0x01, 4, &ok) > 1 || !ok) return -1;
 +    const uint8_t *v;
 +    if ((v = tlv_at_least(&m, 0x10, 2, 0))) {out->end_reason = le16(v); out->has_end = 1;}
 +    if ((v = tlv_at_least(&m, 0x11, 4, 0))) {out->verbose_type = le16(v); out->verbose_reason = (int16_t)le16(v + 2); out->has_verbose = 1;}
@@ -1718,7 +1745,11 @@
 +    if ((v = tlv_at_least(&m, 0x27, 16, 0))) {copy16(out->v6_dns1, v); out->has_v6_dns1 = 1;}
 +    if ((v = tlv_at_least(&m, 0x28, 16, 0))) {copy16(out->v6_dns2, v); out->has_v6_dns2 = 1;}
 +    if ((v = tlv_at_least(&m, 0x29, 4, 0))) out->mtu = le32(v);
-+    if ((v = tlv_at_least(&m, 0x2b, 1, 0))) out->family = v[0];
++    int ok;
++    if (tlv_count(&m, 0x1e, 4, &ok) > 1 || tlv_count(&m, 0x25, 17, &ok) > 1) return -1;
++    const unsigned families = tlv_count(&m, 0x2b, 1, &ok);
++    if (families > 1 || !ok) return -1;
++    if ((v = tlv_at_least(&m, 0x2b, 1, 0))) {out->family = v[0]; out->has_family = 1;}
 +    if (out->has_v6 && out->v6_prefix > 128) return -1;
 +    return out->has_v4 || out->has_v6 ? 0 : -1;
 +}
@@ -1960,7 +1991,7 @@
 +int wds_parse_start(const uint8_t *p, uint32_t n, uint16_t txn, WdsStarted *out);
 +
 +typedef struct {
-+    uint8_t family, has_v4, has_v6;
++    uint8_t family, has_family, has_v4, has_v6;
 +    uint32_t v4_addr, v4_gateway, v4_mask, v4_dns1, v4_dns2;  /* host order */
 +    uint8_t v6_addr[16], v6_gateway[16], v6_dns1[16], v6_dns2[16], v6_prefix, v6_gateway_prefix, has_v6_dns1, has_v6_dns2;
 +    uint32_t mtu;

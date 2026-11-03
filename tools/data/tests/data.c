@@ -194,13 +194,15 @@ static void qmap(void)
     assert(qmap_deaggregate(QMAP_V5, buf, n, 2, deliver, 0, &c) == 1 && got.len[0] == 20);
     assert(!qmap_frame(QMAP_V1, 1, pkt, 0));
     /* command ack */
-    const uint8_t cmd[] = {QMAP_CMD_FLOW_DISABLE, 0x00, 0, 0, 0xaa, 0xbb, 0xcc, 0xdd};
+    const uint8_t cmd[16] = {QMAP_CMD_FLOW_DISABLE, 0x00, 0, 0, 0xaa, 0xbb, 0xcc, 0xdd};
     uint8_t ack[32];
     int flow;
     n = qmap_command_reply(1, cmd, sizeof cmd, ack, sizeof ack, &flow);
-    assert(n == 12 && flow == 0 && ack[0] == 0x80 && ack[3] == 8 && ack[5] == 1 && ack[8] == 0xaa);
-    const uint8_t on[] = {QMAP_CMD_FLOW_ENABLE, 0x00, 0, 0, 1, 2, 3, 4};
-    assert(qmap_command_reply(1, on, sizeof on, ack, sizeof ack, &flow) == 12 && flow == 1 && ack[5] == 1);
+    assert(n == 20 && flow == 0 && ack[0] == 0x80 && ack[3] == 16 && ack[5] == 1 && ack[8] == 0xaa);
+    const uint8_t on[16] = {QMAP_CMD_FLOW_ENABLE, 0x00, 0, 0, 1, 2, 3, 4};
+    assert(qmap_command_reply(1, on, sizeof on, ack, sizeof ack, &flow) == 20 && flow == 1 && ack[5] == 1);
+    const uint8_t longer[20] = {QMAP_CMD_FLOW_DISABLE, 0x00, 0, 0, 1, 2, 3, 4};   /* known name, wrong layout: unsupported */
+    assert(qmap_command_reply(1, longer, sizeof longer, ack, sizeof ack, &flow) == 24 && flow == -1 && ack[5] == 2);
     const uint8_t other[] = {7, 0x00, 0, 0, 1, 2, 3, 4};
     assert(qmap_command_reply(1, other, sizeof other, ack, sizeof ack, &flow) == 12 && flow == -1 && ack[5] == 2);
     const uint8_t done[] = {0x01, 0x01, 0, 0, 0, 0, 0, 0}, shortc[] = {0x01, 0x00, 0, 0};
@@ -792,6 +794,11 @@ static void session_reaudit(void)
     len = IND(0x22, 0x01, 2, 0, 2, 1);
     cell_session_receive(&s, 0, QMI_SVC_WDS, b, len);
     assert(downs == 1 && !s.call[0].up);
+    /* N4: a family TLV of 0 is a conflict, not an absence */
+    static const uint8_t fam0[] = {0x1e, 4, 0, 5, 2, 0, 10, 0x2b, 1, 0, 0};
+    cell_session_poll(&s, t += 1100);
+    answer(&s, 0, QMI_SVC_WDS, WDS_GET_CURRENT_SETTINGS, 0, fam0, sizeof fam0);
+    assert(!s.call[0].up);
     /* N4: unusable addresses and a conflicting family */
     static const uint8_t mcast[] = {0x1e, 4, 0, 1, 0, 0, 224};
     static const uint8_t wrongfam[] = {0x1e, 4, 0, 5, 2, 0, 10, 0x2b, 1, 0, 6};
@@ -803,6 +810,64 @@ static void session_reaudit(void)
     assert(!s.call[0].up);
 }
 
+/* Third audit: malformed start replies keep ownership; the transaction space is never reused. */
+static void session_audit3(void)
+{
+    CellSession s;
+    uint64_t t = 1000;
+    /* stop with both starts out, then QMI successes without handles: still unresolved, a later valid success is stopped */
+    fresh(&s, &CFG, t);
+    to_register(&s, &t);
+    registered(&s);
+    bound(&s);
+    const uint16_t txn0 = sent.txn[find_sent(0, QMI_SVC_WDS, WDS_START_NETWORK)];
+    const uint16_t txn1 = sent.txn[find_sent(1, QMI_SVC_WDS, WDS_START_NETWORK)];
+    cell_session_stop(&s);
+    answer(&s, 0, QMI_SVC_WDS, WDS_START_NETWORK, 0, 0, 0);
+    answer(&s, 1, QMI_SVC_WDS, WDS_START_NETWORK, 0, 0, 0);
+    cell_session_poll(&s, t += 100);
+    assert(s.call[0].start_unknown && s.call[1].start_unknown && !cell_session_idle(&s));
+    uint32_t len = resp(b, 2, txn0, WDS_START_NETWORK, 0, H4, sizeof H4);
+    cell_session_receive(&s, 0, QMI_SVC_WDS, b, len);
+    assert(s.call[0].handle == 0x4444 && find_sent(0, QMI_SVC_WDS, WDS_STOP_NETWORK) >= 0);
+    answer(&s, 0, QMI_SVC_WDS, WDS_STOP_NETWORK, 0, 0, 0);
+    /* a duplicated handle TLV is malformed too */
+    static const uint8_t twice[] = {0x01, 4, 0, 1, 0, 0, 0, 0x01, 4, 0, 2, 0, 0, 0};
+    len = resp(b, 2, txn1, WDS_START_NETWORK, 0, twice, sizeof twice);
+    cell_session_receive(&s, 1, QMI_SVC_WDS, b, len);
+    assert(s.call[1].start_unknown && !s.call[1].handle);
+    cell_session_poll(&s, t += 5000);
+    assert(cell_session_idle(&s) && cell_session_cleanup(&s) == CELL_CLEANUP_UNRESOLVED);
+    /* the same before stop: no second start while the malformed one is unresolved */
+    fresh(&s, &CFG, t = 1000);
+    to_register(&s, &t);
+    registered(&s);
+    bound(&s);
+    answer(&s, 0, QMI_SVC_WDS, WDS_START_NETWORK, 0, 0, 0);
+    const int starts = count_sent(QMI_SVC_WDS, WDS_START_NETWORK);
+    cell_session_poll(&s, t += 7000);
+    assert(s.call[0].start_unknown && count_sent(QMI_SVC_WDS, WDS_START_NETWORK) == starts);
+    /* a valid failure result settles it */
+    fresh(&s, &CFG, t = 1000);
+    to_register(&s, &t);
+    registered(&s);
+    bound(&s);
+    answer(&s, 0, QMI_SVC_WDS, WDS_START_NETWORK, QMI_ERR_INVALID_OPERATION, 0, 0);
+    assert(!s.call[0].start_unknown);
+    /* transactions: setup stops before the cleanup reserve, and no number is used twice */
+    fresh(&s, &CFG, t = 1000);
+    to_register(&s, &t);
+    registered(&s);
+    bound(&s);
+    answer(&s, 0, QMI_SVC_WDS, WDS_START_NETWORK, 0, H4, sizeof H4);
+    s.next_txn = CELL_TXN_RAW - 65;
+    for (unsigned k = 0; k < 400; ++k) cell_session_poll(&s, t += 100);
+    assert(s.state == CS_STOPPED || s.state == CS_FAILED || s.state == CS_STOPPING);
+    for (unsigned i = 0; i < sent.n; ++i)
+        for (unsigned j = i + 1; j < sent.n; ++j) assert(sent.txn[i] != sent.txn[j] || sent.txn[i] < CELL_TXN_RAW - 65);
+    assert(find_sent(0, QMI_SVC_WDS, WDS_STOP_NETWORK) >= 0);
+}
+
 static void session(void)
 {
     session_order();
@@ -810,6 +875,7 @@ static void session(void)
     session_stop_edges();
     session_bounds();
     session_reaudit();
+    session_audit3();
 }
 
 /* ---- raw allow list ---- */
