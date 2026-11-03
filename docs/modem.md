@@ -355,3 +355,18 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 
 
 **Code, reviewed scope.** Sol approved one frozen21881 offline flow/readiness diagnostic after DATA and IPA release ownership. The reviewed runner is waiting for the reservation and lock to clear. This extends the limited known-PAS-retention exception for this measurement only. It requires more than10 fresh UIM replies, sustained selected readiness, healthy flow counters and normal guarded return with clean root. It does not establish M2 or approve ONLINE. See `modem-2188-reaudit.md`.
+
+
+## Data worker integration, patch2189
+
+**Code.** Apply2189 after2188 revision2. It requires data patch2220 before building, because it calls that module directly. The current21881 diagnostic image contains only modem2170 through2188. Patch2189 is desk work and has no phone approval yet.
+
+**Code.** Eight QRTR slots and silent service-zero client ports are already provided by2187. The worker calls sweet_data_attach after QRTR initialization and immediately before MPSS loading. IPA must install its immutable TX/RX binding before that call. The worker sends selected-USIM readiness transitions through sweet_data_usim and calls sweet_data_poll each iteration. It revokes readiness before subsequent callbacks on expiry, endpoint loss, GLINK failure or fatal state.
+
+**Code.** Exact sweetmsession=1 selects a600-second post-authentication session. It requires sweetdata=1 or sweetqmiraw=1, UIM readiness polling, GLINK, RAM-rmtfs, pd-mapper, sysmon, handover and exact fbarm/selftest guards with sweetdeadman=900. Missing dependencies fail before hardware setup. Without the session gate, the120-second offline worker is unchanged. This gate does not itself authorize ONLINE.
+
+**Code.** Teardown revokes readiness, calls sweet_data_stop and pumps transport/poll for up to5 seconds. Both idle and cleanup0 are required for clean data teardown. All other outcomes mark failure while preserving the owed PAS shutdown attempt. IPA integration must quiesce its AP channels before sweet_data_detach, then run SSCTL/PAS4. Failed secure stop retains backing as before. PAS15 teardown and IPA backing release remain conditional on verified modem stop.
+
+**Measured, host.** The ordered-series lifecycle/UIM suites and actual-hook sanitizer tests pass in an isolated reconstruction. Checks cover required session gates,900-second guard, stale readiness before another QRTR callback, endpoint removal, no readiness revival during teardown, bounded stop, partial attach and every nonzero cleanup result. The integration source syntax check passes against kernel headers with existing header warnings. Full kernel build and integrated Sol review are pending.
+
+**Missing.** IPA hardware preparation and a separately reviewed combined image. The owner accepts safe PAS4 retention for bounded data trials and asked to stop separate shutdown-only phone runs. The next hardware priority is sustained QRTR/UIM transport, followed by the IPA readiness barrier and ONLINE sequence in `cellular-data.md`.

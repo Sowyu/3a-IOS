@@ -31,6 +31,7 @@ static void m_smc_raw(uint64_t r[8]){
  else {r[0]=0;r[1]=0;}
  rawcalls++;
 }
+static bool m_data_stop(void){return true;}
 static bool m_shutdown_request(void){return graceful;}
 static int m_assign(bool b){assert(!b);reclaims++;return reclaim_result;}
 static int m_vote(bool b){assert(!b);poweroffs++;return 0;}

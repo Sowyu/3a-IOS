@@ -1,0 +1,193 @@
+diff --git a/bsd/dev/modem/ModemRuntime.inc b/bsd/dev/modem/ModemRuntime.inc
+--- a/bsd/dev/modem/ModemRuntime.inc
++++ b/bsd/dev/modem/ModemRuntime.inc
+@@ -18,6 +18,7 @@
+ #include "ModemRmtfs.h"
+ #include "ModemUim.h"
+ #include "ModemBcm.h"
++#include "../data/sweet_data.h"
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, unsigned int);
+ extern void ml_io_unmap(vm_offset_t, vm_size_t);
+@@ -43,7 +44,7 @@
+     uint32_t qhead,qcount,rxoff,rxbytes;
+     uint32_t rail_addr[2],rail_index[2],xo_addr,state,services;
+     bool xo_pinned, pas_owed, started, votes_owed, vote_uncertain, qmp_owed, shared_owed, fatal;
+-    bool uim_ready_poll, uim_ready, uim_pending[2], uim, glink, rmtfs, pdm, qr_started, stop_verified, failed;
++    bool data_session,data_attached,data_stopping, uim_ready_poll, uim_ready, uim_pending[2], uim, glink, rmtfs, pdm, qr_started, stop_verified, failed;
+     bool bandwidth_irq, bandwidth, bandwidth_pinned, handover_release, bcm_probe, sysmon, shutdown_sent, shutdown_response, shutdown_ind;
+     uint32_t shutdown_node, shutdown_port;
+     uint32_t uim_node,uim_port,uim_done,uim_tries[2];
+@@ -284,10 +285,15 @@
+     m.shutdown_response=result==0 && error==0;
+ }
+ /* Insert before m_greceive after M2 is measured. Never dumps a QMI packet. */
++static void m_uim_readiness(bool ready){
++    ready=ready && !m.data_stopping && !m.failed && !m.fatal;
++    if(m.uim_ready==ready)return;
++    m.uim_ready=ready;if(m.data_attached)sweet_data_usim(ready);
++}
+ static bool m_uim_endpoint_valid(void){
+     int index=qcom_qrtr_find_remote(&m.qr,11);
+     if(m.failed || index<0 || m.qr.remote[index].node!=m.uim_node || m.qr.remote[index].port!=m.uim_port){
+-        m.uim_ready=false;m.uim_pending[0]=m.uim_pending[1]=false;m.failed=true;return false;
++        m_uim_readiness(false);m.uim_pending[0]=m.uim_pending[1]=false;m.failed=true;return false;
+     }
+     return true;
+ }
+@@ -297,11 +303,11 @@
+     if(le16(data+3)==0x2f && m.uim_pending[0] && le16(data+1)==m.uim_txn[0]){
+         m.uim_pending[0]=false;
+         if(!m_uim_endpoint_valid())return;
+-        if(len<7){m.uim_ready=false;return;}
++        if(len<7){m_uim_readiness(false);return;}
+         ModemUimStatus status;int rc=modem_uim_status(data,len,m.uim_txn[0],&status);
+         printf("SWEET MODEM: UIM card-status error=%d slots=%u\n",rc,status.count);
+-        if(rc){m.uim_ready=false;return;}m.uim_done|=1;
+-        m.uim_seen=m_now();m.uim_ready=m.uim_ready_poll && modem_uim_ready(&status);
++        if(rc){m_uim_readiness(false);return;}m.uim_done|=1;
++        m.uim_seen=m_now();m_uim_readiness(m.uim_ready_poll && modem_uim_ready(&status));
+         if(m.uim_ready_poll)printf("SWEET MODEM: UIM primary_GW=%#x USIM_ready=%u\n",status.primary_gw,m.uim_ready);
+         for(unsigned i=0;i<status.count;i++){
+             ModemUimCard *c=&status.card[i];
+@@ -311,10 +317,10 @@
+     }else if(le16(data+3)==0x47 && m.uim_pending[1] && le16(data+1)==m.uim_txn[1]){
+         m.uim_pending[1]=false;
+         if(!m_uim_endpoint_valid())return;
+-        if(len<7){m.uim_ready=false;return;}
++        if(len<7){m_uim_readiness(false);return;}
+         ModemUimSlots slots;int rc=modem_uim_slots(data,len,m.uim_txn[1],&slots);
+         printf("SWEET MODEM: UIM slot-status error=%d slots=%u\n",rc,slots.count);
+-        if(rc){m.uim_ready=false;return;}m.uim_done|=2;
++        if(rc){m_uim_readiness(false);return;}m.uim_done|=2;
+         for(unsigned i=0;i<slots.count;i++){
+             ModemUimSlot *s=&slots.slot[i];
+             printf("SWEET MODEM: UIM physical=%u card=%u active=%u logical=%u ICCID_suffix4=%s\n",i+1,s->card,s->active,s->logical,s->suffix[0]?s->suffix:"unavailable");
+@@ -326,13 +332,13 @@
+     if(!m.uim || !m.qr_started)return;
+     if(m.uim_port && !m_uim_endpoint_valid())return;
+     if(m.uim_ready && m_now()-m.uim_seen>=15000){
+-        m.uim_ready=false;printf("SWEET MODEM: UIM readiness expired; no fresh card status\n");
++        m_uim_readiness(false);printf("SWEET MODEM: UIM readiness expired; no fresh card status\n");
+     }
+     if((!m.uim_ready_poll && m.uim_done==3) || m_now()<m.uim_next)return;
+     int index=qcom_qrtr_find_remote(&m.qr,11);
+-    if(index<0){if(m.uim_port){m.uim_ready=false;m.failed=true;}return;}
++    if(index<0){if(m.uim_port){m_uim_readiness(false);m.failed=true;}return;}
+     uint32_t node=m.qr.remote[index].node,port=m.qr.remote[index].port;
+-    if(m.uim_port && (m.uim_node!=node || m.uim_port!=port)){m.uim_ready=false;m.failed=true;return;}
++    if(m.uim_port && (m.uim_node!=node || m.uim_port!=port)){m_uim_readiness(false);m.failed=true;return;}
+     m.uim_node=node;m.uim_port=port;
+     for(unsigned i=0;i<2;i++){
+         bool monitor=i==0 && m.uim_ready_poll;
+@@ -345,13 +351,16 @@
+ 
+ static void m_greceive(void *ctx,QcomGlinkChannel *ch,const uint8_t *data,uint32_t len){
+     (void)ctx;(void)ch;
++    if(m.uim_ready && (m.fatal || m.failed || m_now()-m.uim_seen>=15000))m_uim_readiness(false);
++    if(m.uim_port)(void)m_uim_endpoint_valid();
+     if(qcom_qrtr_receive(&m.qr,data,len)){printf("SWEET MODEM: invalid QRTR packet\n");return;}
++    if(m.uim_port)(void)m_uim_endpoint_valid();
+     if(len>=52 && le32(data+4)==QCOM_QRTR_NEW_LOOKUP)
+         printf("SWEET MODEM: QRTR NEW_LOOKUP service=%#x\n",le32(data+36));
+     if(len>=52 && le32(data+4)==QCOM_QRTR_NEW_SERVER && le32(data+20)>=20)
+         printf("SWEET MODEM: QRTR NEW_SERVER service=%#x instance=%#x node=%u port=%u\n",le32(data+36),le32(data+40),le32(data+44),le32(data+48));
+ }
+-static void m_gstate(void *ctx,QcomGlinkChannel *ch,int up){(void)ctx;(void)ch;printf("SWEET MODEM: GLINK mpss/IPCRTR up=%d\n",up);if(!up)m.failed=true;}
++static void m_gstate(void *ctx,QcomGlinkChannel *ch,int up){(void)ctx;(void)ch;printf("SWEET MODEM: GLINK mpss/IPCRTR up=%d\n",up);if(!up){m.failed=true;m_uim_readiness(false);}}
+ static int m_glink_prepare(void){
+     uint32_t desc,tx,bytes;
+     if(m_alloc(478,16,&desc) || m_alloc(479,M_FIFO,&tx))return EIO;
+@@ -450,7 +459,27 @@
+     }
+     __asm__ volatile("dsb sy":::"memory");return 0;
+ }
++/* Teardown runs on the transport owner. Pump replies while Stop Network waits. */
++static bool m_data_stop(void){
++    if(!m.data_attached)return true;
++    m.data_stopping=true;m_uim_readiness(false);sweet_data_stop();uint64_t end=m_now()+5000;bool idle=false;
++    do{
++        if(m.started)m_smp_poll();
++        if(m.channel && m.glink)m_ipc_poll();
++        sweet_data_poll(&m.qr,m_now());
++        if(sweet_data_idle()){idle=true;break;}
++        m_sleep(2);
++    }while(m_now()<end);
++    m_uim_readiness(false);
++    /* IPA integration must quiesce its channels here before detach/SSCTL. */
++    int cleanup=sweet_data_cleanup();
++    sweet_data_detach();m.data_attached=false;
++    bool clean=idle && cleanup==0;if(!clean)m.failed=true;
++    printf("SWEET MODEM: data stop idle=%u cleanup=%d bounded_ms=5000\n",idle,cleanup);
++    return clean;
++}
+ static bool m_cleanup(void){
++    (void)m_data_stop();
+     bool stopped=!m.pas_owed;
+     bool graceful=m_shutdown_request();
+     printf("SWEET MODEM: QRTR flow resumes=%u pending=%u failed=%u rx=%u tx=%u refused=%u\n",m.qr.resumes_sent,m.qr.resume_count,m.qr.resume_failed,m.qr.rx_data,m.qr.tx_packets,m.qr.tx_refused);
+@@ -515,9 +544,15 @@
+ #include "ModemGate.h"
+ static bool m_gate(const char *name){return modem_gate(PE_boot_args(),name)!=0;}
+ static int modem_run(const struct wl_fat *f,const uint8_t *mdt,uint32_t size){
+-    memset(&m,0,sizeof(m));m.master=-1;m.glink=m_gate("sweetmglink");m.rmtfs=m_gate("sweetmrmtfs");m.pdm=m_gate("sweetmpdm");m.uim=m_gate("sweetmuim");m.uim_ready_poll=m_gate("sweetmready");m.sysmon=m_gate("sweetmstop");m.bcm_probe=m_gate("sweetmbcm");m.handover_release=m_gate("sweetmho");m.bandwidth=m_gate("sweetmbw");m.bandwidth_irq=m_gate("sweetmbwi");
++    memset(&m,0,sizeof(m));m.master=-1;m.glink=m_gate("sweetmglink");m.rmtfs=m_gate("sweetmrmtfs");m.pdm=m_gate("sweetmpdm");m.uim=m_gate("sweetmuim");m.uim_ready_poll=m_gate("sweetmready");m.data_session=m_gate("sweetmsession");m.sysmon=m_gate("sweetmstop");m.bcm_probe=m_gate("sweetmbcm");m.handover_release=m_gate("sweetmho");m.bandwidth=m_gate("sweetmbw");m.bandwidth_irq=m_gate("sweetmbwi");
+     if((m.rmtfs || m.pdm || m.uim || m.sysmon) && !m.glink){printf("SWEET MODEM: refused missing GLINK dependency\n");return EINVAL;}
+     if(m.uim_ready_poll && !m.uim){printf("SWEET MODEM: readiness polling requires UIM\n");return EINVAL;}
++    bool data_requested=m_gate("sweetdata") || m_gate("sweetqmiraw");
++    if(data_requested!=m.data_session || (m.data_session &&
++        (!m_gate("sweetmpss") || !m.uim || !m.uim_ready_poll || !m.glink || !m.rmtfs || !m.pdm || !m.sysmon || !m.handover_release ||
++        !m_gate("sweetfbarm") || !m_gate("sweetselftest") || !modem_arg_is(PE_boot_args(),"sweetdeadman","900")))){
++        printf("SWEET MODEM: data session dependencies/900s dev guard missing\n");return EINVAL;
++    }
+     m_sleep(30000);m.began=m_now();int rc=EIO;
+     m.smem=ml_io_map(M_SMEM,M_SM_SIZE);m.mutex=ml_io_map(0x1f43000,0x1000);m.ipcc=ml_io_map(0x405000,0x1000);
+     m.qmpmem=ml_io_map(0xc300000,0x400);m.rsc=ml_io_map(0x17a20000,0x4000);m.db=ml_io_map(0x81c60000,0x20000);
+@@ -542,11 +577,18 @@
+     m.qmp_owed=true;if((rc=m_qsend(true)))goto out;
+     if((rc=m_vote(true)))goto out;
+     if((rc=m_bandwidth_vote()))goto out;
++    /* IPA must install its immutable TX hook before this attach. */
++    if(m.data_session){m.data_attached=true;if((rc=sweet_data_attach(&m.qr)))goto out;}
+     if((rc=m_load(f,mdt,size)))goto out;
+     if((rc=m_pas(5,1,0,0)))goto out;m.started=true;
+-    uint64_t end=m_now()+120000,ready_deadline=m_now()+10000;
+-    while(m_now()<end){m_smp_poll();if((rc=m_handover()))break;if(m.glink)m_ipc_poll();if(m.uim && (m.state&6)==6)m_uim_poll();if(m.fatal || m.failed){rc=EIO;break;}
++    uint64_t end=m_now()+(m.data_session?600000:120000),ready_deadline=m_now()+10000;
++    while(m_now()<end){m_smp_poll();if((rc=m_handover()))break;if(m.fatal || m.failed)m_uim_readiness(false);
++        if(m.uim && (m.state&6)==6)m_uim_poll();
++        if(m.glink)m_ipc_poll();
++        if(m.fatal || m.failed)m_uim_readiness(false);
++        if(m.data_attached)sweet_data_poll(&m.qr,m_now());
++        if(m.fatal || m.failed){rc=EIO;break;}
+         if(!(m.state&2) && m_now()>ready_deadline){rc=ETIMEDOUT;break;}m_sleep(2);}
+     if(!m.fatal && !m.failed && (m.state&6)==6)rc=0;else if(!rc)rc=ETIMEDOUT;
+-out:printf("SWEET MODEM: offline run end error=%d elapsed_ms=%llu\n",rc,(unsigned long long)(m_now()-m.began));if(!m_cleanup())rc=EIO;return rc;
+-}
++out:printf("SWEET MODEM: %s run end error=%d elapsed_ms=%llu\n",m.data_session?"data session":"offline",rc,(unsigned long long)(m_now()-m.began));if(!m_cleanup())rc=EIO;return rc;
++}
+diff --git a/bsd/dev/modem/ModemGate.h b/bsd/dev/modem/ModemGate.h
+--- a/bsd/dev/modem/ModemGate.h
++++ b/bsd/dev/modem/ModemGate.h
+@@ -1,15 +1,17 @@
+ #ifndef MODEM_GATE_H
+ #define MODEM_GATE_H
+ #include <stddef.h>
+-/* Exact, single name=1 token. Bare, duplicate, malformed and numeric aliases fail closed. */
+-static inline int modem_gate(const char *args,const char *name){
+-    size_t n=0;while(name[n])n++;unsigned found=0;int enabled=0;
++/* Exact single name=value token. Bare, duplicate and numeric aliases fail closed. */
++static inline int modem_arg_is(const char *args,const char *name,const char *value){
++    size_t n=0,v=0;while(name[n])n++;while(value[v])v++;unsigned found=0;int enabled=0;
+     while(args && *args){
+         while(*args==' ' || *args=='\t')args++;
+         const char *end=args;while(*end && *end!=' ' && *end!='\t')end++;
+         size_t len=(size_t)(end-args),i=0;while(i<n && i<len && args[i]==name[i])i++;
+-        if(i==n && (len==n || args[n]=='=')){found++;enabled=len==n+2 && args[n]=='=' && args[n+1]=='1';}
++        if(i==n && (len==n || args[n]=='=')){found++;enabled=len==n+1+v && args[n]=='=';
++            for(size_t j=0;enabled && j<v;j++)enabled=args[n+1+j]==value[j];}
+         args=end;
+     }return found==1 && enabled;
+ }
++static inline int modem_gate(const char *args,const char *name){return modem_arg_is(args,name,"1");}
+ #endif
