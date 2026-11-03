@@ -72,3 +72,17 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 **Measured, review and build.** Sol approved 2170+2171 for read-only inspection, conditional on a successful full build; `docs/modem-2171-audit.md` records the exact source hashes. The full build passed. A separate build-tool finding was fixed: kextsymboltool now retains failed output instead of calling unlink, and the rebuilt helper's error-path test retains the existing output. No unlink import remains in that helper. The subsequent full install passed and the RAM image hash stayed unchanged. A retained failed output must be Trashed before retrying a failed build.
 
 **Code, boot parser correction.** The platform parser turns bare `sweetmodem` into `1` and uses the last duplicate value. The image builder emits one explicit `sweetmodem=1`; the source-level claim of requiring an equals sign was too strong. Approval remains confined to read-only inspection. No hardware stage is enabled.
+
+## Phone preflight, ast146
+
+**Measured.** `ios-asteroids/logs/ast146-modem-preflight.txt:222` reports PASS with 29 load segments, 109371307 bytes and span 0xd700000. Line 223 reports error=0 and MPSS untouched. The run used the audited 2170+2171 image, returned after 130 seconds, and left OrangeFox recovery with a clean root. Logs and firmware remain local.
+
+**Measured, harness limit.** The loop verdict is selftest-no-frames because the minimal script took no screenshots. This does not negate the logged firmware checks. It does not prove MPSS start, QRTR services or SIM detection. The root retains the inert-without-sweetselftest devloop hook in `/usr/local/libexec/renegade-firstboot.sh` and normal selftest output. No firmware or modem binary was pushed.
+
+## IPC groundwork, 2172
+
+**Code.** `patches/modem/2172-asteroids-modem-smem-glink-core.patch` adds the existing portable UniXNU SMEM/GLINK core with extent and length fixes. SMEM revalidates partition/free markers, bounds cached and uncached data, and rejects allocation overflow or corrupt lookup results. GLINK rejects impossible RX frames instead of waiting indefinitely, and bounds TX length before arithmetic. These modules have no production caller or hardware mapping yet, so they do not start IPC.
+
+**Measured, host only.** `sh tools/modem/check-protocol.sh` reconstructs the public patch sources and runs sanitizer-backed tests. They cover corrupt SMEM extents/allocation overflow, GLINK version/channel/intent exchange with two simulated peers, IPCRTR payload delivery and malformed RX/TX lengths. Local evidence is `plans/modem/logs/protocol-check.txt:1-2`. The 2172 kernel build is still running. It was not used for ast146.
+
+**Missing.** PAS, power/QMP arbitration, SMP2P, QRTR integration and RAM-only rmtfs remain required for M1. No phone modem start or UIM request has occurred. The protocol tests are not M2 evidence.
