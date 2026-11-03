@@ -417,3 +417,12 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 **Code.** `tools/modem/run-data-usb.py` requires a reviewed manifest with pinned artifacts, takes the modem hold and atomic phone lock, and consumes a one-attempt record before invoking dev.py. It refuses replay and extra boot attempts. It verifies the actual first-boot hook composition before launch. Afterward it restores the original network profile from the same phone in clean recovery and verifies the bytes. An uncertain restoration keeps phone ownership.
 
 **Measured, host.** `python3 tools/modem/check-data-runner.py` passes changed-artifact, approval, busy-phone, wrong-phone, dirty-root and restoration-readback refusal cases. No approved manifest exists and this runner has not operated the phone.
+
+
+## Combined2208 image
+
+**Code.** IPA2208 adds non-global leaves, distinct nonzero VMID leases and live collision checks. It refuses unsupported global modes and verifies the private identity before maintenance. The frozen2200 through2207 patches remain unchanged.
+
+**Measured, host.** The corrected combined build passed. Kernel SHA256 is1dcd7de654ed7b81ed721cf95a2cfa4f5cc07a8893fea87d2d7616216e21d869. The data image SHA256 isb141136242ee89934c78e29e78dc881d1800c499fa5a16153af7cd34a478dd8a, with all10 packed kernel segments verified. Independent ordered reconstruction and isolated lifecycle/datapath suites pass, including shared-TLB isolation and the maintained2221 regression cases. The unapproved manifest is refused before any phone claim or mutation.
+
+**Missing.** Fresh source and exact-image review, followed by successful PAS15-only preparation and offline IPA handshake evidence before ONLINE. The modem hold is released while those prerequisites are pending.
