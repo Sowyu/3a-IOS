@@ -4,7 +4,7 @@
 
 I1 is complete. The I2 implementation builds with patches2200 through2212, copied modem2189v2, data2220audit8 and adapter2221. I3 and I4 remain unproven. ast175 authenticated and stopped PAS15, but CPU VA cleanup panicked.
 
-Read-only surveys ast159 and ast170 passed. SMMU-only ast174 passed setup and parking with clean roots. PAS15-only ast175 measured authentication and shutdown success, then exposed a page-size mismatch in CPU VA teardown. Patch2211 fixes that mismatch and passes its build and host regressions. A separately reviewed benign journal-clean boot must precede the next firmware trial.
+Read-only surveys ast159 and ast170 passed. SMMU-only ast174 passed setup and parking. After fixing the CPU VA page-size bug in2211 and the endpoint direction guard in2212, benign ast176 cleaned the journal and PAS15-only ast177 passed authentication, shutdown and complete cleanup with clean roots. The offline GSI/QMI handshake is next.
 
 Host inspection of the existing extracted ipa_fws.mdt found three relocatable loads, 17824 file bytes and a page-rounded span of 0x7000. This fits the 0xa000 GSI reservation. `tools/ipa/inspect_mdt.py` checks ELF bounds, overlap and relocation span without loading firmware. It does not check split-file contents or authenticate the image. Three synthetic host tests pass, including nine malformed cases. Local evidence is `plans/ipa/logs/host-check.txt` and `plans/ipa/logs/firmware-inventory.json`.
 
@@ -336,3 +336,11 @@ Public patch SHA256 is b12cf3a441d384e41f0a089c3e1ef8b7869b35c6c6af57c7acb0b51f0
 The separately reviewed benign C boot finished normally in214seconds. The exact checker accepted rootclean, stale=false, no push and no IPA/modem records. Its raw log has journal replay at384 and DONE at12627, with no FAIL/SKIP or panic. Evidence is ios-asteroids/logs/ast176-ipa-clean-2211.txt and its result directory. The accepted record is plans/ipa/logs/clean-2211-accepted.json.
 
 The image is the unchanged known-good no-IPA/no-modem ee6edefe54b3d218a43540d15981e147ddf30530e4bc1d0dd6e59c2b1671c670, under new review plans/ipa/sol-clean-2211-audit.md. The phone returned to recovery and ownership was released. The existing2210 firmware-named selftest hook ran without any firmware gate. Its old marker is not new firmware evidence. A new2212 PAS15-only image now awaits its separate source/image review.
+
+## ast177, PAS15 lifecycle and cleanup passed
+
+The corrected2212 firmware-only A completed normally in214seconds, with clean roots before/after, stale=false and fresh nonce e72d4738eb414126b6e7af993f96b90a. The exact checker and raw-log inspection passed. PAS15 commands1/2/5 return zero at6628/6630/6631, powered identity matches ast175 at6632, shutdown6 returns zero at6639, and intact guards, parked SMMU and released backing appear at6649. Worker final_error0 is at6652 and DONE at12610. No MPSS/GSI-channel/data work or panic ran.
+
+Evidence is ios-asteroids/logs/ast177-ipa-firmware-2212.txt and its result directory. The accepted record is plans/ipa/logs/firmware-2212-accepted.json. Exact image2a8a5ccd uses kernel1e2d9bd6 under plans/ipa/sol-firmware-2212-audit.md. The phone returned to recovery, runner exited0 and ownership was released. The root retains the ordinary2212 firmware selftest hook, log/frame and completion marker.
+
+This proves PAS15 authentication, shutdown and corrected CPU VA/SMMU cleanup in the bounded firmware-only run. I3 and I4 still need the separately reviewed offline GSI/QMI handshake and later ONLINE run. Source remains2200 through2212 with the pinned modem/data cutoff.
