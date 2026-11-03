@@ -57,16 +57,21 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/data/sweet_data_ipa.h
-@@ -0,0 +1,12 @@
+@@ -0,0 +1,17 @@
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 +/* Binds the IPA driver's data API (bsd/dev/modem/SweetIpa.h, patch 2202) to the data agent's hooks (sweet_data.h, patch 2220). */
 +#ifndef SWEET_DATA_IPA_H
 +#define SWEET_DATA_IPA_H
-+/* Modem worker, once, after the IPA driver is prepared and before sweet_data_attach. Installs the data TX wrapper and the IPA RX
-+ * callback with the limits SweetIpa.h fixes (QMAP v1, 8192-byte receive buffers, 16 datagrams). Returns 0, or an errno when either
-+ * side refuses (for example sweetdata is off, or another receiver is registered). */
++/* Modem worker, once per boot, for a sweetdata=1 session only: after the IPA driver is prepared and before sweet_data_attach, QRTR
++ * start and MPSS authentication. Installs the data TX wrapper, then registers the IPA RX callback, with the limits SweetIpa.h fixes
++ * (QMAP v1, 8192-byte receive buffers, 16 datagrams). Returns 0, EPERM when the data side refuses the TX hook (sweetdata off, already
++ * attached or already bound), or the errno of sweet_ipa_register_rx (EBUSY when another receiver owns RX).
++ * Any nonzero result is terminal for the boot: the TX hook may already be installed and cannot be removed, so the worker must not call
++ * sweet_data_attach, sweet_data_ipa_refresh or start a data session afterwards, and keeps the errno for its final result. */
 +int sweet_data_ipa_bind(void);
-+/* Modem worker, every iteration before sweet_data_poll, and once more on any IPA failure: copies sweet_ipa_ready() into the data side,
-+ * so a lost IPA path revokes data readiness before the session does anything else. */
++/* Modem worker only, after a successful bind: copies sweet_ipa_ready() into the data side. It adds nothing to the IPA latch: it is
++ * only as current as sweet_ipa_ready() is, so the IPA driver must clear that latch the moment it detects a failure (2221 audit,
++ * finding 1). Call it every iteration before sweet_data_poll, and immediately after any IPA readiness change or IPA service loss,
++ * before the worker dispatches any further QRTR message, so a revocation is seen before a data reply can advance setup. */
 +void sweet_data_ipa_refresh(void);
 +#endif

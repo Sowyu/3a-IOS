@@ -42,6 +42,16 @@ Patch 2221 (`patches/data/2221-asteroids-data-ipa-binding.patch`, `bsd/dev/data/
 
 The adapter refuses to build unless `SWEET_IPA_QMAP_VERSION` is 1, and it drops receive buffers over 8192 bytes. 2221 needs 2202 and 2220.
 
+Sol's 2221 audit (`docs/data-2221-audit.md`) passed the adapter itself: types, bounds, copy lifetimes and lock order. It is NO-GO for a trial until three things land in the IPA agent's integration draft (`plans/ipa/draft2204`):
+- The IPA driver clears its ready latch the moment it detects a failure.
+- The worker calls bind and refresh.
+- The worker quiesces the AP packet channels before detach.
+
+The adapter's own part is done:
+- The header now says any nonzero bind result is terminal for the boot, because the TX hook may already be installed.
+- It also says refresh must follow every IPA readiness change or IPA service loss, before any further QRTR dispatch.
+- `tools/data/tests/ipa.c` tests the adapter against stubs of both sides: bind order and limits, the EPERM and EBUSY partial binds, errno mapping, the 8192-byte receive bound including a 64-bit length that would wrap, and refresh in both directions.
+
 The session does nothing that changes modem state until three things hold: the USIM is ready, the IPA is ready, and the transmit hook is set. Losing any of them sends it through cleanup.
 
 ## The iOS-facing interface
