@@ -1,6 +1,6 @@
 # Modem and SIM: desk findings (2026-11-03)
 
-M3 passed in ast161. ast165 also measured the selected USIM at READY, app state7. Replies stopped after ten UIM responses and readiness expired. Patch2188 corrects QRTR receive-flow acknowledgments; host tests and the full kernel build pass, phone validation is pending. PAS shutdown still fails and retains backing until guarded reset, so M2 remains incomplete. ONLINE remains off.
+M3 passed in ast161. ast168 now confirms sustained selected-USIM READY with19 card replies, one slot reply and no freshness expiry. Patch2188 fixed the ten-response QRTR stall. Patch2189 adds600-second data sessions, but its source review found two ordering gaps being fixed before integration approval. PAS shutdown still uses the accepted safe retention path, so M2 remains incomplete. ONLINE is off pending IPA and the combined-image audit.
 
 Labels as in `docs/input.md`: **Measured**, **Code**, **Inferred**, **Missing**.
 
@@ -370,3 +370,12 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 **Measured, host.** The ordered-series lifecycle/UIM suites and actual-hook sanitizer tests pass in an isolated reconstruction. Checks cover required session gates,900-second guard, stale readiness before another QRTR callback, endpoint removal, no readiness revival during teardown, bounded stop, partial attach and every nonzero cleanup result. The integration source syntax check passes against kernel headers with existing header warnings. Full kernel build and integrated Sol review are pending.
 
 **Missing.** IPA hardware preparation and a separately reviewed combined image. The owner accepts safe PAS4 retention for bounded data trials and asked to stop separate shutdown-only phone runs. The next hardware priority is sustained QRTR/UIM transport, followed by the IPA readiness barrier and ONLINE sequence in `cellular-data.md`.
+
+
+## ast168 sustained transport
+
+**Measured.** `ast168-modem-uim-21881.txt:11379` first reports selected USIM READY. Eighteen READY reports continue through line12483. The run received19 card-status replies and one slot-status reply, with ICCID suffix0660 at line11314 and no freshness expiry. This confirms the2188 receive-flow fix beyond the previous ten-response stall. Line12504 reports resumes5, pending0, failed0, rx34, tx41 and refused0.
+
+**Measured.** PAS authentication succeeded at9086, MSS proxy handover at9129 and GLINK at9131. Offline work ended with error0 at12493. SSCTL response, indication and fresh shutdown_ack were all accepted at12503. The known50 PAS shutdown failures followed, with retained backing at12561 and final_error5 at12562. No ownership reclaim or power drop followed retention. Normal DONE is at13283 after365seconds. The nonce matches the frozen script, one checked frame exists, stale=false and root before/after is clean. The phone returned to recovery and the modem hold was released for IPA.
+
+**Code, next integration.** Sol accepts the600-second lifetime design but found two2189 wiring gaps. Data service removals must reach its cache before a later response in the same receive batch can advance setup. UIM freshness must also revoke unconditionally when ready/handover bits clear and traffic stops. The owners are fixing both with connected host tests. See `modem-2189-audit.md`. No further PAS4-only phone diagnostic is planned.
