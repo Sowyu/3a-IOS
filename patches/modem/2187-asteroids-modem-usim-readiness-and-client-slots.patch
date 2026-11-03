@@ -15,16 +15,30 @@
      int master;
      uint64_t began;
  } m;
-@@ -281,19 +281,21 @@
+@@ -278,22 +278,37 @@
+     m.shutdown_response=result==0 && error==0;
+ }
+ /* Insert before m_greceive after M2 is measured. Never dumps a QMI packet. */
++static bool m_uim_endpoint_valid(void){
++    int index=qcom_qrtr_find_remote(&m.qr,11);
++    if(m.failed || index<0 || m.qr.remote[index].node!=m.uim_node || m.qr.remote[index].port!=m.uim_port){
++        m.uim_ready=false;m.uim_pending[0]=m.uim_pending[1]=false;m.failed=true;return false;
++    }
++    return true;
++}
  static void m_uim_receive(void *ctx,QcomQrtr *qr,uint32_t port,uint32_t node,uint32_t from,const uint8_t *data,uint32_t len){
      (void)ctx;(void)qr;(void)port;
-     if(node!=m.uim_node || from!=m.uim_port || len<7)return;
+-    if(node!=m.uim_node || from!=m.uim_port || len<7)return;
 -    if(le16(data+3)==0x2f && m.uim_tries[0]){
++    if(node!=m.uim_node || from!=m.uim_port || len<5)return;
 +    if(le16(data+3)==0x2f && m.uim_pending[0] && le16(data+1)==m.uim_txn[0]){
++        m.uim_pending[0]=false;
++        if(!m_uim_endpoint_valid())return;
++        if(len<7){m.uim_ready=false;return;}
          ModemUimStatus status;int rc=modem_uim_status(data,len,m.uim_txn[0],&status);
          printf("SWEET MODEM: UIM card-status error=%d slots=%u\n",rc,status.count);
 -        if(rc)return;m.uim_done|=1;
-+        if(rc){m.uim_ready=false;return;}m.uim_pending[0]=false;m.uim_done|=1;
++        if(rc){m.uim_ready=false;return;}m.uim_done|=1;
 +        m.uim_seen=m_now();m.uim_ready=m.uim_ready_poll && modem_uim_ready(&status);
 +        if(m.uim_ready_poll)printf("SWEET MODEM: UIM primary_GW=%#x USIM_ready=%u\n",status.primary_gw,m.uim_ready);
          for(unsigned i=0;i<status.count;i++){
@@ -34,20 +48,24 @@
          }
 -    }else if(le16(data+3)==0x47 && m.uim_tries[1]){
 +    }else if(le16(data+3)==0x47 && m.uim_pending[1] && le16(data+1)==m.uim_txn[1]){
++        m.uim_pending[1]=false;
++        if(!m_uim_endpoint_valid())return;
++        if(len<7){m.uim_ready=false;return;}
          ModemUimSlots slots;int rc=modem_uim_slots(data,len,m.uim_txn[1],&slots);
          printf("SWEET MODEM: UIM slot-status error=%d slots=%u\n",rc,slots.count);
 -        if(rc)return;m.uim_done|=2;
-+        if(rc)return;m.uim_pending[1]=false;m.uim_done|=2;
++        if(rc){m.uim_ready=false;return;}m.uim_done|=2;
          for(unsigned i=0;i<slots.count;i++){
              ModemUimSlot *s=&slots.slot[i];
              printf("SWEET MODEM: UIM physical=%u card=%u active=%u logical=%u ICCID_suffix4=%s\n",i+1,s->card,s->active,s->logical,s->suffix[0]?s->suffix:"unavailable");
-@@ -302,16 +304,23 @@
+@@ -302,16 +317,24 @@
      sweet_log_sync();
  }
  static void m_uim_poll(void){
 -    if(!m.uim || !m.qr_started || m.uim_done==3 || m_now()<m.uim_next)return;
 -    int index=qcom_qrtr_find_remote(&m.qr,11);if(index<0)return;
 +    if(!m.uim || !m.qr_started)return;
++    if(m.uim_port && !m_uim_endpoint_valid())return;
 +    if(m.uim_ready && m_now()-m.uim_seen>=15000){
 +        m.uim_ready=false;printf("SWEET MODEM: UIM readiness expired; no fresh card status\n");
 +    }
@@ -72,7 +90,7 @@
  }
  
  static void m_greceive(void *ctx,QcomGlinkChannel *ch,const uint8_t *data,uint32_t len){
-@@ -485,8 +494,9 @@
+@@ -485,8 +508,9 @@
  #include "ModemGate.h"
  static bool m_gate(const char *name){return modem_gate(PE_boot_args(),name)!=0;}
  static int modem_run(const struct wl_fat *f,const uint8_t *mdt,uint32_t size){
