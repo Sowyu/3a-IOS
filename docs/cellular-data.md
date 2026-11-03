@@ -149,8 +149,15 @@ The plan was to show iOS routing real traffic through a kernel Ethernet ifnet wi
 - Writing that service's state with the DHCP values did not stick, because IPConfiguration rewrote it from the preferences file. Switching the preferences file to DHCP needs a configd restart, and the root has no `killall`.
 - No page loaded, and Safari was not tested. The original preferences file is back, byte for byte.
 
-**Inferred.** configd makes a DHCP-configured Ethernet ifnet the primary route with no IOKit object. That is the path the cellular `en2` uses, and `en2` has no competing preferences service. For `ue0`, the root's manual `ue0` service from `tools/sweet-root-tweaks.py` and the `org.sweet.netcfg` job compete with DHCP.
+**Measured, ast167 (2026-11-03 18:26): the proof.**
+- Before boot, `dev.py` replaced the root's `preferences.plist` with a copy whose `ue0` service (5EE7C0DE) has IPv4 ConfigMethod DHCP: 957 -> 806 bytes, undo file in the run directory.
+- With Internet Sharing on (bridge100 at 192.168.2.1, en8 a member), configd's IPConfiguration ran DHCP on `ue0` by itself and took 192.168.2.2.
+- configd's global state then named `ue0` the primary interface for IPv4 (router 192.168.2.1) and IPv6. DNS was the Mac (192.168.2.1, plus its IPv6 link-local), and the default route was via 192.168.2.1.
+- The owner browsed several sites in Safari on the phone over the cable.
+- After the run the original `preferences.plist` was put back byte for byte (SHA-256 prefix e8d0685f5b691028a777). The run ended `selftest-done`, root clean.
 
-**Next try (about 15 minutes):** push a preferences file with the `ue0` service set to DHCP before boot (`06-hfs-put` replaces existing files), switch Internet Sharing on, then fetch and open Safari.
+So configd makes a DHCP-configured kernel Ethernet ifnet the primary route, and Safari loads real pages through it, with no IOKit object, no CommCenter and no kernel change. The cellular `en2` takes the same path: `CellLink.c` answers the DHCP that IPConfiguration sends.
+
+**Follow-up, low priority.** YouTube in Safari showed "An error occurred" while other sites loaded. It might be IPv6 (the Mac advertised an IPv6 router but routes only IPv4), QUIC/UDP through Internet Sharing, or DNS64/NAT64 detection. Not investigated.
 
 **Harness bug.** The `usbdev` self-test hook computes uptime as the wall clock minus boot time. A network clock jump ended ast163's session at once ("time over at 11950000 s"). Any session that reaches the internet hits this, so the hook needs a monotonic uptime. That hook belongs to the USB/devloop owner.
