@@ -408,3 +408,9 @@ Apply after2217, SHA25634f02df2d682ccf4b7ea59807c91ed082fb8408f73fdd2d60a6c86c7b
 2218 passed offline I3. Raw8150 verifies tables/SRAM,8151 AP endpoints,9149 PAS4 authentication,9458 all QMI flags and9461 handshake completion after the transmit queue drained. The worker ended successfully at12176 after122319ms.
 AP channels quiesced at12177 before SSCTL12178. Known PAS4 shutdown failures retained IPA/modem backing at12235..12236 until normal reset. DONE12722,363seconds, clean roots before/after, stale=false and fresh nonce/frame. Exact checker passes. Evidence is pinned in `plans/ipa/logs/handshake-2218-accepted.json`.
 I4 requires a new exact combined ONLINE-image Sol GO with the modem owner. Phone idle in OrangeFox, no claims. The root retains only the ordinary2218 selftest hook, log/frame and completion marker. No data-channel completion type or IP packet transfer is measured yet.
+
+## ast183 combined trial
+
+I3 repeated at7628 with data2220/adapter2221 attached. DPM and WDA advanced, but DMS SET_OPERATING_MODE0x2e was refused at10246. No WDS call or packet attempt followed. I4 remains unproven.
+No GSI fault or kernel panic appears in the full capture. AP quiescence16305 precedes data detach16308, successful data cleanup16309 and SSCTL16310. Known PAS4 retention held IPA backing until normal reset. DONE16975,784seconds, clean roots and stale=false. Evidence is `plans/ipa/logs/combined-2218-online-refused.json`.
+The modem/data owners are diagnosing the DMS response and restoring the trial network profile. IPA source remains frozen through2218. No new IPA boot is queued.
