@@ -4,7 +4,7 @@ root=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 out="$root/tests/out"
 mkdir -p "$out/tmp"
 export TMPDIR="$out/tmp"
-for file in ModemRuntime.inc ModemGate.h ModemRmtfs.c ModemRmtfs.h QcomQrtr.c QcomQrtr.h QcomSmp2p.c QcomSmp2p.h QcomScm.h QcomQmp.c QcomQmp.h QcomRpmh.c QcomRpmh.h; do
+for file in ModemBcm.h ModemRuntime.inc ModemGate.h ModemRmtfs.c ModemRmtfs.h QcomQrtr.c QcomQrtr.h QcomSmp2p.c QcomSmp2p.h QcomScm.h QcomQmp.c QcomQmp.h QcomRpmh.c QcomRpmh.h; do
  python3 "$root/extract.py" "$root/../../patches/modem" "$out/$file" "bsd/dev/modem/$file"
 done
 for pair in 'qrtr' 'rmtfs'; do
@@ -46,3 +46,5 @@ print('PASS: runtime storage references are read-only; rmtfs has no storage API'
 PYCHK
 
 python3 "$root/check-shutdown-joined.py"
+
+python3 "$root/check-bandwidth.py"

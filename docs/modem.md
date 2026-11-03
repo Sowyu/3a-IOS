@@ -1,6 +1,6 @@
 # Modem and SIM: desk findings (2026-11-03)
 
-MPSS boots offline and announces UIM, NAS and WDS services. ast155 completed sysmon shutdown but PAS shutdown still failed. M2 remains incomplete and UIM requests remain off. ast157 passed the read-only BCM survey. Patch 2182 now releases the modem MSS proxy vote at ready/handover, matching the vendor regulator lifecycle. Its host checks and build pass. Sol review and phone validation are pending.
+MPSS boots offline and announces UIM, NAS and WDS services. ast158 released the MSS proxy vote at handover, but PAS shutdown still failed after a successful SSCTL handshake. The root is clean. M2 remains incomplete and UIM requests remain off. Patch 2183 adds the vendor crypto-to-DDR bandwidth floor using resources measured in ast157. Host tests and the full build pass. Sol review is running.
 
 Labels as in `docs/input.md`: **Measured**, **Code**, **Inferred**, **Missing**.
 
@@ -16,7 +16,7 @@ Labels as in `docs/input.md`: **Measured**, **Code**, **Inferred**, **Missing**.
 
 ## State
 
-- `plans/modem/src/lift/` holds unfinished drafts that do not compile. The dedicated `ios-asteroids/research/xnu-modem` tree now has the requested daily series, USB v5 and modem patches 2170 through 2182. Other kernel trees were not edited.
+- `plans/modem/src/lift/` holds unfinished drafts that do not compile. The dedicated `ios-asteroids/research/xnu-modem` tree now has the requested daily series, USB v5 and modem patches 2170 through 2183. Other kernel trees were not edited.
 - The owner wants mobile data only. Calls, SMS and status-bar changes are excluded. A wired-interface approach may avoid Apple baseband integration for data, but still needs a working modem and IPA path.
 
 ## Patch 2170, read-only preflight
@@ -245,3 +245,18 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 **Missing.** Sol GO and phone evidence for 2182. Only the offline image is submitted for review. UIM remains off until verified M2 and a fresh UIM audit.
 
 **Code, integration.** IPA owns 2200 through 2219 and data owns 2220 through 2239. The modem worker is the sole QRTR owner. Ports 0x4004 and 0x4005 are reserved for IPA, which must add two bounded local slots. No userland raw-QMI interface exists in this series. The current API and patch cutoff are in plans/modem/README.md.
+
+
+## ast158 result and 2183 bandwidth candidate
+
+**Measured.** ast158-modem-offline-2182 released the MSS proxy at line7173 and accepted SSCTL shutdown at10636. PAS still returned -3145800 on every attempt. Lines10704 and10705 retain memory and report final_error5. The selftest reached DONE at11443 in364 seconds, with a fresh frame/nonce, stale=false and clean root. Proxy release alone did not resolve the shutdown failure. No UIM request ran.
+
+**Code.** 2183 adds default-off sweetmbw=1. It validates the seven crypto-to-DDR BCM descriptors against the read-only ast157 values, including ACV VCD12. It derives the vendor UINT_MAX bandwidth request from node bus widths and channel counts, requires the result to saturate each rate field, and preserves all legal enable/performance bits for the enable resources. The resulting shared floor remains until reset. IP0 is not touched.
+
+**Code.** The RSC path checks hardware command capacity, owns the existing shared touch/modem lock, chooses one idle active TCS and submits seven commands in VCD order. Commit and wait bits appear only on the last command in each VCD group. It requires a fresh completion IRQ plus acknowledgements for all seven commands. Timeout preserves the programmed TCS and marks cleanup incomplete. The vote happens before PAS initialization and stays present through shutdown. Partition access remains read-only.
+
+**Measured, host.** Sanitizer checks cover the observed metadata, malformed/version-mismatched descriptors, rate saturation, enable masks, VCD ordering, absent gate, fresh versus stale completion, partial completion timeout, retained uncertain state and all three TCS choices. The actual handover-to-shutdown joined tests added after the 2182 review also pass. They exercise PAS attempts and buffer retention after a failed proxy release.
+
+**Measured, build.** The full Trash-safe --remake exited 0. Both images contain all ten expected kernel segments. Offline arguments are 586 bytes and UIM arguments are 598 bytes.
+
+**Missing.** Sol audit and phone measurement. The bandwidth hypothesis comes from the vendor driver and does not decode the secure error. No further unchanged 2182 run is planned.

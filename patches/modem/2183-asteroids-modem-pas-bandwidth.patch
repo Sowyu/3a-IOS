@@ -1,0 +1,140 @@
+--- a/bsd/dev/modem/ModemRuntime.inc
++++ b/bsd/dev/modem/ModemRuntime.inc
+@@ -17,6 +17,7 @@
+ #include "QcomScm.h"
+ #include "ModemRmtfs.h"
+ #include "ModemUim.h"
++#include "ModemBcm.h"
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, unsigned int);
+ extern void ml_io_unmap(vm_offset_t, vm_size_t);
+@@ -43,7 +44,7 @@
+     uint32_t rail_addr[2],rail_index[2],xo_addr,state,services;
+     bool xo_pinned, pas_owed, started, votes_owed, vote_uncertain, qmp_owed, shared_owed, fatal;
+     bool uim, glink, rmtfs, pdm, qr_started, stop_verified, failed;
+-    bool handover_release, bcm_probe, sysmon, shutdown_sent, shutdown_response, shutdown_ind;
++    bool bandwidth, bandwidth_pinned, handover_release, bcm_probe, sysmon, shutdown_sent, shutdown_response, shutdown_ind;
+     uint32_t shutdown_node, shutdown_port;
+     uint32_t uim_node,uim_port,uim_done,uim_tries[2];
+     uint16_t uim_txn[2];
+@@ -108,6 +109,47 @@
+     int rc=m_scm(0x42000c16,0x1117,M_ARGS_PA+64,16,M_ARGS_PA,M_ARGS_PA+256,&result);
+     printf("SWEET MODEM: rmtfs ownership share=%d status=%d result=%lld\n",share,rc,(long long)result);
+     return rc?rc:(int)result;
++}
++/* Pin the vendor crypto-to-DDR PAS bandwidth floor for this guarded boot.
++ * Shared votes are never lowered. No IP0/IPA vote is part of this path. */
++static int m_bandwidth_vote(void){
++    if(!m.bandwidth)return 0;
++    if(m.vote_uncertain){m.failed=true;return EBUSY;}
++    unsigned slots=(m_rd(m.rsc,0x0c)>>27)&31;
++    if(slots<MODEM_BCM_COUNT || slots>16){m.failed=true;return ENOTSUP;}
++    static uint8_t dbcopy[0x20000];
++    for(unsigned i=0;i<sizeof(dbcopy);i+=4){uint32_t v=m_rd(m.db,i);memcpy(dbcopy+i,&v,4);}
++    ModemBcmCommand cmd[MODEM_BCM_COUNT];
++    if(modem_bcm_prepare(dbcopy,sizeof(dbcopy),cmd,MODEM_BCM_COUNT)){m.failed=true;return EINVAL;}
++    sweet_apps_rsc_lock();int chosen=-1,rc=ENODEV;unsigned base=0;
++    for(unsigned i=0;i<3;i++){
++        unsigned t=0xd00+i*0x2a0;
++        if(m_rd(m.rsc,t+0x28) && !m_rd(m.rsc,t+0x24) && !m_rd(m.rsc,t+0x2c) && !m_rd(m.rsc,t+0x20) && !(m_rd(m.rsc,0xd04)&(1u<<i))){chosen=i;base=t;break;}
++    }
++    if(chosen<0)goto out;
++    uint32_t bit=1u<<chosen,irq=m_rd(m.rsc,0xd00),wait=0,mask=(1u<<MODEM_BCM_COUNT)-1;
++    m_wr(m.rsc,0xd00,irq&~bit);
++    for(unsigned i=0;i<MODEM_BCM_COUNT;i++){
++        wait|=cmd[i].wait<<i;
++        m_wr(m.rsc,base+0x34+i*24,0x10108);
++        m_wr(m.rsc,base+0x38+i*24,cmd[i].address);
++        m_wr(m.rsc,base+0x3c+i*24,cmd[i].data);
++    }
++    m_wr(m.rsc,base+0x20,wait);m_wr(m.rsc,base+0x2c,mask);
++    m_wr(m.rsc,base+0x24,1u<<16);m_wr(m.rsc,base+0x24,(1u<<16)|(1u<<24));
++    rc=ETIMEDOUT;
++    for(unsigned us=0;us<100000;us++){
++        /* Require a new completion IRQ, not stale idle/CMD_STATUS alone. */
++        bool done=(m_rd(m.rsc,0xd04)&bit) && m_rd(m.rsc,base+0x28);
++        for(unsigned i=0;i<MODEM_BCM_COUNT;i++)done &= (m_rd(m.rsc,base+0x40+i*24)&0x10100)==0x10100;
++        if(done){rc=0;break;}delay(1);
++    }
++    if(!rc){m.bandwidth_pinned=true;m_wr(m.rsc,base+0x24,0);m_wr(m.rsc,base+0x2c,0);m_wr(m.rsc,base+0x20,0);m_wr(m.rsc,0xd08,bit);m_wr(m.rsc,0xd00,(m_rd(m.rsc,0xd00)&~bit)|(irq&bit));}
++    else m.vote_uncertain=true; /* Retain the TCS and backing until reset. */
++ out:sweet_apps_rsc_unlock();
++    if(rc)m.failed=true;
++    printf("SWEET MODEM: PAS bandwidth tcs=%d error=%d pinned=%u commands=%u\n",chosen,rc,m.bandwidth_pinned,MODEM_BCM_COUNT);
++    sweet_log_sync();return rc;
+ }
+ static int m_vote(bool on){
+     sweet_apps_rsc_lock();int chosen=-1,rc=ENODEV;unsigned base=0;
+@@ -420,7 +462,7 @@
+ #include "ModemGate.h"
+ static bool m_gate(const char *name){return modem_gate(PE_boot_args(),name)!=0;}
+ static int modem_run(const struct wl_fat *f,const uint8_t *mdt,uint32_t size){
+-    memset(&m,0,sizeof(m));m.master=-1;m.glink=m_gate("sweetmglink");m.rmtfs=m_gate("sweetmrmtfs");m.pdm=m_gate("sweetmpdm");m.uim=m_gate("sweetmuim");m.sysmon=m_gate("sweetmstop");m.bcm_probe=m_gate("sweetmbcm");m.handover_release=m_gate("sweetmho");
++    memset(&m,0,sizeof(m));m.master=-1;m.glink=m_gate("sweetmglink");m.rmtfs=m_gate("sweetmrmtfs");m.pdm=m_gate("sweetmpdm");m.uim=m_gate("sweetmuim");m.sysmon=m_gate("sweetmstop");m.bcm_probe=m_gate("sweetmbcm");m.handover_release=m_gate("sweetmho");m.bandwidth=m_gate("sweetmbw");
+     if((m.rmtfs || m.pdm || m.uim || m.sysmon) && !m.glink){printf("SWEET MODEM: refused missing GLINK dependency\n");return EINVAL;}
+     m_sleep(30000);m.began=m_now();int rc=EIO;
+     m.smem=ml_io_map(M_SMEM,M_SM_SIZE);m.mutex=ml_io_map(0x1f43000,0x1000);m.ipcc=ml_io_map(0x405000,0x1000);
+@@ -445,6 +487,7 @@
+     qcom_qmp_init(&m.qp,(volatile uint32_t *)m.qmpmem,0x400,m_qkick,0);if((rc=m_qwait(3000)))goto out;
+     m.qmp_owed=true;if((rc=m_qsend(true)))goto out;
+     if((rc=m_vote(true)))goto out;
++    if((rc=m_bandwidth_vote()))goto out;
+     if((rc=m_load(f,mdt,size)))goto out;
+     if((rc=m_pas(5,1,0,0)))goto out;m.started=true;
+     uint64_t end=m_now()+120000,ready_deadline=m_now()+10000;
+--- /dev/null
++++ b/bsd/dev/modem/ModemBcm.h
+@@ -0,0 +1,53 @@
++/* Fixed volcano crypto-to-DDR bandwidth floor for a bounded development boot.
++ * Source tables: Nothing sm7635/v/mr volcano.c, icc-rpmh.c and bcm-voter.c.
++ * No MMIO here. The caller owns RSC arbitration and completion/retention. */
++#ifndef MODEM_BCM_H
++#define MODEM_BCM_H
++#include "QcomRpmh.h"
++#define MODEM_BCM_COUNT 7u
++typedef struct {uint32_t address,data;unsigned vcd,wait,resource;} ModemBcmCommand;
++static const char *const modem_bcm_names[MODEM_BCM_COUNT]={"CE0","SN3","SN0","SH1","SH0","MC0","ACV"};
++static inline int modem_bcm_prepare(const uint8_t *db,size_t bytes,ModemBcmCommand *out,size_t capacity){
++    if(!out || capacity<MODEM_BCM_COUNT)return -1;
++    /* Corresponding node bus widths/channels. Enable-mask resources use zero. */
++    static const unsigned bus[]={8,16,16,0,16,4,0},channels[]={1,1,1,0,2,2,0};
++    /* Measured read-only in ast157. Refuse a changed firmware resource map. */
++    static const uint32_t address[]={0x50034,0x5001c,0x50010,0x50008,0x50004,0x50000,0x50068};
++    static const uint32_t units[]={7935,530000,530000,4200000,4200000,1600000,1};
++    static const unsigned widths[]={8,8,16,32,32,8,0},vcds[]={6,3,3,1,1,0,12};
++    ModemBcmCommand c[MODEM_BCM_COUNT];
++    for(unsigned i=0;i<MODEM_BCM_COUNT;i++){
++        QcomRpmhResource r={0};if(qcom_cmd_db_find(db,bytes,modem_bcm_names[i],&r))return -2;
++        if(r.aux_version!=0x1000 || r.slave_id!=5 || (r.address>>16)!=5 || (r.address&3) || r.aux_bytes!=8)return -3;
++        const uint8_t *a=r.aux_prefix;
++        uint32_t unit=(uint32_t)a[0]|(uint32_t)a[1]<<8|(uint32_t)a[2]<<16|(uint32_t)a[3]<<24;
++        unsigned width=a[4]|a[5]<<8,vcd=a[6];
++        if(r.address!=address[i] || unit!=units[i] || width!=widths[i] || vcd!=vcds[i] || a[7])return -4;
++        for(unsigned j=0;j<i;j++)if(c[j].address==r.address)return -5;
++        uint32_t vote;
++        if(bus[i]){
++            /* Match the vendor UINT_MAX kB/s request, then require saturation
++             * before pinning a shared floor. Never lower inherited rate votes. */
++            uint64_t avg=(uint64_t)UINT32_MAX*width/(bus[i]*channels[i]);
++            uint64_t peak=(uint64_t)UINT32_MAX*width/bus[i];
++            if(avg*1000/unit<0x3fff || peak*1000/unit<0x3fff)return -6;
++            vote=0x0fffffffu;
++        }else{
++            /* ACV has legal enable/performance bits 1|2. Retain both until reset,
++             * since this isolated driver cannot restore an inherited APPS vote. */
++            vote=i==6?3:1;
++        }
++        c[i]=(ModemBcmCommand){r.address,0x20000000u|vote,vcd,0,i};
++    }
++    for(unsigned i=1;i<MODEM_BCM_COUNT;i++){
++        ModemBcmCommand v=c[i];unsigned j=i;
++        while(j && c[j-1].vcd>v.vcd){c[j]=c[j-1];j--;}c[j]=v;
++    }
++    for(unsigned i=0;i<MODEM_BCM_COUNT;i++){
++        c[i].wait=i+1==MODEM_BCM_COUNT || c[i].vcd!=c[i+1].vcd;
++        if(c[i].wait)c[i].data|=0x40000000u;
++    }
++    for(unsigned i=0;i<MODEM_BCM_COUNT;i++)out[i]=c[i];
++    return 0;
++}
++#endif
