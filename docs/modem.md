@@ -554,3 +554,7 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 **Code.** Data2220 audit10 logs the numeric refusal and hardware-restricted field, and permits at most ONLINE, LOW_POWER, ONLINE with the existing gate. LOW_POWER must be accepted and freshly read back before the retry. Lost Set replies fail locally. Its stage cutoff has a documented late-read exception under the independent600-second runtime.
 
 **Missing.** The changed data source needs integration, build and a new exact-image GO. The cause of ast183's ONLINE refusal, NAS registration, WDS and data packets remain unmeasured. No automatic reset or persistent modem write is authorized.
+
+
+**Code.** The second data candidate includes exact2220 audit10, with only CellSession.c/h changed and IPA still2218. The retained0,1,0 mode budget is subject to a new integrated-image review.
+**Measured, host.** The safe --remake build, actual production data and IPA worker tests,56-file reconstruction and ten packed segments pass. Kernel SHA256 is403877da7b664e8b7cc6153165c5bc08f545d9ecc93be7285b18745a6516f5b2. The154-artifact manifest remains unapproved while Sol reviews source and image together.
