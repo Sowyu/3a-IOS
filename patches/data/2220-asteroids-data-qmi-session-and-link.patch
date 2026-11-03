@@ -347,7 +347,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/data/CellSession.c
-@@ -0,0 +1,644 @@
+@@ -0,0 +1,652 @@
 +#if defined(ARM64_BOARD_CONFIG_SWEET) || !defined(KERNEL)
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 +/* Order and retry behaviour follow ModemManager's QMI bearer for the "ipa" net driver and HakiOS hakios.mpss.c, which learned on
@@ -530,7 +530,13 @@
 +    if (c->exhausted) return;
 +    c->exhausted = 1;
 +    event(s, CE_ERROR, c->family, 0, why);
-+    const CellCall *other = c == &s->call[0] ? &s->call[1] : &s->call[0];
++    CellCall *other = c == &s->call[0] ? &s->call[1] : &s->call[0];
++    /* IPv6 waiting on IPv4 (v6_after_v4) ends with it, unless it already owns a call */
++    if (s->cfg.v6_after_v4 && c == &s->call[0] && other->family && !other->exhausted && !other->up && !other->handle &&
++        !other->start_unknown) {
++        other->exhausted = 1;
++        event(s, CE_ERROR, other->family, 0, "IPv6 not tried: IPv4 did not come up");
++    }
 +    if (!other->family || other->exhausted) fail(s, 0, "no call can come up");
 +}
 +
@@ -580,11 +586,13 @@
 +        return;
 +    }
 +    if (!s->registered || s->now < c->next_start) return;
++    if (cfg->v6_after_v4 && c == &s->call[1] && s->call[0].family && !s->call[0].up) return;  /* IPv4 first */
 +    /* the budget covers the whole cycle: it is reset only when a call comes up */
 +    if (c->start_tries >= START_TRIES) {exhaust(s, c, "start network: tries used up"); return;}
 +    c->start_tries++;
 +    c->next_start = s->now + START_RETRY_MS;
-+    const WdsCall call = {cfg->apn, 0, 0, 0, 0xff, cfg->profile, c->family};
++    /* APN and authentication travel in the request only: no stored profile is created or changed */
++    const WdsCall call = {cfg->apn, 0, 0, 0, cfg->auth, cfg->profile, c->family};
 +    uint8_t m[256];
 +    const uint16_t txn = take_txn(s);
 +    if (txn && issue(s, c->client, QMI_SVC_WDS, m, wds_start_network(m, sizeof m, txn, &call))) {
@@ -994,7 +1002,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/data/CellSession.h
-@@ -0,0 +1,118 @@
+@@ -0,0 +1,120 @@
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 +/* The data session over QMI, as a polled state machine with no transport of its own:
 + *   services present -> read-only DMS/NAS/WDS queries for the log -> wait for the owner's readiness barrier (USIM ready, IPA
@@ -1048,6 +1056,8 @@
 +    uint8_t mux;                 /* QMAP mux id both calls are bound to */
 +    uint32_t ep_interface;       /* embedded endpoint interface number (1, as ModemManager) */
 +    uint32_t ipa_rx, ipa_tx;     /* IPA endpoint the modem receives on (our TX) and sends on (our RX) */
++    uint8_t auth;                /* Start Network authentication: 0 none, 1 PAP, 2 CHAP, 0xff leaves the TLV out */
++    uint8_t v6_after_v4;         /* the IPv6 call starts only once IPv4 is up, and gives up when IPv4 cannot come up */
 +} CellConfig;
 +
 +/* What the readiness barrier supplies: the format the IPA endpoints use and what one receive buffer holds. */
@@ -2297,7 +2307,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/data/sweet_data.c
-@@ -0,0 +1,819 @@
+@@ -0,0 +1,841 @@
 +/*
 + * SWEET DATA: mobile data above the modem runtime (bsd/dev/modem) and the IPA.
 + *
@@ -2308,7 +2318,8 @@
 + *   sweetdataonline=1  lets the session put the modem online (DMS Set Operating Mode 0). Without it the session waits.
 + *   sweetqmiraw=1      sysctl kern.sweet_qmi for root: one call sends a QMI request through the allow list (QmiRaw.c) and returns
 + *                      the response; kern.sweet_qmi_ind returns the last kept indications.
-+ * sweetapn=NAME gives the APN; without it Start Network uses the modem's default profile.
++ * sweetapn=NAME gives the APN (100 bytes at most) and sweetapnauth=pap|chap|none its authentication; both travel only in Start Network,
++ * so no stored profile changes. Without sweetapn the modem's default profile is used. The IPv6 call starts only once IPv4 is up.
 + *
 + * Threads (sweet_data.h): the modem runtime's worker runs the session, every QRTR send and the QRTR receive callbacks. The stack's
 + * output, the IPA's receive and the sysctl callers meet it only under sd_lock: the CellLink state, the raw request slot and the
@@ -2366,7 +2377,7 @@
 +	int session_on, raw_on, attached, closed;
 +	QcomQrtr *qr;                   /* worker thread only */
 +	CellSession session;            /* worker thread only */
-+	char apn[101];
++	char apn[102];                  /* 100 bytes at most; one more to see a longer value and refuse it */
 +	DataServices services;          /* worker thread only */
 +	int usim;                       /* worker thread only */
 +	uint64_t next_ra;
@@ -2730,6 +2741,17 @@
 +	}
 +}
 +
++/* sweetapnauth=pap|chap|none: the Start Network authentication. Absent: 0xff, the TLV is left out. Anything else: -1 (refused). */
++static int
++sd_auth_arg(void)
++{
++	char v[8] = "";
++	if (!PE_parse_boot_arg_str("sweetapnauth", v, sizeof v)) {
++		return 0xff;
++	}
++	return !strcmp(v, "none") ? 0 : !strcmp(v, "pap") ? 1 : !strcmp(v, "chap") ? 2 : -1;
++}
++
 +/* ---- the modem runtime's hooks (worker thread) ---- */
 +int
 +sweet_data_attach(QcomQrtr *qr)
@@ -2742,6 +2764,19 @@
 +	sd.raw_on = sd_gate("sweetqmiraw");
 +	if (!sd.session_on && !sd.raw_on) {
 +		return 0;
++	}
++	/* the session's arguments are checked before anything is registered: a refusal leaves no port behind */
++	int auth = 0xff;
++	if (sd.session_on) {
++		if (!PE_parse_boot_arg_str("sweetapn", sd.apn, sizeof sd.apn)) {
++			sd.apn[0] = 0;
++		}
++		auth = sd_auth_arg();
++		if (strlen(sd.apn) > 100 || auth < 0) {
++			printf("SWEET DATA: refused: sweetapn longer than 100 bytes, or sweetapnauth not pap, chap or none\n");
++			sd.session_on = sd.raw_on = 0;
++			return EINVAL;
++		}
 +	}
 +	/* service 0: QcomQrtr announces nothing for these client ports */
 +	if (qcom_qrtr_add_service(qr, 0, 0, PORT_CLIENT0, sd_receive, NULL) ||
@@ -2758,12 +2793,9 @@
 +	cell_link_init(&sd.link, sd_mac, sd_router_mac);
 +	lck_mtx_unlock(&sd_lock);
 +	if (sd.session_on) {
-+		if (!PE_parse_boot_arg_str("sweetapn", sd.apn, sizeof sd.apn)) {
-+			sd.apn[0] = 0;
-+		}
 +		const CellConfig cfg = {
 +			.allow_online = (uint8_t)sd_gate("sweetdataonline"), .want_v4 = 1, .want_v6 = 1, .apn = sd.apn[0] ? sd.apn : NULL,
-+			.mux = SD_MUX, .ep_interface = 1, .ipa_rx = 2, .ipa_tx = 18,
++			.mux = SD_MUX, .ep_interface = 1, .ipa_rx = 2, .ipa_tx = 18, .auth = (uint8_t)auth, .v6_after_v4 = 1,
 +		};
 +		const CellSessionOps ops = {sd_send, sd_event, NULL};
 +		cell_session_init(&sd.session, &cfg, &ops, sd_now_ms());

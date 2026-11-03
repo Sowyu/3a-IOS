@@ -76,7 +76,7 @@ static const uint32_t PORTS[] = {40, 41, 42, 43, 44, 45};  /* DMS NAS WDS WDA DP
 
 static void start(void)
 {
-    static const CellConfig cfg = {0, 1, 1, 0, 0, 1, 1, 2, 18};
+    static const CellConfig cfg = {0, 1, 1, 0, 0, 1, 1, 2, 18, 0xff, 0};
     static const CellSessionOps ops = {session_send, session_event, 0};
     memset(&out, 0, sizeof out);
     memset(&svcs, 0, sizeof svcs);
@@ -129,7 +129,7 @@ int main(void)
     assert(s.state >= CS_STOPPING && data_services_lookup(&svcs, MODEM, DPM_PORT) < 0 && data_services_lookup(&svcs, MODEM, 99) == QMI_SVC_DPM);
     /* readiness lost just before the last missing service (DPM) is announced: nothing is sent and no setup begins */
     for (int via_receive = 0; via_receive < 2; ++via_receive) {
-        static const CellConfig cfg = {0, 1, 1, 0, 0, 1, 1, 2, 18};
+        static const CellConfig cfg = {0, 1, 1, 0, 0, 1, 1, 2, 18, 0xff, 0};
         static const CellSessionOps ops = {session_send, session_event, 0};
         memset(&out, 0, sizeof out);
         memset(&svcs, 0, sizeof svcs);

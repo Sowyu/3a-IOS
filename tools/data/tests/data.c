@@ -408,7 +408,7 @@ static void answer(CellSession *s, unsigned client, uint8_t service, uint16_t ms
     cell_session_receive(s, client, service, b, len);
 }
 
-static const CellConfig CFG = {0, 1, 1, "internet", 0, 1, 1, 2, 18};
+static const CellConfig CFG = {0, 1, 1, "internet", 0, 1, 1, 2, 18, 0xff, 0};
 static const CellReady READY = {QMAP_V1, 32, 16384};
 static const uint8_t SVCS[] = {QMI_SVC_DMS, QMI_SVC_NAS, QMI_SVC_WDS, QMI_SVC_WDA, QMI_SVC_DPM};
 static const uint8_t ONLINE_MODE[] = {0x01, 1, 0, 0}, OFFLINE_MODE[] = {0x01, 1, 0, 3};
@@ -888,6 +888,59 @@ static void session_audit3(void)
     assert(qmi_response(b, l2, 9, DMS_GET_OPERATING_MODE, &qm) == -1);
 }
 
+/* The first live configuration: APN and PAP in Start Network only, IPv4 first, IPv6 only once IPv4 is up. */
+static void session_carrier(void)
+{
+    CellSession s;
+    uint64_t t = 1000;
+    CellConfig cfg = CFG;
+    cfg.apn = "example.apn";
+    cfg.auth = 1;
+    cfg.v6_after_v4 = 1;
+    fresh(&s, &cfg, t);
+    to_register(&s, &t);
+    registered(&s);
+    for (unsigned c = 0; c < 2; ++c) {
+        answer(&s, c, QMI_SVC_WDS, WDS_BIND_MUX_DATA_PORT, 0, 0, 0);
+        answer(&s, c, QMI_SVC_WDS, WDS_SET_IP_FAMILY, 0, 0, 0);
+    }
+    /* IPv4's start carries the APN and PAP; nothing ever creates or modifies a profile */
+    const int i = find_sent(0, QMI_SVC_WDS, WDS_START_NETWORK);
+    assert(i >= 0 && find_sent(1, QMI_SVC_WDS, WDS_START_NETWORK) < 0);
+    static const uint8_t want[] = {0x14, 11, 0, 'e', 'x', 'a', 'm', 'p', 'l', 'e', '.', 'a', 'p', 'n', 0x16, 1, 0, 1, 0x19, 1, 0, 4};
+    assert(sent.len[i] == 7 + sizeof want && !memcmp(sent.body[i] + 7, want, sizeof want));
+    /* IPv6 waits while IPv4 is refused and retried */
+    answer(&s, 0, QMI_SVC_WDS, WDS_START_NETWORK, QMI_ERR_INVALID_OPERATION, 0, 0);
+    for (unsigned k = 0; k < 70; ++k) cell_session_poll(&s, t += 100);
+    assert(find_sent(1, QMI_SVC_WDS, WDS_START_NETWORK) < 0);
+    answer(&s, 0, QMI_SVC_WDS, WDS_START_NETWORK, 0, H4, sizeof H4);
+    answer(&s, 0, QMI_SVC_WDS, WDS_GET_CURRENT_SETTINGS, 0, SET4, sizeof SET4);
+    assert(s.call[0].up);
+    cell_session_poll(&s, t += 100);
+    const int j = find_sent(1, QMI_SVC_WDS, WDS_START_NETWORK);
+    assert(j >= 0 && sent.body[j][sent.len[j] - 1] == 6);  /* now IPv6 starts, with the same APN and PAP */
+    assert(count_sent(QMI_SVC_WDS, WDS_CREATE_PROFILE) == 0 && count_sent(QMI_SVC_WDS, WDS_MODIFY_PROFILE) == 0);
+    /* IPv4 that never comes up takes IPv6 with it: no IPv6 start, and the session ends */
+    fresh(&s, &cfg, t = 1000);
+    to_register(&s, &t);
+    registered(&s);
+    for (unsigned c = 0; c < 2; ++c) {
+        answer(&s, c, QMI_SVC_WDS, WDS_BIND_MUX_DATA_PORT, 0, 0, 0);
+        answer(&s, c, QMI_SVC_WDS, WDS_SET_IP_FAMILY, 0, 0, 0);
+    }
+    answer(&s, 0, QMI_SVC_WDS, WDS_START_NETWORK, 0x11, 0, 0);  /* a refusal that will not change */
+    cell_session_poll(&s, t += 100);
+    assert(s.call[0].exhausted && s.call[1].exhausted && s.state >= CS_STOPPING);
+    assert(find_sent(1, QMI_SVC_WDS, WDS_START_NETWORK) < 0);
+    /* auth 0xff leaves the TLV out, as before */
+    fresh(&s, &CFG, t = 1000);
+    to_register(&s, &t);
+    registered(&s);
+    bound(&s);
+    const int k = find_sent(0, QMI_SVC_WDS, WDS_START_NETWORK);
+    for (uint32_t at = 7; at + 3 <= sent.len[k]; at += 3u + (sent.body[k][at + 1] | sent.body[k][at + 2] << 8)) assert(sent.body[k][at] != 0x16);
+}
+
 static void session(void)
 {
     session_order();
@@ -896,6 +949,7 @@ static void session(void)
     session_bounds();
     session_reaudit();
     session_audit3();
+    session_carrier();
 }
 
 /* ---- raw allow list ---- */
