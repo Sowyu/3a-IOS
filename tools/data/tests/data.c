@@ -1007,6 +1007,45 @@ static void session_online(void)
     assert(end >= CS_STOPPING && n == 2);
     /* never a mode other than 0 or 1 */
     for (unsigned i = 0; i < n; ++i) assert(m[i] <= 1);
+    /* audit9: lost replies end the session, and a second ONLINE needs LOW_POWER's success reply and a fresh read */
+    for (int lose = 0; lose < 3; ++lose) {
+        CellSession s;
+        uint64_t t = 1000;
+        CellConfig cfg = CFG;
+        cfg.allow_online = 1;
+        fresh(&s, &cfg, t);
+        cell_session_ready(&s, &READY);
+        answer(&s, 0, QMI_SVC_DPM, DPM_OPEN_PORT, 0, 0, 0);
+        answer(&s, 0, QMI_SVC_WDA, WDA_SET_DATA_FORMAT, 0, WDA_OK, sizeof WDA_OK);
+        static const uint8_t lp_mode[] = {0x01, 1, 0, 1};
+        answer(&s, 0, QMI_SVC_DMS, DMS_GET_OPERATING_MODE, 0, lose == 2 ? lp_mode : OFFLINE_MODE, 4);
+        if (lose == 0) {         /* ONLINE's reply never comes */
+        } else {                 /* ONLINE refused, then LOW_POWER's reply never comes (the cached mode may even be 1 already) */
+            answer(&s, 0, QMI_SVC_DMS, DMS_SET_OPERATING_MODE, 0x34, 0, 0);
+            assert(sent.body[find_sent(0, QMI_SVC_DMS, DMS_SET_OPERATING_MODE)][10] == 1);
+        }
+        for (unsigned k = 0; k < 80; ++k) cell_session_poll(&s, t += 100);
+        set_modes(m, &n);
+        assert(s.state >= CS_STOPPING && n == (lose ? 2u : 1u));
+    }
+    {   /* the ONLINE stage ends after 60 s even when every read answers and the modem never reports online */
+        CellSession s;
+        uint64_t t = 1000;
+        CellConfig cfg = CFG;
+        cfg.allow_online = 1;
+        fresh(&s, &cfg, t);
+        cell_session_ready(&s, &READY);
+        answer(&s, 0, QMI_SVC_DPM, DPM_OPEN_PORT, 0, 0, 0);
+        answer(&s, 0, QMI_SVC_WDA, WDA_SET_DATA_FORMAT, 0, WDA_OK, sizeof WDA_OK);
+        answer(&s, 0, QMI_SVC_DMS, DMS_GET_OPERATING_MODE, 0, OFFLINE_MODE, sizeof OFFLINE_MODE);
+        answer(&s, 0, QMI_SVC_DMS, DMS_SET_OPERATING_MODE, 0, 0, 0);  /* accepted, but the modem stays offline */
+        for (unsigned k = 0; k < 700 && s.state == CS_ONLINE; ++k) {
+            if (pending_dms(&s, DMS_GET_OPERATING_MODE)) answer(&s, 0, QMI_SVC_DMS, DMS_GET_OPERATING_MODE, 0, OFFLINE_MODE, sizeof OFFLINE_MODE);
+            cell_session_poll(&s, t += 100);
+        }
+        set_modes(m, &n);
+        assert(s.state >= CS_STOPPING && n == 1 && t - 1000 <= 61000);
+    }
 }
 
 static void session(void)
