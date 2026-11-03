@@ -347,7 +347,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/data/CellSession.c
-@@ -0,0 +1,652 @@
+@@ -0,0 +1,680 @@
 +#if defined(ARM64_BOARD_CONFIG_SWEET) || !defined(KERNEL)
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 +/* Order and retry behaviour follow ModemManager's QMI bearer for the "ipa" net driver and HakiOS hakios.mpss.c, which learned on
@@ -679,10 +679,22 @@
 +        }
 +        if (s->mode == DMS_MODE_ONLINE) {set_state(s, CS_REGISTER); return;}
 +        if (!cfg->allow_online) {set_state(s, CS_WAIT_ONLINE_ALLOWED); return;}
-+        if (!s->online_sent) {
-+            if (find(s, 0, QMI_SVC_DMS, DMS_SET_OPERATING_MODE)) return;
-+            s->online_sent = 1;
++        if (find(s, 0, QMI_SVC_DMS, DMS_SET_OPERATING_MODE)) return;
++        /* online once; after a refusal, low power once and then online once more (HakiOS needed this order on Qualcomm) */
++        if (!s->online_sent || (s->lowpower_sent && s->online_sent == 1 && s->mode == DMS_MODE_LOW_POWER)) {
++            s->online_sent++;
++            s->mode_req = DMS_MODE_ONLINE;
 +            SEND(s, 0, QMI_SVC_DMS, dms_set_operating_mode, DMS_MODE_ONLINE);
++        } else if (s->lowpower_sent && s->online_sent == 1 && s->mode != DMS_MODE_LOW_POWER) {
++            /* low power accepted: three more reads, 5 s apart, for the modem to get there */
++            if (s->lowpower_checks < STEP_TRIES) {
++                if (s->now >= s->next_poll) s->lowpower_checks++;
++                reread_mode(s);
++                return;
++            }
++            char line[64];
++            snprintf(line, sizeof line, "low power accepted but the modem stays in mode %u", s->mode);
++            fail(s, DMS_SET_OPERATING_MODE, line);
 +        } else {
 +            reread_mode(s);
 +        }
@@ -867,12 +879,28 @@
 +        s->mode = md.mode;
 +        s->mode_known = 1;
 +        s->tries = 0;
-+        snprintf(line, sizeof line, "operating mode %u, offline reason %#x", md.mode, md.offline_reason);
++        snprintf(line, sizeof line, "operating mode %u, offline reason %#x, hardware restricted %u", md.mode, md.offline_reason,
++                 md.hw_restricted);
 +        event(s, CE_INFO, md.mode, &md, line);
 +    } else if (p->message == DMS_SET_OPERATING_MODE && s->state == CS_ONLINE) {
-+        if (qmi_response(msg, length, p->txn, p->message, &m)) {fail(s, p->message, "online refused"); return;}
++        const int rc = qmi_response(msg, length, p->txn, p->message, &m);
++        if (rc) {
++            snprintf(line, sizeof line, "%s refused: QMI error %d, from mode %u", s->mode_req == DMS_MODE_ONLINE ? "online" : "low power",
++                     rc, s->mode);
++            /* a first refused online gets one low-power step; anything else ends the session */
++            if (s->mode_req == DMS_MODE_ONLINE && !s->lowpower_sent && rc > 0) {
++                event(s, CE_ERROR, p->message, 0, line);
++                s->lowpower_sent = 1;
++                s->mode_req = DMS_MODE_LOW_POWER;
++                SEND(s, 0, QMI_SVC_DMS, dms_set_operating_mode, DMS_MODE_LOW_POWER);
++                return;
++            }
++            fail(s, p->message, line);
++            return;
++        }
 +        s->mode_known = 0;  /* read it back */
 +        s->tries = 0;
++        s->next_poll = 0;
 +    }
 +}
 +
@@ -1002,7 +1030,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/data/CellSession.h
-@@ -0,0 +1,120 @@
+@@ -0,0 +1,121 @@
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 +/* The data session over QMI, as a polled state machine with no transport of its own:
 + *   services present -> read-only DMS/NAS/WDS queries for the log -> wait for the owner's readiness barrier (USIM ready, IPA
@@ -1090,6 +1118,7 @@
 +    CellState state;
 +    uint8_t services;            /* bit per service present: 0 DMS, 1 NAS, 2 WDS, 3 WDA, 4 DPM */
 +    uint8_t is_ready, info_sent, indications_sent, mode_known, mode, registered, online_sent, tries, failing, unresolved;
++    uint8_t lowpower_sent, mode_req, lowpower_checks;  /* the one low-power step after a refused online, and the mode of the request in flight */
 +    uint16_t next_txn;
 +    uint64_t now, next_poll, state_since, backoff_until;
 +    CellPending pending[CELL_PENDING];

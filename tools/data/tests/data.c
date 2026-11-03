@@ -941,6 +941,74 @@ static void session_carrier(void)
     for (uint32_t at = 7; at + 3 <= sent.len[k]; at += 3u + (sent.body[k][at + 1] | sent.body[k][at + 2] << 8)) assert(sent.body[k][at] != 0x16);
 }
 
+/* ast2218 trial: the modem reported OFFLINE (3) and refused ONLINE. One low-power step, then one more ONLINE; nothing beyond that. */
+static void set_modes(uint8_t *modes, unsigned *n)
+{
+    *n = 0;
+    for (unsigned i = 0; i < sent.n; ++i) if (sent.service[i] == QMI_SVC_DMS && sent.msg[i] == DMS_SET_OPERATING_MODE) modes[(*n)++] = sent.body[i][10];
+}
+
+static int pending_dms(const CellSession *s, uint16_t msg)
+{
+    for (unsigned i = 0; i < CELL_PENDING; ++i)
+        if (s->pending[i].busy && s->pending[i].service == QMI_SVC_DMS && s->pending[i].message == msg) return 1;
+    return 0;
+}
+
+static void online_case(int lp_rc, int online2_rc, uint8_t mode_after_lp, CellState *end, uint8_t *modes, unsigned *n)
+{
+    CellSession s;
+    uint64_t t = 1000;
+    CellConfig cfg = CFG;
+    cfg.allow_online = 1;
+    fresh(&s, &cfg, t);
+    cell_session_ready(&s, &READY);
+    answer(&s, 0, QMI_SVC_DPM, DPM_OPEN_PORT, 0, 0, 0);
+    answer(&s, 0, QMI_SVC_WDA, WDA_SET_DATA_FORMAT, 0, WDA_OK, sizeof WDA_OK);
+    answer(&s, 0, QMI_SVC_DMS, DMS_GET_OPERATING_MODE, 0, OFFLINE_MODE, sizeof OFFLINE_MODE);
+    answer(&s, 0, QMI_SVC_DMS, DMS_SET_OPERATING_MODE, 0x34, 0, 0);  /* online refused: invalid transition */
+    if (find_sent(0, QMI_SVC_DMS, DMS_SET_OPERATING_MODE) >= 0 && sent.body[find_sent(0, QMI_SVC_DMS, DMS_SET_OPERATING_MODE)][10] == 1) {
+        answer(&s, 0, QMI_SVC_DMS, DMS_SET_OPERATING_MODE, lp_rc, 0, 0);
+        const uint8_t after[] = {0x01, 1, 0, mode_after_lp};
+        for (unsigned k = 0; k < 6 && s.state == CS_ONLINE; ++k) {
+            if (find_sent(0, QMI_SVC_DMS, DMS_GET_OPERATING_MODE) >= 0 && pending_dms(&s, DMS_GET_OPERATING_MODE))
+                answer(&s, 0, QMI_SVC_DMS, DMS_GET_OPERATING_MODE, 0, after, sizeof after);
+            if (pending_dms(&s, DMS_SET_OPERATING_MODE)) {
+                answer(&s, 0, QMI_SVC_DMS, DMS_SET_OPERATING_MODE, online2_rc, 0, 0);
+                if (!online2_rc) {
+                    answer(&s, 0, QMI_SVC_DMS, DMS_GET_OPERATING_MODE, 0, ONLINE_MODE, sizeof ONLINE_MODE);
+                    break;
+                }
+            }
+            cell_session_poll(&s, t += 5100);
+        }
+    }
+    cell_session_poll(&s, t += 100);
+    *end = s.state;
+    set_modes(modes, n);
+}
+
+static void session_online(void)
+{
+    uint8_t m[8];
+    unsigned n;
+    CellState end;
+    /* offline, online refused, low power accepted, mode 1, online accepted: registration follows */
+    online_case(0, 0, DMS_MODE_LOW_POWER, &end, m, &n);
+    assert(end == CS_REGISTER && n == 3 && m[0] == 0 && m[1] == 1 && m[2] == 0);
+    /* the second online refused too: the session ends, nothing more is sent */
+    online_case(0, 0x34, DMS_MODE_LOW_POWER, &end, m, &n);
+    assert(end >= CS_STOPPING && n == 3 && m[2] == 0);
+    /* low power refused: the session ends after one low-power request */
+    online_case(0x34, 0, DMS_MODE_LOW_POWER, &end, m, &n);
+    assert(end >= CS_STOPPING && n == 2 && m[1] == 1);
+    /* low power accepted but the modem stays offline: three re-reads, then the session ends without another online */
+    online_case(0, 0, 3, &end, m, &n);
+    assert(end >= CS_STOPPING && n == 2);
+    /* never a mode other than 0 or 1 */
+    for (unsigned i = 0; i < n; ++i) assert(m[i] <= 1);
+}
+
 static void session(void)
 {
     session_order();
@@ -950,6 +1018,7 @@ static void session(void)
     session_reaudit();
     session_audit3();
     session_carrier();
+    session_online();
 }
 
 /* ---- raw allow list ---- */
