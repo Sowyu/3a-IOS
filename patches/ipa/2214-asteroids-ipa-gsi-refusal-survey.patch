@@ -1,0 +1,38 @@
+diff --git a/bsd/dev/modem/IpaHardware.inc b/bsd/dev/modem/IpaHardware.inc
+--- a/bsd/dev/modem/IpaHardware.inc
++++ b/bsd/dev/modem/IpaHardware.inc
+@@ -80,6 +80,25 @@
+     ipa_hw(0x404,0x11); /* IPA5.0 cache flush bits0/4, not pre5.0 0x1111. */
+     printf("SWEET IPA: immediate tables and SRAM readback PASS base=%#x bytes=%#x\n",iph.offset,iph.bytes);sweet_log_sync();return true;
+ }
++/* Refusal diagnostics use only the same AP EE0 registers as availability.
++ * Never clear a fault, reallocate a live context or widen a reported count. */
++static void ipa_hardware_refusal(void){
++    uint32_t status=ipa_gread(0,0x25000),p2=ipa_gread(0,0x25040),p4=ipa_gread(0,0x25050);
++    uint32_t error=ipa_gread(0,0x25240),irq=ipa_gread(0,0x2520c);
++    unsigned channels=p2&255,events=p4&255;
++    printf("SWEET IPA: GSI unavailable status=%#x param2=%#x param4=%#x error=%#x irq=%#x channels=%u events=%u\n",status,p2,p4,error,irq,channels,events);
++    if(channels>=10 && channels<=128 && events>=4 && events<=128){
++        for(unsigned i=0;i<channels;i++){
++            uint32_t ctx=ipa_gread(0,ipa_gch(i,0));
++            printf("SWEET IPA: GSI AP channel=%u context0=%#x state=%u\n",i,ctx,(ctx>>20)&15);
++        }
++        for(unsigned i=0;i<events;i++){
++            uint32_t ctx=ipa_gread(0,ipa_gev(i,0));
++            printf("SWEET IPA: GSI AP event=%u context0=%#x state=%u\n",i,ctx,(ctx>>20)&15);
++        }
++    }
++    sweet_log_sync();
++}
+ static int ipa_hardware_setup(void){
+     memset(&iph,0,sizeof(iph));
+     if(!ipa_local_bounds(ipa_hr(0x40),&iph.offset,&iph.bytes))return EINVAL;
+@@ -90,7 +109,7 @@
+     if(pipes>32 || tx_count>rx_base || rx_base+rx_count>pipes ||
+        tx_count<=9 || rx_base>11 || rx_base+rx_count<=18)return ENOTSUP;
+     IpaGsiIo io={0,ipa_gread,ipa_gwrite,ipa_gsync,ipa_gwait};
+-    if(!ipa_gsi_available(io))return EBUSY;
++    if(!ipa_gsi_available(io)){ipa_hardware_refusal();return EBUSY;}
+     if(!ipa_hconfig(0xc00c,0,~0u) || !ipa_hconfig(0x2c,ipa_hr(0x2c)|(1u<<7)|(1u<<8),~0u) ||
+        !ipa_hconfig(0x54,13,0xff) || !ipa_hconfig(0x58,13,~0u) || !ipa_hconfig(0x4b0,0,~0u) ||
+        !ipa_hconfig(0x4ac,14|(1u<<7)|(14u<<8)|(24u<<16),~0u) ||

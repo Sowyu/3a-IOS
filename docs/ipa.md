@@ -4,7 +4,7 @@
 
 I1 is complete. The I2 implementation builds with patches2200 through2213, copied modem2189v2, data2220audit8 and adapter2221. I3 and I4 remain unproven.
 
-Read-only surveys ast159 and ast170 passed. SMMU-only ast174 passed setup and parking. After fixing the CPU VA page-size bug in2211 and the endpoint direction guard in2212, benign ast176 cleaned the journal and PAS15-only ast177 passed authentication, shutdown and complete cleanup with clean roots. The offline GSI/QMI handshake is next.
+Read-only surveys ast159 and ast170 passed. SMMU-only ast174 passed setup and parking. After fixing the CPU VA page-size bug in2211 and the endpoint direction guard in2212, benign ast176 cleaned the journal and PAS15-only ast177 passed authentication, shutdown and complete cleanup with clean roots. The first offline attempt ast178 safely refused GSI availability before configuration. Read-only refusal diagnostics are next.
 
 Host inspection of the existing extracted ipa_fws.mdt found three relocatable loads, 17824 file bytes and a page-rounded span of 0x7000. This fits the 0xa000 GSI reservation. `tools/ipa/inspect_mdt.py` checks ELF bounds, overlap and relocation span without loading firmware. It does not check split-file contents or authenticate the image. Three synthetic host tests pass, including nine malformed cases. Local evidence is `plans/ipa/logs/host-check.txt` and `plans/ipa/logs/firmware-inventory.json`.
 
@@ -356,3 +356,13 @@ The AP channel quiesce path logs success before data detach and SSCTL. Stop comm
 Maintained ASan/UBSan tests inject ERROR_LOG0x02301000 and IRQ_STTS2 before I3 publication and after a real modeled handshake. They exercise the actual receive precheck, pending RX, copied TX, a fault during event inspection and a fault during descriptor synchronization. Both actual2212 negative controls fail the new checks. Ordered reconstruction reproduces all56 integrated files.
 
 Apply frozen `2213-asteroids-ipa-runtime-gsi-faults.patch` after2212, SHA256 `c972c926ace27c915c1545a556ef89c11106b5f5577c08f9344409abd02179d8`. Keep modem2189v2, data2220audit8 and adapter2221 unchanged. Reproduce with `python3 plans/ipa/tools/check-series.py`; run `sh 3a-IOS/tools/ipa/check-datapath.sh`. A fresh exact offline B review is required before any full IPA boot. ONLINE remains unauthorized until B and a new combined-image review pass.
+
+## ast178 and2214 availability diagnostics
+
+The reviewed2213 B image returned EBUSY16 before IPA configuration or GSI channel programming. PAS15 authenticated successfully at raw lines6235 through6237, then stopped at6248. DMA guards passed, SMMU parked and backing released at6249. The worker ended with16 at6251 and the selftest reached DONE at12653. No PAS4 operation or QMI handshake occurred.
+
+Evidence is `ios-asteroids/logs/ast178-ipa-handshake-2213.txt` and its result directory. The run lasted365seconds, both roots were clean, stale=false and the fresh nonce/frame matched. The I3 checker correctly refused this capture. The phone returned to OrangeFox and both claims were released. The root retains the normal2213 handshake selftest hook, log/frame and completion marker.
+
+Patch2214 only adds read-only diagnostics when the existing GSI availability guard refuses. It prints the status, parameter and error registers and bounded AP channel/event context0 values. It neither clears errors nor takes over live contexts. Invalid reported counts skip context reads. Host cases cover disabled status, bad counts, error registers and an occupied event, with no configuration writes.
+
+Apply `2214-asteroids-ipa-gsi-refusal-survey.patch` after2213, SHA256 `78619050fc9c64d78c3b567e71f3148fb2e4eba5b02b122778c67eb24c6e044a`. Its exact diagnostic B image needs a new Sol review. The measured refusal is unresolved. I3 and ONLINE remain unproven.

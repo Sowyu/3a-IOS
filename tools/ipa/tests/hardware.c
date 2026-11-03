@@ -111,6 +111,12 @@ int supplied_hardware_main(void){
  for(unsigned n=1;n<=7;n++){hreset();fail_immediate=n;assert(ipa_hardware_setup());assert(!iph.ready);assert(ipa_hardware_stop());}
  hreset();corrupt_read=true;assert(ipa_hardware_setup());assert(ipa_hardware_stop());
  hreset();regs[ipa_gch(20,0)/4]=1u<<20;assert(ipa_hardware_setup()==EBUSY);assert(!cfg_writes && !writes);
+ /* Refusal survey keeps measured count bounds and never changes hardware. */
+ const unsigned bad_gsi[][2]={{0x25000,0},{0x25040,9},{0x25040,129},{0x25050,3},{0x25050,129},{0x25240,0x02301000},{0x2520c,2},{0x1c000+0x80*16,1u<<20}};
+ for(unsigned k=0;k<sizeof(bad_gsi)/sizeof(bad_gsi[0]);k++){
+  hreset();regs[0x25040/4]=0xe4046312;regs[0x25050/4]=0x2011;regs[bad_gsi[k][0]/4]=bad_gsi[k][1];
+  assert(ipa_hardware_setup()==EBUSY);assert(!cfg_writes && !writes && !iph.touched && !iph.gsi.claimed);
+ }
  hreset();cfg[0x40/4]=0;assert(ipa_hardware_setup()==EINVAL);assert(!cfg_writes && !writes);
  hreset();assert(!ipa_hardware_setup());cfg[0x100/4]=1u<<18;hold_aggregate=true;assert(!ipa_hardware_stop());assert(iph.gsi.claimed);
  hreset();assert(!ipa_hardware_setup());cfg_drop=cfg_writes+2;assert(!ipa_hardware_stop());assert(iph.count);
