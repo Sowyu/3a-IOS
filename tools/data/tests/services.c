@@ -1,6 +1,7 @@
 /* Modem 2189 audit finding 1: real QRTR (QcomQrtr.c), the real data service cache (DataServices.c) and the real session
  * (CellSession.c), fed whole QRTR packets in the order one GLINK batch can deliver them. The receive callback below makes the same
- * calls in the same order as sweet_data.c sd_receive (sync, lookup, session receive); discovery() is sweet_data_discovery. */
+ * calls in the same order as sweet_data.c sd_receive (data_services_step, lookup, session receive); discovery() is
+ * sweet_data_discovery. ready_now stands for the owner's USIM and IPA evidence. */
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
@@ -13,6 +14,8 @@
 static QcomQrtr q;
 static DataServices svcs;
 static CellSession s;
+static int ready_now;
+static const CellReady READY = {QMAP_V1, 16, 8192};
 static struct {uint8_t service[128]; uint16_t msg[128], txn[128]; unsigned n;} out;
 
 static int link_send(void *ctx, const uint8_t *packet, uint32_t length) {(void)ctx; (void)packet; (void)length; return 0;}
@@ -32,12 +35,12 @@ static void session_event(void *ctx, CellEvent e, uint32_t arg, const void *data
 static void receive(void *ctx, QcomQrtr *qr, uint32_t port, uint32_t node, uint32_t from, const uint8_t *data, uint32_t length)
 {
     (void)ctx;
-    data_services_sync(&svcs, qr, &s, 0, 0);
+    data_services_step(&svcs, qr, &s, ready_now, &READY, 0, 0);
     const int service = data_services_lookup(&svcs, node, from);
     if (service < 0) return;
     cell_session_receive(&s, port == LOCAL0 + 1, (uint8_t)service, data, length);
 }
-static void discovery(void) {data_services_sync(&svcs, &q, &s, 0, 0);}
+static void discovery(void) {data_services_step(&svcs, &q, &s, ready_now, &READY, 0, 0);}
 
 static void put32(uint8_t *p, uint32_t v) {p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);}
 
@@ -75,15 +78,14 @@ static void start(void)
 {
     static const CellConfig cfg = {0, 1, 1, 0, 0, 1, 1, 2, 18};
     static const CellSessionOps ops = {session_send, session_event, 0};
-    static const CellReady ready = {QMAP_V1, 16, 8192};
     memset(&out, 0, sizeof out);
     memset(&svcs, 0, sizeof svcs);
     qcom_qrtr_init(&q, 1, link_send, 0);
     assert(!qcom_qrtr_add_service(&q, 0, 0, LOCAL0, receive, 0));
     assert(!qcom_qrtr_add_service(&q, 0, 0, LOCAL0 + 1, receive, 0));
     cell_session_init(&s, &cfg, &ops, 0);
+    ready_now = 1;
     for (unsigned i = 0; i < DATA_SERVICE_COUNT; ++i) server(QCOM_QRTR_NEW_SERVER, data_service_ids[i], PORTS[i], 1);
-    cell_session_ready(&s, &ready);
     assert(s.state == CS_DPM && sent(QMI_SVC_DPM, DPM_OPEN_PORT) >= 0);
 }
 
@@ -125,6 +127,31 @@ int main(void)
     server(QCOM_QRTR_DEL_SERVER, QMI_SVC_DPM, DPM_PORT, 1);
     server(QCOM_QRTR_NEW_SERVER, QMI_SVC_DPM, 99, 1);
     assert(s.state >= CS_STOPPING && data_services_lookup(&svcs, MODEM, DPM_PORT) < 0 && data_services_lookup(&svcs, MODEM, 99) == QMI_SVC_DPM);
+    /* readiness lost just before the last missing service (DPM) is announced: nothing is sent and no setup begins */
+    for (int via_receive = 0; via_receive < 2; ++via_receive) {
+        static const CellConfig cfg = {0, 1, 1, 0, 0, 1, 1, 2, 18};
+        static const CellSessionOps ops = {session_send, session_event, 0};
+        memset(&out, 0, sizeof out);
+        memset(&svcs, 0, sizeof svcs);
+        qcom_qrtr_init(&q, 1, link_send, 0);
+        assert(!qcom_qrtr_add_service(&q, 0, 0, LOCAL0, receive, 0));
+        cell_session_init(&s, &cfg, &ops, 0);
+        ready_now = 1;
+        for (unsigned i = 0; i < DATA_SERVICE_COUNT; ++i)
+            if (data_service_ids[i] != QMI_SVC_DPM) server(QCOM_QRTR_NEW_SERVER, data_service_ids[i], PORTS[i], 1);
+        assert(s.state == CS_WAIT_READY && s.is_ready && svcs.ready_given);  /* granted while DPM was still missing */
+        const unsigned mark = out.n;
+        ready_now = 0;  /* the owner sees the IPA (or USIM) fail ... */
+        server(QCOM_QRTR_NEW_SERVER, QMI_SVC_DPM, DPM_PORT, !via_receive);  /* ... and in the same step DPM appears */
+        if (via_receive) reply(PORTS[0], DMS_GET_REVISION, 1);  /* the next routed packet runs the step instead of the hook */
+        cell_session_poll(&s, 100);
+        assert(sent(QMI_SVC_DPM, DPM_OPEN_PORT) < 0 && s.state == CS_WAIT_READY && !s.is_ready && !svcs.ready_given);
+        for (unsigned i = mark; i < out.n; ++i) assert(out.msg[i] != DPM_OPEN_PORT && out.msg[i] != NAS_REGISTER_INDICATIONS);
+        /* readiness back: setup starts normally */
+        ready_now = 1;
+        discovery();
+        assert(s.state == CS_DPM && sent(QMI_SVC_DPM, DPM_OPEN_PORT) >= 0);
+    }
     puts("data service cache checks: PASS");
     return 0;
 }

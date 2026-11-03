@@ -1115,7 +1115,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/data/DataServices.c
-@@ -0,0 +1,50 @@
+@@ -0,0 +1,65 @@
 +#if defined(ARM64_BOARD_CONFIG_SWEET) || !defined(KERNEL)
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 +/* Moved out of sweet_data.c so the cache can be tested with the real QRTR and session code (modem 2189 audit, finding 1). */
@@ -1164,11 +1164,26 @@
 +void data_services_clear(DataServices *d)
 +{
 +    for (unsigned i = 0; i < DATA_SERVICE_COUNT; ++i) d->svc[i].present = 0;
++    d->ready_given = 0;
++}
++
++void data_services_step(DataServices *d, const QcomQrtr *qr, CellSession *session, int ready, const CellReady *r,
++                        DataServiceLost lost, void *context)
++{
++    if (session && d->ready_given && !ready) {  /* revoke before any service change can advance setup */
++        cell_session_ready(session, 0);
++        d->ready_given = 0;
++    }
++    data_services_sync(d, qr, session, lost, context);
++    if (session && ready && !d->ready_given) {
++        cell_session_ready(session, r);
++        d->ready_given = 1;
++    }
 +}
 +#endif
 --- /dev/null
 +++ b/bsd/dev/data/DataServices.h
-@@ -0,0 +1,35 @@
+@@ -0,0 +1,43 @@
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 +/* Where each QMI service the data side uses lives, as the modem's QRTR name service last announced it, and the session's view of it.
 + * data_services_sync compares the cache with the QRTR remote list and tells the session about every service that went away or came
@@ -1187,6 +1202,7 @@
 +
 +typedef struct {
 +    struct {uint32_t node, port; int present;} svc[DATA_SERVICE_COUNT];
++    int ready_given;  /* the session currently holds a readiness record from data_services_step */
 +} DataServices;
 +
 +/* Called for a service that went away (before the session hears of it), for example to fail a raw request waiting on it. */
@@ -1199,6 +1215,13 @@
 +/* The cached endpoint of service: 0 and node/port set when present, -1 otherwise. */
 +int data_services_endpoint(const DataServices *d, uint8_t service, uint32_t *node, uint32_t *port);
 +void data_services_clear(DataServices *d);
++
++/* The one ordering every worker entry point uses (poll, receive, discovery, USIM change): a lost readiness is taken from the session
++ * first, then the cache is synced, then readiness is granted if it holds now. So a service that arrives in the same step as a
++ * readiness loss can never let setup advance on the old record. ready is the owner's current evidence, r its limits (used only when
++ * granting). session may be null (raw only): then only the cache is synced. */
++void data_services_step(DataServices *d, const QcomQrtr *qr, CellSession *session, int ready, const CellReady *r,
++                        DataServiceLost lost, void *context);
 +
 +#ifdef __cplusplus
 +}
@@ -2274,7 +2297,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/data/sweet_data.c
-@@ -0,0 +1,834 @@
+@@ -0,0 +1,819 @@
 +/*
 + * SWEET DATA: mobile data above the modem runtime (bsd/dev/modem) and the IPA.
 + *
@@ -2345,7 +2368,7 @@
 +	CellSession session;            /* worker thread only */
 +	char apn[101];
 +	DataServices services;          /* worker thread only */
-+	int usim, ready_given;          /* worker thread only */
++	int usim;                       /* worker thread only */
 +	uint64_t next_ra;
 +	/* the presentation, under sd_lock */
 +	CellLink link;
@@ -2650,8 +2673,7 @@
 +	}
 +}
 +
-+static void sd_readiness(void);
-+static void sd_sync_services(QcomQrtr *qr);
++static void sd_step(QcomQrtr *qr);
 +
 +/* ---- QRTR receive (worker thread) ---- */
 +static void
@@ -2670,8 +2692,8 @@
 +	if (!sd.attached || q != sd.qr) {
 +		return;
 +	}
-+	/* the QRTR list is the truth: a DEL_SERVER earlier in this batch must count before this reply is routed */
-+	sd_sync_services(q);
++	/* the QRTR list is the truth: a DEL_SERVER earlier in this batch, or a readiness loss, counts before this reply is routed */
++	sd_step(q);
 +	const int service = data_services_lookup(&sd.services, node, from_port);
 +	if (service < 0 || length < QCOM_QMI_HEADER) {
 +		return;
@@ -2704,7 +2726,6 @@
 +		lck_mtx_unlock(&sd_lock);
 +	}
 +	if (sd.session_on) {
-+		sd_readiness();  /* a revocation counts before this message can advance anything */
 +		cell_session_receive(&sd.session, client, (uint8_t)service, data, length);
 +	}
 +}
@@ -2768,37 +2789,28 @@
 +	lck_mtx_unlock(&sd_lock);
 +}
 +
-+static void
-+sd_sync_services(QcomQrtr *qr)
-+{
-+	data_services_sync(&sd.services, qr, sd.session_on ? &sd.session : NULL, sd_service_lost, NULL);
-+}
-+
 +void
 +sweet_data_discovery(QcomQrtr *qr)
 +{
 +	if (!sd.attached || qr != sd.qr) {
 +		return;
 +	}
-+	sd_sync_services(qr);
-+	if (sd.session_on) {
-+		sd_readiness();
-+	}
++	sd_step(qr);
 +}
 +
-+/* The readiness barrier: USIM ready (modem runtime), IPA handshake done and the transmit hook set (IPA driver). */
-+static void
-+sd_readiness(void)
++/* The readiness evidence: USIM ready (modem runtime), IPA handshake done and the transmit hook set (IPA driver). */
++static int
++sd_ready_now(void)
 +{
-+	const int ready = sd.usim && LOAD(sd.ipa_ready) && sd.ipa_tx != NULL;
-+	if (ready && !sd.ready_given) {
-+		const CellReady r = {sd.qmap, sd.ipa_datagrams, sd.ipa_rx_bytes};
-+		cell_session_ready(&sd.session, &r);
-+		sd.ready_given = 1;
-+	} else if (!ready && sd.ready_given) {
-+		cell_session_ready(&sd.session, NULL);
-+		sd.ready_given = 0;
-+	}
++	return sd.usim && LOAD(sd.ipa_ready) && sd.ipa_tx != NULL;
++}
++
++/* Revoke, sync services, grant: the order of data_services_step, used by every worker entry point. */
++static void
++sd_step(QcomQrtr *qr)
++{
++	const CellReady r = {sd.qmap, sd.ipa_datagrams, sd.ipa_rx_bytes};
++	data_services_step(&sd.services, qr, sd.session_on ? &sd.session : NULL, sd_ready_now(), &r, sd_service_lost, NULL);
 +}
 +
 +static void
@@ -2831,10 +2843,7 @@
 +	if (!sd.attached || qr != sd.qr) {
 +		return;
 +	}
-+	sd_sync_services(qr);  /* before readiness, so a readiness transition never sends through a stale endpoint */
-+	if (sd.session_on) {
-+		sd_readiness();
-+	}
++	sd_step(qr);  /* revoke, sync, grant: a readiness change never sends through a stale endpoint or on an old record */
 +	sd_raw_poll();
 +	if (sd.session_on) {
 +		cell_session_poll(&sd.session, now_ms);
@@ -2849,7 +2858,7 @@
 +{
 +	sd.usim = ready != 0;
 +	if (sd.attached && sd.session_on) {
-+		sd_readiness();  /* worker thread: a revocation takes effect before anything else runs */
++		sd_step(sd.qr);  /* worker thread: a revocation takes effect before anything else runs */
 +	}
 +}
 +
@@ -2913,7 +2922,6 @@
 +	sd.qr = NULL;
 +	lck_mtx_unlock(&sd_lock);
 +	data_services_clear(&sd.services);
-+	sd.ready_given = 0;
 +	printf("SWEET DATA: detached\n");
 +}
 +
