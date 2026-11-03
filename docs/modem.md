@@ -385,16 +385,16 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 
 **Code.** The 600-second worker expires USIM evidence before every transport/data step, even if SMP2P ready or handover clears. It calls the data discovery hook after every accepted QRTR packet and UIM endpoint check, preserving removal events before later replies. This requires data2220 revision8a0b901c, reviewed in `docs/data-2220-audit6.md`.
 
-**Measured, host.** The extracted worker and real CellSession pass the cleared-state/no-traffic freshness regression. The actual modem receive and data discovery functions pass DEL_DPM/late-reply and DEL/NEW tests with real QRTR, DataServices and CellSession under ASAN/UBSAN. `tools/modem/check-data-hooks.sh` reproduces these checks. The first2189 revision built successfully. The corrected revision is rebuilding.
+**Measured, host.** The extracted worker and real CellSession pass the cleared-state/no-traffic freshness regression. The actual modem receive and data discovery functions pass DEL_DPM/late-reply and DEL/NEW tests with real QRTR, DataServices and CellSession under ASAN/UBSAN. `tools/modem/check-data-hooks.sh` reproduces these checks. The corrected 2189 revision and data2220 audit6 completed a full Trash-safe kernel build.
 
-**Code, reviewed.** Sol closed both findings and approved the source wiring and guarded600-second lifetime in `docs/modem-2189-reaudit.md`. Fresh isolated host checks passed and35 reconstructed source files match production.
+**Code, reviewed.** Sol closed both findings and approved the source wiring and guarded 600-second lifetime in `docs/modem-2189-reaudit.md`. Fresh isolated host checks passed and 35 reconstructed source files match production.
 
-**Missing.** The final combined build and IPA readiness/quiescence approval. No2189 phone image is approved. PAS4 retention remains the owner-accepted bounded-trial policy, with M2 incomplete. M3 and sustained USIM READY are measured in ast168.
+**Missing.** The final combined build and IPA readiness/quiescence approval. No 2189 phone image is approved. PAS4 retention remains the owner-accepted bounded-trial policy, with M2 incomplete. M3 and sustained USIM READY are measured in ast168.
 
 
 ## Interface-bound packet proof
 
-**Code.** `tools/modem/sweeten2.c` makes one IPv4 HTTP HEAD exchange to1.1.1.1 through en2. It requires an up en2 address, sets and reads back IP_BOUND_IF, binds that source address and verifies the connected source. There is no DNS lookup, interface fallback or routing change. One monotonic10-second deadline covers connection, send and receive. Output contains only the interface/index, HTTP status and elapsed time. It does not print response bodies or modem identifiers.
+**Code.** `tools/modem/sweeten2.c` makes one IPv4 HTTP HEAD exchange to 1.1.1.1 through en2. It requires an up en2 address, sets and reads back IP_BOUND_IF, binds that source address and verifies the connected source. There is no DNS lookup, interface fallback or routing change. One monotonic 10-second deadline covers connection, send and receive. Output contains only the interface/index, HTTP status and elapsed time. It does not print response bodies or modem identifiers.
 
 **Measured, host.** `python3 tools/modem/check-en2.py` passes localhost tests of the actual bound socket, fragmented/malformed/truncated status, absent interface and total timeout under ASAN/UBSAN. `sh tools/modem/build-en2.sh` builds and signs the arm64e phone executable, with PAC stripped for this kernel. The binary stays outside the public repository.
 
