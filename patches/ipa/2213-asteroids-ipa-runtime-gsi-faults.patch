@@ -1,0 +1,122 @@
+diff --git a/bsd/dev/modem/IpaData.inc b/bsd/dev/modem/IpaData.inc
+--- a/bsd/dev/modem/IpaData.inc
++++ b/bsd/dev/modem/IpaData.inc
+@@ -24,10 +24,18 @@
+ static bool ipa_data_revoke(void){
+     lck_mtx_lock(&ipa_queue_lock);ipa_data_terminal=true;ipa_tx_drop_all(&ipa_txq);lck_mtx_unlock(&ipa_queue_lock);return false;
+ }
++static bool ipa_data_health(void){
++    if(ipa_gsi_healthy(&iph.gsi))return true;
++    ipa_data_revoke();
++    if(!iph.failed){iph.failed=true;
++        printf("SWEET IPA: GSI fault error=%#x irq=%#x; readiness revoked\n",iph.gsi.error_log,iph.gsi.irq_status);sweet_log_sync();}
++    return false;
++}
+ static bool ipa_data_poll(void){
+-    if(!iph.ready || iph.gsi.failed)return ipa_data_revoke();
++    if(!iph.ready || !ipa_data_health())return ipa_data_revoke();
+     for(unsigned i=1;i<4;i++)for(unsigned work=0;work<64;work++){
+         unsigned offset,bytes;int rc=ipa_gsi_event(&iph.gsi,i,&offset,&bytes);if(!rc)break;if(rc<0)return ipa_data_revoke();
++        if(!ipa_data_health())return false;
+         if(!iph.gsi.ch[i].tx){
+             sweet_ipa_rx_fn receive;void *context;
+             lck_mtx_lock(&ipa_queue_lock);receive=ipa_receive;context=ipa_receive_ctx;bool ready=ipa_txq.ready;lck_mtx_unlock(&ipa_queue_lock);
+@@ -47,5 +55,5 @@
+         lck_mtx_unlock(&ipa_queue_lock);if(!bytes)break;
+         if(!ipa_gsi_post(&iph.gsi,2,(uint16_t)bytes,packet,bytes))return ipa_data_revoke();
+     }
+-    return true;
++    return ipa_data_health();
+ }
+diff --git a/bsd/dev/modem/IpaGsi.h b/bsd/dev/modem/IpaGsi.h
+--- a/bsd/dev/modem/IpaGsi.h
++++ b/bsd/dev/modem/IpaGsi.h
+@@ -16,11 +16,20 @@
+     uint32_t posted,completed,consumed;
+     bool tx,command,event_owned,channel_owned,started;
+ } IpaGsiChannel;
+-typedef struct {IpaGsiIo io;uint8_t *dma;uint32_t base;IpaGsiChannel ch[4];bool claimed,failed,uncertain;uint32_t irq_saved[5];} IpaGsi;
++typedef struct {IpaGsiIo io;uint8_t *dma;uint32_t base;IpaGsiChannel ch[4];bool claimed,failed,uncertain;uint32_t irq_saved[5],error_log,irq_status;} IpaGsi;
+ static inline unsigned ipa_gch(unsigned c,unsigned n){return 0x14000+0x80*c+4*n;}
+ static inline unsigned ipa_gev(unsigned e,unsigned n){return 0x1c000+0x80*e+4*n;}
+ static inline uint32_t ipa_gr(IpaGsi *s,unsigned r){return s->io.read(s->io.ctx,r);}
+ static inline void ipa_gw(IpaGsi *s,unsigned r,uint32_t v){s->io.write(s->io.ctx,r,v);}
++/* Top-level interrupts are masked. The owner must sample faults while
++ * polling, including when no transfer completion arrives. Preserve evidence. */
++static inline bool ipa_gsi_healthy(IpaGsi *s){
++    if(s->failed)return false;
++    if(!s->claimed)return true;
++    uint32_t error=ipa_gr(s,0x25240),status=ipa_gr(s,0x2520c);
++    if(error || status){s->error_log=error;s->irq_status=status;s->failed=true;return false;}
++    return true;
++}
+ static inline unsigned ipa_gstate(IpaGsi *s,IpaGsiChannel *ch,bool ev){return (ipa_gr(s,ev?ipa_gev(ch->event,0):ipa_gch(ch->channel,0))>>20)&15;}
+ static inline bool ipa_gcmd(IpaGsi *s,IpaGsiChannel *ch,bool ev,unsigned opcode,unsigned expected){
+     unsigned id=ev?ch->event:ch->channel,src=ev?0x2509c:0x25090,clr=ev?0x250a4:0x25098;
+@@ -89,28 +98,31 @@
+     if(!ipa_gcmd(s,&s->ch[i],false,1,2))return false;s->ch[i].started=true;return true;
+ }
+ static inline bool ipa_gsi_post(IpaGsi *s,unsigned i,uint16_t length,const void *data,unsigned bytes){
+-    if(i>=4 || s->failed)return false;IpaGsiChannel *ch=&s->ch[i];
++    if(i>=4 || !ipa_gsi_healthy(s))return false;IpaGsiChannel *ch=&s->ch[i];
+     if(!ch->started || ch->posted-ch->completed>=ch->slots-1 || bytes>ch->buffer_size || (!ch->command && length>ch->buffer_size))return false;
+     unsigned slot=ch->posted%ch->slots,buf=ch->buffer+slot*ch->buffer_size,at=ch->ring+slot*16;
+     if(ch->tx){if(!data || !bytes)return false;memcpy(s->dma+buf,data,bytes);}
+     s->io.sync(s->io.ctx,buf,ch->buffer_size);
+     IpaTre tre={s->base+buf,length,0,(ch->command?3u:2u)<<16 | (1u<<9)|(1u<<10)};
+-    memcpy(s->dma+at,&tre,16);s->io.sync(s->io.ctx,at,16);ch->posted++;
++    memcpy(s->dma+at,&tre,16);s->io.sync(s->io.ctx,at,16);
++    if(!ipa_gsi_healthy(s))return false;ch->posted++;
+     ipa_gw(s,0x24004+8*ch->channel,0);ipa_gw(s,0x24000+8*ch->channel,s->base+ch->ring+(ch->posted%ch->slots)*16);return true;
+ }
+ /* One event per TRE. Bad pointers/codes never release or repost DMA buffers. */
+ static inline int ipa_gsi_event(IpaGsi *s,unsigned i,unsigned *buffer,unsigned *bytes){
+-    if(i>=4 || s->failed)return -1;IpaGsiChannel *ch=&s->ch[i];
++    if(i>=4 || !ipa_gsi_healthy(s))return -1;IpaGsiChannel *ch=&s->ch[i];
+     uint32_t base=s->base+ch->events,producer=ipa_gr(s,ipa_gev(ch->event,4));
+     if(producer<base || producer-base>=ch->slots*16 || ((producer-base)&15)){s->failed=true;return -1;}
+     if((producer-base)/16==ch->consumed%ch->slots)return 0;
+     unsigned at=ch->events+(ch->consumed%ch->slots)*16;s->io.sync(s->io.ctx,at,16);IpaEvent ev;memcpy(&ev,s->dma+at,16);
++    if(!ipa_gsi_healthy(s))return -1;
+     if(ch->completed==ch->posted || ev.transfer!=s->base+ch->ring+(ch->completed%ch->slots)*16 ||
+        ev.channel!=ch->channel || ev.type!=0x22 || (ev.code!=1 && ev.code!=2 && ev.code!=4) || (!ch->tx && ev.length>ch->buffer_size)){
+         s->failed=true;return -1;
+     }
+     *buffer=ch->buffer+(ch->completed%ch->slots)*ch->buffer_size;*bytes=ev.length;
+     if(!ch->tx)s->io.sync(s->io.ctx,*buffer,ch->buffer_size);
++    if(!ipa_gsi_healthy(s))return -1;
+     ch->completed++;ch->consumed++;ipa_gw(s,0x24800+8*ch->event,base+((ch->consumed-1)%ch->slots)*16);return 1;
+ }
+ /* Stop all channels before freeing any ring, then reset/deallocate. A command
+diff --git a/bsd/dev/modem/IpaSession.inc b/bsd/dev/modem/IpaSession.inc
+--- a/bsd/dev/modem/IpaSession.inc
++++ b/bsd/dev/modem/IpaSession.inc
+@@ -20,6 +20,7 @@
+ static int ipa_session_poll(void){
+     if(!ipa_full)return 0;
+     if(m.failed || m.fatal || m.data_stopping){ipa_data_revoke();return EIO;}
++    if(!ipa_data_health())return EIO;
+     if(!m.qr_started)return 0;
+     int rc=ipa_qmi_poll(&iph.qmi,&m.qr,m_now(),iph.ready);
+     unsigned state=iph.qmi.sent|(iph.qmi.accepted<<1)|(iph.qmi.registered<<2)|(iph.qmi.uc_done<<3)|(iph.qmi.indicated<<4);
+diff --git a/bsd/dev/modem/ModemRuntime.inc b/bsd/dev/modem/ModemRuntime.inc
+--- a/bsd/dev/modem/ModemRuntime.inc
++++ b/bsd/dev/modem/ModemRuntime.inc
+@@ -569,13 +569,16 @@
+ #include "IpaSession.inc"
+ static void ipa_transport_sync(void){
+     if(!ipa_full)return;
++    if(iph.gsi.claimed && !ipa_data_health())m.failed=true;
+     if(m.failed || m.fatal || m.data_stopping || !iph.ready || iph.gsi.failed || !ipa_qmi_peer_current(&iph.qmi,&m.qr))ipa_data_revoke();
+     if(m.data_attached && m.data_ipa_bound)sweet_data_ipa_refresh();
+ }
+ static bool ipa_data_quiesce(void){
+     if(!ipa_full)return true;
+     ipa_data_revoke();ipa_transport_sync();
+-    if(ipa_hardware_quiesce())return true;
++    if(ipa_hardware_quiesce()){
++        printf("SWEET IPA: AP channels quiesced; ring backing retained\n");sweet_log_sync();return true;
++    }
+     ipa.retained=true;return false;
+ }
+ static int modem_run(const struct wl_fat *f,const uint8_t *mdt,uint32_t size){

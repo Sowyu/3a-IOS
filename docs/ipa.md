@@ -2,7 +2,7 @@
 
 ## Checkpoint, 2026-11-03
 
-I1 is complete. The I2 implementation builds with patches2200 through2212, copied modem2189v2, data2220audit8 and adapter2221. I3 and I4 remain unproven. ast175 authenticated and stopped PAS15, but CPU VA cleanup panicked.
+I1 is complete. The I2 implementation builds with patches2200 through2213, copied modem2189v2, data2220audit8 and adapter2221. I3 and I4 remain unproven.
 
 Read-only surveys ast159 and ast170 passed. SMMU-only ast174 passed setup and parking. After fixing the CPU VA page-size bug in2211 and the endpoint direction guard in2212, benign ast176 cleaned the journal and PAS15-only ast177 passed authentication, shutdown and complete cleanup with clean roots. The offline GSI/QMI handshake is next.
 
@@ -344,3 +344,15 @@ The corrected2212 firmware-only A completed normally in214seconds, with clean ro
 Evidence is ios-asteroids/logs/ast177-ipa-firmware-2212.txt and its result directory. The accepted record is plans/ipa/logs/firmware-2212-accepted.json. Exact image2a8a5ccd uses kernel1e2d9bd6 under plans/ipa/sol-firmware-2212-audit.md. The phone returned to recovery, runner exited0 and ownership was released. The root retains the ordinary2212 firmware selftest hook, log/frame and completion marker.
 
 This proves PAS15 authentication, shutdown and corrected CPU VA/SMMU cleanup in the bounded firmware-only run. I3 and I4 still need the separately reviewed offline GSI/QMI handshake and later ONLINE run. Source remains2200 through2212 with the pinned modem/data cutoff.
+
+## 2213 runtime hardware fault handling
+
+The offline2212 review refused B because hardware ERROR_LOG or BUS_ERROR could leave readiness true while no completion arrived. No B boot occurred. Accepted PAS15-only ast177 remains valid.
+
+Patch2213 samples both GSI error registers on the modem worker before QMI progress, transport callbacks, completion delivery and transfer posting. A detected fault latches failure, clears readiness and copied TX immediately, prevents revival and fails the offline worker. It checks again after DMA synchronization before posting a doorbell or delivering RX. Network transmit still only copies into the bounded queue. It does not perform MMIO.
+
+The AP channel quiesce path logs success before data detach and SSCTL. Stop commands still require fresh completion and state verification. Uncertain stop retains all backing. No PAS15, SMMU, power or firmware-loader behavior changed.
+
+Maintained ASan/UBSan tests inject ERROR_LOG0x02301000 and IRQ_STTS2 before I3 publication and after a real modeled handshake. They exercise the actual receive precheck, pending RX, copied TX, a fault during event inspection and a fault during descriptor synchronization. Both actual2212 negative controls fail the new checks. Ordered reconstruction reproduces all56 integrated files.
+
+Apply frozen `2213-asteroids-ipa-runtime-gsi-faults.patch` after2212, SHA256 `c972c926ace27c915c1545a556ef89c11106b5f5577c08f9344409abd02179d8`. Keep modem2189v2, data2220audit8 and adapter2221 unchanged. Reproduce with `python3 plans/ipa/tools/check-series.py`; run `sh 3a-IOS/tools/ipa/check-datapath.sh`. A fresh exact offline B review is required before any full IPA boot. ONLINE remains unauthorized until B and a new combined-image review pass.
