@@ -147,3 +147,73 @@ app status 2000ms: manager frame y 0 h 48; scene top 68 -> 50; presentation over
 ```
 
 How to read a failure: `app scene skip: bounds ...` means `_referenceBounds` is not 420x930, and the line gives the real value. If the scene top shows 50 while a root view still reads 68, the 68 comes from a source other than the scene inset. The overlap value on the same line then shows whether the presentation path is still the one raising it.
+
+## Round 6: every app launch, and the home screen (2026-11-03)
+
+Owner reports after v5: some apps still show the old gap, and the home screen has a gap above the top widget.
+
+### Why some apps still had the gap
+
+Every built-in app lives at `/Applications/<Name>.app/<Name>` (checked against the root manifest, including Photos, Files, App Store, Maps, Music and Weather), so kernel patch 2058 injects the dylib into all of them. The likely cause is the crash guard. It allows one unfinished start per app per boot, and a start only counted as finished after 60 s of main-queue time. A suspended app runs no timers. So an app that was opened, left and later killed, by the app switcher or by memory pressure, never got its healthy mark, and its next launch in that boot logged `guard blocked` and ran with the stock 68 pt top. The loop runs open each app once, which is why ast110 and every later run looked right: the non-hw frames of ast110, ast119, ast121 and ast131 all put the Calendar and Notes bar ink at 63.0 pt, against 81.7 pt stock (ast96, ast106). Inferred from the code, to be proven by the spacing run.
+
+Fix: an app marks itself healthy after 3 s, or as soon as it goes to the background (`UIApplicationDidEnterBackgroundNotification`). An app that crashes within 3 s of launch is still blocked for the rest of the boot. SpringBoard keeps 60 s.
+
+Not covered: app extensions (`.appex`) and arm64 third-party apps. 2058 never injects into them. Reaching them needs a kernel change and a Sol audit.
+
+### The home screen
+
+The home widget top is at 99.2 pt in every frame, stock and v5. `-[SBIconListView layoutInsetsForOrientation:]` (SpringBoardHome 0x1c17f27e0) returns the layout insets plus `additionalLayoutInsets`, and `getLayoutMetricsParameters:orientation:` (0x1c17f8e48) builds every icon position from the view bounds and that value. `sweetsb_home.h` hooks it in SpringBoard only: portrait, the canvas screen, icon locations `SBIconLocationRoot`, `SBIconLocationRootWithWidgets` and `SBIconLocationTodayView`. Top goes down 18 pt and bottom up 18 pt, so the grid moves up as a block. Row spacing, the dock, folders, the page dots and the Search pill keep their places. It skips an inset that cannot give up 18 pt.
+
+App Library puts its search bar 3 pt below `-[SBHLibrarySearchController _windowSafeAreaInsets]`, the window's safe area (0x1c1a691d0, 0x1c1a6775c). An optional second hook lowers that top by 18 pt when it is a portrait notch top between 68 and 80. The lock screen is not touched.
+
+Off switches for the home change: build without `-DSWEETSB_HOME_SHIFT=1`, or create `/private/var/tmp/sweetsb-home.off` and restart SpringBoard. `/private/var/tmp/sweetsb-app.off` does the same for apps at their next launch. SpringBoard's crash guard is unchanged: one unfinished start per boot, healthy after 60 s.
+
+### Probe mode
+
+With `/private/var/tmp/sweetsb-probe.on` present when a process starts, every line also goes to `/private/var/tmp/sweetsb-real.log`, tagged `[exe pid]`, so no `sweetnull` list is needed. Writing a label to `/private/var/tmp/sweetsb-probe` makes the foreground app log its window, root view and nav bar tops plus every button in the top 140 pt, and makes SpringBoard log each visible icon list, its insets before and after, its first item's top, search fields and window safe areas. Apps also log each touch-down point and the view that took it, for the owner's reports of a dead Calendar "+" and of nav bar buttons that stay blurred after leaving a note. Without the switch file none of this runs.
+
+### Build and checks
+
+`bash build.sh safearea` built the ast152 dylib, sha256 480c5135f4f7bbc6334c31c1abaeb0dbda9aafbe5bd7e7036fcb2e0bb201d53a, with no warnings. v5 is kept in `app-safearea/v5` (0bb25035...). `safearea-check.sh` passes, with new mock cases: the shift for root, root with widgets and Today, none for the dock, folders, App Library pods, nil locations or landscape, a 10 pt top, NaN, an external screen and outside SpringBoard; the library hook for 68, 60, 90, 0, off canvas and outside SpringBoard. `stui-check.sh` passes, and pacstrip finds no PAC code.
+
+### The run
+
+`tools/devloop/selftest/scripts/spacing.sh` does both passes in one boot. It first prints the guard records the last boot left, then turns both fixes off with the switch files and restarts SpringBoard. It measures the home page, the Today view, pages 2 to 5 (App Library), Notification Center and 20 apps, taps Calendar's "+" and opens and leaves a note. Then it turns both fixes on, restarts SpringBoard and repeats everything. Last, it opens Settings, leaves it after 2 s, kills it and opens it again. It takes about 20 minutes, so it uses `boot/next-loop-sb-null30-boot.img` (sha256 28bc5a5c...): the v5 image with `sweetdeadman=600` changed to 1800 and nothing else, 607 of 607 bytes.
+
+### ast152 results (spacing.sh, run by the phone queue)
+
+ast152-spacing6: 63 frames, 0 GPU recoveries, 0 backboardd restarts, root clean. It ended `reset-unknown` after the last frame and before `DONE`, the same end HANDOFF records for 17 of 45 runs. The deadman was 1800 s.
+
+Guard records from earlier boots: `sweetsb-real-MobileTimer.state` read `2 FACD971A-...`, so in that boot a Clock launch was blocked and ran stock. That is the cause the owner saw, now proven on one app.
+
+Apps, nav bar top from the probe log, stock pass then fixed pass:
+
+| App | Stock | Fixed |
+| --- | --- | --- |
+| Settings, Messages, Files (large title bars) | 68 | 50 |
+| Photos, Mail, Music | 68 | 50 |
+| Safari, Clock, Weather, App Store (no nav bar; window safe top) | 68 | 50 |
+| Reminders, Journal, Passwords, Health | 68 (frames) | 50 |
+| Calendar | 68 (frames) | 50 |
+| Notes | 68 (frames) | 50 |
+| Calculator, Camera | 68 (scene log) | 50 |
+| Contacts | 68 (frames) | 50 (window and root) |
+
+The frames agree: each before and after pair is offset by 15 px, which is 17.5 pt at this scale, so 18 pt within a pixel (Settings, Safari, Photos, Messages, Mail, Files, Contacts, Reminders, Calendar, Notes, Health). Full-bleed screens (Weather, Camera, Clock's stopwatch, the blank App Store and Maps) have no edge to compare.
+
+A "Turn On Location Services" alert from Maps stayed up for the rest of each pass. The apps after it were never active, so their labelled probes and touches are missing, and the Calendar "+" and note checks did not happen. Their positions above come from the fixed pass's automatic timeline and the frames.
+
+Home screen, from SpringBoard's probe:
+
+- Page 1: insets 96,224.667 -> 78,242.667, first item 98 -> 80 pt (01-before-home1, 32-after-home1).
+- Page 2: first item 96 -> 78 pt (03, 34).
+- Today: insets 96,0 -> 78,18, first item 96 -> 78 pt (02, 33).
+- Dock (804.3, first item 824.7) and Search pill (754.5) unchanged.
+- App Library: unchanged, search text at 113.2 pt in both passes (04, 35). The hook returned 50 only from its second call on. App Library had already laid out once at SpringBoard start, before the grid hook checked the screen, and kept its 168 pt search bar frame. Fixed: each hook now checks the screen itself, with a host case for a library call that comes first.
+- Notification Center (07, 38): unchanged and not touched, clock text at 105 pt in both.
+
+Guard reopen: Settings opened, left after 2 s, killed and reopened: start=1 and safe top 50 (63-reopen-Preferences). Maps' first launch lived about 15 s but never wrote its healthy mark, and its next launch logged `guard blocked start=2`. Both healthy routes ran on the main queue, which Maps seems to have kept busy. Fixed: apps now mark themselves healthy on a background queue, 3 s after start.
+
+Build after these fixes: sha256 5e5e8c45f07d41c92ccea20c598a93b05f61432f2a4618817391ee39120cd273. Host checks pass.
+
+Next run: `tools/devloop/selftest/scripts/spacing2.sh`, about 9 minutes, with the same image and pulls. It covers the owner reports in both passes, App Library, and the reopen of Settings and Maps.

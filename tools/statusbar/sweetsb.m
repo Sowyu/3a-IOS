@@ -43,6 +43,10 @@ static BOOL save(int starts);
 /* App stderr may go nowhere. Kernel patch 0048 prints /dev/null writes of the processes named in boot-arg sweetnull
    as "|name| text", so a process whose stderr is not /dev/null also writes there. */
 static int teeFd=-1;
+/* With /private/var/tmp/sweetsb-probe.on present at process start, every line also goes to /private/var/tmp/sweetsb-real.log
+   as "[exe pid] text", so a run can read any app without naming it in sweetnull. Off by default. */
+static int logFd=-1;
+static char logWho[40];
 static void openTee(void) {
     struct stat e,n;
     int fd=open("/dev/null",O_WRONLY|O_CLOEXEC);
@@ -58,6 +62,11 @@ static void note(const char *fmt, ...) {
     size_t len=strnlen(line,sizeof(line)-2);line[len++]='\n';
     (void)write(STDERR_FILENO,line,len);
     if(teeFd>=0)(void)write(teeFd,line,len);
+    if(logFd>=0) {
+        char tagged[600];
+        int m=snprintf(tagged,sizeof(tagged),"[%s %d] %.*s",logWho,getpid(),(int)len,line);
+        if(m>0)(void)write(logFd,tagged,(size_t)m<sizeof(tagged)?(size_t)m:sizeof(tagged)-1);
+    }
 }
 static BOOL signature(Method m,const char *ret,unsigned n,const char *last) {
     if (!m || method_getNumberOfArguments(m)!=n) return NO;
@@ -89,11 +98,16 @@ static BOOL canvas(int f,id screen) {
     if(log)note("%s screen %s native=%gx%g scale=%g nativeScale=%g embedded=%d fits=%d",family[f],object_getClassName(screen),r.size.width,r.size.height,s,ns,embedded,fits);
     return fits;
 }
+/* SpringBoard runs for the whole boot, so 60 s of main-queue time is a fair healthy mark. An app is often suspended or killed
+   sooner, and with 60 s every reopen after that read as a crash and ran stock (the gap the owner still saw). Apps get 3 s. */
+static int64_t healthySeconds=60;
+static dispatch_queue_t healthyQueue;   // main queue in SpringBoard; a background queue in apps
 static void scheduleHealthy(void) {
     if(!atomic_exchange(&healthyScheduled,true))
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,60*NSEC_PER_SEC),dispatch_get_main_queue(),^{save(0);});
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,healthySeconds*NSEC_PER_SEC),healthyQueue?healthyQueue:dispatch_get_main_queue(),^{save(0);});
 }
 #include "sweetsb_safearea.h"
+#include "sweetsb_home.h"
 static id decide(int n,id self,SEL cmd,id screen,id info) {
     int f=n/CHAIN;
     if(targets[f]&&canvas(f,screen)) {
@@ -217,7 +231,33 @@ static dispatch_queue_t installQueue;
 static atomic_bool installQueued;
 static void installPending(void *unused) {
     atomic_store(&installQueued,false);
-    installFamily(0);installFamily(1);installAppSafeArea();
+    installFamily(0);installFamily(1);installAppSafeArea();installHome();
+    if(logFd>=0 && appSafeAreaScope)installAppTouchLog();
+}
+/* Probe on request: write a label to /private/var/tmp/sweetsb-probe. The foreground app and SpringBoard log their layout
+   under that label. Only runs with the probe switch file. */
+static char probeLast[64];
+static void probeTick(void *unused) {
+    static BOOL primed;   // a label written before this process started is not a request to it
+    char label[48]="";
+    int fd=open("/private/var/tmp/sweetsb-probe",O_RDONLY|O_CLOEXEC);
+    ssize_t n=fd<0 ? 0 : read(fd,label,sizeof(label)-1);
+    if(fd>=0)close(fd);
+    label[n>0?n:0]=0;label[strcspn(label,"\r\n")]=0;
+    BOOL fresh=primed && label[0] && strcmp(label,probeLast);
+    primed=YES;
+    snprintf(probeLast,sizeof(probeLast),"%s",label);
+    if(!fresh)return;
+    @autoreleasepool {
+        if(!strcmp(logWho,"SpringBoard")) { probeHome(label); return; }
+        id app=sweetSend((id)objc_getClass("UIApplication"),"sharedApplication");
+        SEL st=sel_registerName("applicationState");
+        if(!app || ![app respondsToSelector:st] || ((NSInteger(*)(id,SEL))objc_msgSend)(app,st)!=0)return;
+        probeAppLayout(label);
+        int n=0;
+        for(id w in (NSArray *)sweetSend(app,"windows"))
+            if(CGRectEqualToRect(((CGRect(*)(id,SEL))objc_msgSend)(w,sel_registerName("frame")),CGRectMake(0,0,420,930)))logTopButtons(w,0,&n,label);
+    }
 }
 static void imageLoaded(const struct mach_header *header) {
     // Called under objc runtimeLock: never call runtime APIs or message objects here.
@@ -233,6 +273,10 @@ __attribute__((constructor)) static void start(void) {
     openTee();
     @autoreleasepool { @try {
         NSString *exe=NSBundle.mainBundle.executablePath;
+        if(!access("/private/var/tmp/sweetsb-probe.on",F_OK)) {
+            snprintf(logWho,sizeof(logWho),"%s",exe?exe.lastPathComponent.UTF8String:"?");
+            logFd=open("/private/var/tmp/sweetsb-real.log",O_WRONLY|O_APPEND|O_CREAT|O_CLOEXEC,0666);
+        }
         BOOL spring=[exe isEqualToString:@"/System/Library/CoreServices/SpringBoard.app/SpringBoard"];
         NSString *home=NSHomeDirectory();
         note("loaded pid=%d exe=%s home=%s",getpid(),exe?exe.UTF8String:"nil",home?home.UTF8String:"nil");
@@ -259,7 +303,25 @@ __attribute__((constructor)) static void start(void) {
         note("image callback registered");
         // Install outside runtimeLock. In SpringBoard resolve a late STUI dependency
         // synchronously, before main can construct a bar and cache its provider.
-        installFamily(0);installFamily(1);installAppSafeArea();
+        homeScope=spring;
+        appSafeAreaSwitchOff=!access("/private/var/tmp/sweetsb-app.off",F_OK);
+        if(!spring) {
+            // A clean trip to the background is a healthy start too. Without it an app closed and killed within 3 s stays blocked.
+            healthySeconds=3;
+            // ast152: Maps lived about 15 s with a stuck main queue, never marked itself, and its next launch ran stock.
+            healthyQueue=dispatch_get_global_queue(QOS_CLASS_UTILITY,0);
+            [[NSNotificationCenter defaultCenter] addObserverForName:@"UIApplicationDidEnterBackgroundNotification" object:nil queue:nil
+                usingBlock:^(NSNotification *n){ save(0); }];
+            scheduleHealthy();
+        }
+        if(logFd>=0) {
+            dispatch_source_t t=dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER,0,0,dispatch_get_main_queue());
+            dispatch_source_set_timer(t,dispatch_time(DISPATCH_TIME_NOW,NSEC_PER_SEC),NSEC_PER_SEC,100*NSEC_PER_MSEC);
+            dispatch_source_set_event_handler_f(t,probeTick);
+            dispatch_resume(t);
+        }
+        installFamily(0);installFamily(1);installAppSafeArea();installHome();
+        if(logFd>=0 && appSafeAreaScope)installAppTouchLog();
         if(spring && !installed[1] && !rejected[1]) {
             void *h=dlopen("/System/Library/PrivateFrameworks/SystemStatusUI.framework/SystemStatusUI",RTLD_LAZY|RTLD_LOCAL);
             if(!h)note("STUI failed framework load: %s",dlerror());

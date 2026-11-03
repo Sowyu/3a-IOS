@@ -6,7 +6,7 @@
 // Set to 0 to disable. The ordinary build defaults off; build.sh safearea enables it.
 static const double APP_TOP_SAFE_AREA_PT = SWEETSB_APP_SAFEAREA ? 48 + VERTICAL_SHIFT_PT : 0;
 typedef struct UIEdgeInsets { double top,left,bottom,right; } SweetInsets;
-static BOOL appSafeAreaScope, appSafeAreaInstalled, appSafeAreaRejected;
+static BOOL appSafeAreaScope, appSafeAreaInstalled, appSafeAreaRejected, appSafeAreaSwitchOff;
 static IMP appSafeAreaOriginal, appSceneOriginal;
 static atomic_bool appSafeAreaReported;
 
@@ -46,6 +46,10 @@ static double safeTop(id view) {
     SEL s=sel_registerName("safeAreaInsets");
     return view && [view respondsToSelector:s] ? ((SweetInsets(*)(id,SEL))objc_msgSend)(view,s).top : NAN;
 }
+static CGRect inWindowRect(id v) {
+    CGRect b=((CGRect(*)(id,SEL))objc_msgSend)(v,sel_registerName("bounds"));
+    return ((CGRect(*)(id,SEL,CGRect,id))objc_msgSend)(v,sel_registerName("convertRect:toView:"),b,nil);
+}
 static id findNavigationBar(id view,int depth) {
     Class bar=objc_getClass("UINavigationBar");
     if(!view || !bar || depth>14)return nil;
@@ -56,7 +60,7 @@ static id findNavigationBar(id view,int depth) {
 /* What layout actually used, as a timeline from the first change: window and root view safe area, the first navigation
    bar's top edge, the status bar manager's frame, the scene top before and after the hook, and the presentation overlap. */
 static void probeAppLayout(void *tag) {
-    unsigned long ms=(unsigned long)(uintptr_t)tag;
+    const char *ms=tag;
     id app=sweetSend((id)objc_getClass("UIApplication"),"sharedApplication");
     int n=0;
     for(id w in (NSArray *)sweetSend(app,"windows")) {
@@ -65,7 +69,7 @@ static void probeAppLayout(void *tag) {
         id root=sweetSend(w,"rootViewController"),view=sweetSend(root,"view"),bar=findNavigationBar(w,0);
         CGRect b=bar ? ((CGRect(*)(id,SEL,CGRect,id))objc_msgSend)(bar,sel_registerName("convertRect:toView:"),
             ((CGRect(*)(id,SEL))objc_msgSend)(bar,sel_registerName("bounds")),nil) : CGRectNull;
-        note("app layout %lums: window %s safe top %g; root %s safe top %g; navbar y %g h %g",ms,
+        note("app layout %s: window %s safe top %g; root %s safe top %g; navbar y %g h %g",ms,
             object_getClassName(w),safeTop(w),root?object_getClassName(root):"nil",safeTop(view),
             bar?b.origin.y:NAN,bar?b.size.height:NAN);
         id scene=sweetSend(w,"windowScene"),manager=sweetSend(scene,"statusBarManager");
@@ -77,10 +81,51 @@ static void probeAppLayout(void *tag) {
         Class pc=objc_getClass("UIPresentationController");
         SEL o=sel_registerName("_statusBarOverlapAndMarginInfoForView:inWindow:");
         if(view && pc && [pc respondsToSelector:o])overlap=((SweetInsets(*)(id,SEL,id,id))objc_msgSend)(pc,o,view,w).top;
-        note("app status %lums: manager frame y %g h %g; scene top %g -> %g; presentation overlap %g",ms,
+        note("app status %s: manager frame y %g h %g; scene top %g -> %g; presentation overlap %g",ms,
             CGRectIsNull(sb)?NAN:sb.origin.y,CGRectIsNull(sb)?NAN:sb.size.height,raw0,raw,overlap);
     }
-    if(!n)note("app layout %lums: no full-screen window",ms);
+    if(!n)note("app layout %s: no full-screen window",ms);
+}
+/* Probe mode only: where each finger lands and which view takes it, and where the top bar buttons are drawn.
+   For the owner reports of a dead Calendar "+" and stale nav bar buttons: a touch on the button that names another view
+   means hit testing and drawing disagree. */
+static IMP appSendEventOriginal;
+static atomic_int appTouchLines;
+static void appSendEvent(id app,SEL cmd,id event) {
+    if(((NSInteger(*)(id,SEL))objc_msgSend)(event,sel_registerName("type"))==0 && atomic_load(&appTouchLines)<200) {
+        for(id t in (NSSet *)sweetSend(event,"allTouches")) {
+            if(((NSInteger(*)(id,SEL))objc_msgSend)(t,sel_registerName("phase"))!=0)continue;
+            id w=sweetSend(t,"window"),v=sweetSend(t,"view");
+            CGPoint p=((CGPoint(*)(id,SEL,id))objc_msgSend)(t,sel_registerName("locationInView:"),nil);
+            CGRect r=v?inWindowRect(v):CGRectNull;
+            atomic_fetch_add(&appTouchLines,1);
+            note("app touch at %g,%g: window %s view %s at %g,%g %gx%g",p.x,p.y,w?object_getClassName(w):"nil",v?object_getClassName(v):"nil",
+                r.origin.x,r.origin.y,r.size.width,r.size.height);
+        }
+    }
+    ((void(*)(id,SEL,id))appSendEventOriginal)(app,cmd,event);
+}
+static void installAppTouchLog(void) {
+    Class c=objc_lookUpClass("UIApplication");
+    Method m=c?class_getInstanceMethod(c,sel_registerName("sendEvent:")):NULL;
+    if(appSendEventOriginal || !signature(m,"v",3,NULL))return;
+    appSendEventOriginal=method_getImplementation(m);
+    method_setImplementation(m,(IMP)appSendEvent);
+    note("app touch log on");
+}
+static void logTopButtons(id view,int depth,int *n,const char *label) {
+    if(!view || depth>30 || *n>=12)return;
+    if(((BOOL(*)(id,SEL))objc_msgSend)(view,sel_registerName("isHidden")))return;
+    CGRect r=inWindowRect(view);
+    if(r.origin.y>140 || (r.size.height>120 && depth>2))return;
+    const char *name=object_getClassName(view);
+    if(strstr(name,"Button") && r.size.width<200 && r.size.height<80) {
+        (*n)++;
+        note("app top %s: %s at %g,%g %gx%g alpha %g",label,name,r.origin.x,r.origin.y,r.size.width,r.size.height,
+            ((double(*)(id,SEL))objc_msgSend)(view,sel_registerName("alpha")));
+        return;
+    }
+    for(id sub in (NSArray *)sweetSend(view,"subviews"))logTopButtons(sub,depth+1,n,label);
 }
 /* Portrait full-screen app window on the canvas. who/base: one report per check per caller (window bits 0-5, VC 16-21). */
 static BOOL appWindowFits(id window,SweetInsets original,const char *who,unsigned base) {
@@ -102,9 +147,10 @@ static BOOL appWindowFits(id window,SweetInsets original,const char *who,unsigne
 }
 static void appSafeAreaChanged(void) {
     if(!atomic_exchange(&appSafeAreaReported,true)) {
-        static const unsigned ms[]={0,250,500,1000,2000,4000,10000};   // 0: the next main-queue turn, before the first frame
+        static const unsigned ms[]={0,2000};   // 0: the next main-queue turn, before the first frame
+        static const char *const names[]={"0ms","2000ms"};
         for(unsigned i=0;i<sizeof(ms)/sizeof(*ms);i++)
-            dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW,(int64_t)ms[i]*NSEC_PER_MSEC),dispatch_get_main_queue(),(void *)(uintptr_t)ms[i],probeAppLayout);
+            dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW,(int64_t)ms[i]*NSEC_PER_MSEC),dispatch_get_main_queue(),(void *)names[i],probeAppLayout);
     }
     scheduleHealthy();
 }
@@ -152,6 +198,10 @@ static void installAppSafeArea(void) {
     if(appSafeAreaInstalled || appSafeAreaRejected)return;
     if(!appSafeAreaScope || APP_TOP_SAFE_AREA_PT<=0) {
         if(!atomic_exchange(&appSafeAreaReported,true))note("app safe area off: %s",appSafeAreaScope?"build has target 0":"not a top-level app executable");
+        return;
+    }
+    if(appSafeAreaSwitchOff) {   // /private/var/tmp/sweetsb-app.off at process start: stock insets, probes still answer
+        appSafeAreaRejected=YES;note("app safe area off: /private/var/tmp/sweetsb-app.off");
         return;
     }
     Class window=objc_lookUpClass("UIWindow"),scene=objc_lookUpClass("UIWindowScene");

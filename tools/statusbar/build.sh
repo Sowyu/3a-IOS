@@ -8,7 +8,7 @@ artifact_dir=.
 feature_flags=()
 case "${1:-}" in
   '') ;;
-  safearea) artifact_dir=app-safearea; feature_flags=(-DSWEETSB_APP_SAFEAREA=1); mkdir -p "$artifact_dir" ;;
+  safearea) artifact_dir=app-safearea; feature_flags=(-DSWEETSB_APP_SAFEAREA=1 -DSWEETSB_HOME_SHIFT=1); mkdir -p "$artifact_dir" ;;
   *) echo 'usage: build.sh [safearea]' >&2; exit 2 ;;
 esac
 xcrun --sdk iphoneos clang -target arm64e-apple-ios26.0 -isysroot "$SDK" -O1 -fno-objc-arc -Wall -Wextra -Wno-unused-parameter "${feature_flags[@]}" -dynamiclib -framework Foundation -framework CoreGraphics -lobjc -install_name /usr/local/lib/sweetsb.dylib sweetsb.m -o "$artifact_dir/sweetsb.dylib"
