@@ -194,12 +194,18 @@ static void qmap(void)
     assert(qmap_deaggregate(QMAP_V5, buf, n, 2, deliver, 0, &c) == 1 && got.len[0] == 20);
     assert(!qmap_frame(QMAP_V1, 1, pkt, 0));
     /* command ack */
-    const uint8_t cmd[] = {0x01, 0x00, 0, 0, 0xaa, 0xbb, 0xcc, 0xdd};
+    const uint8_t cmd[] = {QMAP_CMD_FLOW_DISABLE, 0x00, 0, 0, 0xaa, 0xbb, 0xcc, 0xdd};
     uint8_t ack[32];
-    n = qmap_command_ack(1, cmd, sizeof cmd, ack, sizeof ack);
-    assert(n == 12 && ack[0] == 0x80 && ack[3] == 8 && ack[5] == 1 && ack[8] == 0xaa);
-    const uint8_t done[] = {0x01, 0x01, 0, 0};
-    assert(!qmap_command_ack(1, done, sizeof done, ack, sizeof ack));
+    int flow;
+    n = qmap_command_reply(1, cmd, sizeof cmd, ack, sizeof ack, &flow);
+    assert(n == 12 && flow == 0 && ack[0] == 0x80 && ack[3] == 8 && ack[5] == 1 && ack[8] == 0xaa);
+    const uint8_t on[] = {QMAP_CMD_FLOW_ENABLE, 0x00, 0, 0, 1, 2, 3, 4};
+    assert(qmap_command_reply(1, on, sizeof on, ack, sizeof ack, &flow) == 12 && flow == 1 && ack[5] == 1);
+    const uint8_t other[] = {7, 0x00, 0, 0, 1, 2, 3, 4};
+    assert(qmap_command_reply(1, other, sizeof other, ack, sizeof ack, &flow) == 12 && flow == -1 && ack[5] == 2);
+    const uint8_t done[] = {0x01, 0x01, 0, 0, 0, 0, 0, 0}, shortc[] = {0x01, 0x00, 0, 0};
+    assert(!qmap_command_reply(1, done, sizeof done, ack, sizeof ack, &flow));
+    assert(!qmap_command_reply(1, shortc, sizeof shortc, ack, sizeof ack, &flow));
 }
 
 /* ---- Ethernet presentation ---- */
@@ -217,6 +223,15 @@ static uint16_t csum(const uint8_t *p, uint32_t n, uint32_t s)
     if (n & 1) s += (uint32_t)p[n - 1] << 8;
     while (s >> 16) s = (s & 0xffff) + (s >> 16);
     return (uint16_t)s;
+}
+
+/* fills the ICMPv6 checksum of the IPv6 packet at ip */
+static void icmp6_sum(uint8_t *ip)
+{
+    const uint32_t n = (uint32_t)ip[4] << 8 | ip[5];
+    ip[42] = ip[43] = 0;
+    const uint16_t c = (uint16_t)~csum(ip + 40, n, csum(ip + 8, 32, 0) + n + 58);
+    ip[42] = (uint8_t)(c >> 8); ip[43] = (uint8_t)c;
 }
 
 static void link(void)
@@ -246,7 +261,7 @@ static void link(void)
     uint8_t *ip = f + 14, *udp = ip + 20, *bp = udp + 8;
     ip[0] = 0x45; ip[9] = 17; ip[2] = 0x01; ip[3] = 0x48;  /* 328 */
     memset(ip + 16, 0xff, 4);
-    udp[1] = 68; udp[3] = 67;
+    udp[1] = 68; udp[3] = 67; udp[4] = 0x01; udp[5] = 0x34;  /* 308 */
     bp[0] = 1; bp[1] = 1; bp[2] = 6; bp[4] = 0xde; bp[5] = 0xad; memcpy(bp + 28, ME, 6);
     bp[236] = 0x63; bp[237] = 0x82; bp[238] = 0x53; bp[239] = 0x63;
     bp[240] = 53; bp[241] = 1; bp[242] = 1; bp[243] = 255;
@@ -269,6 +284,9 @@ static void link(void)
     assert(cell_link_output(&l, f, n, r, &rn) == CELL_REPLY && rb[240 + 2] == 6);
     memcpy(bp + 245, "\x0a\x00\x02\x05", 4);
     assert(cell_link_output(&l, f, n, r, &rn) == CELL_REPLY && rb[240 + 2] == 5);
+    /* fragments and a UDP length past the datagram are dropped */
+    ip[6] = 0x20; assert(cell_link_output(&l, f, n, r, &rn) == CELL_DROP); ip[6] = 0;
+    udp[4] = 0x02; assert(cell_link_output(&l, f, n, r, &rn) == CELL_DROP); udp[4] = 0x01;
     /* a malformed option list stops cleanly */
     bp[243] = 50; bp[244] = 200;
     assert(cell_link_output(&l, f, n, r, &rn) == CELL_DROP);
@@ -277,7 +295,8 @@ static void link(void)
     n = eth(f, RT, 0x0800);
     ip[0] = 0x45; ip[3] = 40; ip[9] = 6; memcpy(ip + 12, "\x0a\x00\x02\x05", 4); memcpy(ip + 16, "\x08\x08\x08\x08", 4);
     n = 14 + 40;
-    assert(cell_link_output(&l, f, n, r, &rn) == CELL_TO_MODEM);
+    assert(cell_link_output(&l, f, n, r, &rn) == CELL_TO_MODEM && rn == 40);
+    assert(cell_link_output(&l, f, 14 + 60, r, &rn) == CELL_TO_MODEM && rn == 40);  /* Ethernet padding is not sent */
     ip[12] = 169; assert(cell_link_output(&l, f, n, r, &rn) == CELL_DROP);
     ip[12] = 10; ip[16] = 224; assert(cell_link_output(&l, f, n, r, &rn) == CELL_DROP);
     /* IPv6 */
@@ -291,6 +310,8 @@ static void link(void)
     ip[0] = 0x60; ip[5] = 8; ip[6] = 58; ip[7] = 255; ip[8] = 0xfe; ip[9] = 0x80; ip[23] = 1; ip[24] = 0xff; ip[25] = 2; ip[39] = 2;
     ip[40] = 133;
     n = 14 + 48;
+    assert(cell_link_output(&l, f, n, r, &rn) == CELL_DROP);  /* no checksum */
+    icmp6_sum(ip);
     assert(cell_link_output(&l, f, n, r, &rn) == CELL_REPLY);
     const uint8_t *r6 = r + 14, *ra = r6 + 40;
     const uint32_t plen = (uint32_t)r6[4] << 8 | r6[5];
@@ -310,17 +331,20 @@ static void link(void)
     ip[24] = 0xff; ip[25] = 2; ip[35] = 1; ip[36] = 0xff; ip[39] = 0x77;
     ip[40] = 135; ip[48] = 0xfe; ip[49] = 0x80; ip[63] = 0x77;
     n = 14 + 64;
+    icmp6_sum(ip);
+    ip[41] = 1; assert(cell_link_output(&l, f, n, r, &rn) == CELL_DROP); ip[41] = 0;  /* code must be 0 */
     assert(cell_link_output(&l, f, n, r, &rn) == CELL_REPLY && r6[40] == 136 && r6[44] == 0xe0 && r6[63] == 0x77);
     assert(!memcmp(r6 + 24, ip + 8, 16) && !memcmp(r6 + 66, RT, 6));
     assert(csum(r6 + 40, 32, csum(r6 + 8, 32, 0) + 32 + 58) == 0xffff);
     memset(ip + 8, 0, 16);
+    icmp6_sum(ip);
     assert(cell_link_output(&l, f, n, r, &rn) == CELL_DROP);
     /* IPv6 TCP from our prefix to the router -> modem; from fe80:: -> drop */
     memset(f, 0, sizeof f);
     n = eth(f, RT, 0x86dd);
     ip[0] = 0x60; ip[5] = 20; ip[6] = 6; memcpy(ip + 8, v6addr, 8); ip[23] = 0x33; ip[24] = 0x26; ip[25] = 0x06;
     n = 14 + 60;
-    assert(cell_link_output(&l, f, n, r, &rn) == CELL_TO_MODEM);
+    assert(cell_link_output(&l, f, n, r, &rn) == CELL_TO_MODEM && rn == 60);
     ip[8] = 0xfe; ip[9] = 0x80; assert(cell_link_output(&l, f, n, r, &rn) == CELL_DROP);
     /* from the modem */
     uint8_t h[14];
@@ -382,166 +406,370 @@ static void answer(CellSession *s, unsigned client, uint8_t service, uint16_t ms
     cell_session_receive(s, client, service, b, len);
 }
 
-static void session(void)
+static const CellConfig CFG = {0, 1, 1, "internet", 0, 1, 1, 2, 18};
+static const CellReady READY = {QMAP_V1, 32, 16384};
+static const uint8_t SVCS[] = {QMI_SVC_DMS, QMI_SVC_NAS, QMI_SVC_WDS, QMI_SVC_WDA, QMI_SVC_DPM};
+static const uint8_t ONLINE_MODE[] = {0x01, 1, 0, 0}, OFFLINE_MODE[] = {0x01, 1, 0, 3};
+static const uint8_t WDA_OK[] = {0x11, 4, 0, 2, 0, 0, 0, 0x12, 4, 0, 5, 0, 0, 0, 0x13, 4, 0, 5, 0, 0, 0};
+static const uint8_t H4[] = {0x01, 4, 0, 0x44, 0x44, 0, 0}, H6[] = {0x01, 4, 0, 0x66, 0x66, 0, 0};
+static const uint8_t SET4[] = {0x1e, 4, 0, 5, 2, 0, 10, 0x29, 4, 0, 0xdc, 5, 0, 0};
+static const uint8_t SET6[] = {0x25, 17, 0, 0x20, 1, 0xd, 0xb8, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, 64};
+
+static void fresh(CellSession *s, const CellConfig *cfg, uint64_t t)
 {
-    const CellConfig cfg = {0, 1, 1, "internet", 0, 1, 1, 2, 18, QMAP_V1, 32, 16384};
-    const CellSessionOps ops = {fake_send, fake_event, 0};
+    static const CellSessionOps ops = {fake_send, fake_event, 0};
+    memset(&sent, 0, sizeof sent);
+    ups = downs = errors = 0;
+    cell_session_init(s, cfg, &ops, t);
+    for (unsigned i = 0; i < sizeof SVCS; ++i) cell_session_service(s, SVCS[i], 1);
+}
+
+/* From a fresh session to CS_REGISTER with the modem already online. */
+static void to_register(CellSession *s, uint64_t *t)
+{
+    cell_session_ready(s, &READY);
+    answer(s, 0, QMI_SVC_DPM, DPM_OPEN_PORT, 0, 0, 0);
+    answer(s, 0, QMI_SVC_WDA, WDA_SET_DATA_FORMAT, 0, WDA_OK, sizeof WDA_OK);
+    answer(s, 0, QMI_SVC_DMS, DMS_GET_OPERATING_MODE, 0, ONLINE_MODE, sizeof ONLINE_MODE);
+    cell_session_poll(s, *t += 100);
+    assert(s->state == CS_REGISTER);
+}
+
+static void registered(CellSession *s)
+{
+    const uint32_t len = IND(0x24, 0x01, 6, 0, 1, 1, 1, 2, 1, 8);
+    cell_session_receive(s, 0, QMI_SVC_NAS, b, len);
+}
+
+/* Bind and family for both calls; afterwards both starts are outstanding. */
+static void bound(CellSession *s)
+{
+    for (unsigned c = 0; c < 2; ++c) {
+        answer(s, c, QMI_SVC_WDS, WDS_BIND_MUX_DATA_PORT, 0, 0, 0);
+        const int i = find_sent(c, QMI_SVC_WDS, WDS_SET_IP_FAMILY);
+        assert(i >= 0 && sent.body[i][10] == (c ? 6 : 4));
+        answer(s, c, QMI_SVC_WDS, WDS_SET_IP_FAMILY, 0, 0, 0);
+        assert(find_sent(c, QMI_SVC_WDS, WDS_START_NETWORK) >= 0);
+    }
+}
+
+static void session_order(void)
+{
     CellSession s;
     uint64_t t = 1000;
-    memset(&sent, 0, sizeof sent);
-    cell_session_init(&s, &cfg, &ops, t);
-    const uint8_t svcs[] = {QMI_SVC_DMS, QMI_SVC_NAS, QMI_SVC_WDS, QMI_SVC_WDA};
-    for (unsigned i = 0; i < sizeof svcs; ++i) cell_session_service(&s, svcs[i], 1);
-    assert(s.state == CS_WAIT_SERVICES && sent.n == 0);
-    cell_session_service(&s, QMI_SVC_DPM, 1);
-    /* info reads went out, then DPM open port with endpoints 2 and 18; no WDA yet */
-    assert(s.state == CS_DPM && find_sent(0, QMI_SVC_DMS, DMS_GET_IDS) >= 0 && find_sent(0, QMI_SVC_WDS, WDS_GET_PROFILE_LIST) >= 0);
+    fresh(&s, &CFG, t);
+    /* only read-only queries before the readiness barrier */
+    assert(s.state == CS_WAIT_READY && find_sent(0, QMI_SVC_DMS, DMS_GET_IDS) >= 0 && find_sent(0, QMI_SVC_WDS, WDS_GET_PROFILE_LIST) >= 0);
+    for (t = 1000; t < 20000; t += 100) cell_session_poll(&s, t);
+    assert(count_sent(QMI_SVC_DPM, DPM_OPEN_PORT) == 0 && count_sent(QMI_SVC_WDA, WDA_SET_DATA_FORMAT) == 0 && cell_session_idle(&s));
+    for (unsigned i = 0; i < sent.n; ++i)
+        assert(sent.msg[i] == DMS_GET_REVISION || sent.msg[i] == DMS_GET_IDS || sent.msg[i] == NAS_REGISTER_INDICATIONS ||
+               sent.msg[i] == NAS_GET_OPERATOR_NAME || sent.msg[i] == NAS_GET_SIGNAL_INFO || sent.msg[i] == WDS_GET_PROFILE_LIST);
+    /* a bad readiness record is refused */
+    const CellReady bad = {QMAP_V1, 0, 16384};
+    cell_session_ready(&s, &bad);
+    assert(s.state == CS_WAIT_READY);
+    cell_session_ready(&s, &READY);
     int i = find_sent(0, QMI_SVC_DPM, DPM_OPEN_PORT);
-    assert(i >= 0 && sent.body[i][19] == 2 && sent.body[i][23] == 18 && find_sent(0, QMI_SVC_WDA, WDA_SET_DATA_FORMAT) < 0);
+    assert(s.state == CS_DPM && i >= 0 && sent.body[i][19] == 2 && sent.body[i][23] == 18);
     /* a stray response with a raw-tool transaction is ignored */
     uint32_t len = resp(b, 2, 0x8001, DPM_OPEN_PORT, 0, 0, 0);
     cell_session_receive(&s, 0, QMI_SVC_DPM, b, len);
     assert(s.state == CS_DPM);
     answer(&s, 0, QMI_SVC_DPM, DPM_OPEN_PORT, 0, 0, 0);
-    assert(s.state == CS_WDA && find_sent(0, QMI_SVC_WDA, WDA_SET_DATA_FORMAT) >= 0);
-    /* the modem echoes a different aggregation: refuse */
-    {
-        CellSession s2 = s; Sent keep = sent;
-        static const uint8_t qv5[] = {0x13, 4, 0, 9, 0, 0, 0};
-        answer(&s2, 0, QMI_SVC_WDA, WDA_SET_DATA_FORMAT, 0, qv5, sizeof qv5);
-        assert(s2.state == CS_FAILED);
-        sent = keep;
-    }
-    static const uint8_t q1[] = {0x11, 4, 0, 2, 0, 0, 0, 0x13, 4, 0, 5, 0, 0, 0};
-    answer(&s, 0, QMI_SVC_WDA, WDA_SET_DATA_FORMAT, 0, q1, sizeof q1);
+    assert(s.state == CS_WDA);
+    /* an echo with no format TLVs is verified with Get Data Format */
+    answer(&s, 0, QMI_SVC_WDA, WDA_SET_DATA_FORMAT, 0, 0, 0);
+    assert(s.state == CS_WDA_VERIFY && find_sent(0, QMI_SVC_WDA, WDA_GET_DATA_FORMAT) >= 0);
+    answer(&s, 0, QMI_SVC_WDA, WDA_GET_DATA_FORMAT, 0, WDA_OK, sizeof WDA_OK);
     assert(s.state == CS_ONLINE && find_sent(0, QMI_SVC_DMS, DMS_GET_OPERATING_MODE) >= 0);
-    /* offline and online not allowed: no set mode is ever sent */
-    static const uint8_t offline[] = {0x01, 1, 0, 3};
-    answer(&s, 0, QMI_SVC_DMS, DMS_GET_OPERATING_MODE, 0, offline, sizeof offline);
+    /* offline and online not allowed: never a set mode */
+    answer(&s, 0, QMI_SVC_DMS, DMS_GET_OPERATING_MODE, 0, OFFLINE_MODE, sizeof OFFLINE_MODE);
     assert(s.state == CS_WAIT_ONLINE_ALLOWED);
-    for (t = 1000; t < 30000; t += 100) cell_session_poll(&s, t);
+    for (; t < 40000; t += 100) cell_session_poll(&s, t);
     assert(count_sent(QMI_SVC_DMS, DMS_SET_OPERATING_MODE) == 0);
-    /* allowed: the same session from ONLINE sends set mode once, then reads it back */
+    /* allowed: set mode 0 once, then read back */
     CellSession on = s;
     on.cfg.allow_online = 1; on.state = CS_ONLINE; on.mode_known = 1; on.mode = 3;
     cell_session_poll(&on, t);
-    assert(count_sent(QMI_SVC_DMS, DMS_SET_OPERATING_MODE) == 1);
     i = find_sent(0, QMI_SVC_DMS, DMS_SET_OPERATING_MODE);
-    assert(sent.body[i][10] == 0);
+    assert(count_sent(QMI_SVC_DMS, DMS_SET_OPERATING_MODE) == 1 && sent.body[i][10] == 0);
     answer(&on, 0, QMI_SVC_DMS, DMS_SET_OPERATING_MODE, 0, 0, 0);
     cell_session_poll(&on, t += 100);
-    static const uint8_t online[] = {0x01, 1, 0, 0};
-    answer(&on, 0, QMI_SVC_DMS, DMS_GET_OPERATING_MODE, 0, online, sizeof online);
+    answer(&on, 0, QMI_SVC_DMS, DMS_GET_OPERATING_MODE, 0, ONLINE_MODE, sizeof ONLINE_MODE);
     cell_session_poll(&on, t += 100);
     assert(on.state == CS_REGISTER && count_sent(QMI_SVC_DMS, DMS_SET_OPERATING_MODE) == 1);
-    s = on;
-    /* not registered: no WDS start */
+}
+
+static void session_calls(void)
+{
+    CellSession s;
+    uint64_t t = 1000;
+    fresh(&s, &CFG, t);
+    to_register(&s, &t);
     static const uint8_t searching[] = {0x01, 6, 0, 2, 0, 0, 2, 1, 8};
     answer(&s, 0, QMI_SVC_NAS, NAS_SERVING_SYSTEM, 0, searching, sizeof searching);
     assert(s.state == CS_REGISTER && find_sent(0, QMI_SVC_WDS, WDS_BIND_MUX_DATA_PORT) < 0);
-    /* registered by indication */
-    len = IND(0x24, 0x01, 6, 0, 1, 1, 1, 2, 1, 8);
-    cell_session_receive(&s, 0, QMI_SVC_NAS, b, len);
+    registered(&s);
     assert(s.state == CS_CALLS);
-    assert(find_sent(0, QMI_SVC_WDS, WDS_BIND_MUX_DATA_PORT) >= 0 && find_sent(1, QMI_SVC_WDS, WDS_BIND_MUX_DATA_PORT) >= 0);
-    for (unsigned c = 0; c < 2; ++c) {
-        answer(&s, c, QMI_SVC_WDS, WDS_BIND_MUX_DATA_PORT, 0, 0, 0);
-        i = find_sent(c, QMI_SVC_WDS, WDS_SET_IP_FAMILY);
-        assert(i >= 0 && sent.body[i][10] == (c ? 6 : 4));
-        answer(&s, c, QMI_SVC_WDS, WDS_SET_IP_FAMILY, 0, 0, 0);
-        assert(find_sent(c, QMI_SVC_WDS, WDS_START_NETWORK) >= 0);
-    }
+    /* a refused family is retried, not taken as set */
+    answer(&s, 0, QMI_SVC_WDS, WDS_BIND_MUX_DATA_PORT, 0, 0, 0);
+    answer(&s, 0, QMI_SVC_WDS, WDS_SET_IP_FAMILY, 0x1a + 1, 0, 0);
+    assert(!s.call[0].family_set && find_sent(0, QMI_SVC_WDS, WDS_START_NETWORK) < 0);
+    cell_session_poll(&s, t += 1100);
+    answer(&s, 0, QMI_SVC_WDS, WDS_SET_IP_FAMILY, 0, 0, 0);
+    answer(&s, 1, QMI_SVC_WDS, WDS_BIND_MUX_DATA_PORT, 0, 0, 0);
+    answer(&s, 1, QMI_SVC_WDS, WDS_SET_IP_FAMILY, 0, 0, 0);
+    assert(find_sent(0, QMI_SVC_WDS, WDS_START_NETWORK) >= 0 && find_sent(1, QMI_SVC_WDS, WDS_START_NETWORK) >= 0);
     /* IPv4 refused while attaching, retried after 6 s */
     static const uint8_t why[] = {0x10, 2, 0, 1, 0};
     answer(&s, 0, QMI_SVC_WDS, WDS_START_NETWORK, QMI_ERR_INVALID_OPERATION, why, sizeof why);
-    static const uint8_t h6[] = {0x01, 4, 0, 0x66, 0x66, 0, 0};
-    answer(&s, 1, QMI_SVC_WDS, WDS_START_NETWORK, 0, h6, sizeof h6);
-    static const uint8_t set6[] = {0x25, 17, 0, 0x20, 1, 0xd, 0xb8, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, 64};
-    answer(&s, 1, QMI_SVC_WDS, WDS_GET_CURRENT_SETTINGS, 0, set6, sizeof set6);
+    answer(&s, 1, QMI_SVC_WDS, WDS_START_NETWORK, 0, H6, sizeof H6);
+    /* settings with only an IPv4 address do not bring up the IPv6 call */
+    answer(&s, 1, QMI_SVC_WDS, WDS_GET_CURRENT_SETTINGS, 0, SET4, sizeof SET4);
+    assert(!s.call[1].up && ups == 0);
+    cell_session_poll(&s, t += 1100);
+    answer(&s, 1, QMI_SVC_WDS, WDS_GET_CURRENT_SETTINGS, 0, SET6, sizeof SET6);
+    assert(s.call[1].up && ups == 1);
     const int starts = count_sent(QMI_SVC_WDS, WDS_START_NETWORK);
-    cell_session_poll(&s, t + 3000);
+    cell_session_poll(&s, t += 3000);
     assert(count_sent(QMI_SVC_WDS, WDS_START_NETWORK) == starts);
-    cell_session_poll(&s, t += 6100);
+    cell_session_poll(&s, t += 3100);
     assert(count_sent(QMI_SVC_WDS, WDS_START_NETWORK) == starts + 1);
-    i = find_sent(0, QMI_SVC_WDS, WDS_START_NETWORK);
+    int i = find_sent(0, QMI_SVC_WDS, WDS_START_NETWORK);
     assert(!memcmp(sent.body[i] + 10, "internet", 8));
-    static const uint8_t h4[] = {0x01, 4, 0, 0x44, 0x44, 0, 0};
-    answer(&s, 0, QMI_SVC_WDS, WDS_START_NETWORK, 0, h4, sizeof h4);
-    static const uint8_t set4[] = {0x1e, 4, 0, 5, 2, 0, 10, 0x29, 4, 0, 0xdc, 5, 0, 0};
-    answer(&s, 0, QMI_SVC_WDS, WDS_GET_CURRENT_SETTINGS, 0, set4, sizeof set4);
-    assert(ups == 2 && s.call[0].up && s.call[1].up && s.call[0].handle == 0x4444);
+    answer(&s, 0, QMI_SVC_WDS, WDS_START_NETWORK, 0, H4, sizeof H4);
+    answer(&s, 0, QMI_SVC_WDS, WDS_GET_CURRENT_SETTINGS, 0, SET4, sizeof SET4);
+    assert(ups == 2 && s.call[0].up && s.call[0].handle == 0x4444);
     /* the network drops IPv4: down, and started again after the backoff */
-    len = IND(0x22, 0x01, 2, 0, 1, 0, 0x10, 2, 0, 2, 0);
+    uint32_t len = IND(0x22, 0x01, 2, 0, 1, 0, 0x10, 2, 0, 2, 0);
     cell_session_receive(&s, 0, QMI_SVC_WDS, b, len);
     assert(downs == 1 && !s.call[0].handle && s.call[1].up);
     const int before = count_sent(QMI_SVC_WDS, WDS_START_NETWORK);
     cell_session_poll(&s, t += 6100);
     assert(count_sent(QMI_SVC_WDS, WDS_START_NETWORK) == before + 1);
-    answer(&s, 0, QMI_SVC_WDS, WDS_START_NETWORK, 0, h4, sizeof h4);
-    /* stop: Stop Network for both handles, then stopped */
+    answer(&s, 0, QMI_SVC_WDS, WDS_START_NETWORK, 0, H4, sizeof H4);
+    /* stop: a refused stop keeps the handle and is retried; success brings the family down */
     cell_session_stop(&s);
+    assert(s.state == CS_STOPPING);
     i = find_sent(0, QMI_SVC_WDS, WDS_STOP_NETWORK);
     const int j = find_sent(1, QMI_SVC_WDS, WDS_STOP_NETWORK);
     assert(i >= 0 && j >= 0 && sent.body[i][10] == 0x44 && sent.body[j][10] == 0x66);
-    assert(!cell_session_stopped(&s));
+    answer(&s, 0, QMI_SVC_WDS, WDS_STOP_NETWORK, 0x0e, 0, 0);
+    assert(s.call[0].handle == 0x4444 && !cell_session_idle(&s));
+    cell_session_poll(&s, t += 1100);
     answer(&s, 0, QMI_SVC_WDS, WDS_STOP_NETWORK, 0, 0, 0);
     answer(&s, 1, QMI_SVC_WDS, WDS_STOP_NETWORK, 0, 0, 0);
-    assert(cell_session_stopped(&s));
-    /* stop with an unanswered Stop Network still ends after 5 s */
-    CellSession s3;
-    cell_session_init(&s3, &cfg, &ops, 0);
-    s3.state = CS_CALLS; s3.call[0].handle = 7;
-    cell_session_stop(&s3);
-    cell_session_poll(&s3, 4000); assert(!cell_session_stopped(&s3));
-    cell_session_poll(&s3, 5100); assert(cell_session_stopped(&s3));
+    assert(cell_session_idle(&s) && s.state == CS_STOPPED && downs == 2);
+    /* nothing is sent once stopped */
+    const unsigned n = sent.n;
+    for (unsigned k = 0; k < 100; ++k) cell_session_poll(&s, t += 100);
+    assert(sent.n == n);
+}
+
+static void session_stop_edges(void)
+{
+    CellSession s;
+    uint64_t t = 1000;
+    /* stop while a start is in flight: the late handle is stopped, never brought up */
+    fresh(&s, &CFG, t);
+    to_register(&s, &t);
+    registered(&s);
+    bound(&s);
+    cell_session_stop(&s);
+    assert(s.state == CS_STOPPING && !cell_session_idle(&s));
+    answer(&s, 0, QMI_SVC_WDS, WDS_START_NETWORK, 0, H4, sizeof H4);
+    assert(find_sent(0, QMI_SVC_WDS, WDS_STOP_NETWORK) >= 0 && find_sent(0, QMI_SVC_WDS, WDS_GET_CURRENT_SETTINGS) < 0);
+    answer(&s, 0, QMI_SVC_WDS, WDS_STOP_NETWORK, 0, 0, 0);
+    assert(!cell_session_idle(&s));            /* the IPv6 start is still out */
+    answer(&s, 1, QMI_SVC_WDS, WDS_START_NETWORK, QMI_ERR_INVALID_OPERATION, 0, 0);
+    cell_session_poll(&s, t += 100);
+    assert(cell_session_idle(&s) && ups == 0);
+    /* a late DPM or WDA answer cannot restart setup */
+    fresh(&s, &CFG, t);
+    cell_session_ready(&s, &READY);
+    cell_session_stop(&s);
+    answer(&s, 0, QMI_SVC_DPM, DPM_OPEN_PORT, 0, 0, 0);
+    cell_session_poll(&s, t += 100);
+    assert(s.state == CS_STOPPED && count_sent(QMI_SVC_WDA, WDA_SET_DATA_FORMAT) == 0);
+    /* stop before the barrier sends nothing */
+    fresh(&s, &CFG, t);
+    const unsigned n0 = sent.n;
+    cell_session_stop(&s);
+    assert(s.state == CS_STOPPED && sent.n == n0);
+    /* a service leaving with a live call stops the call before FAILED */
+    fresh(&s, &CFG, t);
+    to_register(&s, &t);
+    registered(&s);
+    bound(&s);
+    answer(&s, 0, QMI_SVC_WDS, WDS_START_NETWORK, 0, H4, sizeof H4);
+    answer(&s, 0, QMI_SVC_WDS, WDS_GET_CURRENT_SETTINGS, 0, SET4, sizeof SET4);
+    cell_session_service(&s, QMI_SVC_NAS, 0);
+    assert(s.state == CS_STOPPING && find_sent(0, QMI_SVC_WDS, WDS_STOP_NETWORK) >= 0 && !cell_session_idle(&s));
+    answer(&s, 0, QMI_SVC_WDS, WDS_STOP_NETWORK, 0, 0, 0);
+    answer(&s, 1, QMI_SVC_WDS, WDS_START_NETWORK, 0x46, 0, 0);
+    cell_session_poll(&s, t += 100);
+    assert(s.state == CS_FAILED && downs == 1);
+    /* readiness lost does the same */
+    fresh(&s, &CFG, t);
+    to_register(&s, &t);
+    cell_session_ready(&s, 0);
+    assert(s.state == CS_STOPPING || s.state == CS_FAILED);
+    cell_session_poll(&s, t += 100);
+    assert(s.state == CS_FAILED);
+    /* WDS gone: the stop cannot be sent; FAILED after 5 s, reported unconfirmed */
+    fresh(&s, &CFG, t);
+    to_register(&s, &t);
+    registered(&s);
+    bound(&s);
+    answer(&s, 0, QMI_SVC_WDS, WDS_START_NETWORK, 0, H4, sizeof H4);
+    cell_session_service(&s, QMI_SVC_WDS, 0);
+    cell_session_poll(&s, t += 4000);
+    assert(!cell_session_idle(&s));
+    cell_session_poll(&s, t += 1100);
+    assert(s.state == CS_FAILED);
+    /* an unanswered stop still ends after 5 s */
+    fresh(&s, &CFG, 0);
+    s.state = CS_CALLS; s.call[0].handle = 7;
+    cell_session_stop(&s);
+    cell_session_poll(&s, 4000); assert(!cell_session_idle(&s));
+    cell_session_poll(&s, 5100); assert(cell_session_idle(&s));
+}
+
+static void session_bounds(void)
+{
+    CellSession s;
+    uint64_t t = 0;
     /* DPM never answered: three tries, then failed */
-    CellSession s4;
-    memset(&sent, 0, sizeof sent);
-    cell_session_init(&s4, &cfg, &ops, 0);
-    for (unsigned k = 0; k < sizeof svcs; ++k) cell_session_service(&s4, svcs[k], 1);
-    cell_session_service(&s4, QMI_SVC_DPM, 1);
-    for (t = 0; t < 30000; t += 100) cell_session_poll(&s4, t);
-    assert(s4.state == CS_FAILED && count_sent(QMI_SVC_DPM, DPM_OPEN_PORT) == 3);
-    /* a service leaving fails the session closed */
-    CellSession s5;
-    cell_session_init(&s5, &cfg, &ops, 0);
-    cell_session_service(&s5, QMI_SVC_WDS, 1);
-    cell_session_service(&s5, QMI_SVC_WDS, 0);
-    assert(s5.state == CS_FAILED);
-    (void)errors; (void)last;
+    fresh(&s, &CFG, 0);
+    cell_session_ready(&s, &READY);
+    for (t = 0; t < 30000; t += 100) cell_session_poll(&s, t);
+    assert(s.state == CS_FAILED && count_sent(QMI_SVC_DPM, DPM_OPEN_PORT) == 3);
+    /* a transport that refuses sends: at most one try a second */
+    fresh(&s, &CFG, 0);
+    sent.refuse = 1;
+    cell_session_ready(&s, &READY);
+    for (t = 0; t < 3000; t += 10) cell_session_poll(&s, t);
+    assert(s.tries <= 4);
+    sent.refuse = 0;
+    /* WDA echoing another aggregation or bigger limits fails */
+    static const uint8_t qv5[] = {0x13, 4, 0, 9, 0, 0, 0};
+    static const uint8_t toobig[] = {0x11, 4, 0, 2, 0, 0, 0, 0x12, 4, 0, 5, 0, 0, 0, 0x13, 4, 0, 5, 0, 0, 0, 0x16, 4, 0, 0, 0x80, 0, 0};
+    fresh(&s, &CFG, 0);
+    cell_session_ready(&s, &READY);
+    answer(&s, 0, QMI_SVC_DPM, DPM_OPEN_PORT, 0, 0, 0);
+    answer(&s, 0, QMI_SVC_WDA, WDA_SET_DATA_FORMAT, 0, qv5, sizeof qv5);
+    cell_session_poll(&s, 100);
+    assert(s.state == CS_FAILED);
+    fresh(&s, &CFG, 0);
+    cell_session_ready(&s, &READY);
+    answer(&s, 0, QMI_SVC_DPM, DPM_OPEN_PORT, 0, 0, 0);
+    answer(&s, 0, QMI_SVC_WDA, WDA_SET_DATA_FORMAT, 0, toobig, sizeof toobig);
+    cell_session_poll(&s, 100);
+    assert(s.state == CS_FAILED);
+    /* a start refused for a reason that will not change ends that call; the other family alone keeps the session */
+    fresh(&s, &CFG, 1000);
+    t = 1000;
+    to_register(&s, &t);
+    registered(&s);
+    bound(&s);
+    answer(&s, 0, QMI_SVC_WDS, WDS_START_NETWORK, 0x11, 0, 0);
+    assert(s.call[0].exhausted && s.state == CS_CALLS);
+    answer(&s, 1, QMI_SVC_WDS, WDS_START_NETWORK, 0x11, 0, 0);
+    assert(s.state == CS_STOPPING || s.state == CS_FAILED);
+    /* twenty attaching refusals, then that call stops trying */
+    fresh(&s, &CFG, 1000);
+    t = 1000;
+    CellConfig v4only = CFG;
+    v4only.want_v6 = 0;
+    fresh(&s, &v4only, 1000);
+    to_register(&s, &t);
+    registered(&s);
+    answer(&s, 0, QMI_SVC_WDS, WDS_BIND_MUX_DATA_PORT, 0, 0, 0);
+    answer(&s, 0, QMI_SVC_WDS, WDS_SET_IP_FAMILY, 0, 0, 0);
+    for (unsigned k = 0; k < 40; ++k) {
+        if (find_sent(0, QMI_SVC_WDS, WDS_START_NETWORK) >= 0 && s.pending[0].busy + s.pending[1].busy >= 0) {
+            const int at = find_sent(0, QMI_SVC_WDS, WDS_START_NETWORK);
+            const uint32_t len = resp(b, 2, sent.txn[at], WDS_START_NETWORK, QMI_ERR_INVALID_OPERATION, 0, 0);
+            cell_session_receive(&s, 0, QMI_SVC_WDS, b, len);
+        }
+        cell_session_poll(&s, t += 6100);
+    }
+    assert(count_sent(QMI_SVC_WDS, WDS_START_NETWORK) == 20 && s.call[0].exhausted && s.state == CS_FAILED);
+}
+
+static void session(void)
+{
+    session_order();
+    session_calls();
+    session_stop_edges();
+    session_bounds();
 }
 
 /* ---- raw allow list ---- */
+static int raw_try(uint8_t service, uint8_t client, const uint8_t *msg, uint32_t n)
+{
+    uint8_t req[8 + 256] = {1, service, client, 0, 0xe8, 3, 0, 0};
+    QmiRawRequest r;
+    memcpy(req + 8, msg, n);
+    return qmi_raw_parse(req, 8 + n, &r);
+}
+
+static int raw_id(uint8_t service, uint16_t id)
+{
+    uint8_t m[7] = {0, 0, 0, (uint8_t)id, (uint8_t)(id >> 8), 0, 0};
+    return raw_try(service, 0, m, 7);
+}
+
 static void raw(void)
 {
+    uint8_t m[64];
+    uint32_t n;
+    QmiOut o;
+    n = dms_get_revision(m, sizeof m, 0); assert(!raw_try(QMI_SVC_DMS, 0, m, n));
     uint8_t req[64] = {1, QMI_SVC_DMS, 0, 0, 0xe8, 3, 0, 0};
-    uint32_t n = dms_get_revision(req + 8, sizeof req - 8, 0);
     QmiRawRequest r;
+    memcpy(req + 8, m, n);
     assert(!qmi_raw_parse(req, 8 + n, &r) && r.service == 2 && r.timeout_ms == 1000 && r.length == n);
-    n = dms_get_ids(req + 8, sizeof req - 8, 0); assert(qmi_raw_parse(req, 8 + n, &r) == 1);       /* full IMEI */
-    n = dms_set_operating_mode(req + 8, sizeof req - 8, 0, 0); assert(!qmi_raw_parse(req, 8 + n, &r));
-    req[8 + 10] = 6; assert(qmi_raw_parse(req, 8 + n, &r) == 1);                                    /* persistent low power */
-    req[8 + 10] = 4; assert(qmi_raw_parse(req, 8 + n, &r) == 1);                                    /* reset */
-    req[8 + 3] = 0x3a; assert(qmi_raw_parse(req, 8 + n, &r) == 1);                                  /* factory defaults */
-    req[1] = QMI_SVC_NAS;
-    n = nas_set_mode_preference(req + 8, sizeof req - 8, 0, 1 << 4); assert(!qmi_raw_parse(req, 8 + n, &r));
-    QmiOut o; qmi_begin(&o, req + 8, 56, 0, 0x33); qmi_put_u16(&o, 0x11, 16); n = qmi_end(&o);
-    assert(qmi_raw_parse(req, 8 + n, &r) == 1);                                                     /* no change duration */
-    qmi_begin(&o, req + 8, 56, 0, 0x33); qmi_put_u16(&o, 0x11, 16); qmi_put_u8(&o, 0x17, 1); n = qmi_end(&o);
-    assert(qmi_raw_parse(req, 8 + n, &r) == 1);                                                     /* permanent */
-    req[1] = QMI_SVC_WDS;
-    n = wds_get_profile_list(req + 8, sizeof req - 8, 0); assert(!qmi_raw_parse(req, 8 + n, &r));
-    req[2] = 1; assert(!qmi_raw_parse(req, 8 + n, &r));
-    req[8 + 3] = 0x29; assert(qmi_raw_parse(req, 8 + n, &r) == 1);                                  /* delete profile */
-    req[8 + 3] = 0x51; assert(qmi_raw_parse(req, 8 + n, &r) == 1);                                  /* autoconnect */
-    req[2] = 0; req[1] = QMI_SVC_UIM; req[8 + 3] = 0x2f; assert(!qmi_raw_parse(req, 8 + n, &r));
-    req[8 + 3] = 0x47; assert(qmi_raw_parse(req, 8 + n, &r) == 1);                                  /* slot status: ICCID */
-    req[1] = QMI_SVC_DMS; req[2] = 1; req[8 + 3] = 0x23; assert(qmi_raw_parse(req, 8 + n, &r) == 22); /* client 1 is WDS only */
-    req[2] = 0; req[1] = 0x24; assert(qmi_raw_parse(req, 8 + n, &r) == 1);                          /* PDC */
-    req[1] = QMI_SVC_DMS; req[4] = req[5] = 0; assert(qmi_raw_parse(req, 8 + n, &r) == 22);                  /* zero timeout */
-    req[4] = 0x11; req[5] = 0x27; assert(qmi_raw_parse(req, 8 + n, &r) == 22);                       /* over 10 s */
+    /* identifiers, resets, writes, calls and session state */
+    const struct {uint8_t svc; uint16_t id;} denied[] = {
+        {QMI_SVC_DMS, 0x25}, {QMI_SVC_DMS, 0x24}, {QMI_SVC_DMS, 0x3c}, {QMI_SVC_DMS, 0x43}, {QMI_SVC_DMS, 0x00}, {QMI_SVC_DMS, 0x3a},
+        {QMI_SVC_DMS, 0x28}, {QMI_SVC_NAS, 0x00}, {QMI_SVC_NAS, 0x03}, {QMI_SVC_NAS, 0x21}, {QMI_SVC_NAS, 0x2a},
+        {QMI_SVC_WDS, 0x00}, {QMI_SVC_WDS, 0x20}, {QMI_SVC_WDS, 0x21}, {QMI_SVC_WDS, 0x27}, {QMI_SVC_WDS, 0x28},
+        {QMI_SVC_WDS, 0x29}, {QMI_SVC_WDS, 0x2b}, {QMI_SVC_WDS, 0x2c}, {QMI_SVC_WDS, 0x4a}, {QMI_SVC_WDS, 0x4d},
+        {QMI_SVC_WDS, 0x51}, {QMI_SVC_WDS, 0xa2}, {QMI_SVC_WDS, 0x01}, {QMI_SVC_WDS, 0x86}, {QMI_SVC_WDA, 0x00},
+        {QMI_SVC_WDA, 0x20}, {QMI_SVC_DPM, 0x20}, {QMI_SVC_UIM, 0x47}, {QMI_SVC_UIM, 0x20}, {0x24, 0x01}, {0x31, 0x21},
+    };
+    for (unsigned i = 0; i < sizeof denied / sizeof denied[0]; ++i) assert(raw_id(denied[i].svc, denied[i].id) == 1);
+    assert(!raw_id(QMI_SVC_NAS, 0x24) && !raw_id(QMI_SVC_WDS, 0x2a) && !raw_id(QMI_SVC_UIM, 0x2f) && !raw_id(QMI_SVC_WDA, 0x21));
+    /* DMS set mode: online or low power, one TLV, nothing else */
+    n = dms_set_operating_mode(m, sizeof m, 0, 0); assert(!raw_try(QMI_SVC_DMS, 0, m, n));
+    m[10] = 6; assert(raw_try(QMI_SVC_DMS, 0, m, n) == 1);
+    m[10] = 4; assert(raw_try(QMI_SVC_DMS, 0, m, n) == 1);
+    qmi_begin(&o, m, sizeof m, 0, 0x2e); qmi_put_u8(&o, 1, 0); qmi_put_u8(&o, 1, 4); n = qmi_end(&o);
+    assert(raw_try(QMI_SVC_DMS, 0, m, n) == 1);                           /* a second mode hidden behind the first */
+    qmi_begin(&o, m, sizeof m, 0, 0x2e); qmi_put_u8(&o, 1, 0); qmi_put_u8(&o, 0x10, 1); n = qmi_end(&o);
+    assert(raw_try(QMI_SVC_DMS, 0, m, n) == 1);                           /* an unknown extra TLV */
+    /* NAS mode preference only until power cycle */
+    n = nas_set_mode_preference(m, sizeof m, 0, 1 << 4); assert(!raw_try(QMI_SVC_NAS, 0, m, n));
+    qmi_begin(&o, m, sizeof m, 0, 0x33); qmi_put_u16(&o, 0x11, 16); n = qmi_end(&o); assert(raw_try(QMI_SVC_NAS, 0, m, n) == 1);
+    qmi_begin(&o, m, sizeof m, 0, 0x33); qmi_put_u16(&o, 0x11, 16); qmi_put_u8(&o, 0x17, 1); n = qmi_end(&o);
+    assert(raw_try(QMI_SVC_NAS, 0, m, n) == 1);
+    qmi_begin(&o, m, sizeof m, 0, 0x33); qmi_put_u16(&o, 0x11, 16); qmi_put_u8(&o, 0x17, 0); qmi_put_u8(&o, 0x17, 1); n = qmi_end(&o);
+    assert(raw_try(QMI_SVC_NAS, 0, m, n) == 1);                           /* duplicate duration */
+    qmi_begin(&o, m, sizeof m, 0, 0x33); qmi_put_u16(&o, 0x11, 16); qmi_put_u8(&o, 0x17, 0); qmi_put_u8(&o, 0x16, 1); n = qmi_end(&o);
+    assert(raw_try(QMI_SVC_NAS, 0, m, n) == 1);                           /* network selection */
+    /* duplicates on a read, client 1, timeouts and versions */
+    qmi_begin(&o, m, sizeof m, 0, 0x2a); qmi_put_u8(&o, 0x10, 0); qmi_put_u8(&o, 0x10, 0); n = qmi_end(&o);
+    assert(raw_try(QMI_SVC_WDS, 0, m, n) == 1);
+    n = wds_get_profile_list(m, sizeof m, 0); assert(raw_try(QMI_SVC_WDS, 1, m, n) == 22);
+    memcpy(req + 8, m, n);
+    req[1] = QMI_SVC_WDS; req[4] = req[5] = 0; assert(qmi_raw_parse(req, 8 + n, &r) == 22);
+    req[4] = 0x11; req[5] = 0x27; assert(qmi_raw_parse(req, 8 + n, &r) == 22);
     req[4] = 0xe8; req[5] = 3; req[0] = 2; assert(qmi_raw_parse(req, 8 + n, &r) == 22);
-    req[0] = 1; req[8 + 5] = 9; assert(qmi_raw_parse(req, 8 + n, &r) == 1);                          /* bad QMI length */
+    req[0] = 1; req[8 + 5] = 9; assert(qmi_raw_parse(req, 8 + n, &r) == 1);
+    assert(qmi_raw_indication_kept(QMI_SVC_NAS, 0x24) && qmi_raw_indication_kept(QMI_SVC_WDS, 0x22));
+    assert(!qmi_raw_indication_kept(QMI_SVC_UIM, 0x32) && !qmi_raw_indication_kept(QMI_SVC_DMS, 0x01));
 }
 
 int main(void)

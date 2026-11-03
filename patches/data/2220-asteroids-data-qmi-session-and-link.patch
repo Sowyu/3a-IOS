@@ -12,7 +12,7 @@
 +bsd/dev/data/sweet_data.c standard
 --- /dev/null
 +++ b/bsd/dev/data/CellLink.c
-@@ -0,0 +1,267 @@
+@@ -0,0 +1,274 @@
 +#if defined(ARM64_BOARD_CONFIG_SWEET) || !defined(KERNEL)
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 +/* The design is HakiOS drivers/modem/hakios.cell.c (ARP for everything, in-kernel DHCP from the WDS settings), written again here with
@@ -164,10 +164,15 @@
 +    if (n < CELL_ETHER + 20 || ip[0] >> 4 != 4) return CELL_DROP;
 +    const uint32_t ihl = 4u * (ip[0] & 15), total = be16(ip + 2);
 +    if (ihl < 20 || total < ihl || total > n - CELL_ETHER) return CELL_DROP;
-+    if (ip[9] == 17 && total >= ihl + 8 && be16(ip + ihl + 2) == 67) return dhcp(l, f, CELL_ETHER + total, ihl, r, rn);
++    if (ip[9] == 17 && total >= ihl + 8 && be16(ip + ihl + 2) == 67) {
++        const uint32_t udp_len = be16(ip + ihl + 4);
++        if ((be16(ip + 6) & 0x3fff) || udp_len < 8 + 240 || udp_len > total - ihl) return CELL_DROP;  /* fragments, bad UDP length */
++        return dhcp(l, f, CELL_ETHER + ihl + udp_len, ihl, r, rn);
++    }
 +    const uint32_t dst = be32(ip + 16);
 +    if (!l->v4_up || !same(f, l->router_mac, 6) || be32(ip + 12) != l->v4_addr || dst >> 28 == 0xe || dst == 0xffffffffu)
 +        return CELL_DROP;
++    *rn = total;  /* the datagram without any Ethernet padding */
 +    return CELL_TO_MODEM;
 +}
 +
@@ -231,7 +236,8 @@
 +    const uint8_t *ip = f + CELL_ETHER, *icmp = ip + 40;
 +    if (n < CELL_ETHER + 40 || ip[0] >> 4 != 6 || be16(ip + 4) > n - CELL_ETHER - 40) return CELL_DROP;
 +    const uint32_t payload = be16(ip + 4);
-+    if (ip[6] == 58 && payload >= 8 && ip[7] == 255) {
++    if (ip[6] == 58 && payload >= 8 && ip[7] == 255 && (icmp[0] == 133 || icmp[0] == 135)) {
++        if (icmp[1] != 0 || fold(sum(sum(0, ip + 8, 32) + payload + 58, icmp, payload)) != 0) return CELL_DROP;
 +        if (icmp[0] == 133) {*rn = cell_link_router_advert(l, r, CELL_REPLY_MAX); return *rn ? CELL_REPLY : CELL_DROP;}
 +        if (icmp[0] == 135) {
 +            /* answer any target, but never a duplicate-address probe (source ::) */
@@ -248,6 +254,7 @@
 +        }
 +    }
 +    if (!l->v6_up || !same(f, l->router_mac, 6) || ip[24] == 0xff || !same(ip + 8, l->v6_prefix, 8)) return CELL_DROP;
++    *rn = 40 + payload;
 +    return CELL_TO_MODEM;
 +}
 +
@@ -282,7 +289,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/data/CellLink.h
-@@ -0,0 +1,53 @@
+@@ -0,0 +1,54 @@
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 +/* The Ethernet look of a cellular data session, for an ifnet configd treats like a USB Ethernet adapter. The modem carries bare IP
 + * packets; the stack sees frames between its own MAC and a made-up router MAC. This file answers, from the session's WDS settings,
@@ -322,7 +329,8 @@
 +
 +typedef enum {CELL_DROP = 0, CELL_REPLY = 1, CELL_TO_MODEM = 2} CellAction;
 +/* One frame the stack sent. CELL_REPLY: reply holds *reply_len bytes, a frame to hand back to the stack as received. CELL_TO_MODEM:
-+ * the IP packet is frame + CELL_ETHER, length - CELL_ETHER bytes. */
++ * the IP datagram is frame + CELL_ETHER, *reply_len bytes (its own length, so Ethernet padding never reaches the modem). DHCP must be
++ * unfragmented with a consistent UDP length; solicitations need code 0 and a valid checksum. */
 +CellAction cell_link_output(CellLink *l, const uint8_t *frame, uint32_t length, uint8_t *reply, uint32_t *reply_len);
 +
 +/* The Ethernet header (14 bytes) to put in front of an IP packet from the modem. Returns 0 and counts a drop when the packet is not
@@ -338,18 +346,18 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/data/CellSession.c
-@@ -0,0 +1,437 @@
+@@ -0,0 +1,570 @@
 +#if defined(ARM64_BOARD_CONFIG_SWEET) || !defined(KERNEL)
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 +/* Order and retry behaviour follow ModemManager's QMI bearer for the "ipa" net driver and HakiOS hakios.mpss.c, which learned on
-+ * hardware that without DPM Open Port the modem answers WDA, Bind Mux and Start Network with InvalidOperation. */
++ * hardware that without DPM Open Port the modem answers WDA, Bind Mux and Start Network with InvalidOperation. Fixes from
++ * docs/data-2220-audit.md: the readiness barrier, STOPPING as a terminal barrier, failures through cleanup, validated replies, and a
++ * charge for every attempted send. */
 +#include "CellSession.h"
 +#ifdef KERNEL
 +#include <libkern/libkern.h>
-+#include <os/base.h>
 +#else
 +#include <stdio.h>
-+#define OS_FALLTHROUGH __attribute__((fallthrough))
 +#endif
 +
 +#define REPLY_MS 5000u
@@ -357,7 +365,10 @@
 +#define START_RETRY_MS 6000u
 +#define START_TRIES 20u
 +#define STEP_TRIES 3u
++#define STEP_RETRY_MS 1000u
 +#define STOP_MS 5000u
++#define SEND_BACKOFF_MS 1000u
++#define QMI_ERR_CALL_FAILED 0x0e
 +
 +enum {B_DMS = 1, B_NAS = 2, B_WDS = 4, B_WDA = 8, B_DPM = 16, B_ALL = 31};
 +
@@ -375,10 +386,12 @@
 +
 +const char *cell_state_name(CellState st)
 +{
-+    static const char *const names[] = {"wait-services", "dpm", "wda", "online", "wait-online-allowed", "register", "calls",
-+                                        "stopping", "stopped", "failed"};
++    static const char *const names[] = {"wait-ready", "dpm", "wda", "wda-verify", "online", "wait-online-allowed", "register",
++                                        "calls", "stopping", "stopped", "failed"};
 +    return (unsigned)st < sizeof names / sizeof names[0] ? names[st] : "?";
 +}
++
++static int ending(const CellSession *s) {return s->state >= CS_STOPPING;}
 +
 +static void event(CellSession *s, CellEvent e, uint32_t arg, const void *data, const char *text)
 +{
@@ -394,10 +407,22 @@
 +    event(s, CE_STATE, st, 0, cell_state_name(st));
 +}
 +
++static void advance(CellSession *s);
++
++static void begin_stop(CellSession *s)
++{
++    if (ending(s)) return;
++    set_state(s, CS_STOPPING);
++    advance(s);
++}
++
++/* Every failure ends through cleanup; the reason is kept apart from it. */
 +static void fail(CellSession *s, uint16_t message, const char *why)
 +{
 +    event(s, CE_ERROR, message, 0, why);
-+    set_state(s, CS_FAILED);
++    if (s->state == CS_STOPPED || s->state == CS_FAILED) return;
++    s->failing = 1;
++    begin_stop(s);
 +}
 +
 +/* ---- outstanding requests ---- */
@@ -417,16 +442,20 @@
 +    return t;
 +}
 +
-+/* Sends a built message (its transaction already inside) unless the same message is outstanding. Returns 1 when sent. */
++/* Sends a built message (its transaction already inside) unless the same message is outstanding or its service is gone. Returns 1
++ * when sent. A transport refusal backs every step off for a second, so nothing is resent on each poll. */
 +static int issue(CellSession *s, unsigned client, uint8_t service, const uint8_t *msg, uint32_t length)
 +{
 +    if (!length) return 0;
 +    const uint16_t message = (uint16_t)(msg[3] | msg[4] << 8), txn = (uint16_t)(msg[1] | msg[2] << 8);
-+    if (find(s, client, service, message)) return 0;
++    if (find(s, client, service, message) || !(s->services & bit(service))) return 0;
 +    for (unsigned i = 0; i < CELL_PENDING; ++i) {
 +        CellPending *p = &s->pending[i];
 +        if (p->busy) continue;
-+        if (s->ops.send(s->ops.context, client, service, msg, length)) return 0;
++        if (s->ops.send(s->ops.context, client, service, msg, length)) {
++            s->backoff_until = s->now + SEND_BACKOFF_MS;
++            return 0;
++        }
 +        *p = (CellPending){1, (uint8_t)client, service, txn, message, s->now};
 +        return 1;
 +    }
@@ -436,7 +465,7 @@
 +/* Builds with a fresh transaction and sends. */
 +#define SEND(s, client, service, builder, ...) do { \
 +        uint8_t b_[256]; const uint16_t t_ = take_txn(s); \
-+        issue((s), (client), (service), b_, builder(b_, sizeof b_, t_, ##__VA_ARGS__)); \
++        (void)issue((s), (client), (service), b_, builder(b_, sizeof b_, t_, ##__VA_ARGS__)); \
 +    } while (0)
 +
 +/* The outstanding request this response answers, freed; null when it answers nothing of ours. */
@@ -455,6 +484,7 @@
 +}
 +
 +/* ---- the steps ---- */
++/* Read-only queries for the log; allowed before the readiness barrier. */
 +static void info(CellSession *s)
 +{
 +    if (s->info_sent) return;
@@ -467,10 +497,11 @@
 +    SEND(s, 0, QMI_SVC_WDS, wds_get_profile_list);
 +}
 +
++/* A session step's next attempt: 1 when it should send now (the attempt is charged), 0 when it waits or has failed. */
 +static int step_once(CellSession *s, unsigned client, uint8_t service, uint16_t message)
 +{
 +    if (find(s, client, service, message)) return 0;
-+    if (s->tries++ >= STEP_TRIES) {fail(s, message, "no answer"); return 0;}
++    if (s->tries++ >= STEP_TRIES) {fail(s, message, "no usable answer"); return 0;}
 +    return 1;
 +}
 +
@@ -482,45 +513,123 @@
 +    s->tries = 0;
 +}
 +
++static void exhaust(CellSession *s, CellCall *c, const char *why)
++{
++    if (c->exhausted) return;
++    c->exhausted = 1;
++    event(s, CE_ERROR, c->family, 0, why);
++    const CellCall *other = c == &s->call[0] ? &s->call[1] : &s->call[0];
++    if (!other->family || other->exhausted) fail(s, 0, "no call can come up");
++}
++
++/* One charged attempt of a call's bind or family step. */
++static int call_try(CellSession *s, CellCall *c, uint16_t message)
++{
++    if (find(s, c->client, QMI_SVC_WDS, message) || s->now < c->next_try) return 0;
++    if (c->step_tries++ >= STEP_TRIES) {exhaust(s, c, "bind or family refused"); return 0;}
++    return 1;
++}
++
 +static void call_step(CellSession *s, CellCall *c)
 +{
 +    const CellConfig *cfg = &s->cfg;
-+    if (!c->family) return;
++    if (!c->family || c->exhausted) return;
++    if (c->drop) {  /* a handle whose settings never came: stop it, then start again */
++        if (c->handle && !find(s, c->client, QMI_SVC_WDS, WDS_STOP_NETWORK) && s->now >= c->next_try) {
++            c->next_try = s->now + STEP_RETRY_MS;
++            SEND(s, c->client, QMI_SVC_WDS, wds_stop_network, c->handle);
++        }
++        return;
++    }
 +    if (!c->bound) {
-+        if (!find(s, c->client, QMI_SVC_WDS, WDS_BIND_MUX_DATA_PORT))
++        if (call_try(s, c, WDS_BIND_MUX_DATA_PORT))
 +            SEND(s, c->client, QMI_SVC_WDS, wds_bind_mux, QMI_ENDPOINT_EMBEDDED, cfg->ep_interface, cfg->mux);
 +        return;
 +    }
 +    if (!c->family_set) {
-+        if (!find(s, c->client, QMI_SVC_WDS, WDS_SET_IP_FAMILY)) SEND(s, c->client, QMI_SVC_WDS, wds_set_ip_family, c->family);
++        if (call_try(s, c, WDS_SET_IP_FAMILY)) SEND(s, c->client, QMI_SVC_WDS, wds_set_ip_family, c->family);
 +        return;
 +    }
-+    if (c->handle || !s->registered || s->now < c->next_start || c->start_tries >= START_TRIES) return;
-+    if (find(s, c->client, QMI_SVC_WDS, WDS_START_NETWORK)) return;
++    if (c->handle) {
++        if (c->up || find(s, c->client, QMI_SVC_WDS, WDS_GET_CURRENT_SETTINGS) || s->now < c->next_try) return;
++        if (c->settings_tries >= STEP_TRIES) {
++            event(s, CE_ERROR, WDS_GET_CURRENT_SETTINGS, 0, "no usable settings: stopping the call");
++            c->drop = 1;
++            return;
++        }
++        c->settings_tries++;
++        SEND(s, c->client, QMI_SVC_WDS, wds_get_current_settings);
++        return;
++    }
++    if (!s->registered || s->now < c->next_start || find(s, c->client, QMI_SVC_WDS, WDS_START_NETWORK)) return;
++    if (c->start_tries >= START_TRIES) {exhaust(s, c, "start network: tries used up"); return;}
++    c->start_tries++;
++    c->next_start = s->now + START_RETRY_MS;
 +    const WdsCall call = {cfg->apn, 0, 0, 0, 0xff, cfg->profile, c->family};
 +    SEND(s, c->client, QMI_SVC_WDS, wds_start_network, &call);
++}
++
++static void call_down(CellSession *s, CellCall *c, const WdsPacketStatus *st)
++{
++    const int was_up = c->up;
++    c->handle = WDS_HANDLE_NONE;
++    c->up = c->drop = 0;
++    c->settings_tries = 0;
++    c->next_start = s->now + START_RETRY_MS;
++    if (was_up) event(s, CE_DOWN, c->family, st, "call ended");
++}
++
++static void finish(CellSession *s)
++{
++    for (unsigned i = 0; i < 2; ++i) if (s->call[i].up) {s->call[i].up = 0; event(s, CE_DOWN, s->call[i].family, 0, "session ended");}
++    set_state(s, s->failing ? CS_FAILED : CS_STOPPED);
++}
++
++static void stopping(CellSession *s)
++{
++    unsigned live = 0;
++    for (unsigned i = 0; i < 2; ++i) {
++        CellCall *c = &s->call[i];
++        if (find(s, c->client, QMI_SVC_WDS, WDS_START_NETWORK)) live++;  /* its answer may still bring a handle */
++        if (c->handle == WDS_HANDLE_NONE) continue;
++        live++;
++        if (!find(s, c->client, QMI_SVC_WDS, WDS_STOP_NETWORK) && s->now >= c->next_try) {
++            c->next_try = s->now + STEP_RETRY_MS;
++            SEND(s, c->client, QMI_SVC_WDS, wds_stop_network, c->handle);
++        }
++    }
++    if (live && s->now - s->state_since < STOP_MS) return;
++    if (live) event(s, CE_ERROR, WDS_STOP_NETWORK, 0, "cleanup not confirmed within 5 s");
++    finish(s);
 +}
 +
 +static void advance(CellSession *s)
 +{
 +    const CellConfig *cfg = &s->cfg;
++    if (s->now < s->backoff_until) return;
 +    switch (s->state) {
-+    case CS_WAIT_SERVICES:
++    case CS_WAIT_READY:
 +        if ((s->services & B_ALL) != B_ALL) return;
 +        info(s);
++        if (!s->is_ready) return;
 +        set_state(s, CS_DPM);
-+        OS_FALLTHROUGH;
++        advance(s);
++        return;
 +    case CS_DPM:
 +        if (step_once(s, 0, QMI_SVC_DPM, DPM_OPEN_PORT))
 +            SEND(s, 0, QMI_SVC_DPM, dpm_open_port, QMI_ENDPOINT_EMBEDDED, cfg->ep_interface, cfg->ipa_rx, cfg->ipa_tx);
 +        return;
 +    case CS_WDA:
 +        if (step_once(s, 0, QMI_SVC_WDA, WDA_SET_DATA_FORMAT)) {
-+            const uint32_t agg = cfg->qmap == QMAP_V5 ? WDA_AGG_QMAPV5 : WDA_AGG_QMAP;
-+            const WdaFormat f = {WDA_LINK_RAW_IP, agg, agg, cfg->dl_max_datagrams, cfg->dl_max_size, 0, 0, QMI_ENDPOINT_EMBEDDED,
-+                                 cfg->ep_interface};
++            const uint32_t agg = s->ready.qmap == QMAP_V5 ? WDA_AGG_QMAPV5 : WDA_AGG_QMAP;
++            const WdaFormat f = {WDA_LINK_RAW_IP, agg, agg, s->ready.dl_max_datagrams, s->ready.dl_max_size, 0, 0,
++                                 QMI_ENDPOINT_EMBEDDED, cfg->ep_interface};
 +            SEND(s, 0, QMI_SVC_WDA, wda_set_data_format, &f);
 +        }
++        return;
++    case CS_WDA_VERIFY:
++        if (step_once(s, 0, QMI_SVC_WDA, WDA_GET_DATA_FORMAT))
++            SEND(s, 0, QMI_SVC_WDA, wda_get_data_format, QMI_ENDPOINT_EMBEDDED, cfg->ep_interface);
 +        return;
 +    case CS_ONLINE:
 +        if (!s->mode_known) {
@@ -529,15 +638,16 @@
 +        }
 +        if (s->mode == DMS_MODE_ONLINE) {set_state(s, CS_REGISTER); return;}
 +        if (!cfg->allow_online) {set_state(s, CS_WAIT_ONLINE_ALLOWED); return;}
-+        if (!s->online_sent && !find(s, 0, QMI_SVC_DMS, DMS_SET_OPERATING_MODE)) {
++        if (!s->online_sent) {
++            if (find(s, 0, QMI_SVC_DMS, DMS_SET_OPERATING_MODE)) return;
 +            s->online_sent = 1;
 +            SEND(s, 0, QMI_SVC_DMS, dms_set_operating_mode, DMS_MODE_ONLINE);
-+        } else if (s->online_sent) {
++        } else {
 +            reread_mode(s);
 +        }
 +        return;
 +    case CS_WAIT_ONLINE_ALLOWED:
-+        /* the raw tool may put the modem online by hand */
++        /* the raw tool may put the modem online by hand; this only reads the mode */
 +        if (s->mode_known && s->mode == DMS_MODE_ONLINE) {set_state(s, CS_REGISTER); return;}
 +        if (!s->mode_known) {
 +            if (!find(s, 0, QMI_SVC_DMS, DMS_GET_OPERATING_MODE)) SEND(s, 0, QMI_SVC_DMS, dms_get_operating_mode);
@@ -556,27 +666,196 @@
 +            set_state(s, CS_CALLS);
 +        }
 +        call_step(s, &s->call[0]);
-+        call_step(s, &s->call[1]);
++        if (!ending(s)) call_step(s, &s->call[1]);
 +        return;
-+    case CS_STOPPING: {
-+        unsigned live = 0;
-+        for (unsigned i = 0; i < 2; ++i) {
-+            CellCall *c = &s->call[i];
-+            if (c->handle == WDS_HANDLE_NONE) continue;
-+            live++;
-+            if (!find(s, c->client, QMI_SVC_WDS, WDS_STOP_NETWORK)) SEND(s, c->client, QMI_SVC_WDS, wds_stop_network, c->handle);
-+        }
-+        if (!live || s->now - s->state_since >= STOP_MS) {
-+            if (live) event(s, CE_ERROR, WDS_STOP_NETWORK, 0, "stop network unanswered");
-+            set_state(s, CS_STOPPED);
-+        }
++    case CS_STOPPING:
++        stopping(s);
 +        return;
-+    }
 +    default:
 +        return;
 +    }
 +}
 +
++/* ---- replies ---- */
++/* 1: the modem uses exactly the asked format within the receive limits; 0: it echoed too little to tell; -1: something differs. */
++static int check_format(const CellSession *s, const WdaFormat *f)
++{
++    const uint32_t agg = s->ready.qmap == QMAP_V5 ? WDA_AGG_QMAPV5 : WDA_AGG_QMAP;
++    if ((f->link && f->link != WDA_LINK_RAW_IP) || (f->ul_agg && f->ul_agg != agg) || (f->dl_agg && f->dl_agg != agg)) return -1;
++    if (f->dl_max_datagrams > s->ready.dl_max_datagrams || f->dl_max_size > s->ready.dl_max_size) return -1;
++    return f->link && f->ul_agg && f->dl_agg ? 1 : 0;
++}
++
++static int usable(const CellCall *c, const WdsSettings *w)
++{
++    /* the same rule CellLink applies: a global /64, never link-local or multicast */
++    return c->family == WDS_FAMILY_IPV4 ? w->has_v4 : w->has_v6 && w->v6_prefix == 64 && w->v6_addr[0] != 0xff &&
++           !(w->v6_addr[0] == 0xfe && (w->v6_addr[1] & 0xc0) == 0x80);
++}
++
++static void wds_message(CellSession *s, unsigned client, const uint8_t *msg, uint32_t length, const CellPending *p)
++{
++    CellCall *c = client == 0 ? &s->call[0] : &s->call[1];
++    QcomQmiMessage m;
++    char line[96];
++    if (msg[0] == QCOM_QMI_INDICATION) {
++        WdsPacketStatus st;
++        if (wds_parse_packet_status(msg, length, &st) || !c->family || !c->handle) return;
++        if (st.status == WDS_STATUS_DISCONNECTED) call_down(s, c, &st);
++        else if (st.status == WDS_STATUS_CONNECTED && st.reconfigure && !ending(s)) {c->up = 0; c->settings_tries = 0;}
++        advance(s);
++        return;
++    }
++    if (!p) return;
++    const int stop_phase = ending(s);
++    switch (p->message) {
++    case WDS_GET_PROFILE_LIST: {
++        WdsProfiles list;
++        if (stop_phase || wds_parse_profile_list(msg, length, p->txn, &list)) return;
++        for (unsigned i = 0; i < list.count && i < 4; ++i) SEND(s, 0, QMI_SVC_WDS, wds_get_profile_settings, list.p[i].index);
++        snprintf(line, sizeof line, "%u 3GPP profiles", list.total);
++        event(s, CE_INFO, 0, &list, line);
++        return;
++    }
++    case WDS_GET_PROFILE_SETTINGS: {
++        WdsProfile pr;
++        if (stop_phase || wds_parse_profile_settings(msg, length, p->txn, &pr)) return;
++        snprintf(line, sizeof line, "profile '%s' APN '%s' PDP %u", pr.name, pr.apn, pr.has_pdp ? pr.pdp_type : 0xffu);
++        event(s, CE_INFO, 0, 0, line);  /* the name and APN only: usernames and passwords are never decoded */
++        return;
++    }
++    case WDS_BIND_MUX_DATA_PORT:
++    case WDS_SET_IP_FAMILY:
++        if (stop_phase) return;
++        if (qmi_response(msg, length, p->txn, p->message, &m)) {
++            event(s, CE_ERROR, p->message, 0, p->message == WDS_SET_IP_FAMILY ? "set IP family refused" : "bind mux refused");
++            c->next_try = s->now + STEP_RETRY_MS;
++        } else if (p->message == WDS_SET_IP_FAMILY) {
++            c->family_set = 1;
++            c->step_tries = 0;
++        } else {
++            c->bound = 1;
++            c->step_tries = 0;
++        }
++        break;
++    case WDS_START_NETWORK: {
++        WdsStarted st;
++        const int rc = wds_parse_start(msg, length, p->txn, &st);
++        if (rc == 0) {
++            c->handle = st.handle;  /* in the stop phase too, so STOPPING stops it */
++            c->start_tries = 0;
++            c->settings_tries = 0;
++            break;
++        }
++        if (stop_phase) return;
++        snprintf(line, sizeof line, "start IPv%u refused: error %d, end reason %u, verbose %u/%d (try %u)", c->family, rc,
++                 st.end_reason, st.verbose_type, st.verbose_reason, c->start_tries);
++        event(s, CE_ERROR, p->message, &st, line);
++        /* the packet domain still attaching, or a call the network failed: retried after the backoff; anything else stops it */
++        if (rc > 0 && rc != QMI_ERR_INVALID_OPERATION && rc != QMI_ERR_CALL_FAILED) exhaust(s, c, "start network refused");
++        break;
++    }
++    case WDS_GET_CURRENT_SETTINGS: {
++        WdsSettings w;
++        if (stop_phase || !c->handle) return;
++        if (wds_parse_settings(msg, length, p->txn, &w) || !usable(c, &w)) {
++            event(s, CE_ERROR, p->message, 0, "settings without a usable address for this family");
++            c->next_try = s->now + STEP_RETRY_MS;
++            break;
++        }
++        c->settings = w;
++        c->up = 1;
++        event(s, CE_UP, c->family, &c->settings, "call up");
++        return;
++    }
++    case WDS_STOP_NETWORK: {
++        const int rc = qmi_response(msg, length, p->txn, p->message, &m);
++        if (rc != 0 && rc != QMI_ERR_NO_EFFECT) {
++            event(s, CE_ERROR, p->message, 0, "stop network refused; retrying");  /* the handle stays until a stop succeeds */
++            break;
++        }
++        call_down(s, c, 0);
++        break;
++    }
++    default:
++        return;
++    }
++    advance(s);
++}
++
++static void dms_message(CellSession *s, const uint8_t *msg, uint32_t length, const CellPending *p)
++{
++    QcomQmiMessage m;
++    char line[96];
++    if (!p) return;
++    if (p->message == DMS_GET_REVISION) {
++        DmsRevision r;
++        if (!dms_parse_revision(msg, length, p->txn, &r)) {snprintf(line, sizeof line, "revision %s", r.text); event(s, CE_INFO, 0, 0, line);}
++    } else if (p->message == DMS_GET_IDS) {
++        DmsIds ids;
++        if (!dms_parse_ids(msg, length, p->txn, &ids) && ids.has_imei) {
++            snprintf(line, sizeof line, "IMEI ending %s", ids.imei_last4);
++            event(s, CE_INFO, 0, 0, line);
++        }
++    } else if (p->message == DMS_GET_OPERATING_MODE) {
++        DmsMode md;
++        if (dms_parse_operating_mode(msg, length, p->txn, &md)) return;
++        s->mode = md.mode;
++        s->mode_known = 1;
++        s->tries = 0;
++        snprintf(line, sizeof line, "operating mode %u, offline reason %#x", md.mode, md.offline_reason);
++        event(s, CE_INFO, md.mode, &md, line);
++    } else if (p->message == DMS_SET_OPERATING_MODE && s->state == CS_ONLINE) {
++        if (qmi_response(msg, length, p->txn, p->message, &m)) {fail(s, p->message, "online refused"); return;}
++        s->mode_known = 0;  /* read it back */
++        s->tries = 0;
++    }
++}
++
++static void nas_message(CellSession *s, const uint8_t *msg, uint32_t length, const CellPending *p)
++{
++    const uint16_t message = (uint16_t)(msg[3] | msg[4] << 8), txn = p ? p->txn : 0;
++    if (message == NAS_SERVING_SYSTEM) {
++        NasServing sv;
++        if (nas_parse_serving(msg, length, txn, &sv)) return;
++        s->serving = sv;
++        s->registered = (uint8_t)nas_registered_for_data(&sv);
++        event(s, CE_SERVING, s->registered, &sv, 0);
++    } else if (message == NAS_GET_SIGNAL_INFO || message == NAS_SIGNAL_INFO_IND) {
++        NasSignal sg;
++        if (!nas_parse_signal(msg, length, txn, &sg)) event(s, CE_SIGNAL, (uint32_t)nas_bars(&sg), &sg, 0);
++    } else if (message == NAS_GET_OPERATOR_NAME || message == NAS_OPERATOR_NAME_IND) {
++        NasOperator op;
++        if (!nas_parse_operator(msg, length, txn, &op)) event(s, CE_OPERATOR, 0, &op, 0);
++    }
++}
++
++void cell_session_receive(CellSession *s, unsigned client, uint8_t service, const uint8_t *msg, uint32_t length)
++{
++    QcomQmiMessage m;
++    if (client > 1 || length < QCOM_QMI_HEADER) return;
++    const CellPending *p = answered(s, client, service, msg, length);
++    if (msg[0] == QCOM_QMI_RESPONSE && !p) return;  /* late, duplicate or the raw tool's */
++    if (service == QMI_SVC_WDS) {wds_message(s, client, msg, length, p); return;}
++    if (client != 0 || ending(s)) return;           /* in the stop phase only WDS cleanup matters */
++    if (service == QMI_SVC_NAS) nas_message(s, msg, length, p);
++    else if (service == QMI_SVC_DMS) dms_message(s, msg, length, p);
++    else if (service == QMI_SVC_DPM && p && p->message == DPM_OPEN_PORT && s->state == CS_DPM) {
++        const int rc = qmi_response(msg, length, p->txn, p->message, &m);
++        if (rc && rc != QMI_ERR_NO_EFFECT) {fail(s, p->message, "open port refused"); return;}
++        set_state(s, CS_WDA);
++    } else if (service == QMI_SVC_WDA && p && (p->message == WDA_SET_DATA_FORMAT || p->message == WDA_GET_DATA_FORMAT) &&
++               s->state == (p->message == WDA_SET_DATA_FORMAT ? CS_WDA : CS_WDA_VERIFY)) {
++        WdaFormat f;
++        if (wda_parse_data_format(msg, length, p->txn, p->message, &f)) {fail(s, p->message, "data format refused"); return;}
++        const int ok = check_format(s, &f);
++        if (ok < 0 || (ok == 0 && p->message == WDA_GET_DATA_FORMAT)) {fail(s, p->message, "data format differs"); return;}
++        set_state(s, ok ? CS_ONLINE : CS_WDA_VERIFY);
++    }
++    if (!ending(s)) advance(s);
++}
++
++/* ---- the owner's side ---- */
 +void cell_session_init(CellSession *s, const CellConfig *cfg, const CellSessionOps *ops, uint64_t now_ms)
 +{
 +    *s = (CellSession){0};
@@ -584,7 +863,7 @@
 +    s->cfg = *cfg;
 +    s->now = s->state_since = now_ms;
 +    s->next_txn = 1;
-+    s->state = CS_WAIT_SERVICES;
++    s->state = CS_WAIT_READY;
 +    if (cfg->want_v4) s->call[0] = (CellCall){.family = WDS_FAMILY_IPV4, .client = 0};
 +    if (cfg->want_v6) s->call[1] = (CellCall){.family = WDS_FAMILY_IPV6, .client = 1};
 +}
@@ -596,156 +875,21 @@
 +    if (present) s->services |= b;
 +    else {
 +        s->services &= (uint8_t)~b;
-+        if (s->state != CS_STOPPED && s->state != CS_FAILED) fail(s, 0, "a service went away");
++        if (s->state != CS_WAIT_READY && !ending(s)) fail(s, 0, "a service went away");
 +    }
 +    advance(s);
 +}
 +
-+static void call_down(CellSession *s, CellCall *c, const WdsPacketStatus *st)
++void cell_session_ready(CellSession *s, const CellReady *r)
 +{
-+    const int was_up = c->up;
-+    c->handle = WDS_HANDLE_NONE;
-+    c->up = 0;
-+    c->next_start = s->now + START_RETRY_MS;
-+    if (was_up) event(s, CE_DOWN, c->family, st, "call ended");
-+}
-+
-+static void wds_message(CellSession *s, unsigned client, const uint8_t *msg, uint32_t length, const CellPending *p)
-+{
-+    CellCall *c = client == 0 ? &s->call[0] : &s->call[1];
-+    char line[96];
-+    if (msg[0] == QCOM_QMI_INDICATION) {
-+        WdsPacketStatus st;
-+        if (wds_parse_packet_status(msg, length, &st) || !c->family || s->state == CS_STOPPING) return;
-+        if (st.status == WDS_STATUS_DISCONNECTED) call_down(s, c, &st);
-+        else if (st.status == WDS_STATUS_CONNECTED && st.reconfigure && c->handle) SEND(s, client, QMI_SVC_WDS, wds_get_current_settings);
++    if (!r) {
++        s->is_ready = 0;
++        if (s->state != CS_WAIT_READY && !ending(s)) fail(s, 0, "readiness lost (USIM or IPA)");
 +        return;
 +    }
-+    if (!p) return;
-+    switch (p->message) {
-+    case WDS_GET_PROFILE_LIST: {
-+        WdsProfiles list;
-+        if (wds_parse_profile_list(msg, length, p->txn, &list)) return;
-+        for (unsigned i = 0; i < list.count && i < 4; ++i) SEND(s, 0, QMI_SVC_WDS, wds_get_profile_settings, list.p[i].index);
-+        snprintf(line, sizeof line, "%u 3GPP profiles", list.total);
-+        event(s, CE_INFO, 0, &list, line);
-+        return;
-+    }
-+    case WDS_GET_PROFILE_SETTINGS: {
-+        WdsProfile pr;
-+        if (wds_parse_profile_settings(msg, length, p->txn, &pr)) return;
-+        snprintf(line, sizeof line, "profile '%s' APN '%s' PDP %u", pr.name, pr.apn, pr.has_pdp ? pr.pdp_type : 0xffu);
-+        event(s, CE_INFO, 0, &pr, line);
-+        return;
-+    }
-+    case WDS_BIND_MUX_DATA_PORT: {
-+        QcomQmiMessage m;
-+        const int rc = qmi_response(msg, length, p->txn, p->message, &m);
-+        /* bound or not, go on: ModemManager does too, and the start answer tells the rest */
-+        if (rc) event(s, CE_ERROR, p->message, 0, "bind mux refused");
-+        c->bound = 1;
-+        advance(s);
-+        return;
-+    }
-+    case WDS_SET_IP_FAMILY:
-+        c->family_set = 1;
-+        advance(s);
-+        return;
-+    case WDS_START_NETWORK: {
-+        WdsStarted st;
-+        const int rc = wds_parse_start(msg, length, p->txn, &st);
-+        if (rc == 0) {
-+            c->handle = st.handle;
-+            SEND(s, client, QMI_SVC_WDS, wds_get_current_settings);
-+            return;
-+        }
-+        c->start_tries++;
-+        c->next_start = s->now + START_RETRY_MS;
-+        snprintf(line, sizeof line, "start IPv%u refused: error %d, end reason %u, verbose %u/%d (try %u)", c->family, rc,
-+                 st.end_reason, st.verbose_type, st.verbose_reason, c->start_tries);
-+        event(s, CE_ERROR, p->message, &st, line);
-+        return;
-+    }
-+    case WDS_GET_CURRENT_SETTINGS:
-+        if (wds_parse_settings(msg, length, p->txn, &c->settings)) {event(s, CE_ERROR, p->message, 0, "no usable settings"); return;}
-+        c->up = 1;
-+        event(s, CE_UP, c->family, &c->settings, "call up");
-+        return;
-+    case WDS_STOP_NETWORK:
-+        c->handle = WDS_HANDLE_NONE;
-+        c->up = 0;
-+        advance(s);
-+        return;
-+    default:
-+        return;
-+    }
-+}
-+
-+void cell_session_receive(CellSession *s, unsigned client, uint8_t service, const uint8_t *msg, uint32_t length)
-+{
-+    QcomQmiMessage m;
-+    char line[96];
-+    if (client > 1 || length < QCOM_QMI_HEADER) return;
-+    const CellPending *p = answered(s, client, service, msg, length);
-+    if (msg[0] == QCOM_QMI_RESPONSE && !p) return;  /* late, duplicate or the raw tool's */
-+    if (service == QMI_SVC_WDS) {wds_message(s, client, msg, length, p); return;}
-+    if (client != 0) return;
-+    const uint16_t message = (uint16_t)(msg[3] | msg[4] << 8);
-+    const uint16_t txn = p ? p->txn : 0;
-+    if (service == QMI_SVC_NAS) {
-+        if (message == NAS_SERVING_SYSTEM) {
-+            NasServing sv;
-+            if (nas_parse_serving(msg, length, txn, &sv)) return;
-+            s->serving = sv;
-+            s->registered = (uint8_t)nas_registered_for_data(&sv);
-+            event(s, CE_SERVING, s->registered, &sv, 0);
-+        } else if (message == NAS_GET_SIGNAL_INFO || message == NAS_SIGNAL_INFO_IND) {
-+            NasSignal sg;
-+            if (!nas_parse_signal(msg, length, txn, &sg)) event(s, CE_SIGNAL, (uint32_t)nas_bars(&sg), &sg, 0);
-+        } else if (message == NAS_GET_OPERATOR_NAME || message == NAS_OPERATOR_NAME_IND) {
-+            NasOperator op;
-+            if (!nas_parse_operator(msg, length, txn, &op)) event(s, CE_OPERATOR, 0, &op, 0);
-+        }
-+    } else if (service == QMI_SVC_DMS && p) {
-+        if (message == DMS_GET_REVISION) {
-+            DmsRevision r;
-+            if (!dms_parse_revision(msg, length, txn, &r)) {snprintf(line, sizeof line, "revision %s", r.text); event(s, CE_INFO, 0, 0, line);}
-+        } else if (message == DMS_GET_IDS) {
-+            DmsIds ids;
-+            if (!dms_parse_ids(msg, length, txn, &ids) && ids.has_imei) {
-+                snprintf(line, sizeof line, "IMEI ending %s", ids.imei_last4);
-+                event(s, CE_INFO, 0, 0, line);
-+            }
-+        } else if (message == DMS_GET_OPERATING_MODE) {
-+            DmsMode md;
-+            if (dms_parse_operating_mode(msg, length, txn, &md)) return;
-+            s->mode = md.mode;
-+            s->mode_known = 1;
-+            snprintf(line, sizeof line, "operating mode %u, offline reason %#x", md.mode, md.offline_reason);
-+            event(s, CE_INFO, md.mode, &md, line);
-+            s->tries = 0;
-+        } else if (message == DMS_SET_OPERATING_MODE) {
-+            const int rc = qmi_response(msg, length, txn, message, &m);
-+            if (rc) {fail(s, message, "online refused"); return;}
-+            s->mode_known = 0;  /* read it back */
-+            s->tries = 0;
-+        }
-+    } else if (service == QMI_SVC_DPM && p && message == DPM_OPEN_PORT) {
-+        const int rc = qmi_response(msg, length, txn, message, &m);
-+        if (rc && rc != QMI_ERR_NO_EFFECT) {fail(s, message, "open port refused"); return;}
-+        set_state(s, CS_WDA);
-+    } else if (service == QMI_SVC_WDA && p && message == WDA_SET_DATA_FORMAT) {
-+        WdaFormat f;
-+        const int rc = wda_parse_data_format(msg, length, txn, message, &f);
-+        const uint32_t agg = s->cfg.qmap == QMAP_V5 ? WDA_AGG_QMAPV5 : WDA_AGG_QMAP;
-+        if (rc) {fail(s, message, "data format refused"); return;}
-+        /* a field the modem echoes must be what was asked: anything else would not parse on the IPA side */
-+        if ((f.link && f.link != WDA_LINK_RAW_IP) || (f.dl_agg && f.dl_agg != agg) || (f.ul_agg && f.ul_agg != agg)) {
-+            fail(s, message, "data format differs");
-+            return;
-+        }
-+        set_state(s, CS_ONLINE);
-+    }
++    if (s->state != CS_WAIT_READY || (r->qmap != QMAP_V1 && r->qmap != QMAP_V5) || !r->dl_max_datagrams || !r->dl_max_size) return;
++    s->ready = *r;
++    s->is_ready = 1;
 +    advance(s);
 +}
 +
@@ -756,11 +900,6 @@
 +        CellPending *p = &s->pending[i];
 +        if (p->busy && now_ms - p->sent >= REPLY_MS) {
 +            p->busy = 0;
-+            if (p->service == QMI_SVC_WDS && p->message == WDS_START_NETWORK) {
-+                CellCall *c = p->client ? &s->call[1] : &s->call[0];
-+                c->start_tries++;
-+                c->next_start = now_ms + START_RETRY_MS;
-+            }
 +            event(s, CE_ERROR, p->message, 0, "request timed out");
 +        }
 +    }
@@ -769,23 +908,27 @@
 +
 +void cell_session_stop(CellSession *s)
 +{
-+    if (s->state == CS_STOPPED || s->state == CS_STOPPING) return;
-+    set_state(s, CS_STOPPING);
-+    advance(s);
++    if (s->state == CS_WAIT_READY) {set_state(s, CS_STOPPED); return;}  /* nothing that changes modem state was sent */
++    begin_stop(s);
 +}
 +
-+int cell_session_stopped(const CellSession *s) {return s->state == CS_STOPPED;}
++int cell_session_idle(const CellSession *s)
++{
++    return s->state == CS_STOPPED || s->state == CS_FAILED || s->state == CS_WAIT_READY;
++}
 +#endif
 --- /dev/null
 +++ b/bsd/dev/data/CellSession.h
-@@ -0,0 +1,97 @@
+@@ -0,0 +1,110 @@
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 +/* The data session over QMI, as a polled state machine with no transport of its own:
-+ *   services present -> DMS/NAS/WDS reads for the log -> DPM Open Port (the IPA endpoints) -> WDA Set Data Format (raw IP in QMAP)
-+ *   -> DMS online (only when allowed) -> NAS registered and PS attached -> per IP family: WDS Bind Mux, Set IP Family, Start Network
-+ *   (retried while the packet domain attaches) -> Get Current Settings -> up.
-+ * A Packet Service Status "disconnected" takes the family down and starts it again. cell_session_stop() sends Stop Network for every
-+ * live handle. Requests carry transactions below 0x8000; the raw tool uses the rest.
++ *   services present -> read-only DMS/NAS/WDS queries for the log -> wait for the owner's readiness barrier (USIM ready, IPA
++ *   handshake complete, real QMAP format and receive limits) -> DPM Open Port (the IPA endpoints) -> WDA Set Data Format (raw IP in
++ *   QMAP), verified -> DMS online (only when allowed) -> NAS registered and PS attached -> per IP family: WDS Bind Mux, Set IP Family,
++ *   Start Network (retried while the packet domain attaches) -> Get Current Settings for that family -> up.
++ * A Packet Service Status "disconnected" takes the family down and starts it again. cell_session_stop() and every failure end in
++ * STOPPING, which sends Stop Network for every live handle, catches starts still in flight, and allows nothing else; it ends in STOPPED
++ * or FAILED within 5 s. Requests carry transactions below 0x8000; the raw tool uses the rest.
 + * Client 0 talks to DMS, NAS, WDA, DPM and the IPv4 WDS call; client 1 is a second WDS client for the IPv6 call (one WDS client holds
 + * one call). The owner maps each client to one QRTR port. */
 +#ifndef CELL_SESSION_H
@@ -800,7 +943,8 @@
 +#define CELL_TXN_RAW 0x8000u
 +
 +typedef enum {
-+    CS_WAIT_SERVICES, CS_DPM, CS_WDA, CS_ONLINE, CS_WAIT_ONLINE_ALLOWED, CS_REGISTER, CS_CALLS, CS_STOPPING, CS_STOPPED, CS_FAILED,
++    CS_WAIT_READY, CS_DPM, CS_WDA, CS_WDA_VERIFY, CS_ONLINE, CS_WAIT_ONLINE_ALLOWED, CS_REGISTER, CS_CALLS, CS_STOPPING, CS_STOPPED,
++    CS_FAILED,
 +} CellState;
 +
 +typedef enum {
@@ -829,9 +973,13 @@
 +    uint8_t mux;                 /* QMAP mux id both calls are bound to */
 +    uint32_t ep_interface;       /* embedded endpoint interface number (1, as ModemManager) */
 +    uint32_t ipa_rx, ipa_tx;     /* IPA endpoint the modem receives on (our TX) and sends on (our RX) */
++} CellConfig;
++
++/* What the readiness barrier supplies: the format the IPA endpoints use and what one receive buffer holds. */
++typedef struct {
 +    QmapVersion qmap;
 +    uint32_t dl_max_datagrams, dl_max_size;
-+} CellConfig;
++} CellReady;
 +
 +#define CELL_PENDING 12u
 +typedef struct {
@@ -841,35 +989,41 @@
 +} CellPending;
 +
 +typedef struct {
-+    uint8_t family, client, bound, family_set, up;
++    uint8_t family, client, bound, family_set, up, exhausted, drop;
++    uint8_t step_tries, settings_tries, start_pending;
 +    uint32_t handle, start_tries;
-+    uint64_t next_start;
++    uint64_t next_start, next_try;
 +    WdsSettings settings;
 +} CellCall;
 +
 +typedef struct {
 +    CellSessionOps ops;
 +    CellConfig cfg;
++    CellReady ready;
 +    CellState state;
 +    uint8_t services;            /* bit per service present: 0 DMS, 1 NAS, 2 WDS, 3 WDA, 4 DPM */
-+    uint8_t info_sent, mode_known, mode, registered, online_sent, tries;
++    uint8_t is_ready, info_sent, mode_known, mode, registered, online_sent, tries, failing;
 +    uint16_t next_txn;
-+    uint64_t now, next_poll, state_since;
++    uint64_t now, next_poll, state_since, backoff_until;
 +    CellPending pending[CELL_PENDING];
 +    CellCall call[2];            /* [0] IPv4 on client 0, [1] IPv6 on client 1 */
 +    NasServing serving;
 +} CellSession;
 +
 +void cell_session_init(CellSession *s, const CellConfig *cfg, const CellSessionOps *ops, uint64_t now_ms);
-+/* A service appeared (present 1) or went away over QRTR. */
++/* A service appeared (present 1) or went away over QRTR. A service going away fails the session through cleanup. */
 +void cell_session_service(CellSession *s, uint8_t service, int present);
++/* The readiness barrier: non-null when the USIM is ready and the IPA handshake completed; null when either is lost, which fails the
++ * session through cleanup. Nothing that changes modem state is sent before it. */
++void cell_session_ready(CellSession *s, const CellReady *ready);
 +/* One QMI message that arrived for client. */
 +void cell_session_receive(CellSession *s, unsigned client, uint8_t service, const uint8_t *msg, uint32_t length);
 +/* Timers: retries, polling, start backoff. Call every 100 ms or so. */
 +void cell_session_poll(CellSession *s, uint64_t now_ms);
-+/* Stop Network for every live call. Done when cell_session_stopped(). */
++/* Stop Network for every live call and every start in flight. Done when cell_session_idle(). */
 +void cell_session_stop(CellSession *s);
-+int cell_session_stopped(const CellSession *s);
++/* True when nothing is live and the session will send nothing more: STOPPED, FAILED, or not past the readiness barrier. */
++int cell_session_idle(const CellSession *s);
 +const char *cell_state_name(CellState state);
 +
 +#ifdef __cplusplus
@@ -878,7 +1032,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/data/Qmap.c
-@@ -0,0 +1,75 @@
+@@ -0,0 +1,77 @@
 +#if defined(ARM64_BOARD_CONFIG_SWEET) || !defined(KERNEL)
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 +#include "Qmap.h"
@@ -940,23 +1094,25 @@
 +    return room + length;
 +}
 +
-+/* struct rmnet_map_control_command: command name, then cmd_type in bits 1..0 (0 request, 1 ack). */
-+uint32_t qmap_command_ack(uint8_t mux, const uint8_t *command, uint32_t length, uint8_t *out, uint32_t capacity)
++uint32_t qmap_command_reply(uint8_t mux, const uint8_t *command, uint32_t length, uint8_t *out, uint32_t capacity, int *flow)
 +{
-+    if (length < 2 || length > MAX_PACKET || capacity < QMAP_HEADER || capacity - QMAP_HEADER < length) return 0;
-+    if ((command[1] & 3) != 0) return 0;
++    *flow = -1;
++    if (length < 8 || length > MAX_PACKET || capacity < QMAP_HEADER || capacity - QMAP_HEADER < length) return 0;
++    if ((command[1] & 3) != 0) return 0;  /* an ack or a reply of the modem's own */
++    const int known = command[0] == QMAP_CMD_FLOW_DISABLE || command[0] == QMAP_CMD_FLOW_ENABLE;
++    if (known) *flow = command[0] == QMAP_CMD_FLOW_ENABLE;
 +    out[0] = QMAP_FLAG_COMMAND;
 +    out[1] = mux;
 +    out[2] = (uint8_t)(length >> 8);
 +    out[3] = (uint8_t)length;
 +    for (uint32_t i = 0; i < length; ++i) out[QMAP_HEADER + i] = command[i];
-+    out[QMAP_HEADER + 1] = (uint8_t)((command[1] & ~3u) | 1u);
++    out[QMAP_HEADER + 1] = (uint8_t)((command[1] & ~3u) | (known ? 1u : 2u));
 +    return QMAP_HEADER + length;
 +}
 +#endif
 --- /dev/null
 +++ b/bsd/dev/data/Qmap.h
-@@ -0,0 +1,47 @@
+@@ -0,0 +1,50 @@
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 +/* QMAP (rmnet MAP) framing of the IPA's modem data endpoints. Each packet has a 4-byte header: flags (bit 7 command, bit 6 next header,
 + * bits 5..0 trailing pad length), mux id, and a big-endian length that counts the payload and its pad but not the headers. With
@@ -996,9 +1152,12 @@
 + * with no pad and no checksum offload request. Returns the framed length, or 0 when the packet is empty or too long. */
 +uint32_t qmap_frame(QmapVersion version, uint8_t mux, uint8_t *packet, uint32_t length);
 +
-+/* A received command that is a request becomes the acknowledgement to send back (the same bytes with the type set to ack, as Linux
-+ * rmnet_map_send_ack does); out must hold QMAP_HEADER + length bytes. Returns the ack's length, or 0 when no ack is owed. */
-+uint32_t qmap_command_ack(uint8_t mux, const uint8_t *command, uint32_t length, uint8_t *out, uint32_t capacity);
++/* A received command request (struct rmnet_map_control_command: name, type in bits 1..0, 2 reserved bytes, a 4-byte transaction) gets
++ * the reply Linux rmnet_map_command sends: the same bytes with the type set to ack for flow disable (1) and flow enable (2), and to
++ * unsupported for any other name. *flow is set to 0 for disable, 1 for enable, -1 otherwise. Returns the reply's length in out, 0 when
++ * the command is malformed or not a request (nothing is owed). */
++enum {QMAP_CMD_FLOW_DISABLE = 1, QMAP_CMD_FLOW_ENABLE = 2};
++uint32_t qmap_command_reply(uint8_t mux, const uint8_t *command, uint32_t length, uint8_t *out, uint32_t capacity, int *flow);
 +
 +#ifdef __cplusplus
 +}
@@ -1046,14 +1205,14 @@
 +void qmi_put_string(QmiOut *o, uint8_t type, const char *s, uint32_t max)
 +{
 +    uint32_t n = 0;
-+    while (s[n] && n <= max) ++n;
++    while (n <= max && s[n]) ++n;  /* reads at most max + 1 bytes of s */
 +    if (n > max) {o->bad = 1; return;}
 +    qmi_put_bytes(o, type, s, n);
 +}
 +
 +uint32_t qmi_end(QmiOut *o)
 +{
-+    if (o->bad) return 0;
++    if (o->bad || o->len - QCOM_QMI_HEADER > 0xffff) return 0;
 +    const uint32_t body = o->len - QCOM_QMI_HEADER;
 +    o->buf[5] = (uint8_t)body; o->buf[6] = (uint8_t)(body >> 8);
 +    return o->len;
@@ -1625,7 +1784,7 @@
 +void qmi_put_u16(QmiOut *o, uint8_t type, uint16_t v);
 +void qmi_put_u32(QmiOut *o, uint8_t type, uint32_t v);
 +void qmi_put_bytes(QmiOut *o, uint8_t type, const void *v, uint32_t n);
-+/* A TLV of a NUL-terminated string without its terminator; refused (o->bad) above max bytes. */
++/* A TLV of a string without its terminator; refused (o->bad) above max bytes. s must be terminated within max + 1 bytes. */
 +void qmi_put_string(QmiOut *o, uint8_t type, const char *s, uint32_t max);
 +/* Finishes the header. Returns the message length, or 0 when anything did not fit or was refused. */
 +uint32_t qmi_end(QmiOut *o);
@@ -1757,7 +1916,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/data/QmiRaw.c
-@@ -0,0 +1,79 @@
+@@ -0,0 +1,106 @@
 +#if defined(ARM64_BOARD_CONFIG_SWEET) || !defined(KERNEL)
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 +/* Message ids: libqmi data/qmi-service-*.json. */
@@ -1777,14 +1936,31 @@
 +    return 0;
 +}
 +
-+static const uint16_t dms_ok[] = {0x00, 0x1e, 0x20, 0x21, 0x22, 0x23, 0x26, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f, 0x31, 0x44, 0x45, 0x51};
-+static const uint16_t nas_ok[] = {0x00, 0x01, 0x03, 0x1e, 0x20, 0x21, 0x24, 0x25, 0x26, 0x2b, 0x31, 0x33, 0x34, 0x39, 0x43, 0x44,
-+                                  0x4d, 0x4f, 0x50, 0x5a, 0x6c, 0x7d, 0x89, 0xac, 0xe8};
-+static const uint16_t wds_ok[] = {0x00, 0x01, 0x02, 0x03, 0x1e, 0x20, 0x21, 0x22, 0x23, 0x24, 0x27, 0x28, 0x2a, 0x2b, 0x2c, 0x2d,
-+                                  0x30, 0x34, 0x37, 0x44, 0x49, 0x4d, 0x6c, 0x85, 0x86, 0x92, 0x94, 0xa2, 0xb0};
-+static const uint16_t wda_ok[] = {0x00, 0x1e, 0x20, 0x21};
-+static const uint16_t dpm_ok[] = {0x20, 0x21};
++/* Reads only, plus two settings whose whole request is checked below. Left out on purpose: every Reset (0x00), WDS profile
++ * create/modify/delete/settings (writes, or replies carrying credentials), Start/Stop Network (handles the kernel could not tear
++ * down), Bind, Set IP Family, event and indication registration, WDA Set Data Format and DPM (session state), NAS network scan and
++ * signal reporting setup, and DMS reads of identifiers (IDs, MSISDN, ICCID, IMSI). */
++static const uint16_t dms_ok[] = {0x1e, 0x20, 0x21, 0x22, 0x23, 0x26, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f, 0x31, 0x44, 0x45, 0x51};
++static const uint16_t nas_ok[] = {0x1e, 0x20, 0x24, 0x25, 0x26, 0x2b, 0x31, 0x33, 0x34, 0x39, 0x43, 0x44, 0x4d, 0x4f, 0x5a, 0x7d,
++                                  0x89, 0xac, 0xe8};
++static const uint16_t wds_ok[] = {0x1e, 0x22, 0x23, 0x24, 0x2a, 0x2d, 0x30, 0x34, 0x37, 0x44, 0x49, 0x6c, 0x85, 0x92, 0x94, 0xb0};
++static const uint16_t wda_ok[] = {0x1e, 0x21};
 +static const uint16_t uim_ok[] = {0x2f};  /* card status; slot status carries the ICCID */
++
++/* Every TLV of m has a type in allowed (n of them) and appears once. */
++static int only(const QcomQmiMessage *m, const uint8_t *allowed, unsigned n)
++{
++    uint8_t seen[256] = {0};
++    for (uint32_t at = 0; at + 3 <= m->length;) {
++        const uint8_t type = m->tlvs[at];
++        const uint32_t size = (uint32_t)m->tlvs[at + 1] | (uint32_t)m->tlvs[at + 2] << 8;
++        int ok = !allowed;
++        for (unsigned i = 0; allowed && i < n; ++i) ok |= allowed[i] == type;
++        if (!ok || seen[type]++) return 0;
++        at += 3 + size;
++    }
++    return 1;
++}
 +
 +int qmi_raw_allowed(uint8_t service, const uint8_t *msg, uint32_t length)
 +{
@@ -1796,56 +1972,67 @@
 +    if (length > sizeof copy) return EPERM;
 +    for (uint32_t i = 0; i < length; ++i) copy[i] = msg[i];
 +    copy[0] = QCOM_QMI_REQUEST;
-+    if (qcom_qmi_parse(copy, length, &m)) return EPERM;
++    if (qcom_qmi_parse(copy, length, &m) || !only(&m, 0, 0)) return EPERM;  /* no duplicate TLV anywhere */
 +    const uint16_t id = m.message;
 +#define IN(list) listed(id, list, sizeof list / sizeof list[0])
 +    switch (service) {
 +    case QMI_SVC_DMS:
 +        if (!IN(dms_ok)) return EPERM;
 +        if (id == DMS_SET_OPERATING_MODE) {
++            static const uint8_t t[] = {0x01};
 +            const uint8_t *v = qcom_qmi_tlv(&m, 0x01, &n);
-+            if (!v || n != 1 || (v[0] != DMS_MODE_ONLINE && v[0] != DMS_MODE_LOW_POWER)) return EPERM;
++            if (!only(&m, t, 1) || !v || n != 1 || (v[0] != DMS_MODE_ONLINE && v[0] != DMS_MODE_LOW_POWER)) return EPERM;
 +        }
 +        return 0;
 +    case QMI_SVC_NAS:
 +        if (!IN(nas_ok)) return EPERM;
 +        if (id == NAS_SET_SYSTEM_SELECTION) {
-+            const uint8_t *v = qcom_qmi_tlv(&m, 0x17, &n);  /* change duration must be "until power cycle" */
-+            if (!v || n != 1 || v[0] != 0) return EPERM;
++            static const uint8_t t[] = {0x11, 0x17};  /* mode preference and change duration only */
++            const uint8_t *d = qcom_qmi_tlv(&m, 0x17, &n);
++            if (!only(&m, t, 2) || !d || n != 1 || d[0] != 0) return EPERM;
++            const uint8_t *v = qcom_qmi_tlv(&m, 0x11, &n);
++            if (!v || n != 2 || !(v[0] | v[1]) || v[0] >> 7 || v[1]) return EPERM;
 +        }
 +        return 0;
 +    case QMI_SVC_WDS: return IN(wds_ok) ? 0 : EPERM;
 +    case QMI_SVC_WDA: return IN(wda_ok) ? 0 : EPERM;
-+    case QMI_SVC_DPM: return IN(dpm_ok) ? 0 : EPERM;
 +    case QMI_SVC_UIM: return IN(uim_ok) ? 0 : EPERM;
 +    default: return EPERM;
 +    }
 +#undef IN
 +}
 +
++int qmi_raw_indication_kept(uint8_t service, uint16_t message)
++{
++    return (service == QMI_SVC_NAS && (message == NAS_SERVING_SYSTEM || message == NAS_SIGNAL_INFO_IND ||
++                                       message == NAS_OPERATOR_NAME_IND)) ||
++           (service == QMI_SVC_WDS && message == WDS_PACKET_SERVICE_STATUS);
++}
++
 +int qmi_raw_parse(const uint8_t *buf, uint32_t length, QmiRawRequest *out)
 +{
 +    if (length < QMI_RAW_REQUEST_HEADER + QCOM_QMI_HEADER || length > QMI_RAW_REQUEST_HEADER + QMI_RAW_MAX) return EINVAL;
-+    if (buf[0] != QMI_RAW_VERSION || buf[2] > 1 || buf[3]) return EINVAL;
++    if (buf[0] != QMI_RAW_VERSION || buf[3]) return EINVAL;
 +    out->service = buf[1];
 +    out->client = buf[2];
 +    out->timeout_ms = (uint32_t)buf[4] | (uint32_t)buf[5] << 8 | (uint32_t)buf[6] << 16 | (uint32_t)buf[7] << 24;
 +    if (!out->timeout_ms || out->timeout_ms > QMI_RAW_TIMEOUT_MAX) return EINVAL;
 +    out->msg = buf + QMI_RAW_REQUEST_HEADER;
 +    out->length = length - QMI_RAW_REQUEST_HEADER;
-+    if (out->client == 1 && out->service != QMI_SVC_WDS) return EINVAL;
++    if (out->client != 0) return EINVAL;  /* client 1 belongs to the session's IPv6 call */
 +    return qmi_raw_allowed(out->service, out->msg, out->length);
 +}
 +#endif
 --- /dev/null
 +++ b/bsd/dev/data/QmiRaw.h
-@@ -0,0 +1,35 @@
+@@ -0,0 +1,38 @@
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 +/* The root-only raw QMI path (sysctl kern.sweet_qmi, boot arg sweetqmiraw=1): the wire format between the userland tool and the
-+ * kernel, and the allow list every request passes before it reaches the modem. The list admits reads, the session's own requests
-+ * and transient settings. It refuses anything that returns a full identifier (IMEI, MSISDN, ICCID, IMSI), touches PINs or SIM files,
-+ * resets or reflashes the modem, or persists beyond a modem restart outside the RAM-only EFS (NAS preferences without "until power
-+ * cycle", autoconnect, firmware and lock settings). Every service not listed is refused. */
++ * kernel, and the allow list every request passes before it reaches the modem. The list admits reads only, plus two settings whose
++ * whole request is checked: DMS Set Operating Mode to online or low power, and NAS mode preference "until power cycle". Duplicate TLVs
++ * are refused everywhere. It refuses anything that returns a full identifier (IMEI, MSISDN, ICCID, IMSI) or profile credentials,
++ * touches PINs or SIM files, resets a service, starts or stops a call, or persists past a modem restart. Every service not listed is
++ * refused. Requests use client 0 only. */
 +#ifndef QMI_RAW_H
 +#define QMI_RAW_H
 +#include <stdint.h>
@@ -1854,9 +2041,9 @@
 +#endif
 +
 +#define QMI_RAW_VERSION 1u
-+#define QMI_RAW_REQUEST_HEADER 8u   /* version, service, client, 0, timeout_ms (u32 LE), then a whole QMI message */
++#define QMI_RAW_REQUEST_HEADER 8u   /* version, service, client (0), 0, timeout_ms (u32 LE), then a whole QMI message */
 +#define QMI_RAW_REPLY_HEADER 8u     /* status (i32 LE: 0, or an errno), length (u32 LE), then the response */
-+#define QMI_RAW_MAX 1024u
++#define QMI_RAW_MAX 480u            /* QRTR carries at most 480 data bytes (plans/modem/README.md) */
 +#define QMI_RAW_TIMEOUT_MAX 10000u
 +
 +typedef struct {
@@ -1870,6 +2057,8 @@
 +int qmi_raw_parse(const uint8_t *buf, uint32_t length, QmiRawRequest *out);
 +/* 0 when the message may go to the modem, else EPERM. */
 +int qmi_raw_allowed(uint8_t service, const uint8_t *msg, uint32_t length);
++/* Whether an indication may be kept for kern.sweet_qmi_ind: serving system, signal, operator name, packet service status. */
++int qmi_raw_indication_kept(uint8_t service, uint16_t message);
 +
 +#ifdef __cplusplus
 +}
@@ -1877,22 +2066,22 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/data/sweet_data.c
-@@ -0,0 +1,659 @@
+@@ -0,0 +1,816 @@
 +/*
 + * SWEET DATA: mobile data above the modem runtime (bsd/dev/modem) and the IPA.
 + *
 + * Three parts, all off unless their boot arg is the exact token NAME=1:
-+ *   sweetdata=1     the QMI session (CellSession.c) on two QRTR client ports, and en2, an Ethernet ifnet that configd sets up by
-+ *                   DHCP. Its frames are answered or turned into IP packets by CellLink.c; the packets go through QMAP (Qmap.c)
-+ *                   to the IPA agent's transmit hook, and the IPA agent hands received buffers to sweet_data_ipa_rx().
++ *   sweetdata=1        the QMI session (CellSession.c) on two QRTR client ports, and en2, an Ethernet ifnet that configd sets up by
++ *                      DHCP. Its frames are answered or turned into IP packets by CellLink.c; the packets go through QMAP (Qmap.c)
++ *                      to the IPA driver's transmit hook, and the IPA driver hands received buffers to sweet_data_ipa_rx().
 + *   sweetdataonline=1  lets the session put the modem online (DMS Set Operating Mode 0). Without it the session waits.
-+ *   sweetqmiraw=1   sysctl kern.sweet_qmi for root: one call sends a QMI request through the allow list (QmiRaw.c) and returns
-+ *                   the response; kern.sweet_qmi_ind returns the last indications.
++ *   sweetqmiraw=1      sysctl kern.sweet_qmi for root: one call sends a QMI request through the allow list (QmiRaw.c) and returns
++ *                      the response; kern.sweet_qmi_ind returns the last kept indications.
 + * sweetapn=NAME gives the APN; without it Start Network uses the modem's default profile.
 + *
-+ * Threads: the modem runtime's worker calls sweet_data_attach(), sweet_data_poll() and the QRTR receive callbacks, so the session and
-+ * every QRTR send run on that one thread. The stack's output, the IPA's receive and the sysctl caller meet the worker only under
-+ * sd.lock: the CellLink state, the raw request slot and the indication ring. No packet byte is logged.
++ * Threads (sweet_data.h): the modem runtime's worker runs the session, every QRTR send and the QRTR receive callbacks. The stack's
++ * output, the IPA's receive and the sysctl callers meet it only under sd_lock: the CellLink state, the raw request slot and the
++ * indication ring. ifnet_input and the IPA transmit hook are always called without sd_lock. No packet byte is logged.
 + */
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +#include <sys/param.h>
@@ -1902,8 +2091,10 @@
 +#include <sys/kauth.h>
 +#include <sys/kpi_mbuf.h>
 +#include <sys/sockio.h>
++#include <sys/kern_event.h>
 +#include <kern/locks.h>
 +#include <kern/clock.h>
++#include <kern/kalloc.h>
 +#include <pexpert/pexpert.h>
 +#include <libkern/libkern.h>
 +#include <net/if.h>
@@ -1913,7 +2104,6 @@
 +#include <net/ethernet.h>
 +#include <net/ether_if_module.h>
 +#include <net/kpi_interface.h>
-+#include <sys/kern_event.h>
 +#include <net/bpf.h>
 +#include <net/dlil.h>
 +#include "../modem/QcomQrtr.h"
@@ -1927,35 +2117,42 @@
 +
 +#define PORT_CLIENT0 0x4010u
 +#define PORT_CLIENT1 0x4011u
-+#define RAW_BUF (QMI_RAW_REPLY_HEADER + QMI_RAW_MAX)
 +#define IND_RING 8u
 +#define IND_MAX 256u
++#define RA_REFRESH_MS 600000u
++#define SD_MUX 1u          /* the QMAP mux both calls are bound to */
++
++static LCK_GRP_DECLARE(sd_grp, "sweet_data");
++static LCK_MTX_DECLARE(sd_lock, &sd_grp);
 +
 +static const uint8_t sd_mac[6] = {0x02, 0x53, 0x57, 0x44, 0x41, 0x01};     /* locally administered "SWDA" 1 */
 +static const uint8_t sd_router_mac[6] = {0x02, 0x53, 0x57, 0x44, 0x41, 0xfe};
 +static const uint8_t sd_services[] = {QMI_SVC_DMS, QMI_SVC_NAS, QMI_SVC_WDS, QMI_SVC_WDA, QMI_SVC_DPM, QMI_SVC_UIM};
 +
++enum {RAW_FREE, RAW_COPYING, RAW_QUEUED, RAW_SENT, RAW_DONE};
++
 +static struct {
-+	int session_on, raw_on, attached;
-+	lck_grp_t *grp;
-+	lck_mtx_t *lock;
-+	QcomQrtr *qr;
-+	CellSession session;
++	int session_on, raw_on, attached, closed;
++	QcomQrtr *qr;                   /* worker thread only */
++	CellSession session;            /* worker thread only */
 +	char apn[101];
-+	/* where each service is, as the remote announced it */
 +	struct {uint32_t node, port; int present;} svc[sizeof sd_services];
-+	/* the presentation */
++	int usim, ready_given;          /* worker thread only */
++	uint64_t next_ra;
++	/* the presentation, under sd_lock */
 +	CellLink link;
 +	ifnet_t ifp;
-+	int link_up;
-+	/* the IPA agent's side */
++	int link_up;                    /* atomic */
++	/* the IPA driver's side: written once by set_ipa before attach, read-only afterwards */
 +	int (*ipa_tx)(void *, const uint8_t *, uint32_t);
 +	void *ipa_ctx;
 +	QmapVersion qmap;
-+	QmapCounters qmap_count;
-+	/* one raw request at a time */
++	uint32_t ipa_rx_bytes, ipa_datagrams;
++	int ipa_ready, tx_paused;       /* atomic */
++	QmapCounters qmap_count;        /* the IPA receive thread only */
++	/* one raw request at a time, under sd_lock */
 +	struct {
-+		int state;              /* 0 free, 1 queued, 2 sent, 3 answered, 4 abandoned */
++		int state, err;
 +		uint8_t service, client;
 +		uint16_t txn, next_txn, message;
 +		uint8_t msg[QMI_RAW_MAX];
@@ -1966,20 +2163,21 @@
 +	uint32_t ind_seq;
 +} sd;
 +
-+static void
-+sd_lock_init(void)
-+{
-+	/* ponytail: unsynchronised first call; attach and set_ipa both run during single-threaded bring-up */
-+	if (sd.lock == NULL) {
-+		sd.grp = lck_grp_alloc_init("sweet_data", LCK_GRP_ATTR_NULL);
-+		sd.lock = lck_mtx_alloc_init(sd.grp, LCK_ATTR_NULL);
-+	}
-+}
++#define LOAD(x) __atomic_load_n(&(x), __ATOMIC_ACQUIRE)
++#define STORE(x, v) __atomic_store_n(&(x), (v), __ATOMIC_RELEASE)
 +
 +static int
 +sd_gate(const char *name)
 +{
 +	return modem_gate(PE_boot_args(), name) != 0;
++}
++
++static uint64_t
++sd_now_ms(void)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / NSEC_PER_MSEC;
 +}
 +
 +static int
@@ -1993,29 +2191,31 @@
 +	return -1;
 +}
 +
++/* Worker thread. */
 +static int
 +sd_send(void *ctx, unsigned client, uint8_t service, const uint8_t *msg, uint32_t length)
 +{
 +	(void)ctx;
 +	const int i = sd_index(service);
-+	if (i < 0 || !sd.svc[i].present || sd.qr == NULL || client > 1) {
++	if (i < 0 || !sd.svc[i].present || sd.qr == NULL || client > 1 || (client == 1 && !sd.session_on)) {
 +		return -1;
 +	}
 +	return qcom_qrtr_send_data(sd.qr, client ? PORT_CLIENT1 : PORT_CLIENT0, sd.svc[i].node, sd.svc[i].port, msg, length);
 +}
 +
 +/* ---- the ifnet ---- */
++/* Hands one frame to the stack. Never called with sd_lock held. */
 +static void
 +sd_input(const uint8_t *header, const uint8_t *packet, uint32_t length)
 +{
 +	mbuf_t m = NULL;
-+	const uint32_t total = CELL_ETHER + length;
 +
-+	if (sd.ifp == NULL || total > MCLBYTES) {
++	if (sd.ifp == NULL || length > MCLBYTES - CELL_ETHER) {
 +		return;
 +	}
++	const uint32_t frame_len = CELL_ETHER + length;
 +	if (mbuf_gethdr(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) != 0 || mbuf_mclget(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) != 0 ||
-+	    !(mbuf_flags(m) & MBUF_EXT) || mbuf_maxlen(m) < total) {
++	    !(mbuf_flags(m) & MBUF_EXT) || mbuf_maxlen(m) < frame_len) {
 +		if (m != NULL) {
 +			mbuf_freem(m);
 +		}
@@ -2025,45 +2225,43 @@
 +	uint8_t *d = mbuf_data(m);
 +	memcpy(d, header, CELL_ETHER);
 +	memcpy(d + CELL_ETHER, packet, length);
-+	mbuf_setlen(m, total);
-+	mbuf_pkthdr_setlen(m, total);
++	mbuf_setlen(m, frame_len);
++	mbuf_pkthdr_setlen(m, frame_len);
 +	mbuf_pkthdr_setrcvif(m, sd.ifp);
 +	mbuf_pkthdr_setheader(m, d);
 +	mbuf_pkthdr_adjustlen(m, -(int)CELL_ETHER);
 +	(void)mbuf_setdata(m, d + CELL_ETHER, length);
 +	struct ifnet_stat_increment_param st = {};
 +	st.packets_in = 1;
-+	st.bytes_in = total;
++	st.bytes_in = frame_len;
 +	ifnet_input(sd.ifp, m, &st);
 +}
 +
 +static errno_t
 +sd_output(ifnet_t ifp, mbuf_t m)
 +{
-+	/* room for the QMAP headers in front of the IP packet: the frame's Ethernet header is 14 bytes, QMAPv5 needs 8 */
-+	static uint8_t frame[CELL_FRAME_MAX];
-+	uint8_t reply[CELL_REPLY_MAX];
-+	uint32_t reply_len = 0;
++	/* per call: the frame, with the Ethernet header's 14 bytes as room for the QMAP headers (4 or 8) */
++	uint8_t frame[CELL_FRAME_MAX], reply[CELL_REPLY_MAX];
++	uint32_t n = 0;
++	CellAction a = CELL_DROP;
 +	const size_t len = mbuf_pkthdr_len(m);
-+	int ok = 0, answer = 0;
++	int ok = 0;
 +
-+	lck_mtx_lock(sd.lock);
 +	if (len >= CELL_ETHER && len <= sizeof frame && mbuf_copydata(m, 0, len, frame) == 0) {
-+		const CellAction a = cell_link_output(&sd.link, frame, (uint32_t)len, reply, &reply_len);
-+		if (a == CELL_REPLY) {
-+			answer = ok = 1;
-+		} else if (a == CELL_TO_MODEM && sd.ipa_tx != NULL) {
-+			uint8_t *ip = frame + CELL_ETHER;
-+			const uint32_t n = qmap_frame(sd.qmap, sd.session.cfg.mux, ip, (uint32_t)len - CELL_ETHER);
-+			ok = n && sd.ipa_tx(sd.ipa_ctx, ip - qmap_headroom(sd.qmap), n) == 0;
-+		}
++		lck_mtx_lock(&sd_lock);
++		a = cell_link_output(&sd.link, frame, (uint32_t)len, reply, &n);
++		lck_mtx_unlock(&sd_lock);
 +	}
-+	lck_mtx_unlock(sd.lock);
-+	if (answer) {
-+		sd_input(reply, reply + CELL_ETHER, reply_len - CELL_ETHER);  /* outside the lock: input may come back to output */
++	mbuf_freem(m);
++	if (a == CELL_REPLY) {
++		sd_input(reply, reply + CELL_ETHER, n - CELL_ETHER);
++		ok = 1;
++	} else if (a == CELL_TO_MODEM && sd.ipa_tx != NULL && !LOAD(sd.tx_paused) && LOAD(sd.ipa_ready)) {
++		uint8_t *ip = frame + CELL_ETHER;
++		const uint32_t framed = qmap_frame(sd.qmap, SD_MUX, ip, n);
++		ok = framed && sd.ipa_tx(sd.ipa_ctx, ip - qmap_headroom(sd.qmap), framed) == 0;
 +	}
 +	ifnet_stat_increment_out(ifp, ok, ok ? (uint32_t)len : 0, !ok);
-+	mbuf_freem(m);
 +	return 0;
 +}
 +
@@ -2076,13 +2274,17 @@
 +		struct ifmediareq *ifmr = (struct ifmediareq *)data;
 +		user_addr_t list = (cmd == SIOCGIFMEDIA64) ? ((struct ifmediareq64 *)ifmr)->ifmu_ulist :
 +		    CAST_USER_ADDR_T(((struct ifmediareq32 *)ifmr)->ifmu_ulist);
++		const int asked = ifmr->ifm_count, up = LOAD(sd.link_up);
 +		int word = IFM_ETHER | IFM_AUTO;
++		if (asked < 0) {
++			return EINVAL;
++		}
 +		ifmr->ifm_current = word;
-+		ifmr->ifm_active = sd.link_up ? (IFM_ETHER | IFM_1000_T | IFM_FDX) : word;
++		ifmr->ifm_active = up ? (IFM_ETHER | IFM_1000_T | IFM_FDX) : word;
 +		ifmr->ifm_mask = 0;
-+		ifmr->ifm_status = IFM_AVALID | (sd.link_up ? IFM_ACTIVE : 0);
++		ifmr->ifm_status = IFM_AVALID | (up ? IFM_ACTIVE : 0);
 +		ifmr->ifm_count = 1;
-+		return list != USER_ADDR_NULL ? copyout(&word, list, sizeof(word)) : 0;
++		return asked > 0 && list != USER_ADDR_NULL ? copyout(&word, list, sizeof(word)) : 0;
 +	}
 +	case SIOCSIFADDR:
 +	case SIOCAIFADDR:
@@ -2098,7 +2300,7 @@
 +}
 +
 +static void
-+sd_detach(ifnet_t ifp __unused)
++sd_detach_ifnet(ifnet_t ifp __unused)
 +{
 +}
 +
@@ -2124,7 +2326,7 @@
 +	init.check_multi = ether_check_multi;
 +	init.framer_extended = ether_frameout_extended;
 +	init.ioctl = sd_ioctl;
-+	init.detach = sd_detach;
++	init.detach = sd_detach_ifnet;
 +	init.broadcast_addr = etherbroadcastaddr;
 +	init.broadcast_len = ETHER_ADDR_LEN;
 +	if (ifnet_allocate_extended(&init, &sd.ifp) != 0) {
@@ -2150,30 +2352,46 @@
 +	printf("SWEET DATA: en2 attached, link down until a call is up\n");
 +}
 +
-+/* Link state for configd: KEV_DL_LINK_ON/OFF, read with SIOCGIFMEDIA. Worker thread, sd.lock not held. */
++/* Link state for configd: KEV_DL_LINK_ON/OFF, read with SIOCGIFMEDIA. Worker thread, sd_lock not held. */
 +static void
 +sd_link(int up)
 +{
-+	if (sd.ifp == NULL || sd.link_up == up) {
++	if (sd.ifp == NULL || LOAD(sd.link_up) == up) {
 +		return;
 +	}
-+	sd.link_up = up;
-+	ifnet_set_mtu(sd.ifp, sd.link.mtu ? sd.link.mtu : ETHERMTU);
++	STORE(sd.link_up, up);
 +	dlil_post_msg(sd.ifp, KEV_DL_SUBCLASS, up ? KEV_DL_LINK_ON : KEV_DL_LINK_OFF, NULL, 0, FALSE);
 +	printf("SWEET DATA: en2 link %s\n", up ? "up" : "down");
 +}
 +
-+/* ---- session events ---- */
++/* An unsolicited router advertisement when IPv6 comes up and every 10 minutes after. Worker thread. */
++static void
++sd_advertise(void)
++{
++	uint8_t ra[CELL_REPLY_MAX];
++	lck_mtx_lock(&sd_lock);
++	const uint32_t n = cell_link_router_advert(&sd.link, ra, sizeof ra);
++	lck_mtx_unlock(&sd_lock);
++	if (n) {
++		sd_input(ra, ra + CELL_ETHER, n - CELL_ETHER);
++		sd.next_ra = sd_now_ms() + RA_REFRESH_MS;
++	}
++}
++
++/* ---- session events (worker thread) ---- */
 +static void
 +sd_event(void *ctx, CellEvent e, uint32_t arg, const void *data, const char *text)
 +{
 +	(void)ctx;
 +	switch (e) {
 +	case CE_STATE:
++		printf("SWEET DATA: state %s\n", text);
++		break;
 +	case CE_INFO:
++		printf("SWEET DATA: %s\n", text);
++		break;
 +	case CE_ERROR:
-+		printf("SWEET DATA: %s%s%s\n", e == CE_ERROR ? "error: " : e == CE_STATE ? "state " : "", text ? text : "",
-+		    e == CE_ERROR ? "" : "");
++		printf("SWEET DATA: error (message %#x): %s\n", arg, text);
 +		break;
 +	case CE_SERVING: {
 +		const NasServing *s = data;
@@ -2193,48 +2411,55 @@
 +	}
 +	case CE_UP: {
 +		const WdsSettings *w = data;
-+		lck_mtx_lock(sd.lock);
++		int ok = 1;
++		lck_mtx_lock(&sd_lock);
 +		if (arg == WDS_FAMILY_IPV4) {
 +			cell_link_set_v4(&sd.link, w->v4_addr, w->v4_dns1, w->v4_dns2, w->mtu);
 +		} else {
-+			cell_link_set_v6(&sd.link, w->v6_addr, w->v6_prefix, w->has_v6_dns1 ? w->v6_dns1 : NULL,
-+			    w->has_v6_dns2 ? w->v6_dns2 : NULL, w->mtu);
++			ok = cell_link_set_v6(&sd.link, w->v6_addr, w->v6_prefix, w->has_v6_dns1 ? w->v6_dns1 : NULL,
++			    w->has_v6_dns2 ? w->v6_dns2 : NULL, w->mtu) == 0;
 +		}
-+		lck_mtx_unlock(sd.lock);
++		const uint32_t mtu = sd.link.mtu;
++		lck_mtx_unlock(&sd_lock);
 +		/* addresses are the user's, not identifiers, but only the family and MTU go to the log */
-+		printf("SWEET DATA: IPv%u call up, MTU %u%s\n", arg, w->mtu, sd.ipa_tx ? "" : " (no IPA transmit hook yet)");
++		printf("SWEET DATA: IPv%u call up, MTU %u%s\n", arg, mtu, ok ? "" : ", but the prefix is not presentable");
++		if (!ok) {
++			break;
++		}
++		if (sd.ifp != NULL) {
++			ifnet_set_mtu(sd.ifp, mtu);
++		}
 +		sd_link(1);
++		if (arg == WDS_FAMILY_IPV6) {
++			sd_advertise();
++		}
 +		break;
 +	}
-+	case CE_DOWN:
-+		lck_mtx_lock(sd.lock);
++	case CE_DOWN: {
++		lck_mtx_lock(&sd_lock);
 +		if (arg == WDS_FAMILY_IPV4) {
 +			cell_link_set_v4(&sd.link, 0, 0, 0, 0);
 +		} else {
 +			cell_link_set_v6(&sd.link, NULL, 0, NULL, NULL, 0);
 +		}
 +		const int any = sd.link.v4_up || sd.link.v6_up;
-+		lck_mtx_unlock(sd.lock);
++		lck_mtx_unlock(&sd_lock);
 +		printf("SWEET DATA: IPv%u call down\n", arg);
 +		if (!any) {
 +			sd_link(0);
 +		}
 +		break;
 +	}
++	}
 +}
 +
 +/* ---- QRTR receive (worker thread) ---- */
 +static void
-+sd_keep_indication(unsigned client, uint8_t service, const uint8_t *data, uint32_t length)
++sd_raw_finish(int err)
 +{
-+	lck_mtx_lock(sd.lock);
-+	const uint32_t slot = sd.ind_seq % IND_RING;
-+	sd.ind[slot].seq = ++sd.ind_seq;
-+	sd.ind[slot].service = service;
-+	sd.ind[slot].client = (uint8_t)client;
-+	sd.ind[slot].len = length < IND_MAX ? length : IND_MAX;
-+	memcpy(sd.ind[slot].data, data, sd.ind[slot].len);
-+	lck_mtx_unlock(sd.lock);
++	sd.raw.err = err;
++	sd.raw.state = RAW_DONE;
++	wakeup(&sd.raw);
 +}
 +
 +static void
@@ -2248,73 +2473,153 @@
 +			service = sd_services[i];
 +		}
 +	}
-+	if (service < 0 || length < QCOM_QMI_HEADER) {
++	if (!sd.attached || service < 0 || length < QCOM_QMI_HEADER) {
 +		return;
 +	}
-+	const uint16_t txn = (uint16_t)(data[1] | data[2] << 8);
++	const uint16_t txn = (uint16_t)(data[1] | data[2] << 8), message = (uint16_t)(data[3] | data[4] << 8);
 +	if (data[0] == QCOM_QMI_RESPONSE && txn >= CELL_TXN_RAW) {
-+		lck_mtx_lock(sd.lock);
-+		if (sd.raw.state == 2 && sd.raw.txn == txn && sd.raw.service == service && sd.raw.client == client &&
-+		    (uint16_t)(data[3] | data[4] << 8) == sd.raw.message && length <= sizeof sd.raw.reply) {
-+			memcpy(sd.raw.reply, data, length);
-+			sd.raw.reply_len = length;
-+			sd.raw.state = 3;
-+			wakeup(&sd.raw);
-+		} else if (sd.raw.state == 4 && sd.raw.txn == txn) {
-+			sd.raw.state = 0;
++		/* only the request in flight is answered; replies to retired transactions are dropped */
++		lck_mtx_lock(&sd_lock);
++		if (sd.raw.state == RAW_SENT && sd.raw.txn == txn && sd.raw.service == service && sd.raw.client == client &&
++		    sd.raw.message == message) {
++			if (length > sizeof sd.raw.reply) {
++				sd_raw_finish(EMSGSIZE);
++			} else {
++				memcpy(sd.raw.reply, data, length);
++				sd.raw.reply_len = length;
++				sd_raw_finish(0);
++			}
 +		}
-+		lck_mtx_unlock(sd.lock);
++		lck_mtx_unlock(&sd_lock);
 +		return;
 +	}
-+	if (data[0] == QCOM_QMI_INDICATION && sd.raw_on) {
-+		sd_keep_indication(client, (uint8_t)service, data, length);
++	if (data[0] == QCOM_QMI_INDICATION && sd.raw_on && qmi_raw_indication_kept((uint8_t)service, message)) {
++		lck_mtx_lock(&sd_lock);
++		const uint32_t slot = sd.ind_seq % IND_RING;
++		sd.ind[slot].seq = ++sd.ind_seq;
++		sd.ind[slot].service = (uint8_t)service;
++		sd.ind[slot].client = (uint8_t)client;
++		sd.ind[slot].len = length < IND_MAX ? length : IND_MAX;
++		memcpy(sd.ind[slot].data, data, sd.ind[slot].len);
++		lck_mtx_unlock(&sd_lock);
 +	}
 +	if (sd.session_on) {
 +		cell_session_receive(&sd.session, client, (uint8_t)service, data, length);
 +	}
 +}
 +
-+/* ---- the modem runtime's hooks ---- */
++/* ---- the modem runtime's hooks (worker thread) ---- */
 +int
 +sweet_data_attach(QcomQrtr *qr)
 +{
++	if (sd.attached) {
++		return EBUSY;
++	}
 +	sd.session_on = sd_gate("sweetdata");
 +	sd.raw_on = sd_gate("sweetqmiraw");
 +	if (!sd.session_on && !sd.raw_on) {
 +		return 0;
 +	}
-+	sd_lock_init();
-+	sd.qr = qr;
-+	/* ponytail: announced as service 0 like the UIM client, until QcomQrtr has a client port that is not announced */
++	/* service 0: QcomQrtr announces nothing for these client ports */
 +	if (qcom_qrtr_add_service(qr, 0, 0, PORT_CLIENT0, sd_receive, NULL) ||
 +	    (sd.session_on && qcom_qrtr_add_service(qr, 0, 0, PORT_CLIENT1, sd_receive, NULL))) {
 +		printf("SWEET DATA: refused: no free QRTR port (QCOM_QRTR_MAX_LOCAL)\n");
 +		sd.session_on = sd.raw_on = 0;
 +		return EIO;
 +	}
++	lck_mtx_lock(&sd_lock);
++	sd.qr = qr;
++	sd.closed = 0;
++	sd.raw.state = RAW_FREE;
 +	sd.raw.next_txn = CELL_TXN_RAW;
 +	cell_link_init(&sd.link, sd_mac, sd_router_mac);
++	lck_mtx_unlock(&sd_lock);
 +	if (sd.session_on) {
-+		uint64_t ns;
-+		absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
 +		if (!PE_parse_boot_arg_str("sweetapn", sd.apn, sizeof sd.apn)) {
 +			sd.apn[0] = 0;
 +		}
 +		const CellConfig cfg = {
 +			.allow_online = (uint8_t)sd_gate("sweetdataonline"), .want_v4 = 1, .want_v6 = 1, .apn = sd.apn[0] ? sd.apn : NULL,
-+			.mux = 1, .ep_interface = 1, .ipa_rx = 2, .ipa_tx = 18, .qmap = sd.qmap ? sd.qmap : QMAP_V1,
-+			.dl_max_datagrams = 32, .dl_max_size = 16384,
++			.mux = SD_MUX, .ep_interface = 1, .ipa_rx = 2, .ipa_tx = 18,
 +		};
 +		const CellSessionOps ops = {sd_send, sd_event, NULL};
-+		cell_session_init(&sd.session, &cfg, &ops, ns / NSEC_PER_MSEC);
++		cell_session_init(&sd.session, &cfg, &ops, sd_now_ms());
 +		if (!sd.ifp) {
 +			sd_ifnet_create();
 +		}
 +	}
 +	sd.attached = 1;
-+	printf("SWEET DATA: attached (session %d, online allowed %d, raw %d, APN %s)\n", sd.session_on,
-+	    sd.session_on && sd.session.cfg.allow_online, sd.raw_on, sd.apn[0] ? "given" : "default profile");
++	printf("SWEET DATA: attached (session %d, online allowed %d, raw %d, APN %s, IPA hook %s)\n", sd.session_on,
++	    sd.session_on && sd.session.cfg.allow_online, sd.raw_on, sd.apn[0] ? "given" : "default profile",
++	    sd.ipa_tx ? "set" : "absent");
 +	return 0;
++}
++
++static void
++sd_service_changes(QcomQrtr *qr)
++{
++	for (unsigned i = 0; i < sizeof sd_services; ++i) {
++		const int r = qcom_qrtr_find_remote(qr, sd_services[i]);
++		const int moved = r >= 0 && sd.svc[i].present && (sd.svc[i].node != qr->remote[r].node || sd.svc[i].port != qr->remote[r].port);
++		if (sd.svc[i].present && (r < 0 || moved)) {
++			sd.svc[i].present = 0;
++			lck_mtx_lock(&sd_lock);
++			if (sd.raw.state == RAW_SENT && sd.raw.service == sd_services[i]) {
++				sd_raw_finish(ENOENT);
++			}
++			lck_mtx_unlock(&sd_lock);
++			if (sd.session_on) {
++				cell_session_service(&sd.session, sd_services[i], 0);
++			}
++		}
++		if (r >= 0 && !sd.svc[i].present) {
++			sd.svc[i].node = qr->remote[r].node;
++			sd.svc[i].port = qr->remote[r].port;
++			sd.svc[i].present = 1;
++			if (sd.session_on) {
++				cell_session_service(&sd.session, sd_services[i], 1);
++			}
++		}
++	}
++}
++
++/* The readiness barrier: USIM ready (modem runtime), IPA handshake done and the transmit hook set (IPA driver). */
++static void
++sd_readiness(void)
++{
++	const int ready = sd.usim && LOAD(sd.ipa_ready) && sd.ipa_tx != NULL;
++	if (ready && !sd.ready_given) {
++		const CellReady r = {sd.qmap, sd.ipa_datagrams, sd.ipa_rx_bytes};
++		cell_session_ready(&sd.session, &r);
++		sd.ready_given = 1;
++	} else if (!ready && sd.ready_given) {
++		cell_session_ready(&sd.session, NULL);
++		sd.ready_given = 0;
++	}
++}
++
++static void
++sd_raw_poll(void)
++{
++	lck_mtx_lock(&sd_lock);
++	if (sd.raw.state != RAW_QUEUED) {
++		lck_mtx_unlock(&sd_lock);
++		return;
++	}
++	uint8_t msg[QMI_RAW_MAX];
++	const uint32_t len = sd.raw.len;
++	const uint8_t service = sd.raw.service, client = sd.raw.client;
++	const uint16_t txn = sd.raw.txn;
++	memcpy(msg, sd.raw.msg, len);
++	sd.raw.state = RAW_SENT;
++	lck_mtx_unlock(&sd_lock);
++	if (sd_send(NULL, client, service, msg, len)) {
++		lck_mtx_lock(&sd_lock);
++		if (sd.raw.state == RAW_SENT && sd.raw.txn == txn) {
++			sd_raw_finish(ENOENT);  /* not sent: the service is not there or the link refused */
++		}
++		lck_mtx_unlock(&sd_lock);
++	}
 +}
 +
 +void
@@ -2323,53 +2628,41 @@
 +	if (!sd.attached || qr != sd.qr) {
 +		return;
 +	}
-+	/* services appearing and going away */
-+	for (unsigned i = 0; i < sizeof sd_services; ++i) {
-+		const int r = qcom_qrtr_find_remote(qr, sd_services[i]);
-+		const int present = r >= 0;
-+		if (present && (!sd.svc[i].present || sd.svc[i].node != qr->remote[r].node || sd.svc[i].port != qr->remote[r].port)) {
-+			sd.svc[i].node = qr->remote[r].node;
-+			sd.svc[i].port = qr->remote[r].port;
-+			sd.svc[i].present = 1;
-+			if (sd.session_on) {
-+				cell_session_service(&sd.session, sd_services[i], 1);
-+			}
-+		} else if (!present && sd.svc[i].present) {
-+			sd.svc[i].present = 0;
-+			if (sd.session_on) {
-+				cell_session_service(&sd.session, sd_services[i], 0);
-+			}
-+		}
-+	}
-+	/* the queued raw request */
-+	lck_mtx_lock(sd.lock);
-+	if (sd.raw.state == 1) {
-+		uint8_t msg[QMI_RAW_MAX];
-+		const uint32_t len = sd.raw.len;
-+		const uint8_t service = sd.raw.service, client = sd.raw.client;
-+		memcpy(msg, sd.raw.msg, len);
-+		sd.raw.state = 2;
-+		lck_mtx_unlock(sd.lock);
-+		if (sd_send(NULL, client, service, msg, len)) {
-+			lck_mtx_lock(sd.lock);
-+			if (sd.raw.state == 2) {
-+				sd.raw.state = 3;
-+				sd.raw.reply_len = 0;   /* not sent: the waiter reports ENOENT */
-+				wakeup(&sd.raw);
-+			}
-+			lck_mtx_unlock(sd.lock);
-+		}
-+	} else {
-+		lck_mtx_unlock(sd.lock);
-+	}
++	sd_service_changes(qr);
++	sd_raw_poll();
 +	if (sd.session_on) {
++		sd_readiness();
 +		cell_session_poll(&sd.session, now_ms);
++		if (LOAD(sd.link_up) && now_ms >= sd.next_ra) {
++			sd_advertise();
++		}
 +	}
++}
++
++void
++sweet_data_usim(int ready)
++{
++	sd.usim = ready != 0;
++}
++
++static void
++sd_raw_close(void)
++{
++	lck_mtx_lock(&sd_lock);
++	sd.closed = 1;
++	if (sd.raw.state == RAW_QUEUED || sd.raw.state == RAW_SENT) {
++		sd_raw_finish(ESHUTDOWN);
++	}
++	lck_mtx_unlock(&sd_lock);
 +}
 +
 +void
 +sweet_data_stop(void)
 +{
++	if (!sd.attached) {
++		return;
++	}
++	sd_raw_close();
 +	if (sd.session_on) {
 +		cell_session_stop(&sd.session);
 +	}
@@ -2378,37 +2671,77 @@
 +int
 +sweet_data_idle(void)
 +{
-+	return !sd.session_on || cell_session_stopped(&sd.session) || sd.session.state == CS_FAILED;
++	return !sd.attached || !sd.session_on || cell_session_idle(&sd.session);
 +}
 +
-+/* ---- the IPA agent's hooks ---- */
 +void
-+sweet_data_set_ipa(int (*tx)(void *, const uint8_t *, uint32_t), void *ctx, int qmap_version)
++sweet_data_detach(void)
 +{
-+	sd_lock_init();
-+	lck_mtx_lock(sd.lock);
-+	sd.ipa_tx = tx;
++	if (!sd.attached) {
++		return;
++	}
++	sd_raw_close();
++	sd_link(0);
++	lck_mtx_lock(&sd_lock);
++	cell_link_set_v4(&sd.link, 0, 0, 0, 0);
++	cell_link_set_v6(&sd.link, NULL, 0, NULL, NULL, 0);
++	sd.attached = 0;
++	sd.qr = NULL;
++	lck_mtx_unlock(&sd_lock);
++	for (unsigned i = 0; i < sizeof sd_services; ++i) {
++		sd.svc[i].present = 0;
++	}
++	sd.ready_given = 0;
++	printf("SWEET DATA: detached\n");
++}
++
++/* ---- the IPA driver's hooks ---- */
++int
++sweet_data_set_ipa(int (*tx)(void *, const uint8_t *, uint32_t), void *ctx, int qmap_version, uint32_t rx_buffer_bytes,
++    uint32_t max_datagrams)
++{
++	if (!sd_gate("sweetdata") || sd.attached || sd.ipa_tx != NULL || tx == NULL || (qmap_version != 1 && qmap_version != 5) ||
++	    !rx_buffer_bytes || !max_datagrams) {
++		return -1;
++	}
 +	sd.ipa_ctx = ctx;
 +	sd.qmap = qmap_version == 5 ? QMAP_V5 : QMAP_V1;
-+	lck_mtx_unlock(sd.lock);
++	sd.ipa_rx_bytes = rx_buffer_bytes;
++	sd.ipa_datagrams = max_datagrams;
++	__atomic_store_n(&sd.ipa_tx, tx, __ATOMIC_RELEASE);
++	return 0;
 +}
 +
++void
++sweet_data_ipa_ready(int ready)
++{
++	STORE(sd.ipa_ready, ready != 0);
++}
++
++/* The IPA receive thread: no sd_lock while packets go to the stack or replies to the IPA. */
 +static void
 +sd_deliver(void *ctx, uint8_t mux, int command, const uint8_t *data, uint32_t length)
 +{
 +	(void)ctx;
++	if (mux != SD_MUX) {
++		return;
++	}
 +	if (command) {
-+		uint8_t ack[64];
-+		const uint32_t n = length <= sizeof ack - QMAP_HEADER ? qmap_command_ack(mux, data, length, ack, sizeof ack) : 0;
-+		if (n && sd.ipa_tx) {
-+			(void)sd.ipa_tx(sd.ipa_ctx, ack, n);
++		uint8_t reply[64];
++		int flow;
++		const uint32_t n = qmap_command_reply(mux, data, length, reply, sizeof reply, &flow);
++		if (flow >= 0) {
++			STORE(sd.tx_paused, !flow);
++		}
++		if (n) {
++			(void)sd.ipa_tx(sd.ipa_ctx, reply, n);
 +		}
 +		return;
 +	}
 +	uint8_t header[CELL_ETHER];
-+	lck_mtx_lock(sd.lock);
++	lck_mtx_lock(&sd_lock);
 +	const uint32_t made = cell_link_input_header(&sd.link, data, length, header);
-+	lck_mtx_unlock(sd.lock);
++	lck_mtx_unlock(&sd_lock);
 +	if (made) {
 +		sd_input(header, data, length);
 +	}
@@ -2417,11 +2750,10 @@
 +void
 +sweet_data_ipa_rx(const uint8_t *buf, uint32_t length)
 +{
-+	if (sd.lock == NULL || !sd.session_on) {
++	if (!sd.session_on || sd.ipa_tx == NULL || !LOAD(sd.ipa_ready)) {
 +		return;
 +	}
-+	/* one IPA receive thread: the counters are its own */
-+	(void)qmap_deaggregate(sd.qmap, buf, length, 1u << sd.session.cfg.mux, sd_deliver, NULL, &sd.qmap_count);
++	(void)qmap_deaggregate(sd.qmap, buf, length, 1u << SD_MUX, sd_deliver, NULL, &sd.qmap_count);
 +}
 +
 +/* ---- kern.sweet_qmi, root only ---- */
@@ -2429,12 +2761,12 @@
 +sd_sysctl_qmi SYSCTL_HANDLER_ARGS
 +{
 +#pragma unused(oidp, arg1, arg2)
-+	static uint8_t in[QMI_RAW_REQUEST_HEADER + QMI_RAW_MAX];
++	static uint8_t in[QMI_RAW_REQUEST_HEADER + QMI_RAW_MAX];   /* used only by the caller that holds the slot (RAW_COPYING) */
 +	uint8_t out[QMI_RAW_REPLY_HEADER + QMI_RAW_MAX];
 +	QmiRawRequest r;
-+	int status;
++	int status, error;
 +
-+	if (!sd.raw_on || !sd.attached) {
++	if (!sd.raw_on) {
 +		return ENOENT;
 +	}
 +	if (!kauth_cred_issuser(kauth_cred_get())) {
@@ -2443,57 +2775,64 @@
 +	if (req->newptr == USER_ADDR_NULL || req->oldptr == USER_ADDR_NULL || req->newlen > sizeof in) {
 +		return EINVAL;
 +	}
-+	lck_mtx_lock(sd.lock);
-+	if (sd.raw.state != 0) {
-+		lck_mtx_unlock(sd.lock);
++	lck_mtx_lock(&sd_lock);
++	if (!sd.attached || sd.closed) {
++		lck_mtx_unlock(&sd_lock);
++		return ENOENT;
++	}
++	if (sd.raw.state != RAW_FREE) {
++		lck_mtx_unlock(&sd_lock);
 +		return EBUSY;
 +	}
-+	sd.raw.state = 5;           /* ours while the request is copied in */
-+	lck_mtx_unlock(sd.lock);
++	sd.raw.state = RAW_COPYING;
++	lck_mtx_unlock(&sd_lock);
 +	const uint32_t inlen = (uint32_t)req->newlen;
-+	int error = SYSCTL_IN(req, in, inlen);
++	error = SYSCTL_IN(req, in, inlen);
 +	if (!error) {
 +		error = qmi_raw_parse(in, inlen, &r);
 +	}
-+	lck_mtx_lock(sd.lock);
-+	if (error) {
-+		sd.raw.state = 0;
-+		lck_mtx_unlock(sd.lock);
-+		printf("SWEET DATA: raw request refused (%d)\n", error);
-+		return error;
++	lck_mtx_lock(&sd_lock);
++	if (error || sd.closed) {
++		sd.raw.state = RAW_FREE;
++		lck_mtx_unlock(&sd_lock);
++		printf("SWEET DATA: raw request refused (%d)\n", error ? error : ESHUTDOWN);
++		return error ? error : ENOENT;
 +	}
 +	memcpy(sd.raw.msg, r.msg, r.length);
 +	sd.raw.len = r.length;
 +	sd.raw.service = r.service;
 +	sd.raw.client = r.client;
++	/* a fresh transaction each time, so a reply to a retired one never matches */
 +	sd.raw.txn = sd.raw.next_txn;
 +	sd.raw.next_txn = (uint16_t)(sd.raw.next_txn == 0xffff ? CELL_TXN_RAW : sd.raw.next_txn + 1);
 +	sd.raw.message = (uint16_t)(r.msg[3] | r.msg[4] << 8);
 +	sd.raw.msg[0] = QCOM_QMI_REQUEST;
 +	sd.raw.msg[1] = (uint8_t)sd.raw.txn;
 +	sd.raw.msg[2] = (uint8_t)(sd.raw.txn >> 8);
-+	sd.raw.state = 1;
-+	printf("SWEET DATA: raw request service %#x client %u message %#x\n", r.service, r.client, sd.raw.message);
-+	struct timespec ts = {.tv_sec = r.timeout_ms / 1000, .tv_nsec = (long)(r.timeout_ms % 1000) * NSEC_PER_MSEC};
-+	while (sd.raw.state == 1 || sd.raw.state == 2) {
-+		if (msleep(&sd.raw, sd.lock, PZERO, "sweetqmi", &ts) == EWOULDBLOCK) {
++	sd.raw.err = 0;
++	sd.raw.reply_len = 0;
++	sd.raw.state = RAW_QUEUED;
++	printf("SWEET DATA: raw request service %#x message %#x\n", r.service, sd.raw.message);
++	const uint64_t deadline = sd_now_ms() + r.timeout_ms;
++	while (sd.raw.state == RAW_QUEUED || sd.raw.state == RAW_SENT) {
++		const uint64_t now = sd_now_ms();
++		if (now >= deadline) {
 +			break;
 +		}
++		const uint64_t left = deadline - now;
++		struct timespec ts = {.tv_sec = (long)(left / 1000), .tv_nsec = (long)(left % 1000) * NSEC_PER_MSEC};
++		(void)msleep(&sd.raw, &sd_lock, PZERO, "sweetqmi", &ts);
 +	}
 +	uint32_t n = 0;
-+	if (sd.raw.state == 3 && sd.raw.reply_len) {
++	if (sd.raw.state == RAW_DONE && !sd.raw.err) {
 +		status = 0;
 +		n = sd.raw.reply_len;
 +		memcpy(out + QMI_RAW_REPLY_HEADER, sd.raw.reply, n);
-+		sd.raw.state = 0;
-+	} else if (sd.raw.state == 3) {
-+		status = ENOENT;        /* the service is not there */
-+		sd.raw.state = 0;
 +	} else {
-+		status = ETIMEDOUT;
-+		sd.raw.state = sd.raw.state == 1 ? 0 : 4;   /* a late answer frees the slot */
++		status = sd.raw.state == RAW_DONE ? sd.raw.err : ETIMEDOUT;
 +	}
-+	lck_mtx_unlock(sd.lock);
++	sd.raw.state = RAW_FREE;    /* a timed-out transaction is retired: its late reply is dropped */
++	lck_mtx_unlock(&sd_lock);
 +	for (unsigned i = 0; i < 4; ++i) {
 +		out[i] = (uint8_t)((uint32_t)status >> 8 * i);
 +		out[4 + i] = (uint8_t)(n >> 8 * i);
@@ -2501,21 +2840,25 @@
 +	return SYSCTL_OUT(req, out, QMI_RAW_REPLY_HEADER + n);
 +}
 +
-+/* The indication ring: for each kept indication seq (u32), service, client, length (u16), then the message. Root only. */
++/* The kept indications: for each, seq (u32), service, client, length (u16), then the message. Root only. */
 +static int
 +sd_sysctl_ind SYSCTL_HANDLER_ARGS
 +{
 +#pragma unused(oidp, arg1, arg2)
-+	static uint8_t out[IND_RING * (8 + IND_MAX)];
++	const uint32_t size = IND_RING * (8 + IND_MAX);
 +	uint32_t at = 0;
 +
-+	if (!sd.raw_on || !sd.attached) {
++	if (!sd.raw_on) {
 +		return ENOENT;
 +	}
 +	if (!kauth_cred_issuser(kauth_cred_get())) {
 +		return EPERM;
 +	}
-+	lck_mtx_lock(sd.lock);
++	uint8_t *out = kalloc_data(size, Z_WAITOK | Z_ZERO);
++	if (out == NULL) {
++		return ENOMEM;
++	}
++	lck_mtx_lock(&sd_lock);
 +	for (unsigned k = 0; k < IND_RING; ++k) {
 +		const unsigned i = (sd.ind_seq + k) % IND_RING;
 +		if (!sd.ind[i].seq) {
@@ -2529,34 +2872,50 @@
 +		memcpy(out + at + 8, sd.ind[i].data, sd.ind[i].len);
 +		at += 8 + sd.ind[i].len;
 +	}
-+	lck_mtx_unlock(sd.lock);
-+	return SYSCTL_OUT(req, out, at);
++	lck_mtx_unlock(&sd_lock);
++	const int error = SYSCTL_OUT(req, out, at);
++	kfree_data(out, size);
++	return error;
 +}
 +
++/* The names always exist; without sweetqmiraw=1 both answer ENOENT before touching any state. */
 +SYSCTL_PROC(_kern, OID_AUTO, sweet_qmi, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_MASKED, 0, 0, sd_sysctl_qmi, "S", "");
 +SYSCTL_PROC(_kern, OID_AUTO, sweet_qmi_ind, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_MASKED, 0, 0, sd_sysctl_ind, "S",
 +    "");
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 --- /dev/null
 +++ b/bsd/dev/data/sweet_data.h
-@@ -0,0 +1,20 @@
+@@ -0,0 +1,33 @@
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent */
-+/* The data agent's hooks for the modem runtime and the IPA driver (bsd/dev/data/sweet_data.c). */
++/* The data agent's hooks for the modem runtime and the IPA driver (bsd/dev/data/sweet_data.c). Every hook does nothing unless the
++ * boot args carry sweetdata=1 or sweetqmiraw=1. */
 +#ifndef SWEET_DATA_H
 +#define SWEET_DATA_H
 +#include <stdint.h>
 +#include "../modem/QcomQrtr.h"
 +
-+/* Modem runtime, from its worker thread only. attach: after qcom_qrtr_init, before qcom_qrtr_start; 0 also when every data gate is
-+ * off. poll: every worker iteration. stop: before the modem stops; keep polling until idle() or 5 s. */
++/* Modem runtime, from its worker thread only.
++ *   attach   after qcom_qrtr_init, before qcom_qrtr_start. Returns 0, also when every data gate is off.
++ *   poll     every worker iteration.
++ *   usim     1 once UIM card status shows the USIM application ready, 0 when that is lost.
++ *   stop     before the modem stops; then keep receiving and polling until idle() or 5 s have passed.
++ *   detach   after idle() (or the 5 s), before the QRTR object goes away. Nothing in this file touches it afterwards. */
 +int sweet_data_attach(QcomQrtr *qr);
 +void sweet_data_poll(QcomQrtr *qr, uint64_t now_ms);
++void sweet_data_usim(int ready);
 +void sweet_data_stop(void);
 +int sweet_data_idle(void);
++void sweet_data_detach(void);
 +
-+/* IPA driver. set_ipa: the transmit of one framed QMAP buffer on the AP->modem endpoint (0 when queued) and the QMAP version the
-+ * endpoints use (1 or 5); call before the modem starts. ipa_rx: one completed receive buffer from the modem->AP endpoint, not from
-+ * interrupt context. */
-+void sweet_data_set_ipa(int (*tx)(void *ctx, const uint8_t *buf, uint32_t length), void *ctx, int qmap_version);
++/* IPA driver, any thread except interrupt context.
++ *   set_ipa  once, before the modem starts: tx sends one framed QMAP buffer on the AP->modem endpoint and must copy it before it
++ *            returns (the buffer is on the caller's stack); it is never called with a data-agent lock held and must not call back into
++ *            this file. qmap_version is 1 or 5 as the endpoints are programmed; rx_buffer_bytes and max_datagrams bound one downlink
++ *            aggregate. The callback and its context must stay valid until the system goes down. Returns 0, or -1 when refused.
++ *   ipa_ready 1 once the IPA QMI handshake completed (modem completion 0x35) and both endpoints run, 0 when that is lost.
++ *   ipa_rx   one completed receive buffer from the modem->AP endpoint, length = the bytes the hardware wrote. One thread only. */
++int sweet_data_set_ipa(int (*tx)(void *ctx, const uint8_t *buf, uint32_t length), void *ctx, int qmap_version,
++                       uint32_t rx_buffer_bytes, uint32_t max_datagrams);
++void sweet_data_ipa_ready(int ready);
 +void sweet_data_ipa_rx(const uint8_t *buf, uint32_t length);
 +#endif

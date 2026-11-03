@@ -19,20 +19,24 @@ The modem and IPA agents follow this order. Each step names who does it and what
 9. **IPA agent, then data agent.** The IPA agent's RX and TX paths hand whole buffers to and from the data agent's QMAP layer (`qmap_deaggregate`, `qmap_frame`, mux 1). The data agent's interface presents them to iOS (below) and runs DHCP and router advertisements from the step 8 settings.
 10. **Teardown, data agent first.** WDS Stop Network for every live handle, then the IPA agent drains and stops its channels, then the modem agent shuts the modem down. Every exit path runs these in that order.
 
-### What the data agent needs from the other agents
+### Agreed interfaces (2026-11-03)
 
-From the modem agent:
-- `QCOM_QRTR_MAX_LOCAL` raised from 4 to at least 6. rmtfs, pd-mapper and UIM use three slots; data needs two client ports (0x4010 for client 0, 0x4011 for the IPv6 WDS client).
-- A way to add a client port that does not announce NEW_SERVER (today `qcom_qrtr_add_service(q, 0, 0, ...)` announces service 0). Until then the data clients register the way UIM does.
-- Three hooks in the runtime's worker: `sweet_data_attach(&m.qr)` after `qcom_qrtr_init`, `sweet_data_poll(&m.qr, now_ms)` each loop, and `sweet_data_stop()` before the modem stops, which returns when every Stop Network is answered or after 5 s.
-- The NEW_SERVER and DEL_SERVER events (or the existing remote list) for DMS, NAS, WDS, WDA and DPM, so the session can start and fail closed when a service leaves.
-- A long-running mode: the 120 s bound stays for probes, with a separate gate for a data session.
+These are the hooks in `bsd/dev/data/sweet_data.h` after the first Sol audit, plus the other agents' answers in `plans/modem/README.md` and `plans/ipa/README.md`. Each hook does nothing unless the boot args hold `sweetdata=1` or `sweetqmiraw=1`.
 
-From the IPA agent:
-- The QMAP version the endpoints are programmed for. Linux's IPA 5.2 table turns checksum offload on, which means QMAPv5 with a 4-byte checksum header. The first data boot is simpler with checksum offload off and plain QMAP. The data agent's code supports both; the IPA agent picks, and WDA then asks for the same.
-- The RX buffer size and aggregation byte and packet limits, so WDA's downlink limits never exceed them.
-- Two calls: a transmit of one framed buffer on endpoint 2, and an RX callback per completed buffer from endpoint 18, both outside interrupt context.
-- Confirmation of the endpoint numbers 2 and 18 for DPM from the live hardware.
+Modem runtime, all on its single worker thread:
+- QRTR local capacity rises to 8: rmtfs, pd-mapper, UIM, SSCTL, IPA 0x4004 and 0x4005, data 0x4010 and 0x4011. Service-0 client ports are already unannounced, so no new QRTR API is needed.
+- `sweet_data_attach(&qr)` after `qcom_qrtr_init` and after every other port is registered, and before `qcom_qrtr_start`.
+- `sweet_data_poll(&qr, now_ms)` every worker iteration.
+- `sweet_data_usim(1)` once a selected USIM reports app state 7, and `sweet_data_usim(0)` when that evidence is lost. The 2185 run saw the USIM at app state 1 (initializing), so this needs a status poll on the modem side.
+- Teardown: `sweet_data_stop()`, then keep pumping GLINK and QRTR and calling poll until `sweet_data_idle()` or 5 s have passed. Then drain IPA, then `sweet_data_detach()`, then SSCTL and PAS. A data-session gate may extend the 120 s probe lifetime, but the hard deadline and deadman stay.
+
+IPA driver (its API: `sweet_ipa_transmit`, `sweet_ipa_register_rx`, `sweet_ipa_ready` in `bsd/dev/modem/SweetIpa.h`):
+- `sweet_data_set_ipa(tx, ctx, 1, 8192, 16)` once, before the modem starts. Here `tx` wraps `sweet_ipa_transmit`, which copies the frame before it returns. The values are QMAP v1 with no checksum offload, 8192-byte receive buffers, and at most 16 datagrams per aggregate.
+- `sweet_data_ipa_ready(sweet_ipa_ready())` whenever that changes.
+- The `sweet_ipa_register_rx` callback calls `sweet_data_ipa_rx(buf, bytes)`.
+- Endpoints for DPM: the modem receives on our TX endpoint 2 and sends on our RX endpoint 18.
+
+The session does nothing that changes modem state until three things hold: the USIM is ready, the IPA is ready, and the transmit hook is set. Losing any of them sends it through cleanup.
 
 ## The iOS-facing interface
 
@@ -48,13 +52,51 @@ From the IPA agent:
 
 ## Status
 
-**Code.** Patch 2220 (`patches/data/2220-asteroids-data-qmi-session-and-link.patch`) adds `bsd/dev/data/`: QMI encoders and decoders for DMS, NAS, WDS, WDA and DPM (`QmiData.c`), QMAP v1 and v5 (`Qmap.c`), the Ethernet presentation (`CellLink.c`), the session state machine (`CellSession.c`), the raw allow list (`QmiRaw.c`) and the kernel glue (`sweet_data.c`): two QRTR client ports, `en2`, `kern.sweet_qmi` and `kern.sweet_qmi_ind`, and the hooks in `sweet_data.h`. Every gate is off by default. Nothing calls the hooks yet: the modem agent adds the three runtime calls and the IPA agent the two data calls.
+**Code.** Patch 2220 adds `bsd/dev/data/`:
+- `QmiData.c`: QMI encoders and decoders for DMS, NAS, WDS, WDA and DPM.
+- `Qmap.c`: QMAP v1 and v5 framing and deaggregation, and flow-control commands.
+- `CellLink.c`: the Ethernet presentation.
+- `CellSession.c`: the session state machine.
+- `QmiRaw.c`: the raw allow list.
+- `sweet_data.c`: the kernel glue (two QRTR client ports, `en2`, `kern.sweet_qmi` and `kern.sweet_qmi_ind`, and the hooks above).
 
-**Measured, host.** `tools/data/check.sh` rebuilds the source from the public patches and passes under AddressSanitizer and UndefinedBehaviorSanitizer. It checks every request against its byte layout, every decoder against hand-built responses, including malformed lengths and wrong transactions, and the IMEI's last four digits. It also covers QMAP aggregates, pads, empty frames, commands and v5 checksum headers, plus ARP, DHCP offer, ACK and NAK, IPv6 RA and NA with valid checksums, the session order with a fake modem (no online without the gate, retry after error 0x46, a call dropping and coming back, stop), and the allow list.
+Every gate is off by default.
 
-**Measured, compile.** All six kernel files compile against the xnu-12377 headers with the modem tree's exact flags (`-fsyntax-only`, no warnings from this code). There is no full kernel build or link yet.
+**Review.** The first Sol audit (`docs/data-2220-audit.md`) was NO-GO with ten blocking findings. The revised 2220 addresses each one:
+- The raw list is now read-only, apart from strictly checked DMS mode and NAS mode-preference requests. Duplicate TLVs are refused, and only client 0 may be used.
+- The raw slot always frees on timeout, send failure, service loss and shutdown, and replies to retired transactions are dropped.
+- Stop is a terminal barrier. It also stops handles that arrive late from starts already in flight.
+- Failures go through cleanup.
+- A Stop Network reply is checked. The handle stays until a stop succeeds.
+- A readiness barrier covers the USIM and the IPA.
+- The data format is checked, with Get Data Format when the modem's echo is incomplete, and it must fit the IPA limits.
+- Family and settings replies are checked, so a call only comes up with a usable address for its own family.
+- Every send attempt is charged, and every retry is bounded.
+- Each indication read gets its own buffer.
+- The lock is static, and the IPA transmit hook is called outside the lock.
+- `SIOCGIFMEDIA` honours the caller's count.
+- DHCP and ICMPv6 inputs are checked: fragments, UDP length, code and checksum.
+- Ethernet padding is trimmed before QMAP framing.
+- An unsolicited RA goes out when IPv6 comes up, refreshed every 10 minutes.
 
-**Missing.** Sol review of 2220 before any boot with `sweetdata` or `sweetqmiraw`. The modem agent's port and hook changes. The IPA data path. The USB proof of the presentation path (below).
+A second Sol audit is running.
+
+**Measured, host.** `tools/data/check.sh` rebuilds the source from the public patches and passes under AddressSanitizer and UndefinedBehaviorSanitizer. The session tests cover:
+- Nothing beyond read-only queries before the barrier.
+- A stop with starts in flight.
+- Late DPM answers after a stop.
+- Loss of a service, of readiness and of WDS during a live call.
+- Refused and unanswered stops.
+- Send refusals backing off.
+- WDA mismatches and oversized limits.
+- Family and settings refusals.
+- Terminal start errors, and the 20-try limit.
+
+`sweet_data.c` itself has no host test. It needs kernel APIs.
+
+**Measured, compile.** All six kernel files compile against the xnu-12377 headers with the modem tree's exact flags. The only remaining warnings come from XNU's own macros. There is no full kernel build or link yet.
+
+**Missing.** A Sol GO for 2220, the modem agent's hooks, the IPA data path, and the USB proof below.
 
 ## USB proof of the presentation path
 
