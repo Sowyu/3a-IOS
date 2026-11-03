@@ -1,0 +1,432 @@
+diff --git a/bsd/dev/sweet_smmu.c b/bsd/dev/sweet_smmu.c
+--- a/bsd/dev/sweet_smmu.c
++++ b/bsd/dev/sweet_smmu.c
+@@ -48,6 +48,10 @@
+ static unsigned smmu_nsmr;
+ static int smmu_next_smr;               /* first free SMR to try next */
+ static volatile uint32_t smmu_lock;
++int sweet_apps_smmu_claim(void);
++void sweet_apps_smmu_release(void);
++int sweet_apps_smmu_claim(void) { return __atomic_exchange_n(&smmu_lock, 1, __ATOMIC_ACQUIRE) == 0; }
++void sweet_apps_smmu_release(void) { __atomic_store_n(&smmu_lock, 0, __ATOMIC_RELEASE); }
+ 
+ static uint32_t
+ smmu_rd(uint32_t off)
+diff --git a/bsd/dev/sweet_touch_asteroids.c b/bsd/dev/sweet_touch_asteroids.c
+--- a/bsd/dev/sweet_touch_asteroids.c
++++ b/bsd/dev/sweet_touch_asteroids.c
+@@ -505,7 +505,7 @@
+ 
+ /* Free SMR -> UFS's S2CR (CB0), S2CR before SMR as arm_smmu_write_sme(). */
+ static int
+-at_smmu_route(uint32_t sid)
++at_smmu_route_owned(uint32_t sid)
+ {
+ 	unsigned nsmr = at_rd(at.smmu, SMMU_ID0) & 0xffu;
+ 	int ufs = -1, slot = -1;
+@@ -535,6 +535,16 @@
+ 	uint32_t rc = at_rd(at.smmu, (int32_t)SMMU_S2CR(slot));
+ 	printf("SWEET TOUCH: SMMU SID %#x -> SMR %d smr=%#x s2cr=%#x\n", sid, slot, rs, rc);
+ 	return rs == smr && rc == s2cr ? 0 : EIO;
++}
++
++extern int sweet_apps_smmu_claim(void);
++extern void sweet_apps_smmu_release(void);
++static int at_smmu_route(uint32_t sid)
++{
++    if (!sweet_apps_smmu_claim()) return EBUSY;
++    int error = at_smmu_route_owned(sid);
++    sweet_apps_smmu_release();
++    return error;
+ }
+ 
+ /* ---- GPI ---- */
+diff --git a/bsd/dev/modem/ModemRuntime.inc b/bsd/dev/modem/ModemRuntime.inc
+--- a/bsd/dev/modem/ModemRuntime.inc
++++ b/bsd/dev/modem/ModemRuntime.inc
+@@ -485,8 +485,11 @@
+ #include "ModemGate.h"
+ static bool m_gate(const char *name){return modem_gate(PE_boot_args(),name)!=0;}
+ #include "IpaProbe.inc"
++#include "IpaRuntime.inc"
+ static int modem_run(const struct wl_fat *f,const uint8_t *mdt,uint32_t size){
+     memset(&m,0,sizeof(m));m.master=-1;m.glink=m_gate("sweetmglink");m.rmtfs=m_gate("sweetmrmtfs");m.pdm=m_gate("sweetmpdm");m.uim=m_gate("sweetmuim");m.sysmon=m_gate("sweetmstop");m.bcm_probe=m_gate("sweetmbcm");m.handover_release=m_gate("sweetmho");m.bandwidth=m_gate("sweetmbw");m.bandwidth_irq=m_gate("sweetmbwi");
++    memset(&ipa,0,sizeof(ipa));ipa.enabled=m_gate("sweetipafw");
++    if(ipa.enabled && (!m.bandwidth || !m.bandwidth_irq || !m_gate("sweetmpss"))){printf("SWEET IPA: requires strict sweetmpss, sweetmbw and sweetmbwi gates\n");return EINVAL;}
+     if((m.rmtfs || m.pdm || m.uim || m.sysmon) && !m.glink){printf("SWEET MODEM: refused missing GLINK dependency\n");return EINVAL;}
+     m_sleep(30000);m.began=m_now();int rc=EIO;
+     m.smem=ml_io_map(M_SMEM,M_SM_SIZE);m.mutex=ml_io_map(0x1f43000,0x1000);m.ipcc=ml_io_map(0x405000,0x1000);
+@@ -512,11 +515,12 @@
+     m.qmp_owed=true;if((rc=m_qsend(true)))goto out;
+     if((rc=m_vote(true)))goto out;
+     if((rc=m_bandwidth_vote()))goto out;
++    if(ipa.enabled){rc=ipa_prepare(f);goto out;} /* PAS15-only probe stops before MPSS authentication. */
+     if((rc=m_load(f,mdt,size)))goto out;
+     if((rc=m_pas(5,1,0,0)))goto out;m.started=true;
+     uint64_t end=m_now()+120000,ready_deadline=m_now()+10000;
+     while(m_now()<end){m_smp_poll();if((rc=m_handover()))break;if(m.glink)m_ipc_poll();if(m.uim && (m.state&6)==6)m_uim_poll();if(m.fatal || m.failed){rc=EIO;break;}
+         if(!(m.state&2) && m_now()>ready_deadline){rc=ETIMEDOUT;break;}m_sleep(2);}
+     if(!m.fatal && !m.failed && (m.state&6)==6)rc=0;else if(!rc)rc=ETIMEDOUT;
+-out:printf("SWEET MODEM: offline run end error=%d elapsed_ms=%llu\n",rc,(unsigned long long)(m_now()-m.began));if(!m_cleanup())rc=EIO;return rc;
+-}
++out:printf("SWEET MODEM: offline run end error=%d elapsed_ms=%llu\n",rc,(unsigned long long)(m_now()-m.began));if(!m_cleanup())rc=EIO;if(!ipa_cleanup(m.stop_verified))rc=EIO;return rc;
++}
+diff --git a/bsd/dev/modem/IpaSmmu.h b/bsd/dev/modem/IpaSmmu.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/modem/IpaSmmu.h
+@@ -0,0 +1,44 @@
++#ifndef IPA_SMMU_H
++#define IPA_SMMU_H
++#include <stdint.h>
++#include <stddef.h>
++#define IPA_PT_PAGE 4096u
++#define IPA_PT_PAGES 16u
++/* One L1, allocated L2/L3 pages. 4 KiB granule, 39-bit IOVA, 48-bit PA.
++ * The caller supplies zeroed, physically contiguous tables and synchronizes them
++ * before installing TTBR0. No broad block mappings are emitted. */
++typedef struct {uint64_t *words,physical;unsigned used;} IpaPageTable;
++static inline int ipa_pt_init(IpaPageTable *t,uint64_t *words,uint64_t pa){
++    if(!words || ((uintptr_t)words&7) || (pa&4095) || pa>0x0000ffffffff0000ull)return -1;
++    t->words=words;t->physical=pa;t->used=1;
++    for(unsigned i=0;i<IPA_PT_PAGES*512;i++)words[i]=0;
++    return 0;
++}
++static inline int ipa_pt_next(IpaPageTable *t,unsigned parent,unsigned index,unsigned *child){
++    uint64_t *e=&t->words[parent*512+index];
++    if(*e){
++        uint64_t pa=*e&0x0000fffffffff000ull;
++        if((*e&3)!=3 || pa<t->physical || pa>=t->physical+(uint64_t)t->used*4096)return -1;
++        *child=(unsigned)((pa-t->physical)/4096);return 0;
++    }
++    if(t->used==IPA_PT_PAGES)return -1;
++    *child=t->used++;*e=(t->physical+(uint64_t)*child*4096)|3;return 0;
++}
++static inline int ipa_pt_map_attr(IpaPageTable *t,uint64_t iova,uint64_t pa,size_t bytes,unsigned attr){
++    if(attr>1)return -1;
++    if(!bytes || ((iova|pa|bytes)&4095) || iova>=(1ull<<39) || bytes>(1ull<<39)-iova ||
++       pa>=(1ull<<48) || bytes>(1ull<<48)-pa)return -1;
++    for(size_t at=0;at<bytes;at+=4096){
++        uint64_t v=iova+at;unsigned l2,l3;
++        if(ipa_pt_next(t,0,(unsigned)(v>>30)&511,&l2) ||
++           ipa_pt_next(t,l2,(unsigned)(v>>21)&511,&l3))return -1;
++        uint64_t *e=&t->words[l3*512+((v>>12)&511)];
++        if(*e)return -1; /* Refuse duplicate/overlapping mappings, even identical. */
++        /* AF, inner-shareable, unprivileged RW, Normal NC attr0, UXN/PXN. */
++        *e=(pa+at)|3|((uint64_t)attr<<2)|(1ull<<10)|(3ull<<8)|(1ull<<6)|(3ull<<53);
++    }
++    return 0;
++}
++static inline int ipa_pt_map(IpaPageTable *t,uint64_t iova,uint64_t pa,size_t bytes){return ipa_pt_map_attr(t,iova,pa,bytes,0);}
++/* A partial mapping failure requires discarding the whole unpublished table. */
++#endif
+diff --git a/bsd/dev/modem/IpaMmu.h b/bsd/dev/modem/IpaMmu.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/modem/IpaMmu.h
+@@ -0,0 +1,108 @@
++#ifndef IPA_MMU_H
++#define IPA_MMU_H
++#include <stdint.h>
++#include <stdbool.h>
++/* One serialized caller owns APPS stream allocation. No global SMMU control,
++ * global invalidation or implementation-defined registers are written. */
++typedef struct {
++    void *ctx;
++    uint32_t (*read)(void *,unsigned);
++    void (*write)(void *,unsigned,uint32_t);
++    void (*write64)(void *,unsigned,uint64_t);
++    void (*delay)(void *);
++} IpaMmuIo;
++typedef struct {
++    unsigned slot,bank,sid;
++    uint32_t smr,s2cr,cbar,cba2r,saved[9];
++    bool touched,published;
++} IpaMmuContext;
++typedef struct {IpaMmuIo io;IpaMmuContext context[2];bool retained;} IpaMmu;
++static const unsigned ipa_mmu_regs[9]={0,0x10,0x20,0x24,0x30,0x38,0x3c,0x28,0x2c};
++static inline unsigned ipa_cb(unsigned n){return 0x80000+4096*n;}
++static inline bool ipa_mmu_sync(IpaMmu *s,unsigned base){
++    s->io.write(s->io.ctx,base+0x7f0,0);
++    for(unsigned n=0;n<100000;n++){if(!(s->io.read(s->io.ctx,base+0x7f4)&1))return true;s->io.delay(s->io.ctx);}
++    s->retained=true;return false;
++}
++static inline bool ipa_mmu_choose(IpaMmu *s){
++    IpaMmuIo *io=&s->io;void *c=io->ctx;
++    /* Geometry measured in ast159. A different boot firmware is a new probe. */
++    if(io->read(c,0x20)!=0x4c017e72 || io->read(c,0x24)!=0x60000048 || io->read(c,0x28)!=0x5111)return false;
++    bool used[72]={0};unsigned slots[2],ns=0;
++    for(unsigned i=0;i<114;i++){
++        uint32_t smr=io->read(c,0x800+4*i),s2=io->read(c,0xc00+4*i);
++        if(!(smr>>31)){if(ns<2)slots[ns++]=i;continue;}
++        uint32_t mask=(smr>>16)&0x7fff;
++        if(!((smr^0x4a0)&~mask&0x7fff) || !((smr^0x4a2)&~mask&0x7fff))return false;
++        if(((s2>>16)&3)==0){if((s2&255)>=72)return false;used[s2&255]=true;}
++    }
++    if(ns!=2)return false;
++    unsigned nb=0;
++    for(unsigned i=0;i<72 && nb<2;i++){
++        unsigned b=ipa_cb(i);
++        if(used[i] || io->read(c,b) || io->read(c,b+0x20) || io->read(c,b+0x24) || io->read(c,b+0x28) || io->read(c,b+0x2c) || io->read(c,b+0x58))continue;
++        IpaMmuContext *p=&s->context[nb];p->slot=slots[nb];p->bank=i;p->sid=nb?0x4a2:0x4a0;
++        p->smr=io->read(c,0x800+4*p->slot);p->s2cr=io->read(c,0xc00+4*p->slot);
++        p->cbar=io->read(c,0x1000+4*i);p->cba2r=io->read(c,0x1800+4*i);
++        for(unsigned j=0;j<9;j++)p->saved[j]=io->read(c,b+ipa_mmu_regs[j]);nb++;
++    }
++    return nb==2;
++}
++static inline bool ipa_mmu_install(IpaMmu *s,const uint64_t table[2]){
++    IpaMmuIo *io=&s->io;void *c=io->ctx;
++    if(!ipa_mmu_choose(s))return false;
++    for(unsigned n=0;n<2;n++)if((table[n]&4095) || table[n]>=(1ull<<48))return false;
++    for(unsigned n=0;n<2;n++){
++        IpaMmuContext *p=&s->context[n];unsigned b=ipa_cb(p->bank);
++        /* Recheck ownership immediately before touching each reserved slot. */
++        if(io->read(c,0x800+4*p->slot)!=p->smr || io->read(c,0xc00+4*p->slot)!=p->s2cr || io->read(c,b)!=p->saved[0])return false;
++        p->touched=true;
++        io->write(c,0x1800+4*p->bank,1); /* 64-bit context */
++        io->write(c,0x1000+4*p->bank,0x1f300); /* stage 1, stage 2 bypass */
++        /* SEP=7, PASIZE=5 (48-bit), 39-bit IOVA, EPD1, noncached walks. */
++        io->write(c,b+0x10,(7u<<15)|5);io->write(c,b+0x30,(1u<<23)|(3u<<12)|25);
++        uint64_t ttbr=table[n]|((uint64_t)(p->bank+1)<<48);
++        io->write64(c,b+0x20,ttbr);io->write64(c,b+0x28,0);
++        io->write(c,b+0x38,0x0444);io->write(c,b+0x3c,0);
++        io->write(c,b+0x618,0);
++        if(!ipa_mmu_sync(s,b))return false;
++        /* Terminate faults, never stall. No IRQ without an installed handler. */
++        uint32_t ctl=1|2|4|0x20|0x1000|(3u<<22);
++        io->write(c,b,ctl);
++        if(io->read(c,b)!=ctl || io->read(c,b+0x20)!=(uint32_t)ttbr || io->read(c,b+0x24)!=(uint32_t)(ttbr>>32) || io->read(c,b+0x30)!=((1u<<23)|(3u<<12)|25) || io->read(c,b+0x10)!=((7u<<15)|5))return false;
++        if(io->read(c,0x1800+4*p->bank)!=1 || io->read(c,0x1000+4*p->bank)!=0x1f300 ||
++           io->read(c,b+0x38)!=0x0444 || io->read(c,b+0x3c) || io->read(c,b+0x28) || io->read(c,b+0x2c))return false;
++        io->write(c,0xc00+4*p->slot,p->bank|(3u<<8));
++        /* Publication last: only exact IPA SID can reach this table. */
++        p->published=true;io->write(c,0x800+4*p->slot,0x80000000u|p->sid);
++        if(io->read(c,0x800+4*p->slot)!=(0x80000000u|p->sid) || io->read(c,0xc00+4*p->slot)!=(p->bank|(3u<<8)))return false;
++    }
++    return true;
++}
++/* Caller must prove both PAS15 and every GSI DMA producer stopped first.
++ * Any failed sync/readback pins page tables and all DMA allocations to reset. */
++static inline bool ipa_mmu_restore(IpaMmu *s,bool stopped){
++    if(!stopped || s->retained){s->retained=true;return false;}
++    IpaMmuIo *io=&s->io;void *c=io->ctx;
++    for(unsigned n=0;n<2;n++){
++        IpaMmuContext *p=&s->context[n];if(!p->touched)continue;unsigned b=ipa_cb(p->bank);
++        if(p->published){
++            if(io->read(c,0x800+4*p->slot)!=(0x80000000u|p->sid)){s->retained=true;return false;}
++            io->write(c,0xc00+4*p->slot,2u<<16); /* route all owned requests to fault */
++            if(io->read(c,0xc00+4*p->slot)!=(2u<<16)){s->retained=true;return false;}
++        }
++        io->write(c,b,0);io->write(c,b+0x618,0);if(!ipa_mmu_sync(s,b))return false;
++        if(io->read(c,b)){s->retained=true;return false;}
++        io->write(c,0x800+4*p->slot,p->smr);io->write(c,0xc00+4*p->slot,p->s2cr);
++        io->write64(c,b+0x20,(uint64_t)p->saved[2]|(uint64_t)p->saved[3]<<32);
++        io->write64(c,b+0x28,(uint64_t)p->saved[7]|(uint64_t)p->saved[8]<<32);
++        for(unsigned j=1;j<=6;j++)if(j!=2 && j!=3)io->write(c,b+ipa_mmu_regs[j],p->saved[j]);
++        io->write(c,0x1800+4*p->bank,p->cba2r);io->write(c,0x1000+4*p->bank,p->cbar);
++        if(io->read(c,0x800+4*p->slot)!=p->smr || io->read(c,0xc00+4*p->slot)!=p->s2cr){s->retained=true;return false;}
++        for(unsigned j=0;j<9;j++)if(io->read(c,b+ipa_mmu_regs[j])!=p->saved[j]){s->retained=true;return false;}
++        if(io->read(c,0x1800+4*p->bank)!=p->cba2r || io->read(c,0x1000+4*p->bank)!=p->cbar){s->retained=true;return false;}
++        p->touched=false;p->published=false;
++    }
++    return true;
++}
++#endif
+diff --git a/bsd/dev/modem/IpaPower.h b/bsd/dev/modem/IpaPower.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/modem/IpaPower.h
+@@ -0,0 +1,25 @@
++#ifndef IPA_POWER_H
++#define IPA_POWER_H
++#include "QcomRpmh.h"
++/* The modem 2183 bandwidth floor covers SN3/SN0/SH1/SH0/MC0/ACV.
++ * Add IPA's configuration path and core clock, each as a separate VCD commit.
++ * Shared bandwidth floors and the owned 120 MHz clock request stay until reset. */
++static inline int ipa_power_command(const uint8_t *db,size_t bytes,unsigned resource,uint32_t *address,uint32_t *data){
++    if(resource>1)return -1;
++    QcomRpmhResource r={0};
++    if(qcom_cmd_db_find(db,bytes,resource?"IP0":"CN0",&r) || r.slave_id!=5 || (r.address>>16)!=5 ||
++       (r.address&3) || r.aux_version!=0x1000 || r.aux_bytes!=8 || r.aux_prefix[7])return -1;
++    uint32_t unit=(uint32_t)r.aux_prefix[0]|(uint32_t)r.aux_prefix[1]<<8|(uint32_t)r.aux_prefix[2]<<16|(uint32_t)r.aux_prefix[3]<<24;
++    if(!unit || r.aux_prefix[6]>15)return -1;
++    /* Nothing's ipa3_controller_static_bind selects the v5.0 clock table
++     * for v5.2. Its initial SVS2 rate is 120 MHz. The clock driver uses
++     * command-db unit in kHz, with X=0 and Y=ceil(rate/unit). */
++    uint32_t vote=1;
++    if(resource){
++        if(r.address!=0x50038 || unit!=40 || r.aux_prefix[4]!=8 || r.aux_prefix[5] || r.aux_prefix[6]!=7)return -1;
++        vote=(120000u+unit-1)/unit;
++        if(vote>0x3fff)return -1;
++    }
++    *address=r.address;*data=0x60000000u|vote;return 0;
++}
++#endif
+diff --git a/bsd/dev/modem/IpaRuntime.inc b/bsd/dev/modem/IpaRuntime.inc
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/modem/IpaRuntime.inc
+@@ -0,0 +1,162 @@
++/* 2201: guarded IPA5.2 PAS15 lifecycle. No packet endpoint is advertised yet. */
++#include "IpaSmmu.h"
++#include "IpaMmu.h"
++#include "IpaPower.h"
++#ifndef IPA_HOST_TEST
++#include "../sweet_board.h"
++#include <vm/vm_kern_xnu.h>
++#define IPA_BARRIER() __asm__ volatile("dsb sy":::"memory")
++#else
++#define IPA_BARRIER() ((void)0)
++#endif
++extern int sweet_apps_smmu_claim(void);
++extern void sweet_apps_smmu_release(void);
++extern ppnum_t pmap_find_phys(pmap_t,addr64_t);
++#define IPA_DMA_BYTES 0x100000u
++#define IPA_DMA_IOVA 0x20000000u
++#define IPA_PT_BYTES (IPA_PT_PAGES*IPA_PT_PAGE)
++static struct {
++    vm_offset_t smmu,block,firmware,dma,pt[2],metadata;
++    uint64_t dma_pa,pt_pa[2],metadata_pa;
++    IpaMmu mmu;
++    uint32_t smem_off,smem_bytes;
++    bool enabled,pas_owed,started,retained,clock_pinned,mmu_attempted;
++} ipa;
++static uint32_t ipa_mread(void *unused,unsigned off){(void)unused;return m_rd(ipa.smmu,off);}
++static void ipa_mwrite(void *unused,unsigned off,uint32_t v){(void)unused;m_wr(ipa.smmu,off,v);}
++static void ipa_mwrite64(void *unused,unsigned off,uint64_t v){(void)unused;IPA_BARRIER();*(volatile uint64_t *)(ipa.smmu+off)=v;IPA_BARRIER();}
++static void ipa_mdelay(void *unused){(void)unused;delay(1);}
++static int ipa_alloc(vm_offset_t *va,uint64_t *pa,vm_size_t size){
++    if(kmem_alloc_contig(kernel_map,va,size,PAGE_MASK,0,0,KMA_DATA|KMA_ZERO,VM_KERN_MEMORY_IOKIT)!=KERN_SUCCESS)return ENOMEM;
++    *pa=ptoa_64(pmap_find_phys(kernel_pmap,(addr64_t)*va));
++    if(!*pa || *pa>=(1ull<<48) || size>(1ull<<48)-*pa)return EINVAL;
++    for(vm_size_t off=0;off<size;off+=PAGE_SIZE)if(ptoa_64(pmap_find_phys(kernel_pmap,(addr64_t)(*va+off)))!=*pa+off)return EINVAL;
++    return 0;
++}
++static int ipa_vote_extra(void){
++    if(!m.bandwidth_pinned || !m.bandwidth_irq || !m.gic || m.vote_uncertain)return EINVAL;
++    static uint8_t dbcopy[0x20000];
++    for(unsigned i=0;i<sizeof(dbcopy);i+=4){uint32_t v=m_rd(m.db,i);memcpy(dbcopy+i,&v,4);}
++    uint32_t address[2],data[2];
++    for(unsigned i=0;i<2;i++)if(ipa_power_command(dbcopy,sizeof(dbcopy),i,&address[i],&data[i]))return EINVAL;
++    if(address[0]==address[1])return EINVAL;
++    for(unsigned i=0;i<2;i++){
++        sweet_apps_rsc_lock();int chosen=-1,rc=ETIMEDOUT;unsigned b=0;
++        /* The completion status is masked by RSC IRQ enable. Poll with the
++         * owned source unmasked only while GIC delivery remains disabled. */
++        uint32_t gbit=1u<<5,group=m_rd(m.gic,0x84),priority=(m_rd(m.gic,0x424)>>8)&255;
++        if((!(group&gbit) && !priority) || (m_rd(m.gic,0x104)&gbit) || (m_rd(m.gic,0x304)&gbit)){
++            sweet_apps_rsc_unlock();return EBUSY;
++        }
++        for(unsigned j=0;j<3;j++){
++            unsigned t=0xd00+j*0x2a0;
++            if(m_rd(m.rsc,t+0x28) && !m_rd(m.rsc,t+0x24) && !m_rd(m.rsc,t+0x2c) && !m_rd(m.rsc,t+0x20) && !(m_rd(m.rsc,0xd04)&(1u<<j))){chosen=j;b=t;break;}
++        }
++        if(chosen<0){sweet_apps_rsc_unlock();return EBUSY;}
++        uint32_t bit=1u<<chosen,irq=m_rd(m.rsc,0xd00);
++        m_wr(m.rsc,0xd08,bit);m_wr(m.rsc,0xd00,irq|bit);
++        if(!(m_rd(m.rsc,0xd00)&bit) || (m_rd(m.rsc,0xd04)&bit)){
++            m_wr(m.rsc,0xd00,(m_rd(m.rsc,0xd00)&~bit)|(irq&bit));sweet_apps_rsc_unlock();return EIO;
++        }
++        m_wr(m.rsc,b+0x34,0x10108);m_wr(m.rsc,b+0x38,address[i]);m_wr(m.rsc,b+0x3c,data[i]);
++        m_wr(m.rsc,b+0x20,1);m_wr(m.rsc,b+0x2c,1);m_wr(m.rsc,b+0x24,1u<<16);m_wr(m.rsc,b+0x24,(1u<<16)|(1u<<24));
++        for(unsigned us=0;us<100000;us++){
++            if((m_rd(m.rsc,0xd04)&bit) && m_rd(m.rsc,b+0x28) && (m_rd(m.rsc,b+0x40)&0x10100)==0x10100){rc=0;break;}delay(1);
++        }
++        if(!rc){m_wr(m.rsc,b+0x24,0);m_wr(m.rsc,b+0x2c,0);m_wr(m.rsc,b+0x20,0);m_wr(m.rsc,0xd08,bit);m_wr(m.rsc,0xd00,(m_rd(m.rsc,0xd00)&~bit)|(irq&bit));}
++        else{m_wr(m.rsc,0xd00,m_rd(m.rsc,0xd00)&~bit);m.vote_uncertain=true;ipa.retained=true;}
++        sweet_apps_rsc_unlock();printf("SWEET IPA: resource=%s address=%#x vote=%#x error=%d\n",i?"IP0":"CN0",address[i],data[i],rc);sweet_log_sync();
++        if(rc)return rc;
++    }
++    ipa.clock_pinned=true;return 0;
++}
++static int ipa_pas(unsigned cmd,uint32_t info,uint64_t a,uint64_t b){
++    uint64_t result=~0ull;int rc=m_scm(qcom_scm_fn(2,cmd),info,15,a,b,0,&result);
++    printf("SWEET IPA: PAS15 cmd=%u status=%d result=%lld\n",cmd,rc,(long long)result);sweet_log_sync();
++    return rc?rc:(int)result;
++}
++static int ipa_memory_prepare(void){
++    int rc=ipa_alloc(&ipa.dma,&ipa.dma_pa,IPA_DMA_BYTES+2*PAGE_SIZE);if(rc)return rc;
++    memset((void *)ipa.dma,0xa5,PAGE_SIZE);memset((void *)(ipa.dma+PAGE_SIZE+IPA_DMA_BYTES),0x5a,PAGE_SIZE);
++    for(unsigned i=0;i<2;i++){rc=ipa_alloc(&ipa.pt[i],&ipa.pt_pa[i],IPA_PT_BYTES);if(rc)return rc;}
++    if(m_alloc(497,0xb000,&ipa.smem_off))return EIO;
++    uint32_t actual=0;if(m_item(497,0xb000,&ipa.smem_off,&actual) || actual!=0xb000)return EINVAL;
++    ipa.smem_bytes=actual;
++    IpaPageTable pt[2];
++    for(unsigned i=0;i<2;i++)if(ipa_pt_init(&pt[i],(uint64_t *)ipa.pt[i],ipa.pt_pa[i]))return EINVAL;
++    if(ipa_pt_map(&pt[0],IPA_DMA_IOVA,ipa.dma_pa+PAGE_SIZE,IPA_DMA_BYTES))return EINVAL;
++    if(ipa_pt_map_attr(&pt[0],0x14683000,0x14683000,0x2000,1))return EINVAL;
++    uint64_t shared=M_SMEM+ipa.smem_off,low=shared&~4095ull,high=(shared+actual+4095)&~4095ull;
++    if(low<M_SMEM || high>M_SMEM+M_SM_SIZE || ipa_pt_map(&pt[0],low,low,(size_t)(high-low)))return EINVAL;
++    /* uC has its own empty domain. No optional WLAN/uC feature buffers exist. */
++    sweet_dma_sync_va((void *)ipa.dma,IPA_DMA_BYTES+2*PAGE_SIZE);
++    for(unsigned i=0;i<2;i++)sweet_dma_sync_va((void *)ipa.pt[i],IPA_PT_BYTES);
++    ipa.smmu=ml_io_map_unmappable(0x15000000,0x100000,VM_WIMG_IO);if(!ipa.smmu)return ENOMEM;
++    ipa.mmu.io=(IpaMmuIo){0,ipa_mread,ipa_mwrite,ipa_mwrite64,ipa_mdelay};
++    if(!sweet_apps_smmu_claim())return EBUSY;
++    ipa.mmu_attempted=true;bool ok=ipa_mmu_install(&ipa.mmu,ipa.pt_pa);sweet_apps_smmu_release();
++    if(!ok)return EIO;
++    printf("SWEET IPA: isolated SIDs AP=%#x CB=%u SMR=%u uC=%#x CB=%u SMR=%u DMA=%#llx SMEM=%#llx\n",0x4a0,ipa.mmu.context[0].bank,ipa.mmu.context[0].slot,0x4a2,ipa.mmu.context[1].bank,ipa.mmu.context[1].slot,(unsigned long long)ipa.dma_pa+PAGE_SIZE,(unsigned long long)shared);
++    sweet_log_sync();return 0;
++}
++static int ipa_load_firmware(const struct wl_fat *f){
++    uint32_t cl,size;int rc=fat_open(f,"image/ipa_fws.mdt",&cl,&size);if(rc)return rc;
++    if(size<52 || size>IPA_FW_METADATA_MAX)return EINVAL;
++    rc=ipa_alloc(&ipa.metadata,&ipa.metadata_pa,IPA_FW_METADATA_MAX);if(rc)return rc;
++    if((rc=fat_read_chain(f,cl,0,(void *)ipa.metadata,size)))return rc;
++    IpaFirmware fw;if(ipa_firmware_parse((void *)ipa.metadata,size,&fw))return EINVAL;
++    /* Validate every split before PAS init or writing the reservation. */
++    for(unsigned i=0;i<fw.count;i++){
++        IpaLoad *p=&fw.loads[i];if(!p->file_bytes)continue;char name[32];uint32_t actual;uint8_t last;
++        snprintf(name,sizeof(name),"image/ipa_fws.b%02u",p->index);
++        if(fat_open(f,name,&cl,&actual) || actual!=p->file_bytes || fat_read_chain(f,cl,actual-1,&last,1))return EIO;
++    }
++    uint64_t supported=0;rc=m_scm(qcom_scm_fn(2,7),1,15,0,0,0,&supported);if(rc || supported!=1)return ENOTSUP;
++    sweet_dma_sync_va((void *)ipa.metadata,IPA_FW_METADATA_MAX);
++    ipa.pas_owed=true;
++    if((rc=ipa_pas(1,qcom_scm_args(2,0,2,0),ipa.metadata_pa,0)))return rc;
++    if((rc=ipa_pas(2,qcom_scm_args(3,0,0,0),IPA_FW_BASE,fw.span)))return rc;
++    /* Map a full CPU page range but write only the DT's 0xa000 reservation. */
++    ipa.firmware=ml_io_map_unmappable(IPA_FW_BASE,IPA_FW_SIZE,VM_WIMG_WCOMB);if(!ipa.firmware)return ENOMEM;
++    for(unsigned i=0;i<fw.count;i++){
++        IpaLoad *p=&fw.loads[i];char name[32];uint32_t actual;
++        if(p->file_bytes){snprintf(name,sizeof(name),"image/ipa_fws.b%02u",p->index);
++            if(fat_open(f,name,&cl,&actual) || actual!=p->file_bytes)return EIO;
++            if((rc=fat_read_chain(f,cl,0,(void *)(ipa.firmware+p->offset),p->file_bytes)))return rc;}
++        if(p->memory_bytes>p->file_bytes)memset((void *)(ipa.firmware+p->offset+p->file_bytes),0,p->memory_bytes-p->file_bytes);
++    }
++    IPA_BARRIER();
++    if((rc=ipa_pas(5,1,0,0)))return rc;ipa.started=true;return 0;
++}
++static int ipa_prepare(const struct wl_fat *f){
++    int rc=ipa_vote_extra();if(rc)return rc;
++    if((rc=ipa_memory_prepare()))return rc;
++    if((rc=ipa_load_firmware(f)))return rc;
++    ipa.block=ml_io_map_unmappable(0x3e00000,0x200000,VM_WIMG_IO);if(!ipa.block)return ENOMEM;
++    printf("SWEET IPA: powered read-only flavor=%#x shared_mem=%#x GSI_status=%#x param2=%#x param4=%#x\n",
++        m_rd(ipa.block,0x140000),m_rd(ipa.block,0x140040),m_rd(ipa.block,0x4000+0x25000),m_rd(ipa.block,0x4000+0x25040),m_rd(ipa.block,0x4000+0x25050));
++    sweet_log_sync();return 0;
++}
++static bool ipa_cleanup(bool modem_stopped){
++    if(!ipa.enabled)return true;
++    if(!modem_stopped){ipa.retained=true;goto retain;}
++    if(ipa.pas_owed){
++        int rc=EIO;for(unsigned n=0;n<4;n++){rc=ipa_pas(6,1,0,0);if(!rc)break;m_sleep(100);}
++        if(rc){ipa.retained=true;goto retain;}ipa.pas_owed=false;ipa.started=false;
++    }
++    if(ipa.retained || ipa.mmu.retained)goto retain;
++    if(ipa.mmu_attempted){
++        if(!sweet_apps_smmu_claim()){ipa.retained=true;goto retain;}
++        bool ok=ipa_mmu_restore(&ipa.mmu,true);sweet_apps_smmu_release();if(!ok)goto retain;
++    }
++    if(ipa.dma){sweet_dma_sync_va((void *)ipa.dma,IPA_DMA_BYTES+2*PAGE_SIZE);
++        for(unsigned i=0;i<PAGE_SIZE;i++)if(*(uint8_t *)(ipa.dma+i)!=0xa5 || *(uint8_t *)(ipa.dma+PAGE_SIZE+IPA_DMA_BYTES+i)!=0x5a){ipa.retained=true;goto retain;}}
++    if(ipa.block)ml_io_unmap(ipa.block,0x200000);
++    if(ipa.firmware)ml_io_unmap(ipa.firmware,IPA_FW_SIZE);
++    if(ipa.smmu)ml_io_unmap(ipa.smmu,0x100000);
++    if(ipa.metadata)kmem_free(kernel_map,ipa.metadata,IPA_FW_METADATA_MAX);
++    if(ipa.dma)kmem_free(kernel_map,ipa.dma,IPA_DMA_BYTES+2*PAGE_SIZE);
++    for(unsigned i=0;i<2;i++)if(ipa.pt[i])kmem_free(kernel_map,ipa.pt[i],IPA_PT_BYTES);
++    printf("SWEET IPA: PAS15 stopped; DMA guards intact; SMMU restored; backing released; shared power floors pinned=%u\n",ipa.clock_pinned);sweet_log_sync();return true;
++retain:printf("SWEET IPA: cleanup UNVERIFIED; retain memory, mappings and power until reset\n");sweet_log_sync();return false;
++}
