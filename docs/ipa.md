@@ -2,9 +2,9 @@
 
 ## Checkpoint, 2026-11-03
 
-I1 is complete. The I2 implementation builds with patches2200 through2210, copied modem2189v2, data2220audit8 and adapter2221. I3 and I4 remain unproven, and no IPA firmware has been started.
+I1 is complete. The I2 implementation builds with patches2200 through2211, copied modem2189v2, data2220audit8 and adapter2221. I3 and I4 remain unproven. ast175 authenticated and stopped PAS15, but CPU VA cleanup panicked.
 
-Read-only surveys ast159 and ast170 passed. ast172 cleaned the root after ast171. ast173 safely refused the optional ASIDPNE hint. Patch2210 leaves that hint clear. Its reviewed SMMU-only run ast174 passed in214seconds with clean roots and fresh evidence. AP/uC private contexts installed, then parked with intact guards and backing released. PAS15 firmware and the offline handshake still need separate reviewed runs.
+Read-only surveys ast159 and ast170 passed. SMMU-only ast174 passed setup and parking with clean roots. PAS15-only ast175 measured authentication and shutdown success, then exposed a page-size mismatch in CPU VA teardown. Patch2211 fixes that mismatch and passes its build and host regressions. A separately reviewed benign journal-clean boot must precede the next firmware trial.
 
 Host inspection of the existing extracted ipa_fws.mdt found three relocatable loads, 17824 file bytes and a page-rounded span of 0x7000. This fits the 0xa000 GSI reservation. `tools/ipa/inspect_mdt.py` checks ELF bounds, overlap and relocation span without loading firmware. It does not check split-file contents or authenticate the image. Three synthetic host tests pass, including nine malformed cases. Local evidence is `plans/ipa/logs/host-check.txt` and `plans/ipa/logs/firmware-inventory.json`.
 
@@ -310,3 +310,13 @@ The exact2210 S image df39ea12 completed normally in214seconds on2026-11-03. Bot
 Evidence is ios-asteroids/logs/ast174-ipa-smmu-2210.txt and its result.json directory. The accepted record is plans/ipa/logs/smmu-2210-accepted.json. Source and exact-image review is plans/ipa/sol-2210-audit.md. The phone returned to recovery, the runner exited0 and its hold/lock were released. The root retains the normal selftest hook, log/frame and ipa-smmu-complete.txt marker. No partition changed.
 
 This proves setup and known-format parking on this boot. It does not prove hardware DMA translations, PAS15, GSI rings or I3. Next is a newly reviewed PAS15-only image on the unchanged2210 kernel.
+
+## ast175 and2211, page-aligned firmware VA teardown
+
+The2210 PAS15-only trial ast175 reset after63seconds. It measured successful PAS15 init1, memory2, authentication5 and shutdown6. Raw log lines5512,5520,5523 and5534 contain zero results. Line5527 reports FLAVOR0xb0f0b1a, shared memory0x880, GSIstatus1, HW_PARAM2 0xe4046312 and HW_PARAM4 0x2011. No MPSS started.
+
+The doubled panic at5536 decodes to pmap_remove_options_internal rejecting an address range of0xa000 bytes. Native io_map rounds allocations to the CPU page, but ml_io_unmap forwards the exact length to pmap_remove. The kernel uses16KiB pages. IPA's firmware reservation is0xa000 bytes, so its VA mapping occupies0xc000 bytes. Patch2211 uses that same rounded size for mapping and unmapping. Firmware parser and writes remain bounded by the original0xa000 reservation. No extra firmware bytes or adjacent GPU bytes are written.
+
+The real runtime test now models native mapping rounding, page-aligned unmap and exact allocation-size matching with PAGE_SIZE16384. Actual old2210 fails that model at the unmap assertion. Corrected2211 passes all lifecycle and datapath sanitizer checks, preserves the firmware tail guards and reproduces all56 integrated files. Its --remake -j6 build exited0. Public patch SHA256 is59a5f8da26864cd9546e959ba842dc9cd2aef57c192e38bf724f0587cbf11d77. Apply it after2210, with the same modem2189v2/dataaudit8/2221 cutoff. No modem source changes are needed.
+
+The run is not accepted A evidence because cleanup panicked, root became dirty and stale=true. The phone returned to recovery and its runner released ownership. The root still has the ordinary2210 firmware selftest hook and logs. A separate benign journal-replay C image is under new review before any further firmware probe. OldA/B/ONLINE candidates stay suspended. I3 and I4 remain unproven. Evidence is ios-asteroids/logs/ast175-ipa-firmware-2210.txt, its result.json, plans/ipa/logs/host-2211-negative-control.txt and build-2211.txt.

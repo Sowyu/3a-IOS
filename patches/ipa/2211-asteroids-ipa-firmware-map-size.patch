@@ -1,0 +1,30 @@
+--- a/bsd/dev/modem/IpaRuntime.inc
++++ b/bsd/dev/modem/IpaRuntime.inc
+@@ -16,6 +16,9 @@
+ #define IPA_DMA_BYTES 0x100000u
+ #define IPA_DMA_IOVA 0x20000000u
+ #define IPA_PT_BYTES (IPA_PT_PAGES*IPA_PT_PAGE)
++/* io_map rounds its VA allocation, but ml_io_unmap requires page alignment.
++ * The trailing partial CPU page is mapped only, never firmware storage. */
++#define IPA_FW_MAP_BYTES ((IPA_FW_SIZE+PAGE_MASK)&~PAGE_MASK)
+ static struct {
+     vm_offset_t smmu,block,firmware,dma,pt[2],metadata;
+     uint64_t dma_pa,pt_pa[2],metadata_pa;
+@@ -138,7 +141,7 @@
+     if((rc=ipa_pas(1,qcom_scm_args(2,0,2,0),ipa.metadata_pa,0)))return rc;
+     if((rc=ipa_pas(2,qcom_scm_args(3,0,0,0),IPA_FW_BASE,fw.span)))return rc;
+     /* Map a full CPU page range but write only the DT's 0xa000 reservation. */
+-    ipa.firmware=ml_io_map_unmappable(IPA_FW_BASE,IPA_FW_SIZE,VM_WIMG_WCOMB);if(!ipa.firmware)return ENOMEM;
++    ipa.firmware=ml_io_map_unmappable(IPA_FW_BASE,IPA_FW_MAP_BYTES,VM_WIMG_WCOMB);if(!ipa.firmware)return ENOMEM;
+     for(unsigned i=0;i<fw.count;i++){
+         IpaLoad *p=&fw.loads[i];char name[32];uint32_t actual;
+         if(p->file_bytes){snprintf(name,sizeof(name),"image/ipa_fws.b%02u",p->index);
+@@ -176,7 +179,7 @@
+     if(ipa.dma){sweet_dma_sync_va((void *)ipa.dma,IPA_DMA_BYTES+2*PAGE_SIZE);
+         for(unsigned i=0;i<PAGE_SIZE;i++)if(*(uint8_t *)(ipa.dma+i)!=0xa5 || *(uint8_t *)(ipa.dma+PAGE_SIZE+IPA_DMA_BYTES+i)!=0x5a){ipa.retained=true;goto retain;}}
+     if(ipa.block)ml_io_unmap(ipa.block,0x200000);
+-    if(ipa.firmware)ml_io_unmap(ipa.firmware,IPA_FW_SIZE);
++    if(ipa.firmware)ml_io_unmap(ipa.firmware,IPA_FW_MAP_BYTES);
+     if(ipa.smmu)ml_io_unmap(ipa.smmu,0x100000);
+     if(ipa.metadata)kmem_free(kernel_map,ipa.metadata,IPA_FW_METADATA_MAX);
+     if(ipa.dma)kmem_free(kernel_map,ipa.dma,IPA_DMA_BYTES+2*PAGE_SIZE);

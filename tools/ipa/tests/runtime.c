@@ -28,10 +28,11 @@ static struct {bool bandwidth_pinned,bandwidth_irq,vote_uncertain;vm_offset_t rs
 static unsigned freed,unmapped,alloc_calls,fail_alloc,pas_calls[8],fail_pas,shutdown_fails;
 static bool held,timeout,drop_irq_enable,drop_irq_clear;
 static uint32_t gic[0x1000/4];
-static uint32_t smmu[0x100000/4],rsc[0x4000/4],block[0x200000/4];
-static uint8_t firmware[0x10000],mdt[256];static unsigned mdt_bytes;
+_Alignas(PAGE_SIZE) static uint32_t smmu[0x100000/4],rsc[0x4000/4],block[0x200000/4];
+_Alignas(PAGE_SIZE) static uint8_t firmware[0x10000],mdt[256];static unsigned mdt_bytes;
 static struct {void *ptr;size_t size;uint64_t pa;} allocation[8];static unsigned allocations;
 static unsigned clocks;
+static size_t mapped_size[3];
 static int kmem_alloc_contig(void *map,vm_offset_t *va,size_t size,unsigned mask,unsigned a,unsigned b,unsigned flags,unsigned tag){
  (void)map;(void)mask;(void)a;(void)b;(void)flags;(void)tag;
  if(++alloc_calls==fail_alloc)return ENOMEM;
@@ -40,8 +41,21 @@ static int kmem_alloc_contig(void *map,vm_offset_t *va,size_t size,unsigned mask
 }
 ppnum_t pmap_find_phys(pmap_t map,addr64_t va){(void)map;for(unsigned i=0;i<allocations;i++)if(va>=(uintptr_t)allocation[i].ptr && va-(uintptr_t)allocation[i].ptr<allocation[i].size)return (allocation[i].pa+va-(uintptr_t)allocation[i].ptr)>>14;return 0;}
 static void kmem_free(void *map,vm_offset_t va,size_t size){(void)map;for(unsigned i=0;i<allocations;i++)if((uintptr_t)allocation[i].ptr==va){assert(allocation[i].size==size);free(allocation[i].ptr);allocation[i].ptr=NULL;freed++;return;}assert(0);}
-static vm_offset_t ml_io_map_unmappable(uint64_t pa,size_t size,unsigned flags){(void)size;(void)flags;if(++alloc_calls==fail_alloc)return 0;if(pa==0x15000000)return (uintptr_t)smmu;if(pa==IPA_FW_BASE)return (uintptr_t)firmware;if(pa==0x3e00000)return (uintptr_t)block;assert(0);return 0;}
-static void ml_io_unmap(vm_offset_t va,size_t size){(void)va;(void)size;unmapped++;}
+static vm_offset_t ml_io_map_unmappable(uint64_t pa,size_t size,unsigned flags){
+ (void)flags;if(++alloc_calls==fail_alloc)return 0;
+ assert(!(pa&PAGE_MASK));unsigned i;vm_offset_t va;
+ if(pa==0x15000000){i=0;va=(uintptr_t)smmu;}
+ else if(pa==IPA_FW_BASE){i=1;va=(uintptr_t)firmware;assert(size<=sizeof(firmware));}
+ else {assert(pa==0x3e00000);i=2;va=(uintptr_t)block;}
+ /* Model native io_map's rounded allocation and ml_io_unmap's exact span. */
+ mapped_size[i]=(size+PAGE_MASK)&~PAGE_MASK;return va;
+}
+static void ml_io_unmap(vm_offset_t va,size_t size){
+ assert(!((va|size)&PAGE_MASK));
+ unsigned i=va==(uintptr_t)smmu?0:va==(uintptr_t)firmware?1:2;
+ assert(i!=2 || va==(uintptr_t)block);assert(mapped_size[i]==size);
+ mapped_size[i]=0;unmapped++;
+}
 static void sweet_dma_sync_va(const void *va,size_t size){assert(va && size);}
 static uint32_t m_rd(vm_offset_t p,unsigned o){if(p==m.db)return 0;assert(p);if(p==m.rsc && o==0xd04)return rsc[o/4]&rsc[0xd00/4];return *(uint32_t *)(p+o);}
 static void m_wr(vm_offset_t p,unsigned o,uint32_t v){
@@ -75,6 +89,7 @@ static void put32(uint8_t *p,uint32_t x){p[0]=x;p[1]=x>>8;p[2]=x>>16;p[3]=x>>24;
 static void reset(void){
  /* Test process owns all retained allocations after the simulated reboot. */
  for(unsigned i=0;i<allocations;i++)if(allocation[i].ptr)free(allocation[i].ptr);
+ memset(mapped_size,0,sizeof(mapped_size));
  allocations=freed=unmapped=alloc_calls=fail_alloc=fail_pas=shutdown_fails=clocks=0;held=timeout=drop_irq_enable=drop_irq_clear=false;memset(pas_calls,0,sizeof(pas_calls));memset(&ipa,0,sizeof(ipa));ipa.enabled=true;
  memset(smmu,0,sizeof(smmu));smmu[0x20/4]=0x4c017e72;smmu[0x24/4]=0x60000048;smmu[0x28/4]=0x5111;
  for(unsigned i=0;i<72;i++){
@@ -88,7 +103,7 @@ static void reset(void){
  put32(mdt+52+16,148);put32(mdt+84+16,16);put32(mdt+84+24,0x02000000);put32(mdt+116,1);put32(mdt+116+12,0x10000);put32(mdt+116+16,32);put32(mdt+116+20,64);put32(mdt+116+24,0x08000000);mdt_bytes=164;
 }
 int main(void){
- struct wl_fat f={0};reset();assert(!ipa_prepare(&f));assert(pas_calls[1]==1 && pas_calls[2]==1 && pas_calls[5]==1);assert(clocks==2);unsigned steps=alloc_calls;assert(ipa_cleanup(true));assert(pas_calls[6]==1 && freed==allocations);
+ struct wl_fat f={0};reset();assert(!ipa_prepare(&f));assert(pas_calls[1]==1 && pas_calls[2]==1 && pas_calls[5]==1);assert(clocks==2);assert(mapped_size[1]==0xc000 && IPA_FW_SIZE==0xa000);unsigned steps=alloc_calls;assert(ipa_cleanup(true));assert(pas_calls[6]==1 && freed==allocations);assert(!mapped_size[0] && !mapped_size[1] && !mapped_size[2]);
  for(unsigned i=0;i<32;i++)assert(firmware[i]==0x17);for(unsigned i=32;i<64;i++)assert(firmware[i]==0);for(unsigned i=64;i<sizeof(firmware);i++)assert(firmware[i]==0x6c);
  for(unsigned n=1;n<=steps;n++){reset();fail_alloc=n;assert(ipa_prepare(&f));assert(ipa_cleanup(true));assert(freed==allocations);}
  for(unsigned cmd=1;cmd<=5;cmd++){if(cmd!=1 && cmd!=2 && cmd!=5)continue;reset();fail_pas=cmd;assert(ipa_prepare(&f));assert(ipa_cleanup(true));assert(pas_calls[6]==1 && freed==allocations);}
