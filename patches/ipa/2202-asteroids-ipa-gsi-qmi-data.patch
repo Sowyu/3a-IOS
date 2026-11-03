@@ -14,7 +14,7 @@ diff --git a/bsd/dev/modem/ModemRuntime.inc b/bsd/dev/modem/ModemRuntime.inc
      uint32_t off,bytes;
      if(m_item(435,QCOM_SMP2P_ITEM_BYTES,&off,&bytes))return;
      m.sp.in=(volatile uint32_t *)(m.smem+off);
-@@ -355,6 +360,7 @@
+@@ -361,6 +366,7 @@
      static const QcomGlinkClient client={m_gstate,m_greceive};
      m.channel=qcom_glink_channel(&m.gl,"IPCRTR",M_RX_SIZE,8,m.rx,&client,0,1);
      qcom_qrtr_init(&m.qr,1,m_qsend_packet,0);
@@ -22,7 +22,7 @@ diff --git a/bsd/dev/modem/ModemRuntime.inc b/bsd/dev/modem/ModemRuntime.inc
      if(m.rmtfs && qcom_qrtr_add_service(&m.qr,14,1,0x4000,m_rmtfs_receive,0))return EIO;
      if(m.sysmon && qcom_qrtr_add_service(&m.qr,0,0,0x4003,m_shutdown_receive,0))return EIO;
      if(m.uim && qcom_qrtr_add_service(&m.qr,0,0,0x4002,m_uim_receive,0))return EIO;
-@@ -509,9 +515,16 @@
+@@ -516,9 +522,16 @@
  static bool m_gate(const char *name){return modem_gate(PE_boot_args(),name)!=0;}
  #include "IpaProbe.inc"
  #include "IpaRuntime.inc"
@@ -40,7 +40,7 @@ diff --git a/bsd/dev/modem/ModemRuntime.inc b/bsd/dev/modem/ModemRuntime.inc
      if(ipa.enabled && (!m.bandwidth || !m.bandwidth_irq || !m_gate("sweetmpss"))){printf("SWEET IPA: requires strict sweetmpss, sweetmbw and sweetmbwi gates\n");return EINVAL;}
      if((m.rmtfs || m.pdm || m.uim || m.sysmon) && !m.glink){printf("SWEET MODEM: refused missing GLINK dependency\n");return EINVAL;}
      if(m.uim_ready_poll && !m.uim){printf("SWEET MODEM: readiness polling requires UIM\n");return EINVAL;}
-@@ -532,19 +545,27 @@
+@@ -539,19 +552,27 @@
              if(old&2){rc=EBUSY;goto out;}}
      }
      uint32_t outoff;if(m_alloc(428,QCOM_SMP2P_ITEM_BYTES,&outoff)){rc=EIO;goto out;}
@@ -288,7 +288,7 @@ diff --git a/bsd/dev/modem/IpaQmi.h b/bsd/dev/modem/IpaQmi.h
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/modem/IpaQmi.h
-@@ -0,0 +1,102 @@
+@@ -0,0 +1,108 @@
 +#ifndef IPA_QMI_H
 +#define IPA_QMI_H
 +#include <stdint.h>
@@ -299,7 +299,7 @@ new file mode 100644
 +#define IPA_QMI_SERVER 0x4004u
 +#define IPA_QMI_CLIENT 0x4005u
 +typedef struct {
-+    uint32_t node,port,peer_node,peer_port,mem_offset,mem_size;
++    uint32_t node,port,peer_node,peer_port,mem_offset,mem_size,smem_size;
 +    uint16_t transaction;
 +    bool bound,peer_bound,sent,response_seen,accepted,registered,uc_done,indicated,failed;
 +    uint64_t deadline;
@@ -312,8 +312,8 @@ new file mode 100644
 +static inline unsigned ipa_tlv_pair(uint8_t *out,unsigned at,uint8_t type,uint32_t a,uint32_t b){
 +    out[at]=type;ipa_put16(out+at+1,8);ipa_put32(out+at+3,a);ipa_put32(out+at+7,b);return at+11;
 +}
-+static inline unsigned ipa_qmi_init_request(uint8_t out[256],uint16_t transaction,uint32_t base,uint32_t size){
-+    if(size<0x3fe8 || base>0xffff || size>0x10000-base)return 0;
++static inline unsigned ipa_qmi_init_request(uint8_t out[256],uint16_t transaction,uint32_t base,uint32_t size,uint32_t smem_size){
++    if(size<0x3fe8 || base>0xffff || size>0x10000-base || smem_size!=0xb000)return 0;
 +    memset(out,0,256);out[0]=QCOM_QMI_REQUEST;ipa_put16(out+1,transaction);ipa_put16(out+3,0x21);
 +    unsigned n=7;
 +    n=ipa_tlv32(out,n,0x10,3); /* MSM Android */
@@ -328,6 +328,12 @@ new file mode 100644
 +    n=ipa_tlv32(out,n,0x1d,base+0x288);n=ipa_tlv32(out,n,0x1e,base+0x388);
 +    n=ipa_tlv32(out,n,0x1f,base+0x1868);n=ipa_tlv32(out,n,0x20,0x60);
 +    n=ipa_tlv32(out,n,0x21,base+0x2870);n=ipa_tlv32(out,n,0x22,0x20);
++    /* Nothing vendor TLV0x23 uses the unprefixed SRAM offset, unlike
++     * quota/drop fields. Indices128..179 occupy 52 sixteen-byte records. */
++    out[n++]=0x23;ipa_put16(out+n,10);n+=2;
++    ipa_put32(out+n,0x1cd0);ipa_put32(out+n+4,52*16);out[n+8]=128;out[n+9]=179;n+=10;
++    /* Vendor leaves block_start_addr zero. Size is SMEM item497, not SRAM. */
++    n=ipa_tlv_pair(out,n,0x24,0,smem_size);
 +    ipa_put16(out+5,(uint16_t)(n-7));return n;
 +}
 +static inline bool ipa_qmi_unique(const QcomQmiMessage *m){
@@ -379,7 +385,7 @@ new file mode 100644
 +    if((s->peer_bound && node!=s->peer_node) || (s->bound && (node!=s->node || port!=s->port))){s->failed=true;return -1;}
 +    s->bound=true;s->node=node;s->port=port;
 +    if(!s->sent){uint8_t out[256];s->transaction=1;
-+        unsigned n=ipa_qmi_init_request(out,s->transaction,s->mem_offset,s->mem_size);
++        unsigned n=ipa_qmi_init_request(out,s->transaction,s->mem_offset,s->mem_size,s->smem_size);
 +        if(!n || qcom_qrtr_send_data(qr,IPA_QMI_CLIENT,node,port,out,n)){s->failed=true;return -1;}
 +        s->sent=true;s->deadline=now+60000;
 +    }
@@ -499,7 +505,7 @@ new file mode 100644
 +        if(!iph.gsi.ch[i].tx)for(unsigned n=0;n<iph.gsi.ch[i].slots-1;n++)if(!ipa_gsi_post(&iph.gsi,i,8192,0,0))return EIO;
 +    }
 +    if(!ipa_tables_setup())return EIO;
-+    iph.qmi.mem_offset=iph.offset;iph.qmi.mem_size=iph.bytes;iph.ready=true;
++    iph.qmi.mem_offset=iph.offset;iph.qmi.mem_size=iph.bytes;iph.qmi.smem_size=ipa.smem_bytes;iph.ready=true;
 +    printf("SWEET IPA: AP endpoints 9/ch6 11/ch7 2/ch5 18/ch9 ready QMAPv1 RX8192 aggr6144/16/500us\n");sweet_log_sync();return 0;
 +}
 +static bool ipa_hardware_stop(void){

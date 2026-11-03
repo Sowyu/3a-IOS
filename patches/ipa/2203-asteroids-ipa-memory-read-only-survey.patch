@@ -1,0 +1,59 @@
+diff --git a/bsd/dev/modem/IpaProbe.inc b/bsd/dev/modem/IpaProbe.inc
+--- a/bsd/dev/modem/IpaProbe.inc
++++ b/bsd/dev/modem/IpaProbe.inc
+@@ -35,5 +35,21 @@
+         }
+         printf("SWEET IPA: SID=%#x matches=%u\n",sid,matches);
+     }
++    bool used[256]={0};
++    for(unsigned i=0;i<count;i++){
++        uint32_t smr=m_rd(smmu,0x800+4*i),s2=m_rd(smmu,0xc00+4*i);
++        if((smr>>31) && ((s2>>16)&3)==0 && (s2&255)<banks)used[s2&255]=true;
++    }
++    for(unsigned i=0;i<banks;i++){
++        unsigned b=(unsigned)(cbbase+((uint64_t)i<<shift));
++        printf("SWEET IPA: CBsurvey bank=%u referenced=%u SCTLR=%#x TTBR0=%#x:%#x TTBR1=%#x:%#x FSR=%#x CBAR=%#x CBA2R=%#x read_only=1\n",
++            i,used[i],m_rd(smmu,b),m_rd(smmu,b+0x24),m_rd(smmu,b+0x20),m_rd(smmu,b+0x2c),m_rd(smmu,b+0x28),m_rd(smmu,b+0x58),m_rd(smmu,0x1000+4*i),m_rd(smmu,0x1800+4*i));
++    }
++    vm_offset_t smem=ml_io_map(M_SMEM,M_SM_SIZE);if(!smem)return ENOMEM;
++    QcomSmem shared={(volatile uint8_t *)smem,M_SM_SIZE};QcomSmemPartition part={0};
++    int part_rc=qcom_smem_partition(&shared,0,1,&part);uint32_t item=0,bytes=0;
++    int item_rc=part_rc?part_rc:qcom_smem_find(&shared,&part,497,&item,&bytes);
++    printf("SWEET IPA: SMEMsurvey partition_result=%d offset=%#x size=%#x uncached=%#x cached=%#x item497_result=%d offset=%#x bytes=%#x read_only=1\n",
++        part_rc,part.offset,part.size,part_rc?0:qcom_smem_read32(&shared,part.offset+12),part_rc?0:qcom_smem_read32(&shared,part.offset+16),item_rc,item,bytes);
+     printf("SWEET IPA: preflight complete; no IPA/GSI register access or SMMU writes\n");sweet_log_sync();return 0;
+ }
+diff --git a/bsd/dev/modem/IpaRuntime.inc b/bsd/dev/modem/IpaRuntime.inc
+--- a/bsd/dev/modem/IpaRuntime.inc
++++ b/bsd/dev/modem/IpaRuntime.inc
+@@ -79,9 +79,11 @@
+     int rc=ipa_alloc(&ipa.dma,&ipa.dma_pa,IPA_DMA_BYTES+2*PAGE_SIZE);if(rc)return rc;
+     memset((void *)ipa.dma,0xa5,PAGE_SIZE);memset((void *)(ipa.dma+PAGE_SIZE+IPA_DMA_BYTES),0x5a,PAGE_SIZE);
+     for(unsigned i=0;i<2;i++){rc=ipa_alloc(&ipa.pt[i],&ipa.pt_pa[i],IPA_PT_BYTES);if(rc)return rc;}
+-    if(m_alloc(497,0xb000,&ipa.smem_off))return EIO;
++    rc=m_alloc(497,0xb000,&ipa.smem_off);
++    printf("SWEET IPA: prepare SMEM497 alloc_error=%d offset=%#x\n",rc,ipa.smem_off);sweet_log_sync();
++    if(rc)return rc;
+     uint32_t actual=0;if(m_item(497,0xb000,&ipa.smem_off,&actual) || actual!=0xb000)return EINVAL;
+-    ipa.smem_bytes=actual;
++    ipa.smem_bytes=actual;printf("SWEET IPA: prepare SMEM497 actual=%#x\n",actual);sweet_log_sync();
+     IpaPageTable pt[2];
+     for(unsigned i=0;i<2;i++)if(ipa_pt_init(&pt[i],(uint64_t *)ipa.pt[i],ipa.pt_pa[i]))return EINVAL;
+     if(ipa_pt_map(&pt[0],IPA_DMA_IOVA,ipa.dma_pa+PAGE_SIZE,IPA_DMA_BYTES))return EINVAL;
+@@ -95,7 +97,15 @@
+     ipa.mmu.io=(IpaMmuIo){0,ipa_mread,ipa_mwrite,ipa_mwrite64,ipa_mdelay};
+     if(!sweet_apps_smmu_claim())return EBUSY;
+     ipa.mmu_attempted=true;bool ok=ipa_mmu_install(&ipa.mmu,ipa.pt_pa);sweet_apps_smmu_release();
+-    if(!ok)return EIO;
++    if(!ok){
++        printf("SWEET IPA: prepare SMMU install refused retained=%u\n",ipa.mmu.retained);
++        for(unsigned i=0;i<2;i++){
++            IpaMmuContext *p=&ipa.mmu.context[i];unsigned b=ipa_cb(p->bank);
++            printf("SWEET IPA: prepare SMMU bank=%u slot=%u touched=%u published=%u saved_CTL=%#x CTL=%#x TCR=%#x TCR2=%#x CBAR=%#x CBA2R=%#x\n",
++                p->bank,p->slot,p->touched,p->published,p->saved[0],ipa_mread(0,b),ipa_mread(0,b+0x30),ipa_mread(0,b+0x10),ipa_mread(0,0x1000+4*p->bank),ipa_mread(0,0x1800+4*p->bank));
++        }
++        sweet_log_sync();return EIO;
++    }
+     printf("SWEET IPA: isolated SIDs AP=%#x CB=%u SMR=%u uC=%#x CB=%u SMR=%u DMA=%#llx SMEM=%#llx\n",0x4a0,ipa.mmu.context[0].bank,ipa.mmu.context[0].slot,0x4a2,ipa.mmu.context[1].bank,ipa.mmu.context[1].slot,(unsigned long long)ipa.dma_pa+PAGE_SIZE,(unsigned long long)shared);
+     sweet_log_sync();return 0;
+ }

@@ -27,7 +27,7 @@ diff --git a/bsd/dev/sweet_modem.c b/bsd/dev/sweet_modem.c
 diff --git a/bsd/dev/modem/ModemRuntime.inc b/bsd/dev/modem/ModemRuntime.inc
 --- a/bsd/dev/modem/ModemRuntime.inc
 +++ b/bsd/dev/modem/ModemRuntime.inc
-@@ -507,6 +507,7 @@
+@@ -514,6 +514,7 @@
  }
  #include "ModemGate.h"
  static bool m_gate(const char *name){return modem_gate(PE_boot_args(),name)!=0;}

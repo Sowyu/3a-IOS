@@ -44,7 +44,7 @@ diff --git a/bsd/dev/sweet_touch_asteroids.c b/bsd/dev/sweet_touch_asteroids.c
 diff --git a/bsd/dev/modem/ModemRuntime.inc b/bsd/dev/modem/ModemRuntime.inc
 --- a/bsd/dev/modem/ModemRuntime.inc
 +++ b/bsd/dev/modem/ModemRuntime.inc
-@@ -508,8 +508,11 @@
+@@ -515,8 +515,11 @@
  #include "ModemGate.h"
  static bool m_gate(const char *name){return modem_gate(PE_boot_args(),name)!=0;}
  #include "IpaProbe.inc"
@@ -56,7 +56,7 @@ diff --git a/bsd/dev/modem/ModemRuntime.inc b/bsd/dev/modem/ModemRuntime.inc
      if((m.rmtfs || m.pdm || m.uim || m.sysmon) && !m.glink){printf("SWEET MODEM: refused missing GLINK dependency\n");return EINVAL;}
      if(m.uim_ready_poll && !m.uim){printf("SWEET MODEM: readiness polling requires UIM\n");return EINVAL;}
      m_sleep(30000);m.began=m_now();int rc=EIO;
-@@ -536,11 +539,12 @@
+@@ -543,11 +546,12 @@
      m.qmp_owed=true;if((rc=m_qsend(true)))goto out;
      if((rc=m_vote(true)))goto out;
      if((rc=m_bandwidth_vote()))goto out;

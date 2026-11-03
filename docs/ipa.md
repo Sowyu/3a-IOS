@@ -2,7 +2,7 @@
 
 ## Checkpoint, 2026-11-03
 
-I1 is complete. I2 is in progress. Patch 2200 passed its audited read-only phone run, ast159. Firmware bounds and the APPS SMMU survey passed, with no IPA/GSI MMIO or PAS15 call. The isolated xnu-ipa tree now carries copied modem patches 2170 through 2187 revision 2. Mobile data does not work yet.
+I1 is complete. I2 is in progress. Patch 2200 passed its audited read-only phone run, ast159. Firmware bounds and the APPS SMMU survey passed, with no IPA/GSI MMIO or PAS15 call. The isolated xnu-ipa tree now carries copied modem patches 2170 through 2188 revision 2. Mobile data does not work yet.
 
 Host inspection of the existing extracted ipa_fws.mdt found three relocatable loads, 17824 file bytes and a page-rounded span of 0x7000. This fits the 0xa000 GSI reservation. `tools/ipa/inspect_mdt.py` checks ELF bounds, overlap and relocation span without loading firmware. It does not check split-file contents or authenticate the image. Three synthetic host tests pass, including nine malformed cases. Local evidence is `plans/ipa/logs/host-check.txt` and `plans/ipa/logs/firmware-inventory.json`.
 
@@ -176,3 +176,17 @@ Full mode requires sweetipa=1 plus strict modem, bandwidth, guarded completion, 
 The previous firmware image is obsolete and must not boot. The current common kernel SHA256 is 9967fa32fb1242ca523dae10306a0585120badf1ad7a8049a844e93295ab543e. The firmware-only image is 39e08eecd19009f5fccc027ec2cba78d06b551f0d4127fa4df467531ddfb57a3. The handshake image is dc92356124af17ed81fb8bffbefd4f3d921bafd5a5ced76de7681ef1470c4ca8. Both passed all ten segment checks. Neither is approved for a phone run yet. The runner permits one boot attempt and forbids replay boots.
 
 The ordered public series now reproduces all 18 IPA-touched files exactly from pristine XNU and the specified prerequisites. Local evidence is plans/ipa/logs/series-check.txt. Current parser, lifecycle and datapath sanitizer checks all pass. A fresh staged Sol review covers the firmware-only probe and the subsequent offline handshake, with separate approval decisions. Neither runner has started.
+
+## ast166 firmware preparation refusal
+
+The one approved Stage A attempt finished normally in 217 seconds, with a fresh matching nonce, stale=false and clean root before and after. The phone returned to recovery and the IPA hold/lock were released for the owner's next data USB slot. Local evidence is ios-asteroids/logs/ast166-ipa-firmware-2201.txt and its result directory.
+
+CN0 and IP0 votes succeeded at 53.54 and 53.55 seconds. Preparation then returned error 5 before any PAS15 call or powered IPA/GSI read. The worker logged final_error=5. Its generic cleanup message reported released backing and preserved power floors, but does not establish that PAS15 started or that any SMMU context was installed. Stage A did not pass and I3 remains unproven.
+
+Patch 2203 adds a read-only survey of all measured SMMU context banks and the modem SMEM partition/item497. This will distinguish lack of SMEM capacity from unused-context selection or register readback failure. It also adds precise preparation diagnostics to a later reviewed firmware attempt. The next survey uses only sweetipaprobe, with MPSS/IPA firmware and GSI gates absent. It requires a new exact-image review before use.
+
+The next desk source includes copied modem 2188 revision2, hash 01d1979ea44147622f2aba7468ba22b475d306ba6128aa2835c853b9ec54e878. The copied revision1 is obsolete. No IPA image has run 2188 yet.
+
+The corrected 2202 request now sends vendor TLV 0x23 with filter-statistics offset 0x1cd0, size 832 bytes and inclusive indices 128 through 179. Unlike the other SRAM table fields, the vendor uses this offset without the restricted-memory prefix. TLV 0x24 carries block_start_addr zero and the verified 0xb000-byte SMEM item 497 size. Optional peripheral telemetry remains absent because the driver does not implement it. Golden wire tests verify both extensions with a nonzero SRAM prefix against the pinned [Nothing QMI wire schema](https://github.com/NothingOSS/android_kernel_msm-6.1_nothing_sm7635/blob/d5f5f965fd0b478eaf4eb63fd984c5a4a92135a7/vendor/qcom/opensource/dataipa/drivers/platform/msm/ipa/ipa_v3/ipa_qmi_service_v01.c).
+
+The read-only 2203 image has SHA256 456f6108e87b52d9096203d70406b35ec432dde311542d26bade338d02258792, with kernel 3c320313139626124ba4882ed68d1c9bd79d74dd3d61de795d3af1cce767b091. Full remake and all ten segment checks passed. A fresh Sol review is running. The survey runner acquires the hold exclusively and consumes a per-image attempt record, so two launchers cannot share a hold or repeat an approval.

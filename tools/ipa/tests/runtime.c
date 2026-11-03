@@ -67,7 +67,8 @@ static int m_scm(uint32_t fn,uint32_t info,uint64_t pas,uint64_t a,uint64_t b,ui
 }
 static int fat_open(const struct wl_fat *f,const char *name,uint32_t *cl,uint32_t *size){(void)f;if(!strcmp(name,"image/ipa_fws.mdt")){*cl=1;*size=mdt_bytes;return 0;}assert(!strcmp(name,"image/ipa_fws.b02"));*cl=2;*size=32;return 0;}
 static int fat_read_chain(const struct wl_fat *f,uint32_t cl,uint32_t off,void *dst,uint32_t size){(void)f;if(cl==1){assert(off+size<=mdt_bytes);memcpy(dst,mdt+off,size);}else{assert(cl==2 && off+size<=32);memset(dst,0x17,size);}return 0;}
-#define printf(...) ((void)0)
+static int quiet_printf(const char *format,...){(void)format;return 0;}
+#define printf quiet_printf
 #include "IpaRuntime.inc"
 #undef printf
 static void put32(uint8_t *p,uint32_t x){p[0]=x;p[1]=x>>8;p[2]=x>>16;p[3]=x>>24;}

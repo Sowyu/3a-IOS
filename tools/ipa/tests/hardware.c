@@ -6,7 +6,7 @@
 #define PAGE_SIZE 16384u
 #define IPA_DMA_IOVA 0x20000000u
 typedef uintptr_t vm_offset_t;
-static struct {vm_offset_t dma,block;bool clock_pinned;} ipa;
+static struct {vm_offset_t dma,block;bool clock_pinned;uint32_t smem_bytes;} ipa;
 static uint32_t cfg[0x10000/4];static uint8_t local[0x10000];
 static unsigned cfg_writes,cfg_drop,immediates,fail_immediate,cmd_seen;
 static bool corrupt_read,hold_aggregate;
@@ -55,7 +55,7 @@ static void qreceive(unsigned msg){
 }
 static unsigned received;
 static void rx_callback(void *ctx,const uint8_t *p,size_t n){assert(ctx==&received && !queue_locked);assert(n==8 && p[4]==0x45);received++;assert(!sweet_ipa_transmit(p,n));}
-static void hreset(void){reset();memset(cfg,0,sizeof(cfg));memset(local,0x6a,sizeof(local));ipa.dma=(uintptr_t)dma-PAGE_SIZE;ipa.block=1;cfg[0x40/4]=(0x800u<<16)|0x800;cfg[0]=24|(12u<<16);cfg_writes=cfg_drop=immediates=fail_immediate=cmd_seen=0;corrupt_read=hold_aggregate=false;}
+static void hreset(void){reset();memset(cfg,0,sizeof(cfg));memset(local,0x6a,sizeof(local));ipa.smem_bytes=0xb000;ipa.dma=(uintptr_t)dma-PAGE_SIZE;ipa.block=1;cfg[0x40/4]=(0x800u<<16)|0x800;cfg[0]=24|(12u<<16);cfg_writes=cfg_drop=immediates=fail_immediate=cmd_seen=0;corrupt_read=hold_aggregate=false;}
 int main(void){
  hreset();assert(!ipa_hardware_setup());assert(immediates==7 && iph.ready);assert(cfg[0x38/4]==(11|(11u<<8)|(3u<<26)));assert(iph.gsi.ch[3].posted==63);assert(cfg[(0x1040+0x80*2)/4]==33 && !cfg[(0x1040+0x80*18)/4]);assert(!(cfg[(0x1008+0x80*18)/4]&0x7f));assert((cfg[(0x1024+0x80*18)/4]>>5&63)==6);
  for(unsigned i=0;i<0x280;i++)assert(local[0x4000+i]==0x6a);
