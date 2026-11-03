@@ -481,3 +481,6 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 **Code.** Additive2212 fixes the measured flavor partition check. It validates AP TX endpoints against the hardware consumer range and AP RX against the producer range before configuration writes.
 
 **Measured, host.** The actual0xb0f0b1a flavor and0x880 shared-memory value pass the hardware setup model. Invalid partitions are refused before writes. The combined datapath sanitizer suite,56-file reproduction, safe build and10-segment image comparison pass. The frozen data kernel is a37e260bf19409e2f4dadf8615ef786cb1e6eb93c18644d40f0061c77a61303e. Its image remains unapproved pending hardware prerequisites and a fresh exact-image review.
+
+
+**Measured, root restored.** The separate benign cleanup ast176 completed normally in214seconds. Its raw log shows journal replay at384 and DONE at12627, with no IPA or modem worker output. The accepted capture hashes match, root_state is clean and stale=false. IPA released ownership in recovery before its separately reviewed2212 firmware trial.
