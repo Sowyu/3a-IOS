@@ -4,6 +4,8 @@ Updated 2026-11-02, about 22:20 AEDT. Update this file whenever the state change
 
 ## Phone state right now
 
+- **Battery:** 2190+2191 add an off-by-default, read-only ADSP resource survey; Sol approved the corrected source, host checks pass, full build is running, no phone run or ADSP-start approval yet. The reference battery client writes USB current limits and must not be copied unchanged. See `docs/battery.md` and `plans/battery/README.md`.
+
 - iOS 26.6.2 cold boots from the power button, with no Mac.
 - `boot_a` holds the recovery-capable shim plus iOS, a full 100 MiB partition image with the signed vbmeta moved. It was built by `tools/ablfix/make_relocated.py` from `plans/recovery/out/recovery-boot.img`, the iOS image `next-flash-boot.img` with the recovery chain added.
 - `boot_b` holds the plain iOS image, without the recovery chain, as a fallback.
