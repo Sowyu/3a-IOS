@@ -26,7 +26,8 @@ Updated 2026-11-02, about 22:20 AEDT. Update this file whenever the state change
 
 - **Owner trial of combo-ub** (UBWC + pool + 2144, RAM boot, nothing flashed): "feels steadier when it is steady but it jumps often". The jumps come mostly while a finger is down, and every tap feels delayed. The root now has the `next-luma-ub` driver (`plans/lag/owner-ub.sh`; `--restore` puts `next-luma` back).
 - **Touch measured, ast139:** the controller reports at about 252 per second with 0 missed reports, and the kernel sends each one 1.1 to 1.5 ms after noticing it. The delay is in iOS or the display path. Frames/s with the owner's finger was 33, against 41 to 44 scripted. Details in `docs/input.md`.
-- **In progress:** 2154 adds absolute touch-down and lift times to the stats line, so `tools/input/tapdelay.py` can split each tap's delay into iOS (touch to frame start) and render plus display (frame start to latch). The next owner run is 5 minutes of taps on `touch-taps`, with the UBWC trace driver.
+- **Tap delay, partial (ast140):** 2154 adds touch-down and lift times, and `tools/input/tapdelay.py` splits each tap. Only 11 of 52 taps survived, because PosterBoard's logging wrapped the kernel log. From those, frame start to panel takes 15 to 60 ms. The wait before CoreAnimation starts a frame varies from 5 to over 300 ms, so the iOS side is the likely target. Details and the fix for the next run are in `docs/input.md`. The root has the UBWC trace driver (`plans/lag/arms/lumaub`); `plans/lag/owner-ub.sh` puts the clean `next-luma-ub` back.
+- **Modem/SIM:** an agent started at 12:13 on modem start and SIM read (`plans/modem/`, report to come in `docs/modem.md`).
 
 ## What works
 

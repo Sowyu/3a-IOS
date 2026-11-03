@@ -178,3 +178,18 @@ So the kernel's touch path is not where the delay or the unevenness comes from. 
 **Next, 2154** (`patches/input/2154-asteroids-touch-stats-times.patch`). The stats line now ends with `down D up U`, absolute microseconds on the frame trace's clock, and covers the first 100 touches. `tools/input/tapdelay.py RUNDIR` joins those times to the trace's frames. For each touch from idle, it reports the time to the first frame CoreAnimation starts and the time to its latch on the panel, both after touch-down and after lift. The owner run uses the UBWC trace driver (`plans/lag/arms/lumaub`) and `tools/input/touch-owner.sh`, a 5-minute window with no scripted touches.
 
 **Tree note.** Running `tools/xnu-local-build.sh` without `--remake` deletes `dxb/xnu` and reclones it with only the stock patches through 2120. That happened to `research/xnu-combined` on 2026-11-03. The tree was rebuilt from the saved patches in this order: 2130 v4, 2140 to 2144, 2150, 2151, 2153, 2152 v4, 2154. Always pass `--remake` for an existing tree.
+
+### Tap run, ast140: partial
+
+`touch-taps` (kernel-touch with 2154, UBWC trace driver `plans/lag/arms/lumaub`) ran for 5 minutes of owner taps. **Measured:** only touches 42 to 52 survived in the kernel log. The RAM log wrapped, because PosterBoard's scene logging (`[Scene]`, `[ProcessScene]`, `[ViewController]` lines, about 5000 in the run) filled it. Of the 11 left, 2 started from a still screen.
+
+| Touch | Down to first frame start | Lift to first frame start | Lift to latch on the panel |
+|---|---:|---:|---:|
+| 50 (from idle) | 95.5 ms | 31.0 ms | 89.8 ms |
+| 52 (from idle) | 33.8 ms | 5.1 ms | 45.9 ms |
+| 45 | 84.1 ms | 96.1 ms | 129.1 ms |
+| 49 | 323.7 ms | 127.4 ms | 174.1 ms |
+
+**Inferred, from too few taps:** the render and display part, from frame start to latch, is 15 to 60 ms. The part before CoreAnimation starts a frame varies far more, from 5 to over 300 ms, and that part is iOS: HID to backboardd, SpringBoard, and its commit. A home-screen touch-down may also wait out the scroll view's touch delay, about 150 ms on a real iPhone too, so lift times say more than touch-down times.
+
+Next, for a run with enough taps: mute PosterBoard's output in that image, or put the touch times into the 2140 tick ring, which the trace pulls separately, so the kernel log can wrap without losing them. Then 30 or more taps from a still screen.
