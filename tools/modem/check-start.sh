@@ -4,7 +4,7 @@ root=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 out="$root/tests/out"
 mkdir -p "$out/tmp"
 export TMPDIR="$out/tmp"
-for file in ModemRuntime.inc ModemGate.h ModemRmtfs.c ModemRmtfs.h QcomQrtr.c QcomQrtr.h QcomSmp2p.c QcomSmp2p.h QcomQmp.c QcomQmp.h QcomRpmh.c QcomRpmh.h; do
+for file in ModemRuntime.inc ModemGate.h ModemRmtfs.c ModemRmtfs.h QcomQrtr.c QcomQrtr.h QcomSmp2p.c QcomSmp2p.h QcomScm.h QcomQmp.c QcomQmp.h QcomRpmh.c QcomRpmh.h; do
  python3 "$root/extract.py" "$root/../../patches/modem" "$out/$file" "bsd/dev/modem/$file"
 done
 for pair in 'qrtr' 'rmtfs'; do
@@ -20,7 +20,7 @@ import sys
 root,out=map(Path,sys.argv[1:])
 s=(out/'ModemRuntime.inc').read_text()
 def function(start,end): return s[s.index(start):s.index(end)]
-(out/'lifecycle.c').write_text((root/'tests/lifecycle-prefix.c').read_text()+function('static int m_scm(','static int m_pas(')+function('static bool m_cleanup(','static int m_power_inspect(')+(root/'tests/lifecycle-tail.c').read_text())
+(out/'lifecycle.c').write_text((root/'tests/lifecycle-prefix.c').read_text()+function('static int m_scm(','static int m_assign(')+function('static bool m_cleanup(','static int m_power_inspect(')+(root/'tests/lifecycle-tail.c').read_text())
 (out/'power.c').write_text((root/'tests/power-prefix.c').read_text()+function('static int m_power_inspect(', '#include "ModemGate.h"')+(root/'tests/power-tail.c').read_text())
 (out/'vote.c').write_text((root/'tests/vote-prefix.c').read_text()+function('static int m_vote(', 'static int m_qwait(')+(root/'tests/vote-tail.c').read_text())
 PY

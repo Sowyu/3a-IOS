@@ -142,3 +142,18 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 
 
 **Measured, ast150.** The repeated probe met the completion conditions. Local log `ios-asteroids/logs/ast150-modem-power-probe-repeat.txt:4970` reports hardware preflight error 0, line 4972 records no-PAS cleanup ok, and line 10587 records DONE. The fresh completion token and checked frame match this run. It returned after 245 seconds with a clean root, no stale files, no fired deadman or panic, and no USB stale/lost TX. The separately reviewed offline image is now being tested with UIM off.
+
+
+## Offline modem boot, ast151
+
+**Measured.** MPSS authenticated and booted. Local log `ios-asteroids/logs/ast151-modem-offline-usb.txt:8753` records PAS authentication success, line 8766 ready and handover, and line 8771 the GLINK mpss/IPCRTR channel. Lines 8955 and 8966 record actual pd-mapper and rmtfs responses. Line 10775 announces UIM service 0x0b. NAS and WDS services also announced while the modem stayed offline. No TFTP server ran during this boot.
+
+**Measured, failure.** After the bounded 120-second runtime, SMP2P stop acknowledgment arrived at line 11697. PAS shutdown returned raw status -3145800 at line 11698. The next line reports STOP UNVERIFIED and retains memory and power. The selftest completed in 366 seconds and recovery found a clean root. M2 remains incomplete because shutdown did not verify. No UIM request was sent.
+
+**Code.** Patch 2178 clears the stop request after acknowledgment or timeout, following [Linux qcom_q6v5_request_stop](https://github.com/torvalds/linux/blob/v6.12/drivers/remoteproc/qcom_q6v5.c#L196). It applies [Linux SCM error mapping](https://github.com/torvalds/linux/blob/v6.12/drivers/firmware/qcom/qcom_scm.h#L160) to shutdown transport failures, preserving raw logs. Unknown negative transport errors map to -EINVAL, so the existing bounded [decrypt-shutdown poll](https://github.com/torvalds/linux/blob/v6.12/drivers/remoteproc/qcom_q6v5_pas.c#L188) can retry them. Nonzero results never establish a verified stop. Cleanup failures and missing handover now reach the final worker error.
+
+**Inferred.** The missing stop-bit clear and raw-versus-mapped error handling are source differences that can explain shutdown failure. The vendor error itself has not been decoded.
+
+**Measured, host.** Production PAS and cleanup tests pass for transient and permanent vendor failures, bounded retries, known fatal errors, stop-bit clearing on acknowledgment and timeout, and retaining buffers after failure. Preflight and UIM tests also pass, and the matching kernel remake finished successfully.
+
+**Missing.** A fresh Sol review and another offline boot must verify shutdown before enabling UIM. The phone was released to the queued tests during this work.

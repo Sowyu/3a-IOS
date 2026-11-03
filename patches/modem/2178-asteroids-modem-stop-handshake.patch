@@ -1,0 +1,74 @@
+diff --git a/bsd/dev/modem/ModemRuntime.inc b/bsd/dev/modem/ModemRuntime.inc
+--- a/bsd/dev/modem/ModemRuntime.inc
++++ b/bsd/dev/modem/ModemRuntime.inc
+@@ -80,6 +80,18 @@
+ static int m_pas(unsigned cmd,uint32_t info,uint64_t b,uint64_t c){
+     uint64_t result=~0ull;int rc=m_scm(qcom_scm_fn(2,cmd),info,4,b,c,0,&result);
+     printf("SWEET MODEM: PAS4 cmd=%u status=%d result=%lld\n",cmd,rc,(long long)result);sweet_log_sync();
++    /* Linux maps unrecognized SCM transport failures to -EINVAL. Its modem
++     * decrypt-shutdown poll retries that class; ast151 returned raw -3145800.
++     * Keep raw status in the log, and never normalize a failure to success. */
++    if(cmd==6 && rc<0){
++        switch(rc){
++        case -1:return -EIO;
++        case -4:return -ENOTSUP;
++        case -5:return -ENOMEM;
++        case -12:return -EBUSY;
++        default:return -EINVAL;
++        }
++    }
+     return rc?rc:(int)result;
+ }
+ static int m_assign(bool share){
+@@ -290,7 +302,11 @@
+ static bool m_cleanup(void){
+     bool stopped=!m.pas_owed;
+     if(m.started && m.sp.out){qcom_smp2p_update(&m.sp,m.master,1,1);m_ring(2,2);uint64_t end=m_now()+3000;
+-        while(m_now()<end){m_smp_poll();if(m.state&8)break;m_sleep(10);}}
++        while(m_now()<end){m_smp_poll();if(m.state&8)break;m_sleep(10);}
++        /* qcom_q6v5_request_stop clears the request after ack or timeout. */
++        qcom_smp2p_update(&m.sp,m.master,1,0);m_ring(2,2);
++        printf("SWEET MODEM: stop request cleared; acknowledged=%u\n",!!(m.state&8));
++    }
+     if(m.pas_owed){int rc=EIO;for(unsigned i=0;i<50;i++){rc=m_pas(6,1,0,0);if(rc!=-22)break;m_sleep(100);}stopped=rc==0;}
+     if(!stopped){printf("SWEET MODEM: STOP UNVERIFIED; retaining memory and power until reboot\n");sweet_log_sync();return false;}
+     bool clean=!m.vote_uncertain;m.stop_verified=true;
+@@ -331,9 +347,9 @@
+ }
+ #include "ModemGate.h"
+ static bool m_gate(const char *name){return modem_gate(PE_boot_args(),name)!=0;}
+-static void modem_run(const struct wl_fat *f,const uint8_t *mdt,uint32_t size){
++static int modem_run(const struct wl_fat *f,const uint8_t *mdt,uint32_t size){
+     memset(&m,0,sizeof(m));m.master=-1;m.glink=m_gate("sweetmglink");m.rmtfs=m_gate("sweetmrmtfs");m.pdm=m_gate("sweetmpdm");m.uim=m_gate("sweetmuim");
+-    if((m.rmtfs || m.pdm || m.uim) && !m.glink){printf("SWEET MODEM: refused missing GLINK dependency\n");return;}
++    if((m.rmtfs || m.pdm || m.uim) && !m.glink){printf("SWEET MODEM: refused missing GLINK dependency\n");return EINVAL;}
+     m_sleep(30000);m.began=m_now();int rc=EIO;
+     m.smem=ml_io_map(M_SMEM,M_SM_SIZE);m.mutex=ml_io_map(0x1f43000,0x1000);m.ipcc=ml_io_map(0x405000,0x1000);
+     m.qmpmem=ml_io_map(0xc300000,0x400);m.rsc=ml_io_map(0x17a20000,0x4000);m.db=ml_io_map(0x81c60000,0x20000);
+@@ -362,6 +378,6 @@
+     uint64_t end=m_now()+120000,ready_deadline=m_now()+10000;
+     while(m_now()<end){m_smp_poll();if(m.glink)m_ipc_poll();if(m.uim && (m.state&6)==6)m_uim_poll();if(m.fatal || m.failed){rc=EIO;break;}
+         if(!(m.state&2) && m_now()>ready_deadline){rc=ETIMEDOUT;break;}m_sleep(2);}
+-    if(!m.fatal && !m.failed && (m.state&2))rc=0;
+-out:printf("SWEET MODEM: offline run end error=%d elapsed_ms=%llu\n",rc,(unsigned long long)(m_now()-m.began));m_cleanup();
+-}
++    if(!m.fatal && !m.failed && (m.state&6)==6)rc=0;else if(!rc)rc=ETIMEDOUT;
++out:printf("SWEET MODEM: offline run end error=%d elapsed_ms=%llu\n",rc,(unsigned long long)(m_now()-m.began));if(!m_cleanup())rc=EIO;return rc;
++}
+diff --git a/bsd/dev/sweet_modem.c b/bsd/dev/sweet_modem.c
+--- a/bsd/dev/sweet_modem.c
++++ b/bsd/dev/sweet_modem.c
+@@ -352,11 +352,11 @@
+     if (!err) err = fat_read_chain(&f, cl, 0, mdt, size);
+     if (!err) err = modem_mdt(mdt, size, &f);
+ #ifndef MODEM_HOST_TEST
+-    if (!err && (m_gate("sweetmpss") || m_gate("sweetmprobe"))) modem_run(&f,mdt,size);
++    if (!err && (m_gate("sweetmpss") || m_gate("sweetmprobe"))) err=modem_run(&f,mdt,size);
+ #endif
+     if (mdt) kfree_data(mdt, size);
+ #ifndef MODEM_HOST_TEST
+-    if (m_gate("sweetmpss") || m_gate("sweetmprobe")) printf("SWEET MODEM: gated modem worker finished preflight_error=%d\n",err);
++    if (m_gate("sweetmpss") || m_gate("sweetmprobe")) printf("SWEET MODEM: gated modem worker finished final_error=%d\n",err);
+     else
+ #endif
+     printf("SWEET MODEM: read-only probe end error=%d; MPSS untouched\n", err);
