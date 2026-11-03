@@ -506,3 +506,8 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 **Measured, refusal identified.** ast179 completed normally in362seconds with clean roots and stale=false. At6249 the GSI status is1, ERROR_LOG is0x83c7ffe1 and general IRQ status is0. All18 AP channels and17 event contexts are state0 at6250 through6284. The guard still refused EBUSY16. PAS15 stopped at6330, backing was parked/released at6359, final_error16 appeared at6372 and DONE at12601. MPSS and I3 did not start.
 
 **Inferred.** The error-log value may be uninitialized state. It sets reserved bits in the primary register definition, and Linux initializes ERROR_LOG before channel setup. This capture does not establish a pending global-error interrupt. IPA owns further investigation and any separately reviewed initialization change. No guard relaxation or fault clear is approved by the diagnostic trial.
+
+
+**Code.** Combined2215 adds guarded initial ERROR_LOG initialization, matching the primary driver sequence. It refuses pending global/general status and nonzero AP context states, rechecks after masking output and verifies the zero write before allocation. It never writes ERROR_LOG_CLR or clears pending status. Active raw/global/general faults remain terminal.
+
+**Measured, host.** Actual initialization/fault regressions, lifecycle/datapath sanitizer suites,56-file reconstruction, the safe build and ten-segment image checks pass. The replacement kernel is71c3a760c9c767ba4fdaf400bd2facfc9ee581429bedfaa5b84020dbbb65e8a2. Its77-artifact data manifest remains unapproved pending the newly reviewed offline trial and accepted I3 evidence.
