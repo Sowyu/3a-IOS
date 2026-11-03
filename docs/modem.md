@@ -6,7 +6,7 @@ Labels as in `docs/input.md`: **Measured**, **Code**, **Inferred**, **Missing**.
 
 ## Facts
 
-- **Code, firmware.** The `modem_a` partition (FAT16, 4096-byte sectors) holds `image/modem.mdt` and `modem.b01` to `b30`. That is 30 relocatable load segments, about 109 MB, spanning 0xd700000. It fits in `mpss_mem` (0x8ac00000 + 0xe600000). There is no `modem_dtb.mdt`. Mainline Linux runs this SoC family's modem as PAS id 4 without a DTB image. `plans/modem/tools/fatls.py` lists and extracts it read-only. The firmware stays out of this repo.
+- **Code, firmware.** The `modem_a` partition (FAT16, 4096-byte sectors) holds `image/modem.mdt` and `modem.b01` to `b30`. That is 29 relocatable load segments plus a hash segment, about 109 MB, spanning 0xd700000. It fits in `mpss_mem` (0x8ac00000 + 0xe600000). There is no `modem_dtb.mdt`. Mainline Linux runs this SoC family's modem as PAS id 4 without a DTB image. `plans/modem/tools/fatls.py` lists and extracts it read-only. The firmware stays out of this repo.
 - **Code, DT.** `remoteproc-mss@04080000`, compatible `qcom,volcano-modem-pas`. Its regions are `mpss_mem`, `q6_mpss_dtb_mem` (0x99200000 + 0x80000) and a third (phandle 0x7a). Its interrupts are wdog, fatal, handover, ready, stop-ack and shutdown-ack. It has a "stop" SMP2P state, GLINK edge "mpss" (remote pid 1, IPCC mailbox) and AOP QMP signalling.
 - **Code, memory.** XNU's RAM is 0x8c0000000 + 0x134000000, so the kernel cannot allocate below 4 GB. rmtfs needs a 2.5 MiB buffer below 4 GB. The bank at 0xe0a00000 is the only free low RAM, and 0xe1000000 to 0xe2000000 is unused.
 - **Code, storage.** `sweet_ufs_read_part()` reads `modem_a` and the EFS partitions read-only. The kernel's UFS write path refuses anything outside `userdata`. The modem's EFS (`modemst1`, `modemst2`, `fsg`) holds the IMEI and RF calibration. It must never be written: serve it read-only, and keep any writes in RAM.
@@ -56,3 +56,13 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 **Inferred.** A wired Ethernet presentation is a practical first option. The existing `iokit/Kernel/arm/SweetNetwork.cpp` publishes an IOKit Ethernet facade so configd adopts the USB BSD ifnet. Reuse that pattern for a distinct modem ifnet after M6, keeping USB separate.
 
 **Missing.** IPA carries IP/QMAP, not Ethernet. The adapter must translate Ethernet/ARP or provide a private routed Ethernet link with DHCP and a matching gateway; IPv6 needs its own routing/RA design. A virtual Ethernet label alone does not configure the WDS address or DNS. Test configd adoption, route selection, DNS and app traffic on this iOS build. CommCenter emulation is not planned. No status-bar sysctl is planned.
+
+## Follow-up 2171
+
+**Measured, host.** The original preflight fails against the existing modem_a backup with MDT lookup error 2. VFAT long names map to unrelated short aliases. Patch 2171 adds one-slot VFAT lookup with sequence, ASCII and checksum validation. The real-image candidate now reports 29 load segments, 109371307 bytes, span 0xd700000. Local evidence is `plans/modem/logs/real-image-check-candidate.txt:1`. This is not a live phone result or firmware authentication.
+
+**Code.** 2171 also rejects repeated file clusters, free terminal clusters, inconsistent zero-memory loads and numeric boot-argument aliases. The boot gate accepts the exact text `1`. Synthetic checks reconstruct and compile both patches, including bad VFAT checksums and the file-chain cases identified by Sol.
+
+**Measured, source review.** Sol approved exact 2170 read-only inspection conditionally on a successful full kernel build, with no approval for modem start. The audit is `docs/modem-2170-audit.md`. 2171 needs its own review. The full 2170 build is running in the dedicated tree with recoverable cleanup. Its known file-lookup failure makes it unsuitable for the phone test; apply 2171 and rebuild first.
+
+**Code, build safety.** The dedicated tree's local MakeInc.cmd redirects RM/RMDIR to a wrapper that invokes only `/usr/bin/trash` on absolute build-tree paths. PATH routes unqualified shell cleanup to it. Make preserves intermediate and failed targets. Host checks confirmed that trashing a symlink retains its target and that outside paths are rejected. Do not use MAKEFILES to insert these rules: the build derives its top-level file from MAKEFILE_LIST.

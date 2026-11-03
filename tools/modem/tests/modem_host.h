@@ -26,8 +26,12 @@ static void kfree_data(void *p,size_t n) {(void)p;(void)n;}
 static int current_thread(void) {return 0;}
 static void thread_terminate(int t) {(void)t;}
 static void thread_deallocate(int t) {(void)t;}
-static int PE_parse_boot_argn(const char *name,void *v,int n) {
- assert(!strcmp(name,"sweetmodem") && n==sizeof(int)); *(int *)v=boot_level;return boot_level!=-99;
+static const char *boot_text;
+static int PE_parse_boot_arg_str(const char *name,char *v,int n) {
+ assert(!strcmp(name,"sweetmodem"));
+ if (boot_text) {snprintf(v,n,"%s",boot_text);return 1;}
+ if (boot_level == -99) return 0;
+ snprintf(v,n,"%d",boot_level);return 1;
 }
 static int kernel_thread_start(void (*fn)(void *,int),void *a,thread_t *t) {
  threads++; *t=1;fn(a,0);return 0;

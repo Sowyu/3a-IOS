@@ -7,7 +7,10 @@ static void entry(uint8_t *p,const char *n,unsigned cl,unsigned size,bool dir) {
 }
 int main(void) {
  for (int i=-1;i<=5;i++) {if(i==1)continue;boot_level=i;sweet_modem_start();}
- boot_level=-99;sweet_modem_start(); assert(!threads && !reads);
+ boot_level=-99;sweet_modem_start();
+ const char *invalid[] = {"4294967297", "01", "1x", "1.0", "0x1", "", "-1"};
+ for(unsigned i=0;i<sizeof(invalid)/sizeof(invalid[0]);i++){boot_text=invalid[i];sweet_modem_start();}
+ boot_text=NULL;assert(!threads && !reads);
  w16(disk+11,512);disk[13]=1;w16(disk+14,1);disk[16]=1;
  w16(disk+17,16);w16(disk+19,4200);w16(disk+22,17);disk[510]=0x55;disk[511]=0xaa;
  for(unsigned i=2;i<=4;i++)w16(disk+512+i*2,0xffff);
@@ -28,7 +31,23 @@ int main(void) {
  w16(disk+22,1);assert(fat_mount(&f,"modem_a"));w16(disk+22,17);
  assert(!fat_mount(&f,"modem_a")); uint8_t byte;assert(fat_read_chain(&f,f.ncl+2,0,&byte,1));
  w16(disk+512+2*2,2);assert(!fat_mount(&f,"modem_a"));uint32_t entries;assert(fat_dir_load(&f,2,&entries));
- w16(disk+512+2*2,0xffff); boot_level=1;sweet_modem_start();assert(threads==1);
+ w16(disk+512+2*2,0xffff);
+ assert(!fat_mount(&f,"modem_a"));assert(!fat_validate_file(&f,4,1));
+ w16(disk+512+4*2,4);assert(!fat_mount(&f,"modem_a"));assert(fat_validate_file(&f,4,513));
+ w16(disk+512+4*2,0);assert(!fat_mount(&f,"modem_a"));assert(fat_validate_file(&f,4,1));
+ w16(disk+512+4*2,0xffff);
+ uint8_t lfn[32]={0};lfn[0]=0x41;lfn[11]=15;
+ const unsigned at[]={1,3,5,7,9,14,16,18,20,22,24,28,30};
+ const char *name="modem.mdt";
+ for(unsigned i=0;i<13;i++)w16(lfn+at[i],i<9?(unsigned)name[i]:i==9?0:0xffff);
+ assert(fat_lfn_match(lfn,name,9));
+ uint8_t pair[64]={0};memcpy(pair,lfn,32);entry(pair+32,"ALIAS1  MDT",3,148,false);
+ uint8_t sum=0;for(unsigned i=0;i<11;i++)sum=(uint8_t)((sum>>1)|(sum<<7))+pair[32+i];
+ pair[13]=sum;uint32_t found_cl,found_size;bool found_dir;
+ assert(!fat_find(pair,2,name,9,&found_cl,&found_size,&found_dir));assert(found_cl==3 && found_size==148 && !found_dir);
+ pair[13]^=1;assert(fat_find(pair,2,name,9,&found_cl,&found_size,&found_dir)==ENOENT);
+ lfn[0]=0x42;assert(!fat_lfn_match(lfn,name,9));
+ boot_level=1;sweet_modem_start();assert(threads==1);
  assert(modem_read("modemst1",0,&byte,1));assert(modem_read("modem_a",UINT64_MAX,&byte,1));
  puts("PASS: off/invalid gates, FAT bounds/cycle, MDT truncation/overflow/span, partition allowlist");
 }
