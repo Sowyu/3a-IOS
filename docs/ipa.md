@@ -330,3 +330,9 @@ Primary definitions are plans/ipa/reference/msm_ipa_ipa_v3_ipahal_ipahal_reg_i.h
 The maintained hardware regression now uses actual ast175 FLAVOR0xb0f0b1a, and separately shared-memory0x880. The full real hardware_setup model completes seven immediate commands and admits all four AP channels. Eight invalid partition cases refuse before any IPA/GSI write. Actual old2211 fails the measured-word test. The corrected datapath sanitizer suite and56-file reconstruction pass, and --remake -j6 build exited0. No hardware GSI or handshake claim follows from those host tests.
 
 Public patch SHA256 is b12cf3a441d384e41f0a089c3e1ef8b7869b35c6c6af57c7acb0b51f00c7a15c. Apply2200 through2212 numerically after the pinned modem2189v2/dataaudit8/2221 source series. This changes only IpaHardware.inc. Modem/Data owner patches remain byte-identical. The next PAS15-only image will use this final kernel with full hardware setup disabled. Its own fresh review and accepted benign C are still required.
+
+## ast176, clean journal after the CPU VA panic
+
+The separately reviewed benign C boot finished normally in214seconds. The exact checker accepted rootclean, stale=false, no push and no IPA/modem records. Its raw log has journal replay at384 and DONE at12627, with no FAIL/SKIP or panic. Evidence is ios-asteroids/logs/ast176-ipa-clean-2211.txt and its result directory. The accepted record is plans/ipa/logs/clean-2211-accepted.json.
+
+The image is the unchanged known-good no-IPA/no-modem ee6edefe54b3d218a43540d15981e147ddf30530e4bc1d0dd6e59c2b1671c670, under new review plans/ipa/sol-clean-2211-audit.md. The phone returned to recovery and ownership was released. The existing2210 firmware-named selftest hook ran without any firmware gate. Its old marker is not new firmware evidence. A new2212 PAS15-only image now awaits its separate source/image review.
