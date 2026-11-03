@@ -5,7 +5,7 @@ import argparse,subprocess,uuid
 here=Path(__file__).resolve().parent
 root=here.parents[2]
 ap=argparse.ArgumentParser(description=__doc__)
-ap.add_argument('stage',choices=['power-probe','offline','uim'])
+ap.add_argument('stage',choices=['power-probe','offline','uim','data'])
 a=ap.parse_args();name='modem-'+a.stage
 s=(here/(name+'.sh')).read_text();assert s.count('@RUN_NONCE@')==1
 nonce=uuid.uuid4().hex
