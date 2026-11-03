@@ -446,3 +446,6 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 **Measured, host.** All56 combined source files reconstruct exactly. The lifecycle, datapath and modem/data hook tests pass. The safe kernel build passed, and all10 packed segments match the replacement image. Its kernel SHA256 isbfa56dd9f1198ff099ebe7a62df26d9d5ae8897498687c3298e39b74b400738b and image SHA256 isf2360ae9a17f538a3452f48c5301809647bf4299942e2c73533c9a2d66120a50.
 
 **Missing.** A new exact-image review is running. Separate benign root cleaning, SMMU-only validation, PAS15 and offline IPA handshake trials must pass before ONLINE. The77-artifact manifest remains unapproved. No replacement image has touched the phone.
+
+
+**Review.** The new exact-image review in `modem-2209-data-image-audit.md` found no new combined kernel or runner defect, but remains NO-GO because the prerequisite SMMU-only checker rejects its own required success line. IPA owns that correction and fresh review. A final data-image decision follows accepted clean-root, SMMU-only, PAS15-only and offline handshake evidence.
