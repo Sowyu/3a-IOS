@@ -490,3 +490,8 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 
 
 **Code, review blocker.** The fresh full-mode2212 review reproduced live GSI error-register faults leaving readiness true after setup. Offline B is NO-GO and has not booted. IPA owns additive2213 to check health before callbacks, TX/RX and readiness publication, with actual-path regressions and a new review. Accepted ast177 firmware-only evidence remains valid. The combined2212 ONLINE manifest stays unapproved and requires replacement.
+
+
+**Code.** Published2213 is integrated. Worker-only GSI health checks now precede transport callbacks, posting, completions and readiness publication. A fault latches failure and revokes readiness. Asynchronous network output remains queue-only. Unclaimed/uninitialized GSI skips register reads, and teardown still requires verified stops or retained backing.
+
+**Measured, host.** The actual fault regressions before and after I3, before receive/discovery, during RX/TX and through uncertain stop pass with sanitizers. Lifecycle tests,56-file reproduction, the safe build and all10 packed-segment comparisons pass. The replacement kernel is64d03caf96a3ed007d22f41c06de44945a955b5b13438b4ee793f99080d56f2d. Its77-artifact data manifest stays unapproved. A new offline B review and accepted hardware result remain before the final ONLINE review.
