@@ -1,6 +1,6 @@
 # Modem and SIM: desk findings (2026-11-03)
 
-Desk work only. Patch 2170 now provides a read-only firmware preflight. It has synthetic host checks but no full kernel rebuild or phone run. M1 is incomplete. MPSS start and SIM detection are not implemented.
+The read-only firmware preflight passed on the phone in ast146. Patch 2173 is the first offline MPSS start candidate and has passed host checks and a full kernel build. Sol review is pending. M1 remains incomplete until review findings are resolved. No modem start or SIM detection has been measured.
 
 Labels as in `docs/input.md`: **Measured**, **Code**, **Inferred**, **Missing**.
 
@@ -86,3 +86,13 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 **Measured, host only.** `sh tools/modem/check-protocol.sh` reconstructs the public patch sources and runs sanitizer-backed tests. They cover corrupt SMEM extents/allocation overflow, GLINK version/channel/intent exchange with two simulated peers, IPCRTR payload delivery and malformed RX/TX lengths. Local evidence is `plans/modem/logs/protocol-check.txt:1-2`. The 2172 kernel build is still running. It was not used for ast146.
 
 **Missing.** PAS, power/QMP arbitration, SMP2P, QRTR integration and RAM-only rmtfs remain required for M1. No phone modem start or UIM request has occurred. The protocol tests are not M2 evidence.
+
+## Offline MPSS candidate, 2173
+
+**Code.** `patches/modem/2173-asteroids-modem-pas-offline.patch` adds PAS4 start with stock signed firmware read from modem_a, QMP, coordinated RPMh votes, SMP2P, the mpss GLINK edge over IPCC, QRTR and optional pd-mapper. The gates are `sweetmpss=1`, `sweetmglink=1`, `sweetmrmtfs=1` and `sweetmpdm=1`. Each rejects bare, duplicate or nonexact values. IPC requires MPSS. rmtfs and pd-mapper require IPC.
+
+**Code.** rmtfs snapshots modemst1, modemst2, fsc and fsg through the existing read-only partition API before startup. Its protocol handler has no storage callback. Reads and writes copy only between the snapshots and the low shared RAM window. Shutdown requests stop-ack, calls PAS shutdown, reclaims shared memory and releases power. An unverified stop retains buffers and power until reboot. Cleanup errors retain buffers. The offline run is bounded to 120 seconds after authentication. No online QMI command exists.
+
+**Measured, host only.** `sh tools/modem/check-start.sh` passes sanitizer-backed QRTR/QMI, rmtfs, gate, QMP, SMP2P and command-db checks. It extracts the actual SCM retry and cleanup functions from the patch for fault tests, including failed shutdown and failed memory reclamation. `check.sh` and `check-protocol.sh` still pass. Full 2173 kernel build and final remake completed with exit 0. Local evidence is `plans/modem/logs/start-check.txt:1-10` and `plans/modem/logs/build-2173-final.txt`.
+
+**Missing.** Sol approval for this candidate is pending. The inherited XO state and shared power votes require review. TFTP will be added if requested by the modem. UIM is staged separately and has not run. The ast146 preflight is still the only modem-related phone evidence.
