@@ -70,6 +70,7 @@ static unsigned received;
 static void rx_callback(void *ctx,const uint8_t *p,size_t n){assert(ctx==&received && !queue_locked);assert(n==8 && p[4]==0x45);received++;assert(!sweet_ipa_transmit(p,n));}
 static void hreset(void){reset();memset(cfg,0,sizeof(cfg));memset(local,0x6a,sizeof(local));ipa.smem_bytes=0xb000;ipa.dma=(uintptr_t)dma-PAGE_SIZE;ipa.block=1;cfg[0x40/4]=(0x800u<<16)|0x800;cfg[0]=0x0b0f0b1a; /* ast175 measured FLAVOR: TX0..10, RX11..25. */cfg_writes=cfg_drop=immediates=fail_immediate=cmd_seen=0;corrupt_read=hold_aggregate=fault_on_producer=false;}
 int supplied_hardware_main(void){
+ hreset();regs[0x25240/4]=0x83c7ffe1;assert(!ipa_hardware_setup());assert(error_inits==1 && !regs[0x25240/4]);assert(ipa_hardware_stop());
  /* Real ast175 registers must admit the actual command/LAN/WAN endpoints. */
  hreset();cfg[0x40/4]=0x880;assert(!ipa_hardware_setup());
  assert(iph.offset==0 && iph.bytes==0x4400 && immediates==7);
@@ -112,7 +113,7 @@ int supplied_hardware_main(void){
  hreset();corrupt_read=true;assert(ipa_hardware_setup());assert(ipa_hardware_stop());
  hreset();regs[ipa_gch(20,0)/4]=1u<<20;assert(ipa_hardware_setup()==EBUSY);assert(!cfg_writes && !writes);
  /* Refusal survey keeps measured count bounds and never changes hardware. */
- const unsigned bad_gsi[][2]={{0x25000,0},{0x25040,9},{0x25040,129},{0x25050,3},{0x25050,129},{0x25240,0x02301000},{0x2520c,2},{0x1c000+0x80*16,1u<<20}};
+ const unsigned bad_gsi[][2]={{0x25000,0},{0x25040,9},{0x25040,129},{0x25050,3},{0x25050,129},{0x25200,1},{0x2520c,2},{0x1c000+0x80*16,1u<<20}};
  for(unsigned k=0;k<sizeof(bad_gsi)/sizeof(bad_gsi[0]);k++){
   hreset();regs[0x25040/4]=0xe4046312;regs[0x25050/4]=0x2011;regs[bad_gsi[k][0]/4]=bad_gsi[k][1];
   assert(ipa_hardware_setup()==EBUSY);assert(!cfg_writes && !writes && !iph.touched && !iph.gsi.claimed);
@@ -184,8 +185,8 @@ int main(void){
  for(unsigned i=0;i<4;i++)assert(!iph.gsi.ch[i].started && iph.gsi.ch[i].channel_owned && iph.gsi.ch[i].event_owned);
  ipa_data_ready(true);assert(!sweet_ipa_ready());assert(ipa_hardware_stop());
  /* Both registers fail closed before publication and after actual I3. */
- const unsigned faults[][2]={{0x25240,0x02301000},{0x2520c,2}};
- for(unsigned k=0;k<2;k++)for(unsigned published=0;published<2;published++){
+ const unsigned faults[][2]={{0x25240,0x02301000},{0x2520c,2},{0x25200,1}};
+ for(unsigned k=0;k<3;k++)for(unsigned published=0;published<2;published++){
   handshake_stage(published);before=received;
   if(published)assert(!sweet_ipa_transmit(packet,8));
   memcpy(dma+iph.gsi.ch[3].buffer,packet,8);emit(&iph.gsi,3,IPA_DMA_IOVA+iph.gsi.ch[3].ring,8,2);
@@ -199,7 +200,7 @@ int main(void){
   assert(ipa_data_quiesce());assert(ipa_hardware_stop());
  }
  /* The actual QRTR receive precheck revokes before the next data callback. */
- for(unsigned k=0;k<2;k++){
+ for(unsigned k=0;k<3;k++){
   good_handshake();assert(!qcom_qrtr_add_service(&m.qr,0,0,0x4010,data_reply,0));
   unsigned callbacks=data_callbacks;regs[faults[k][0]/4]=faults[k][1];
   uint8_t reply[33]={0};word(reply,1);word(reply+4,QCOM_QRTR_DATA);word(reply+12,80);word(reply+20,1);word(reply+24,1);word(reply+28,0x4010);

@@ -1,0 +1,118 @@
+diff --git a/bsd/dev/modem/IpaData.inc b/bsd/dev/modem/IpaData.inc
+--- a/bsd/dev/modem/IpaData.inc
++++ b/bsd/dev/modem/IpaData.inc
+@@ -28,7 +28,7 @@
+     if(ipa_gsi_healthy(&iph.gsi))return true;
+     ipa_data_revoke();
+     if(!iph.failed){iph.failed=true;
+-        printf("SWEET IPA: GSI fault error=%#x irq=%#x; readiness revoked\n",iph.gsi.error_log,iph.gsi.irq_status);sweet_log_sync();}
++        printf("SWEET IPA: GSI fault error=%#x global=%#x irq=%#x; readiness revoked\n",iph.gsi.error_log,iph.gsi.global_status,iph.gsi.irq_status);sweet_log_sync();}
+     return false;
+ }
+ static bool ipa_data_poll(void){
+diff --git a/bsd/dev/modem/IpaGsi.h b/bsd/dev/modem/IpaGsi.h
+--- a/bsd/dev/modem/IpaGsi.h
++++ b/bsd/dev/modem/IpaGsi.h
+@@ -16,7 +16,7 @@
+     uint32_t posted,completed,consumed;
+     bool tx,command,event_owned,channel_owned,started;
+ } IpaGsiChannel;
+-typedef struct {IpaGsiIo io;uint8_t *dma;uint32_t base;IpaGsiChannel ch[4];bool claimed,failed,uncertain;uint32_t irq_saved[5],error_log,irq_status;} IpaGsi;
++typedef struct {IpaGsiIo io;uint8_t *dma;uint32_t base;IpaGsiChannel ch[4];bool claimed,failed,uncertain;uint32_t irq_saved[5],error_log,global_status,irq_status;} IpaGsi;
+ static inline unsigned ipa_gch(unsigned c,unsigned n){return 0x14000+0x80*c+4*n;}
+ static inline unsigned ipa_gev(unsigned e,unsigned n){return 0x1c000+0x80*e+4*n;}
+ static inline uint32_t ipa_gr(IpaGsi *s,unsigned r){return s->io.read(s->io.ctx,r);}
+@@ -26,8 +26,8 @@
+ static inline bool ipa_gsi_healthy(IpaGsi *s){
+     if(s->failed)return false;
+     if(!s->claimed)return true;
+-    uint32_t error=ipa_gr(s,0x25240),status=ipa_gr(s,0x2520c);
+-    if(error || status){s->error_log=error;s->irq_status=status;s->failed=true;return false;}
++    uint32_t error=ipa_gr(s,0x25240),global=ipa_gr(s,0x25200),status=ipa_gr(s,0x2520c);
++    if(error || global || status){s->error_log=error;s->global_status=global;s->irq_status=status;s->failed=true;return false;}
+     return true;
+ }
+ static inline unsigned ipa_gstate(IpaGsi *s,IpaGsiChannel *ch,bool ev){return (ipa_gr(s,ev?ipa_gev(ch->event,0):ipa_gch(ch->channel,0))>>20)&15;}
+@@ -38,18 +38,23 @@
+     ipa_gw(s,ev?0x25010:0x25008,id|(opcode<<24));
+     for(unsigned us=0;us<50000;us+=10){
+         if((ipa_gr(s,src)&bit) && ipa_gstate(s,ch,ev)==expected){ipa_gw(s,clr,bit);return true;}
+-        if(ipa_gr(s,0x25240) || ipa_gr(s,0x2520c))break;s->io.wait_us(s->io.ctx,10);
++        if(ipa_gr(s,0x25240) || ipa_gr(s,0x25200) || ipa_gr(s,0x2520c))break;s->io.wait_us(s->io.ctx,10);
+     }
+-    s->failed=s->uncertain=true;return false;
++    s->failed=s->uncertain=true;
++    printf("SWEET IPA: GSI command unverified event=%u id=%u opcode=%u expected=%u state=%u error=%#x global=%#x irq=%#x\n",ev,id,opcode,expected,ipa_gstate(s,ch,ev),ipa_gr(s,0x25240),ipa_gr(s,0x25200),ipa_gr(s,0x2520c));return false;
+ }
+ static inline bool ipa_gwrite_checked(IpaGsi *s,unsigned r,uint32_t v,uint32_t mask){
+-    ipa_gw(s,r,v);if((ipa_gr(s,r)&mask)!=(v&mask)){s->failed=true;return false;}return true;
++    ipa_gw(s,r,v);uint32_t actual=ipa_gr(s,r);
++    if((actual&mask)!=(v&mask)){s->failed=true;
++        printf("SWEET IPA: GSI configuration mismatch offset=%#x requested=%#x actual=%#x mask=%#x\n",r,v,actual,mask);return false;}return true;
+ }
+-/* Read-only ownership survey, usable before any IPA configuration write. */
++/* Read-only ownership survey, usable before any IPA configuration write.
++ * ERROR_LOG has no validity bit. Before initialization, only pending global
++ * status identifies an error record. Reject every pending global/general IRQ. */
+ static inline bool ipa_gsi_available(IpaGsiIo io){
+     IpaGsi probe={.io=io};IpaGsi *s=&probe;
+     unsigned channels=ipa_gr(s,0x25040)&255,events=ipa_gr(s,0x25050)&255;
+-    if(!(ipa_gr(s,0x25000)&1) || channels<10 || channels>128 || events<4 || events>128 || ipa_gr(s,0x25240) || ipa_gr(s,0x2520c))return false;
++    if(!(ipa_gr(s,0x25000)&1) || channels<10 || channels>128 || events<4 || events>128 || ipa_gr(s,0x25200) || ipa_gr(s,0x2520c))return false;
+     /* Never take over an EE with live channels or rings, including unowned IDs. */
+     for(unsigned i=0;i<channels;i++)if((ipa_gr(s,ipa_gch(i,0))>>20)&15)return false;
+     for(unsigned i=0;i<events;i++)if((ipa_gr(s,ipa_gev(i,0))>>20)&15)return false;
+@@ -68,6 +73,11 @@
+     /* Poll completion sources. Top-level interrupt output stays masked. */
+     if(!ipa_gwrite_checked(s,0x25088,0,~0u) || !ipa_gwrite_checked(s,0x25094,0x2e0,~0u) ||
+        !ipa_gwrite_checked(s,0x250a0,15,~0u) || !ipa_gwrite_checked(s,0x250ac,0,~0u) || !ipa_gwrite_checked(s,0x25220,1,1))return false;
++    /* Linux gsi_setup and vendor gsi_register_device initialize ERROR_LOG.
++     * Recheck the whole idle EE after masking output. Never clear pending
++     * status or ERROR_LOG_CLR. No channel/event allocation has happened yet. */
++    if(!ipa_gsi_available(io)){s->failed=true;return false;}
++    if(!ipa_gwrite_checked(s,0x25240,0,~0u) || !ipa_gsi_healthy(s))return false;
+     for(unsigned i=0;i<4;i++){
+         IpaGsiChannel *ch=&s->ch[i];ch->ring=0x2000+0x2000*i;ch->events=ch->ring+0x1000;
+         memset(dma+ch->ring,0,0x2000);io.sync(io.ctx,ch->ring,0x2000);
+diff --git a/bsd/dev/modem/IpaHardware.inc b/bsd/dev/modem/IpaHardware.inc
+--- a/bsd/dev/modem/IpaHardware.inc
++++ b/bsd/dev/modem/IpaHardware.inc
+@@ -18,7 +18,9 @@
+     if(iph.count==128)return false;
+     bool saved=false;for(unsigned i=0;i<iph.count;i++)if(iph.saved[i].off==o){saved=true;break;}
+     if(!saved){iph.saved[iph.count].off=o;iph.saved[iph.count].old=ipa_hr(o);iph.saved[iph.count++].mask=mask;}
+-    iph.touched=true;ipa_hw(o,v);return (ipa_hr(o)&mask)==(v&mask);
++    iph.touched=true;ipa_hw(o,v);uint32_t actual=ipa_hr(o);
++    if((actual&mask)==(v&mask))return true;
++    printf("SWEET IPA: configuration mismatch offset=%#x requested=%#x actual=%#x mask=%#x\n",o,v,actual,mask);sweet_log_sync();return false;
+ }
+ static bool ipa_endpoint_program(IpaGsiChannel *ch){
+     unsigned b=0x1000+0x80*ch->endpoint;bool qmap=ch->endpoint==2 || ch->endpoint==18;uint32_t hdr=0,ext=0,aggr=0;
+@@ -84,9 +86,9 @@
+  * Never clear a fault, reallocate a live context or widen a reported count. */
+ static void ipa_hardware_refusal(void){
+     uint32_t status=ipa_gread(0,0x25000),p2=ipa_gread(0,0x25040),p4=ipa_gread(0,0x25050);
+-    uint32_t error=ipa_gread(0,0x25240),irq=ipa_gread(0,0x2520c);
++    uint32_t error=ipa_gread(0,0x25240),global=ipa_gread(0,0x25200),irq=ipa_gread(0,0x2520c);
+     unsigned channels=p2&255,events=p4&255;
+-    printf("SWEET IPA: GSI unavailable status=%#x param2=%#x param4=%#x error=%#x irq=%#x channels=%u events=%u\n",status,p2,p4,error,irq,channels,events);
++    printf("SWEET IPA: GSI unavailable status=%#x param2=%#x param4=%#x error=%#x global=%#x irq=%#x channels=%u events=%u\n",status,p2,p4,error,global,irq,channels,events);
+     if(channels>=10 && channels<=128 && events>=4 && events<=128){
+         for(unsigned i=0;i<channels;i++){
+             uint32_t ctx=ipa_gread(0,ipa_gch(i,0));
+@@ -110,6 +112,7 @@
+        tx_count<=9 || rx_base>11 || rx_base+rx_count<=18)return ENOTSUP;
+     IpaGsiIo io={0,ipa_gread,ipa_gwrite,ipa_gsync,ipa_gwait};
+     if(!ipa_gsi_available(io)){ipa_hardware_refusal();return EBUSY;}
++    printf("SWEET IPA: GSI idle survey raw_error=%#x global=%#x irq=%#x\n",ipa_gread(0,0x25240),ipa_gread(0,0x25200),ipa_gread(0,0x2520c));sweet_log_sync();
+     if(!ipa_hconfig(0xc00c,0,~0u) || !ipa_hconfig(0x2c,ipa_hr(0x2c)|(1u<<7)|(1u<<8),~0u) ||
+        !ipa_hconfig(0x54,13,0xff) || !ipa_hconfig(0x58,13,~0u) || !ipa_hconfig(0x4b0,0,~0u) ||
+        !ipa_hconfig(0x4ac,14|(1u<<7)|(14u<<8)|(24u<<16),~0u) ||
+@@ -119,6 +122,7 @@
+      * the zeroed FNR region; modem-owned counter indices are advertised later. */
+     for(unsigned i=0;i<4;i++)if(!ipa_hconfig(0x700+4*i,iph.offset+0x1cd0,~0u))return EIO;
+     if(!ipa_gsi_setup(&iph.gsi,io,(void *)(ipa.dma+PAGE_SIZE),IPA_DMA_IOVA))return EIO;
++    printf("SWEET IPA: GSI error log initialized and verified before allocation\n");sweet_log_sync();
+     for(unsigned i=0;i<4;i++)if(!ipa_endpoint_program(&iph.gsi.ch[i]))return EIO;
+     if(!ipa_hconfig(0x38,11|(11u<<8)|(1u<<26)|(1u<<27),0x1fffffff))return EIO;
+     for(unsigned i=0;i<19;i++)if(!ipa_hconfig(0x1070+0x80*i,0,0x7f))return EIO;

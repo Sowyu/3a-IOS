@@ -2,9 +2,9 @@
 
 ## Checkpoint, 2026-11-03
 
-I1 is complete. The I2 implementation builds with patches2200 through2213, copied modem2189v2, data2220audit8 and adapter2221. I3 and I4 remain unproven.
+I1 is complete. The I2 implementation builds with patches2200 through2215, copied modem2189v2, data2220audit8 and adapter2221. I3 and I4 remain unproven.
 
-Read-only surveys ast159 and ast170 passed. SMMU-only ast174 passed setup and parking. After fixing the CPU VA page-size bug in2211 and the endpoint direction guard in2212, benign ast176 cleaned the journal and PAS15-only ast177 passed authentication, shutdown and complete cleanup with clean roots. The first offline attempt ast178 safely refused GSI availability before configuration. Read-only refusal diagnostics are next.
+Read-only surveys ast159 and ast170 passed. SMMU-only ast174 passed setup and parking. After fixing the CPU VA page-size bug in2211 and the endpoint direction guard in2212, benign ast176 cleaned the journal and PAS15-only ast177 passed authentication, shutdown and complete cleanup with clean roots. The first offline attempt ast178 safely refused GSI availability before configuration. ast179 identified a nonzero raw error log with every AP context free. Guarded error-log initialization is next.
 
 Host inspection of the existing extracted ipa_fws.mdt found three relocatable loads, 17824 file bytes and a page-rounded span of 0x7000. This fits the 0xa000 GSI reservation. `tools/ipa/inspect_mdt.py` checks ELF bounds, overlap and relocation span without loading firmware. It does not check split-file contents or authenticate the image. Three synthetic host tests pass, including nine malformed cases. Local evidence is `plans/ipa/logs/host-check.txt` and `plans/ipa/logs/firmware-inventory.json`.
 
@@ -366,3 +366,17 @@ Evidence is `ios-asteroids/logs/ast178-ipa-handshake-2213.txt` and its result di
 Patch2214 only adds read-only diagnostics when the existing GSI availability guard refuses. It prints the status, parameter and error registers and bounded AP channel/event context0 values. It neither clears errors nor takes over live contexts. Invalid reported counts skip context reads. Host cases cover disabled status, bad counts, error registers and an occupied event, with no configuration writes.
 
 Apply `2214-asteroids-ipa-gsi-refusal-survey.patch` after2213, SHA256 `78619050fc9c64d78c3b567e71f3148fb2e4eba5b02b122778c67eb24c6e044a`. Its exact diagnostic B image needs a new Sol review. The measured refusal is unresolved. I3 and ONLINE remain unproven.
+
+## ast179 and2215 error-log initialization
+
+The2214 diagnostic returned EBUSY before configuration. Raw line6249 reports GSI enabled,18channels,17events, ERROR_LOG0x83c7ffe1 and general IRQ status0. All35 AP context0 values are0 at6250 through6284. The global error status was not sampled, so this capture does not establish whether the raw log was valid. Its reserved bits are set.
+
+PAS15 shutdown succeeded at6330, guards/parking/release at6359, final16 at6372 and DONE12601. The run lasted362seconds with clean roots before/after, stale=false and a fresh nonce/frame. The exact safe-refusal checker passes. I3 remains unproven. The phone returned to OrangeFox with no claims. The root retains only the normal2214 selftest hook, log/frame and marker from this run.
+
+Primary Linux `gsi.c:2088` initializes ERROR_LOG to0 before channel setup. Its handler at1298 processes the log only when global ERROR_INT is set. The matching Nothing vendor `gsi.c:597` uses the same validity test and initializes the register at1724. Local pinned copies are `plans/ipa/reference/gsi.c`, `gsi_reg.h` and `nothing-gsi.c`. The origin of the measured raw bits remains unproven.
+
+Patch2215 rejects any pending global or general status and every occupied AP context before claiming GSI. It rechecks all idle contexts after masking output, writes ERROR_LOG0 before any channel/event command and requires zero readback plus clear pending status. It never writes ERROR_LOG_CLR or a global/general status-clear register. A failed initialization or a newly pending status stops setup. Runtime still treats any nonzero initialized log as terminal and now also catches global status with a zero log.
+
+Maintained tests cover the measured raw value, pending global error and generic status refusal, a dropped initialization write, a fault arriving during initialization, runtime global status, both prior hardware fault classes and uncertain-stop retention. The model checks idle contexts and clear pending status at the actual zero write. Actual2214 refuses the measured-value/no-pending-status negative control. Readback mismatches and unverified commands now log their registers and expected values without weakening checks.
+
+Apply `2215-asteroids-ipa-initialize-error-log.patch` after2214, SHA256 `bb1360646f45ed0f10a7d4dffd6fceec0e3b5046521581f805136aa4a957db30`. No PAS15, SMMU, power or modem lifecycle changes. A NEW Sol source/exact-image decision is required before this initialization write reaches the phone. ONLINE remains suspended.

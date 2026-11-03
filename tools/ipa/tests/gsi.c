@@ -3,11 +3,18 @@
 #include <string.h>
 #include "IpaGsi.h"
 static uint32_t regs[0x40000/4];static uint8_t dma[0x100000] __attribute__((aligned(4096)));
-static unsigned writes,commands,fail_command,drop_at;static bool sync_seen;
+static unsigned writes,commands,fail_command,drop_at,error_inits;static bool init_fault;static bool sync_seen;
 static unsigned fault_sync_offset=~0u,fault_register,fault_value;
 static uint32_t rd(void *c,unsigned o){(void)c;assert(o<sizeof(regs));return regs[o/4];}
 static void wr(void *c,unsigned o,uint32_t v){
  (void)c;assert(o<sizeof(regs));assert(o<0x26000);writes++;if(writes==drop_at)return;
+ if(o==0x25240){
+  assert(v==0 && !regs[0x25200/4] && !regs[0x2520c/4]);
+  for(unsigned i=0;i<(regs[0x25040/4]&255);i++)assert(!((regs[ipa_gch(i,0)/4]>>20)&15));
+  for(unsigned i=0;i<(regs[0x25050/4]&255);i++)assert(!((regs[ipa_gev(i,0)/4]>>20)&15));
+  error_inits++;if(init_fault)regs[0x25200/4]=1;
+ }
+ assert(o!=0x25244 && o!=0x25208 && o!=0x25214);
  if(o==0x250b0){regs[0x250a8/4]&=~v;return;}
  if(o==0x25098){regs[0x25090/4]&=~v;return;}if(o==0x250a4){regs[0x2509c/4]&=~v;return;}
  if(o==0x25008 || o==0x25010){
@@ -25,7 +32,7 @@ static void wr(void *c,unsigned o,uint32_t v){
 static void sync1(void *c,unsigned o,unsigned n){(void)c;assert(n && o<=sizeof(dma) && n<=sizeof(dma)-o);sync_seen=true;if(o==fault_sync_offset){regs[fault_register/4]=fault_value;fault_sync_offset=~0u;}}
 static void wait1(void *c,unsigned us){(void)c;assert(us<=1000);}
 static IpaGsiIo io={0,rd,wr,sync1,wait1};
-static void reset(void){memset(regs,0,sizeof(regs));memset(dma,0,sizeof(dma));writes=commands=fail_command=drop_at=0;sync_seen=false;fault_sync_offset=~0u;regs[0x25000/4]=1;regs[0x25040/4]=32;regs[0x25050/4]=32;}
+static void reset(void){memset(regs,0,sizeof(regs));memset(dma,0,sizeof(dma));writes=commands=fail_command=drop_at=error_inits=0;init_fault=false;sync_seen=false;fault_sync_offset=~0u;regs[0x25000/4]=1;regs[0x25040/4]=32;regs[0x25050/4]=32;}
 static void emit(IpaGsi *s,unsigned i,uint64_t address,unsigned len,unsigned code){
  IpaGsiChannel *ch=&s->ch[i];IpaEvent ev={address,len,0,code,0,0x22,ch->channel};memcpy(dma+ch->events+(ch->consumed%ch->slots)*16,&ev,16);regs[ipa_gev(ch->event,4)/4]=s->base+ch->events+((ch->consumed+1)%ch->slots)*16;
 }
@@ -53,8 +60,8 @@ int main(void){
   unsigned before=writes;assert(!ipa_gsi_stop(&s) && writes==before);
  }
  /* Runtime faults must be observed with no completion and before a doorbell. */
- const unsigned faults[][2]={{0x25240,0x02301000},{0x2520c,2}};
- for(unsigned k=0;k<2;k++){
+ const unsigned faults[][2]={{0x25240,0x02301000},{0x2520c,2},{0x25200,1}};
+ for(unsigned k=0;k<3;k++){
   reset();assert(ipa_gsi_setup(&s,io,dma,0x20000000));assert(ipa_gsi_start(&s,2));
   regs[faults[k][0]/4]=faults[k][1];unsigned before=writes;
   assert(ipa_gsi_event(&s,2,&buf,&n)==-1 && s.failed);
@@ -66,5 +73,16 @@ int main(void){
   fail_command=commands+1;assert(!ipa_gsi_stop(&s) && s.uncertain && s.ch[2].channel_owned);
   before=writes;assert(!ipa_gsi_stop(&s) && writes==before);
  }
+ /* ast179 raw log contents are not pending status before initialization. */
+ reset();regs[0x25240/4]=0x83c7ffe1;assert(ipa_gsi_setup(&s,io,dma,0x20000000));
+ assert(error_inits==1 && !regs[0x25240/4]);assert(ipa_gsi_stop(&s));
+ for(unsigned global=1;global<=2;global++){
+  reset();regs[0x25240/4]=0x83c7ffe1;regs[0x25200/4]=global;
+  assert(!ipa_gsi_setup(&s,io,dma,0x20000000));assert(!writes && !error_inits);
+ }
+ reset();regs[0x25240/4]=0x83c7ffe1;drop_at=6;
+ assert(!ipa_gsi_setup(&s,io,dma,0x20000000));assert(s.failed && !commands && !error_inits && regs[0x25240/4]==0x83c7ffe1);assert(ipa_gsi_stop(&s));
+ reset();regs[0x25240/4]=0x83c7ffe1;init_fault=true;
+ assert(!ipa_gsi_setup(&s,io,dma,0x20000000));assert(s.failed && !commands && error_inits==1 && regs[0x25200/4]==1);assert(ipa_gsi_stop(&s));
  puts("IPA GSI5.2 layout, ring wrap, event validation, command timeout and DMA stop PASS");return 0;
 }
