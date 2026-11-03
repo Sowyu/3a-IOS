@@ -200,3 +200,19 @@ The frozen sweet_modem.o contains `ldr w16, [x25], #0x4` at object offset0x1900 
 Patch2204 adds explicit plain ARM64 ldr/str accessors for IPA's SMMU and IPA/GSI accesses. It preserves the modem owner's helpers and all lifecycle gates. It does not relax context selection, add a power vote or enable firmware. Host parser, probe, lifecycle and datapath sanitizer suites pass. `sh tools/ipa/check-mmio.sh` cross-compiles the actual production accessors and verifies plain instructions and barriers. Ordered patch reconstruction passes. A fresh Sol review of the rebuilt frozen survey is required before another phone run.
 
 Local evidence is ios-asteroids/logs/ast169-ipa-memory-2203.txt, its result.json, and plans/ipa/frozen-2203-survey/sweet_modem-disassembly.txt. The frozen old image and its single-attempt record remain preserved. The iOS root contains the normal inert selftest hook and prior logs/frames/IPA markers. No IPA firmware or data executable was installed. I3 is unproven.
+
+## Readiness contract for adapter2221
+
+`sweet_ipa_ready()` means the IPA hardware and modem IPA handshake have completed. It is not a TX-queue-capacity test. The first true transition requires configured and running AP endpoints, successful INIT_MODEM_DRIVER0x21, INDICATION_REGISTER0x20, modem INIT_MODEM_DRIVER_COMPLETE0x35, the AP completion indication0x22 and a drained outgoing transport queue. A full TX queue can still return EAGAIN while readiness is true. NAS registration, ONLINE mode, WDS setup and IP connectivity remain separate data-agent states.
+
+The published2202 through2204 code establishes that initial true transition, but its error-path revocation has the gap identified in data2221's audit. The private integration draft makes revocation terminal for this boot, clears copied TX on GSI/QMI/transport failure or stop, and publishes false before later QRTR/data callbacks. It also quiesces AP channels before data detach while retaining PAS15 and backing until verified PAS4 stop. Those changes have host coverage but are not yet in a phone candidate. Adapter2221 must wait for the audited integrated revision before a live data trial.
+
+## Integration2205 desk status
+
+Public2204 is only the plain-MMIO correction. The next integration patch is2205. The working draft in plans/ipa/draft2205 implements all three IPA obligations from data2221's audit: terminal readiness revocation, the real2221 bind/refresh calls, and AP channel quiescence before data detach. It uses modem2189revision2 SHA9b4b570d and data2220audit6 SHA8a0b901c, with adapter2221 SHA4bdc74ce. Modem source approval does not approve this integration or an image.
+
+The worker binds exactly once for sweetdata, after IPA preparation and before attach/MPSS. A partial bind failure preserves its errno and never reaches attach or refresh. Raw-only operation skips binding. IPA readiness is synchronized before and after each QRTR receive, before data discovery, before each normal/cleanup data poll and on transport loss. GSI/QMI errors clear the mutex-protected queue latch and drop copied TX before returning failure. The latch cannot revive after stop or failure.
+
+After bounded WDS cleanup, the worker closes RX aggregation and stops owned AP GSI channels before data detach. It keeps channel/event ownership, mappings and power until verified PAS4 stop permits final GSI/PAS15 teardown. An uncertain stop remains an error and retains backing. Host sanitizer fixtures exercise the actual merged receive/stop code, real2221 partial-bind failure, successful handshake followed by service/GSI failure, DEL_SERVER followed by a data reply, and all four channel-stop failures.
+
+This is private desk work while the reviewed2204 survey runs. It is not yet a public frozen2205 cutoff, full integrated build or phone GO. The data agent is checking one further readiness-before-service-sync edge before the combined review.
