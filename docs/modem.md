@@ -463,3 +463,16 @@ M1 remains the guarded PAS/IPC/rmtfs implementation and host checks. M2 requires
 
 
 **Measured, SMMU prerequisite passed.** ast174 completed the2210 SMMU-only trial normally in214seconds. Setup completed at log7734, private contexts were parked and backing released at7940, final_error0 appeared at7942 and DONE at11129. The fresh nonce matched, root before/after was clean and stale=false. No firmware, PAS15 or GSI ran. The phone returned to recovery and ownership was released. PAS15-only and offline IPA handshake trials remain before ONLINE.
+
+
+## IPA firmware teardown correction
+
+**Measured.** ast175 returned successful PAS15 initialization, memory setup, authentication and shutdown at raw log lines5512,5520,5523 and5534. Powered IPA/GSI register reads appeared at5527. The run reset after63seconds and collection reported a dirty root with stale=true. It does not qualify the firmware lifecycle.
+
+**Code.** IPA identified an unaligned firmware unmap in the panic. Native ml_io_unmap passes the exact length to pmap_remove. Additive2211 maps and unmaps the16KiB-page-rounded0xc000 span while firmware storage and parser bounds remain0xa000. The combined tree includes this exact published patch.
+
+**Measured, host.** The real runtime regression uses16KiB CPU pages. Lifecycle and datapath sanitizer suites pass, all56 source files reconstruct, the safe build exited0 and all10 packed segments match. Kernel SHA256 is44b85b9bc2f6645a84b30c3e3f48e7b8743bba707cd3438e1851b67e7a38c68f. The replacement data image remains unapproved.
+
+**Code, blocker.** The current hardware setup also rejects measured flavor0xb0f0b1a because its producer-range check uses the wrong direction. The reference defines our RX as an IPA producer and our TX as an IPA consumer. IPA owns a separate correction before the offline handshake trial.
+
+**Missing.** A reviewed benign root cleanup, accepted firmware teardown and offline IPA/GSI/QMI handshake still precede a fresh exact ONLINE-image review. No data profile or packet-proof helper has been installed.
