@@ -5,7 +5,7 @@
 #include <string.h>
 #include "BatteryRead.c"
 #include "QcomGlink.h"
-static struct {BatteryRead read;bool reads,battery_up,fatal,failed;unsigned state;uint64_t cycle_started,request_sent,cycle_due;QcomGlink gl;QcomGlinkChannel *battery;}m;
+static struct {BatteryRead read;bool reads,daily,meter,battery_up,fatal,failed;unsigned state,read_failures,cycles;int32_t last_status,last_online;uint64_t cycle_started,request_sent,cycle_due,read_quiet_until;bool refresh_pending,notify_pending;uint64_t last_trigger,last_notify_cycle,settle_until;unsigned unmatched,notifies;bool probing;uint64_t probe_sent,online_due;unsigned online_ms;int32_t known_online;QcomGlink gl;QcomGlinkChannel *battery;}m;
 static uint64_t now=1000;
 static unsigned sent,published,cleared;
 static int send_result;

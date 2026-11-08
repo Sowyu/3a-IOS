@@ -1,0 +1,81 @@
+--- a/bsd/dev/battery/BatterySnapshot.inc
++++ b/bsd/dev/battery/BatterySnapshot.inc
+@@ -6,6 +6,8 @@
+ static LCK_MTX_DECLARE(battery_snapshot_mutex,&battery_snapshot_group);
+ static BatterySnapshot battery_snapshot;
+ static bool battery_snapshot_valid;
++/* 2297: iokit/Kernel/arm/SweetBattery.cpp republishes at once when what iOS shows changes. */
++extern void sweet_battery_kick(void);
+ static void battery_snapshot_clear(void){
+  lck_mtx_lock(&battery_snapshot_mutex);battery_snapshot_valid=false;lck_mtx_unlock(&battery_snapshot_mutex);
+ }
+@@ -18,7 +20,12 @@
+   .external=b->value[6]!=0,.charging=b->value[6]!=0 && b->value[0]==1,
+   .full=b->value[0]==4,.sampled_ms=now
+  };
+- lck_mtx_lock(&battery_snapshot_mutex);battery_snapshot=s;battery_snapshot_valid=true;lck_mtx_unlock(&battery_snapshot_mutex);
++ lck_mtx_lock(&battery_snapshot_mutex);
++ const BatterySnapshot *o=&battery_snapshot;
++ bool shown=!battery_snapshot_valid || o->percent!=s.percent || o->external!=s.external || o->charging!=s.charging || o->full!=s.full;
++ battery_snapshot=s;battery_snapshot_valid=true;
++ lck_mtx_unlock(&battery_snapshot_mutex);
++ if(shown)sweet_battery_kick();
+ }
+ int sweet_adsp_battery_snapshot(BatterySnapshot *out){
+  if(!out)return 0;
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -16,6 +16,23 @@
+ #include "../../../bsd/dev/sweet_board.h"
+ #include "../../../bsd/dev/battery/BatterySnapshot.h"
+ #include "../../../bsd/dev/battery/ModemGate.h"
++/*
++ * 2297: the ADSP worker calls sweet_battery_kick() when the percent, the cable or the charge state changed, so iOS
++ * hears it at once instead of on the next 5 s tick. The kick sets a flag and arms the timer for 1 ms; timerFired
++ * clears the flag before it polls and re-arms 1 ms if a kick landed during its poll, so none is lost.
++ */
++static IOTimerEventSource *volatile sweet_battery_kick_timer;
++static volatile int sweet_battery_kick_pending;
++extern "C" void sweet_battery_kick(void);
++extern "C" void
++sweet_battery_kick(void)
++{
++	IOTimerEventSource *t = __atomic_load_n(&sweet_battery_kick_timer, __ATOMIC_ACQUIRE);
++	if (t != NULL) {
++		__atomic_store_n(&sweet_battery_kick_pending, 1, __ATOMIC_RELEASE);
++		t->setTimeoutMS(1);
++	}
++}
+ /* bsd/dev/sweet_adsp.c: stop the ADSP cleanly before power off or restart (2291). */
+ extern "C" void sweet_adsp_shutdown(void);
+ /* bsd/dev/sweet_spmi.c */
+@@ -417,8 +434,10 @@
+ {
+ 	SweetBattery *self = OSDynamicCast(SweetBattery, owner);
+ 	if (self && self->fRunning) {
++		__atomic_store_n(&sweet_battery_kick_pending, 0, __ATOMIC_RELEASE);
+ 		self->poll();
+-		sender->setTimeoutMS(self->fADSP ? 5000 : 30000);
++		bool again = self->fADSP && __atomic_load_n(&sweet_battery_kick_pending, __ATOMIC_ACQUIRE);
++		sender->setTimeoutMS(again ? 1 : self->fADSP ? 5000 : 30000);
+ 	}
+ }
+ 
+@@ -449,6 +468,9 @@
+ 			fTimerAdded = true;
+ 			fRunning = true;
+ 			fTimer->setTimeoutMS(fADSP ? 5000 : 30000);
++			if (fADSP) {
++				__atomic_store_n(&sweet_battery_kick_timer, fTimer, __ATOMIC_RELEASE);
++			}
+ 		} else {
+ 			fReal = fADSP = false;
+ 			poll();
+@@ -462,6 +484,7 @@
+ void
+ SweetBattery::stop(IOService *provider)
+ {
++	__atomic_store_n(&sweet_battery_kick_timer, (IOTimerEventSource *)NULL, __ATOMIC_RELEASE);
+ 	if (fLoop && fTimerAdded) {
+ 		/* Serialize against a running timer callback, including rearming. */
+ 		(void)fLoop->runAction(&SweetBattery::stopPolling, this);

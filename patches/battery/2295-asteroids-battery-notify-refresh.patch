@@ -1,0 +1,115 @@
+--- a/bsd/dev/battery/BatteryRead.h
++++ b/bsd/dev/battery/BatteryRead.h
+@@ -13,10 +13,8 @@
+     unsigned cursor, waiting, failed, fields;
+ } BatteryRead;
+ int battery_read_complete(const BatteryRead *);
+-uint32_t battery_read_request(const BatteryRead *,uint8_t out[24]);
+-int battery_read_allowed(const uint8_t *,uint32_t);
+-int battery_read_sent(BatteryRead *);
+-int battery_read_receive(BatteryRead *,const uint8_t *,uint32_t);
+-void battery_read_timeout(BatteryRead *);
+-int battery_read_valid(const BatteryRead *);
++/* 2295/2296: the header of any PMIC GLINK message, and whether it is a battery-manager notification
++ * (owner 32778, type 2, opcode 7, 16 bytes; Linux qcom_battmgr). A notification carries no value we use. */
++int battery_msg_header(const uint8_t *,uint32_t,uint32_t *owner,uint32_t *type,uint32_t *opcode);
++int battery_notify_parse(const uint8_t *,uint32_t,uint32_t *code);
+ #endif
+--- a/bsd/dev/battery/BatteryRead.c
++++ b/bsd/dev/battery/BatteryRead.c
+@@ -39,3 +39,12 @@
+  b->value[4]>=-20000000 && b->value[4]<=20000000 && b->value[5]>=-4000 && b->value[5]<=10000 &&
+  (b->value[6]==0 || b->value[6]==1);
+ }
++int battery_msg_header(const uint8_t *p,uint32_t n,uint32_t *owner,uint32_t *type,uint32_t *opcode){
++ if(!p || n<12 || !owner || !type || !opcode)return 0;
++ *owner=get32(p);*type=get32(p+4);*opcode=get32(p+8);return 1;
++}
++int battery_notify_parse(const uint8_t *p,uint32_t n,uint32_t *code){
++ if(!p || n!=16 || get32(p)!=32778 || get32(p+4)!=2 || get32(p+8)!=7)return 0;
++ if(code)*code=get32(p+12);
++ return 1;
++}
+--- a/bsd/dev/battery/AdspRuntime.inc
++++ b/bsd/dev/battery/AdspRuntime.inc
+@@ -48,6 +48,7 @@
+  bool failed,fatal,qr_started,battery_up,votes_owed,vote_uncertain,xo_pinned,qmp_owed,glink,proxy_released;
+  int master;
+  BatteryRead read;bool reads,daily,meter;uint64_t cycle_started,request_sent,cycle_due,read_quiet_until;unsigned read_failures,cycles;int32_t last_status,last_online;
++ bool refresh_pending,notify_pending;uint64_t last_trigger,last_notify_cycle,settle_until;unsigned unmatched,notifies;
+  struct adsp_image images[2];
+ } m;
+ static uint64_t m_now(void);
+@@ -59,6 +60,15 @@
+ /* 2292 sweetbmeter=1 (daily only): a 5 s cycle that also reads the meter fields and logs every cycle. */
+ #define B_CYCLE_METER_MS 5000u
+ #define B_QUIET_MS 30000u
++/* 2295: a battery-manager notification starts one full read, at most once per B_NOTIFY_MIN_MS, so a stream of
++ * notifications (ast188 saw about one every 6 s) cannot raise the read rate more than that. A USB-online change
++ * (2296) starts a full read at most once per B_TRIGGER_MIN_MS and then, for B_SETTLE_MS, cycles every
++ * B_SETTLE_CYCLE_MS, so the charge status that follows a plug (ast192: discharging, then charging 20 s later)
++ * shows quickly. */
++#define B_NOTIFY_MIN_MS 5000u
++#define B_TRIGGER_MIN_MS 1000u
++#define B_SETTLE_MS 30000u
++#define B_SETTLE_CYCLE_MS 2000u
+ #define B_READ_FAILURES 5u
+ /* Set by sweet_adsp_shutdown() at power off or restart; outside m, which adsp_run clears. */
+ static volatile bool adsp_stop_requested;
+@@ -72,6 +82,15 @@
+  else printf("SWEET BATTERY: B5 read failure %u; fresh client in %u s\n",m.read_failures,B_QUIET_MS/1000);
+  sweet_log_sync();
+ }
++static void adsp_refresh_soon(void){m.refresh_pending=true;m.settle_until=m_now()+B_SETTLE_MS;}
++/* 2295: what the ADSP sends that no request asked for, rate-limited: the first 16, then every 64th. */
++static void adsp_log_unmatched(const uint8_t *data,uint32_t bytes){
++ uint32_t owner,type,opcode,n=m.unmatched++;
++ if(n>=16 && n%64)return;
++ if(battery_msg_header(data,bytes,&owner,&type,&opcode))
++  printf("SWEET BATTERY: B7 unmatched #%u bytes=%u owner=%u type=%u opcode=%#x word3=%#x\n",n,bytes,owner,type,opcode,bytes>=16?(uint32_t)data[12]|(uint32_t)data[13]<<8|(uint32_t)data[14]<<16|(uint32_t)data[15]<<24:0u);
++ else printf("SWEET BATTERY: B7 unmatched #%u bytes=%u\n",n,bytes);
++}
+ static void m_bstate(void *ctx,QcomGlinkChannel *ch,int up){
+  (void)ctx;(void)ch;m.battery_up=up!=0;
+  printf("SWEET BATTERY: B2 PMIC_RTR_ADSP_APPS up=%d\n",up);
+@@ -80,7 +99,15 @@
+ static void m_breceive(void *ctx,QcomGlinkChannel *ch,const uint8_t *data,uint32_t bytes){
+  (void)ctx;(void)ch;
+  if(!m.reads || m_now()<m.read_quiet_until)return;
++ /* A battery-manager notification is only a cue: values still come from GET replies. */
++ uint32_t code;
++ if(battery_notify_parse(data,bytes,&code)){
++  if(m.notifies++<16 || !(m.notifies%64))printf("SWEET BATTERY: B7 notify #%u code=%#x\n",m.notifies-1,code);
++  if(m.daily)m.notify_pending=true;
++  return;
++ }
+  int rc=battery_read_receive(&m.read,data,bytes);
++ if(!rc){adsp_log_unmatched(data,bytes);return;}
+  if(rc<0){printf("SWEET BATTERY: B3 reply error field=%u\n",m.read.cursor);adsp_read_fail();return;}
+  if(rc==1 && battery_read_complete(&m.read)){
+   /* Log raw values before validation, so a wrong property id is visible. */
+@@ -100,7 +127,7 @@
+    printf("SWEET BATTERY: B6 meter ms=%llu vbat_uV=%d ibat_uA=%d charge_uAh=%d vusb_uV=%d iusb_uA=%d status=%d online=%d\n",
+     (unsigned long long)ms,m.read.value[3],m.read.value[4],m.read.value[7],m.read.value[8],m.read.value[9],m.read.value[0],m.read.value[6]);
+   }
+-  m.cycle_due=m_now()+(m.meter?B_CYCLE_METER_MS:m.daily?B_CYCLE_DAILY_MS:B_CYCLE_TEST_MS);
++  m.cycle_due=m_now()+(m.meter?B_CYCLE_METER_MS:m.daily?(m_now()<m.settle_until?B_SETTLE_CYCLE_MS:B_CYCLE_DAILY_MS):B_CYCLE_TEST_MS);
+  }
+ }
+ #include "AdspHelpers.inc"
+@@ -109,7 +136,14 @@
+  uint64_t now=m_now();
+  if(now<m.read_quiet_until)return;
+  if(battery_read_complete(&m.read)){
+-  if(now<m.cycle_due)return;
++  bool changed=m.refresh_pending && now>=m.last_trigger+B_TRIGGER_MIN_MS;
++  bool notified=m.notify_pending && now>=m.last_notify_cycle+B_NOTIFY_MIN_MS;
++  bool triggered=changed || notified;
++  if(now<m.cycle_due && !triggered)return;
++  /* Any cycle that starts now reads the state after the cue, so both cues are spent. */
++  if(changed)m.last_trigger=now;
++  if(notified)m.last_notify_cycle=now;
++  m.refresh_pending=m.notify_pending=false;
+   adsp_read_reset();m.cycle_started=now;
+  }
+  if(!m.cycle_started)m.cycle_started=now;

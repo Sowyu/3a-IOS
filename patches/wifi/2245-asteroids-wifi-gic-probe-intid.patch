@@ -1,0 +1,38 @@
+diff --git a/bsd/dev/wifi/WpssRuntime.inc b/bsd/dev/wifi/WpssRuntime.inc
+index 733905009..ff6766096 100644
+--- a/bsd/dev/wifi/WpssRuntime.inc
++++ b/bsd/dev/wifi/WpssRuntime.inc
+@@ -279,6 +279,12 @@ static void w_unmap(vm_offset_t va,vm_size_t bytes){vm_offset_t off=va&PAGE_MASK
+ #define W_GICD_PA 0x17100000ull
+ #define W_GICD_BYTES 0x1000u
+ #define W_WDOG_SPI 579u       /* DT wpss_pas interrupts-extended = <&intc 0 0x243 1 ...>: SPI 0x243 = 579 */
++/* 2245: the device tree numbers the watchdog SPI 0x243 = 579, but a GIC distributor counts shared peripheral
++ * interrupts from INTID 32, so its INTID is always SPI + 32 = 611, at word 19 bit 3. W2b read word 18 bit 3, which is
++ * INTID 579, that is SPI 547: a different interrupt that exists, so the read succeeded and silently said "not pending".
++ * Every other GIC reader in this tree does it the same way: the modem path prints IRQ 37 (SPI 5) from ISENABLER 0x104
++ * bit 5, and 32 + 5 = 37. A wrong bit here is worse than a fault, because it reports a clean watchdog no matter what. */
++#define W_WDOG_INTID (W_WDOG_SPI + 32u)   /* 611 */
+ /* The WPSS crash reason (vendor volcano_wpss_resource .crash_reason_smem = 626): a line of text the firmware leaves
+  * in a global SMEM item when it gives up. Read only, word by word (SMEM is device memory and must not be
+  * byte-addressed), and never interpreted: it is the firmware's own words for the log. */
+@@ -298,15 +304,15 @@ static void wpss_crash_reason(void){
+  sweet_log_sync();
+ }
+ static void w_state_probe(void){
+- /* The WPSS watchdog (SPI 579) as the GIC sees it now. A pending-and-not-enabled interrupt is a bite we did not take. */
++ /* The WPSS watchdog as the GIC sees it now. A pending-and-not-enabled interrupt is a bite we did not take. */
+  vm_offset_t gic=ml_io_map_unmappable(W_GICD_PA,W_GICD_BYTES,VM_WIMG_IO);
+  if(!gic){printf("SWEET WIFI: W2 probe: GIC mapping failed\n");sweet_log_sync();return;}
+- unsigned word=W_WDOG_SPI/32u,bit=W_WDOG_SPI%32u;
++ unsigned word=W_WDOG_INTID/32u,bit=W_WDOG_INTID%32u;
+  uint32_t group=w_rd(gic,0x080u+4u*word),enable=w_rd(gic,0x100u+4u*word);
+  uint32_t pending=w_rd(gic,0x200u+4u*word),active=w_rd(gic,0x300u+4u*word);
+- printf("SWEET WIFI: W2 probe: wdog spi=%u group1=%u enabled=%u pending=%u active=%u (read only)\n",
+-  W_WDOG_SPI,!!(group&(1u<<bit)),!!(enable&(1u<<bit)),!!(pending&(1u<<bit)),!!(active&(1u<<bit)));
+- if(pending&(1u<<bit))printf("SWEET WIFI: W2 probe: WPSS WATCHDOG HAS FIRED (spi %u pending, not taken by us)\n",W_WDOG_SPI);
++ printf("SWEET WIFI: W2 probe: wdog spi=%u intid=%u word=%u bit=%u group1=%u enabled=%u pending=%u active=%u (read only)\n",
++  W_WDOG_SPI,W_WDOG_INTID,word,bit,!!(group&(1u<<bit)),!!(enable&(1u<<bit)),!!(pending&(1u<<bit)),!!(active&(1u<<bit)));
++ if(pending&(1u<<bit))printf("SWEET WIFI: W2 probe: WPSS WATCHDOG HAS FIRED (spi %u intid %u pending, not taken by us)\n",W_WDOG_SPI,W_WDOG_INTID);
+  w_unmap(gic,W_GICD_BYTES);
+  /* Our SMP2P item as the WPSS would see it, and the WPSS's item as we see it. */
+  uint32_t off=0,bytes=0;

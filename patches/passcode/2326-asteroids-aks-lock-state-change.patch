@@ -1,0 +1,107 @@
+SWEET AKS: a lock tells SpringBoard the lock state changed, so the lock screen asks for the code (2326)
+
+ast266, 2026-11-07: the owner set a code through Settings ("SWEET AKS: set -> ok"), the runner pressed the side
+button, SpringBoard called selector 8 within 0.2 s and the kernel logged `lock -> ok` seven times. On the wake and
+the swipe, the lock screen went straight into Settings with no keypad, with code 8361 live. This is the ast253
+bypass again, in the third place it occurs. 2325 fixed the set, 2325b fixed the turn-off; a lock was still silent
+in the form SpringBoard listens for.
+
+The decision, from the 26.6.2 cache (full addresses in plans/passcode/lock3-decision-path.md):
+
+  -[SBLockScreenManager lockScreenViewControllerDidPresent]'s block (0x224befa4c) shows the keypad only when
+  -isAuthenticated (0x22517c240) is false and -hasPasscodeSet (0x225167700) is true. The has-passcode byte was
+  already right after 2325. The failing half is isAuthenticated: -[SBFUserAuthenticationController isAuthenticated]
+  (0x1c16a8424) tail-calls -_isUserAuthenticated (0x1c16a8428), which branches on _authState (+0x28). When that is
+  Revoking (2) it does NOT read the lock state; it returns the grace-period assertion's validity
+  (0x1c16a8474-0x1c16a856c). And -_revokeAuthenticationImmediately:forPublicReason: (0x1c170c568) -- the only caller
+  of MKBLockDevice, and therefore of selector 8 -- ends with `_setAuthState: 2` (0x1c170c6f0) and creates that
+  assertion (0x1c16ea1c8). A lock therefore pins SpringBoard in Revoking, and a successful selector 26 (the
+  transient tracker's addAssertion:, 0x1c16eadc0 -> MKBDeviceLockAssertion -> aks_assert_hold) keeps the assertion
+  valid, so isAuthenticated stays true for the rest of the boot.
+
+  The way out of Revoking is -_updateAuthenticationStateAndDateForLockState: (0x1c170c1a0), which stores Revoked
+  when isEffectivelyLocked is true (0x1c170c1f8). isEffectivelyLocked (0x1c16b0498) is the mask 0x46 over the MAPPED
+  lockState, so sls 1 -> Locked -> true. The kernel's answer after a lock was already right. That method's only
+  caller is -[SBFUserAuthenticationController keybag:extendedStateDidChange:] (0x1c16ec7fc), reached from
+  SBFMobileKeyBag's status-change dispatch (0x1c16ec6e4), reached from -_queue_handleKeybagStatusChanged
+  (0x1c16ec1c4), reached from the interest block (0x1c16ec08c) ONLY for AKSEvent 1:
+
+    0x1c16ec0bc  cbz   w21, 0x1c16ec0ec    ; event 0: +0x31 and _queue_firstUnlockOccurred
+    0x1c16ec0c0  cmp   w21, #1
+    0x1c16ec0c4  b.ne  0x1c16ec104         ; everything else: return, no refresh
+
+  Apple's aksNotificationCB (0x1e4ae45f4) maps 0xd00c -> 4, 0xd00d -> 1, 0xd00f -> 0, 0xd010 -> 3. Our lock sent
+  only 0xd00c, AKSEvent 4, which the block ignores. So the lock never reached the one method that revokes the session.
+
+- SweetPasscode.c, spc_lock_now_locked: when the lock actually happens (`l->unlocked` was true) it now raises
+  SPC_EV_UNLOCKED as well as SPC_EV_LOCKED. SPC_EV_UNLOCKED is the event bit whose message is 0xd00d, the only form
+  the interest block acts on; here it means "the lock state moved, re-read it", not "a session is open", and both
+  consumers (SBFMobileKeyBag and MobileKeyBag) re-read the kernel's own answers and ignore the payload. The raise is
+  inside the existing `if (l->unlocked)` guard, so a second selector 8/32/13 on an already locked phone posts
+  nothing, and a lock with no code still does nothing at all. The event map in SweetKeyStore.cpp already sends
+  0xd00c before 0xd00d, so the pair goes out in that order; the locked message is unchanged.
+- SweetPasscode.h: the contract above, on spc_lock_now_locked's declaration.
+
+Not changed: every selector's arguments and answers, the stub, the two-phase stage and commit, the device state
+(`ss`, `sls`, `sb`, `sfa`, `sgs`, `sas`, `sgpe`, `srcd`), the entitlement, root, the backoff, and the
+count-before-hash ordering. The kernel's post-lock answer was always sls 1; only its announcement was missing.
+
+Host: check-2325.py runs springboard_test.c against the real SweetKeyStore.cpp. It now models the controller as well
+as the keybag: _authState and the grace assertion (sb_auth_lock, sb_is_authenticated, sb_update_auth_for_lock_state,
+sb_keypad_needed), the transient tracker's selector 26 hold, and the interest block's restriction to AKSEvent 1.
+116 assertions in 11 tests (was 76 in 8). The three new tests are `lock needs code` (the ast266 defect end to end:
+set, lock, selector 8, selector 26, then the lock screen's own question must say a keypad is needed),
+`second lock quiet` and `lock without code`. 24 checks (was 20): 9 source, 14 negative controls and the blindness
+control, each caught. The new controls remove 2326's half in the core and in the map, and add a guarded raise; each
+makes the suite fail. The blindness control now also drops the three new tests before it rebuilds 2325's turn-off
+test, and check-2325.py refuses a tree without 2326 by name instead of testing it as if it were the shipped one.
+check-2phase 37, check-lock 57 (PASSCODE_OUT=out-lock3), test_turnon 21 cases unchanged.
+
+Needs 2321, 2322, 2323, 2323b, 2324, 2325 and 2325b. Security code: plans/passcode/audit-brief-lock3.md is the audit
+brief for the rebuilt image, and no image should boot until that audit is a GO.
+
+Check: python3 -I plans/passcode/tools/check-2325.py XNU_DIR (24 checks)
+       python3 -I plans/passcode/tools/check-2phase.py XNU_DIR (2324, 37 checks)
+       python3 -I plans/passcode/tools/check-lock.py XNU_DIR (2321/2322, 57 checks)
+       python3 -I plans/passcode/tools/test_turnon.py plans/passcode/tools/turnon.py (21 cases)
+Apply: git apply -p1 in the kernel tree, after 2321, 2322, 2323, 2323b, 2324, 2325 and 2325b.
+diff --git a/bsd/dev/SweetPasscode.c b/bsd/dev/SweetPasscode.c
+--- a/bsd/dev/SweetPasscode.c
++++ b/bsd/dev/SweetPasscode.c
+@@ -902,6 +902,18 @@
+ 	if (l->unlocked) {
+ 		l->unlocked = false;
+ 		ev->on[SPC_EV_LOCKED] = true;
++		/*
++		 * 2326: and it must tell SpringBoard that the lock state moved, not just that a lock happened. A lock left
++		 * -[SBFUserAuthenticationController _authState] at Revoking (2), and in that state -isAuthenticated answers
++		 * from the grace-period assertion instead of the lock state, so the lock screen believed the session was
++		 * still open and presented no keypad (ast266). Only AKSEvent 1 runs -_queue_handleKeybagStatusChanged, and
++		 * only 0xd00d is that event, so the lock raises SPC_EV_UNLOCKED as well. It means "the lock state changed,
++		 * re-read it" here, not "a session is open"; every consumer re-reads the kernel's own answer.
++		 *
++		 * Only on a real transition: a second lock while already locked says nothing, or every selector 8/32/13
++		 * call would post a status change for a state that has not moved.
++		 */
++		ev->on[SPC_EV_UNLOCKED] = true;
+ 	}
+ }
+ 
+diff --git a/bsd/dev/SweetPasscode.h b/bsd/dev/SweetPasscode.h
+--- a/bsd/dev/SweetPasscode.h
++++ b/bsd/dev/SweetPasscode.h
+@@ -212,7 +212,13 @@
+ enum spc_try spc_lock_set(struct spc_lock *l, const uint8_t *old, size_t old_len,
+     const uint8_t *new_code, size_t new_len, bool force, struct spc_events *ev);
+ 
+-/* Lock the session. Does nothing when no code is set: there is nothing to unlock against. */
++/* Lock the session. Does nothing when no code is set: there is nothing to unlock against.
++ *
++ * 2326: a lock that actually happens also raises SPC_EV_UNLOCKED, the event whose handler re-reads the lock state
++ * (AKSEvent 1, which only 0xd00d produces). 2325's set and 2325b's turn-off had both learned that lesson; a lock had
++ * not, so SpringBoard stayed in its Revoking state and answered isAuthenticated from a grace-period assertion for the
++ * whole boot. The lock state itself was always right; only the announcement was missing.
++ */
+ void spc_lock_now_locked(struct spc_lock *l, struct spc_events *ev);
+ 
+ /* The DER device-state fields, filled from the lock. */

@@ -303,3 +303,434 @@ Both runs use `plans/lag/next-ff3`'s two dylibs and `plans/freeform/out/ff-owner
 
 - Kernel: give non-compositor submissions a time budget and attribute a stall to its client. Then a timed-out client is killed and refused further submissions, instead of every client's fences being voided. This helps only if the kernel keeps running, which in ast102 it did not.
 - Userspace: hand the device only to PencilKit, not to Freeform's in-process CoreAnimation, which ran on the CPU in the builds where drawing only crashed Freeform. That needs `MTLCreateSystemDefaultDevice` to answer per caller, and is a design to check first.
+
+## Hands-free retry (prepared 2026-11-06, not run)
+
+ast109 and ast111 never reached a board. Their `bgmtl-app.log` sections have no PencilKit pipeline. Freeform opened on its sidebar (`CRLiOSSidebarViewController`, a 106-pt navbar at UIKit y 50 or 68), and the `+` tap at sweettouch y 62 did nothing (`no visible effect` in ast109). Their frames are also unreadable, because `sweetfb_ast_hw=1` captures come out striped (`docs/lag.md`). So no stroke has yet reached PencilKit on Chlorophyll.
+
+The image is `plans/freeform/out/ff-daily-boot.img`, built by `plans/freeform/build-images.sh --daily MANIFEST` from the B-noK5 daily's manifest. It uses the daily's own kernel (B-noK5, SHA256 f78dd695e3f1..., which already carries 2130 v4; the first build picked the unapproved K5 kernel 981c13cc..., which the audit caught, and was rebuilt as image bb120a9d19b9...), so no kernel build is needed. The boot line is the daily's with four changes. It drops `sweetfb_ast_hw=1` for readable frames, drops `sweetdaily=1 sweetapn=... sweetapnauth=...` to fit 607 bytes, which also keeps the modem out of the run, and adds `sweetappmetal=Freeform sweetdeadman=900 sweetselftest=1`. That is 573 bytes. The run pushes next-ff3's inject, libchlorophyll and launcher, the stack ast109 survived.
+
+The test body is `plans/freeform/selftest/freeform-handsfree.sh`:
+
+1. It opens Freeform, taps the first sidebar row and then the first board, so an existing board opens.
+2. It goes back, taps new board, and tries five pen positions in the bottom toolbar. It keeps the first one after which `bgmtl-app.log` gains PencilKit lines.
+3. It draws five strokes, goes back to the grid for the thumbnail, and goes home.
+4. It writes `ff-hf.txt` (Freeform's pid at each step, PencilKit line counts, dispatch and commit counts), this boot's slice of the app log, and any Freeform crash report from this boot.
+
+A status-bar tap every 15 s keeps auto-lock from turning the display off during waits.
+
+Run command (inside the /tmp/phone.lock protocol):
+
+```
+python3 -I plans/devloop/dev.py plans/freeform/out/ff-daily-boot.img \
+  /usr/local/lib/bgmtl/bgmtl-inject.dylib=plans/lag/next-ff3/out-metal/bgmtl-inject.dylib \
+  /usr/local/lib/bgmtl/libchlorophyll.dylib=plans/lag/next-ff3/out-metal/libchlorophyll.dylib \
+  /usr/local/lib/bergamota-gl/bgl-launch=plans/lag/next-ff3/out-metal/bgl-launch \
+  --test ../../../freeform/selftest/freeform-handsfree --note ff-handsfree \
+  --pull /private/var/tmp/bgmtl-app.log --pull /private/var/tmp/ff-hf.txt \
+  --pull /private/var/tmp/ff-hf-app.log --pull /private/var/tmp/ff-hf-crash.ips \
+  --key 'SWEET EXEC: appmetal' --key 'SELFTEST: FF ' --key 'CRASH Freeform'
+```
+
+Then `python3 -u plans/smooth/run-smooth.py promote` before the owner boots the daily: next-ff3 is not a proven daily driver.
+
+Afterwards the root holds next-ff3's three files, not the daily driver. `plans/smooth/run-smooth.py promote` puts `drv/clean` back on its pinned check image.
+
+It passes only if all of these hold:
+
+1. The console has `SWEET EXEC: appmetal inject for /Applications/Freeform.app/Freeform`.
+2. `ff-hf.txt` names a pen position, and `ff-hf-app.log` has `app dispatch` lines for `paint_kernel`, `particle_kernel` or `sdfPen_kernel`.
+3. `ff-hf-app.log` has no `draw with no pipeline` and no `refusing` line.
+4. Frames `ff-stroke1`, `ff-stroke2` and `ff-stroke5` show the strokes, and `ff-grid` shows the new board's thumbnail with them.
+5. Freeform's pid is the same at every step, with no `CRASH Freeform`, an empty `ff-hf-crash.ips` and no new kill switch.
+6. Recoveries are 0, backboardd restarts are 0, the result is `selftest-done` with no reset, and the root is clean.
+
+A run that reaches a board but finds no pen is inconclusive, not a failure. Read the frames, fix `FF_PENS` or the other points at the top of the script, and rerun.
+
+## ast231: hands-free retry (2026-11-06)
+
+ast231 ran `ff-daily-boot.img` (bb120a9d19b9...) with `freeform-handsfree.sh` 3bb4b893 (saved as `plans/freeform/tests/old/freeform-handsfree-ast231.sh`). dev.py called it `reset-unknown` in 460 s, with a clean root, 0 recoveries and 0 backboardd restarts. Freeform kept pid 437 the whole time and left no crash report. It opened an existing board with app Metal, which the daily driver cannot do. No stroke reached a canvas, so PencilKit never drew: `app dispatches 0, commits 95, no pipeline 0`.
+
+### What the frames show
+
+The check frames are 360x797, and sweettouch points are 375x812, so a point is (frame x * 375/360, frame y * 812/797).
+
+| Frame | Tap before it (point, frame) | What it shows |
+|---|---|---|
+| 01 ff-open | none | Freeform opened on All Boards, not on its sidebar. There are two cards: Untitled 2 at frame x 18-173, y 140-283, and Untitled. The search bar is at the bottom, with its mic at 259,753, and new board is the compose button at 316,753 |
+| 02 ff-row1 | 100,178 = 96,175 | The Untitled 2 board opened, an empty dot grid. Back is at 36,61. The bottom toolbar holds a shapes button (44,753), then pen (130,753), text (180,753) and attachments (230,753) in one bar, then new board (316,753) |
+| 03 ff-existing | 100,230 = 96,226 | The tap hit the canvas, so Freeform shows "Select Objects" |
+| 04 ff-back | 27,71 = 26,70 | All Boards again |
+| 05 ff-new | 343,71 = 329,70 | The ... menu (Select, Icons, List, Sort). On the grid, top right is ..., not new board |
+| 06 ff-pen-300 | 300,761 = 288,747 | That tap only closed the menu |
+| 07 ff-pen-257 | 257,761 = 247,747 | The search bar's microphone opened the Enable Dictation alert |
+| 08 ff-pen-187 | 187,761 = 180,747 | The search field, with the keyboard up |
+| 09, 10 | 327 and 117 at y 761 | Taps on the keyboard area. The first stroke swipe after 117 typed into search |
+| 11-14 | strokes and back | The strokes typed "Week", so the screen reads "No Results for Week". Back landed on the keyboard |
+| 15 settle | home | The home screen |
+
+ast231's single "PencilKit line" after pen 117 was `render pipeline uber_vertex+fa17fmha4` at 353 s, which Freeform built while the search screen was showing. It was not a stroke.
+
+### Script fix
+
+The new `freeform-handsfree.sh`, measured from the frames above, has SHA256 `b27c15db8d8ba11df1910432596606227b6343ad5f0b113a6c456ba32e9abb12`.
+
+| Name | Point | Frame | Source |
+|---|---|---|---|
+| `FF_CARD1` | 100 178 | 96,175 | first card. It opened a board in frame 02 |
+| `FF_BACK` | 37 62 | 36,61 | the centre of the back button in 02. The old 27 71 also worked, in 04 |
+| `FF_NEW` | 329 767 | 316,753 | the compose button in 01 and 04 |
+| `FF_PEN` | 135 767 | 130,753 | the pen icon in 02 |
+| canvas | x 80-300, y 250-600 | x 77-288, y 245-589 | the empty dot grid in 02, between the navbar (y < 85) and the toolbar (y > 725) |
+| `FF_CANCEL`, `FF_NOTNOW`, `FF_BLANK` | 343 480, 187 470, 104 509 | 329,471, 180,461, 100,500 | ways out of search (08), the dictation alert (07) and the ... menu (05) |
+
+The script now checks the screen after every navigation tap. `ff_grab` reads `kern.sweet_fb_shot` raw with `/var/jb/usr/sbin/sysctl -b`. That is the same buffer `sweetshot` turns into a PNG, a 16-byte header and then BGRA rows. The script accepts it only if the header reads 360x797 with 1440 bytes per row. `ff_count` reads boxes with `od` and counts pixels by colour class. `ff_screen` uses those counts to call the screen grid, menu, board, keyboard, dimmed or unknown:
+
+| Box (frame) | Class | Grid | Board | Menu | Keyboard | Alert |
+|---|---|---|---|---|---|---|
+| title "All" 18-60, 97-122 | cyan | 352 | 0 | 352 | 0 | 0 |
+| ... dots 312-334, 56-66 | dark | 26 | 26 | 0 | 0 | 0 |
+| search mic 252-266, 743-763 | dark | 68 | 0 | 68 | 0 | 71 |
+| pen 120-140, 743-763 | dark | 0 | 99 | 0 | 0 | 0 |
+| paperclip 220-240, 743-763 | dark | 0 | 89 | 0 | 0 | 0 |
+| keyboard margin 0-8, 600-700 | 226,227,231 | 0 | 0 | 0 | 683 | 0 |
+| centre 160-199, 380-399 | dimmed grey | 0 | 4 | 0 | 0 | 280 |
+
+The flow:
+
+1. Open Freeform, then reach the grid with at most four bounded actions. Board means back, keyboard means cancel, the alert means Not Now, and the menu means a blank tap. An unknown screen gets one reopen and one back, and is then refused.
+2. Tap the first card and require a board. Tap back and require the grid. Tap new board and require a board.
+3. Tap the pen once. Nobody has seen the pen's toolbar yet, so this check is negative. The screen must be board or unknown, not grid, menu, keyboard or the alert, and at least 150 bytes below the status bar must have changed. There is no second pen tap, because it would put the pen away again.
+4. Before each stroke, Freeform's pid must equal the one at open and the screen must keep the pen check's class. If Freeform crashes, the home screen would also read as unknown, and the pid check stops strokes landing there. Stroke 1 logs the ink at its midpoint and the PencilKit line count before and after. That is evidence for the test, not a gate.
+5. Tap back, and tap back again if that only closed the pen. Require the grid.
+
+A failed check writes `REFUSED at STEP` to `ff-hf.txt` and the console, keeps a `refused-STEP` frame, skips the rest of the navigation and runs the report as before. A run without a refusal should take about 3 minutes of waits plus a few seconds per check, against ast231's 5 minutes. The check cost on the phone is not measured; on the Mac one check takes about 0.6 s.
+
+`plans/freeform/tests/handsfree_frames.sh` takes the script's frame-check functions from between its markers and runs them under dash. It feeds them ast231's 15 frames, converted back to the raw sysctl layout, through a stub sysctl. All 15 classify as the table says, the three diff checks pass, and a bad header is refused. Its SHA256 is `18e45ebed880aee274a0ee6d9778f88cac80d323b4f317b5cedd3746173d0ba5`. A host dry run with the same stubs went through the happy path, a keyboard restored from search, ast231's menu tap (refused at `new`) and a pen tap that changes nothing (refused at `pen`). The composed `renegade-firstboot.sh` body passes `dash -n` at 14,626 bytes, up from 8,078.
+
+Assumptions, all inferred:
+
+- `sysctl -b` writes the opaque value raw. The root's binary is procursus system_cmds, and its usage lists `-b`.
+- Freeform stays in light mode. ast231 ran at the same hour in light mode, and a dark screen would be refused, not mis-tapped.
+- The compose button on the grid opens the new board directly.
+- The pen tap changes the screen enough to pass. If it does not, the run refuses at `pen` and the `refused-pen` frame shows the toolbar for the next fix.
+
+### The reset: after the test, not during GPU work
+
+Proven:
+
+- The script reached its last frame. `15-settle.png` exists and shows the home screen. hook.sh moves the old frames directory aside at start, so every frame in it is from this boot. The only commands after `shot settle` are `say DONE`, `sync`, `sleep 1` and `sweetreboot fastboot`.
+- The console's last stats line is `up_s=442`, at line 15764, just after `SELFTEST: step settle` at line 15758. The next stats line, due at 452, is missing. `step settle` came before 442 and `shot settle` at least 10 s later, so the log stops in the seconds where the script was calling `finish`.
+- The root was clean. dev.py reads the state in recovery straight after the run, with no replay boot. Clean means `06-hfs-put.py` found the volume's unmounted bit set and an empty journal, which needs an orderly unmount. ast100 and ast102, the two real hard resets, both left the root dirty.
+- The deadman (900 s) did not fire. There is no RECOVERY, no panic, no SMMU fault, and no stalled-fence kick after line 14051 (about up_s 211). The last GPU lines are ordinary stats (`submit_us avg=372`, 6,427 fences). The last ~30 lines are routine launchd work: fairplayd, bluetoothd, wifip2pd and seputil.
+- The phone was back in fastboot 18 s after the last stats line. In ast196 to ast233, runs that end with DONE show 3 to 23 s.
+
+Inferred: the reset was the script's own `sweetreboot fastboot`, and the console ring lost its last seconds, `SELFTEST: DONE` included. That is the same end-of-run `reset-unknown` HANDOFF counts in 17 of 45 runs. In this log series it also appears in ast198, ast199, ast211 and ast215, each with a 10 to 16 s gap.
+
+Unknown: why the ring drops the tail in some runs. That predates Freeform.
+
+Against ast100 and ast102: those reset during or right after Freeform's first GPU use, with dirty roots, stats that stopped mid-run, and in ast102 a stalled-fence kick as the last A810 line. ast231 shows none of that. Freeform held a Chlorophyll device for about 5 minutes, opened a board through app Metal, and built PencilKit's uber pipeline, all without a reset. This is the first Freeform run on Chlorophyll that did not hard-reset. It still says nothing about strokes, because none was drawn.
+
+Containment: nothing is warranted by ast231. The proposal under ast102 stands as written and is still not built.
+
+### Rerun
+
+The same image, files, pulls and keys as the original command, inside the /tmp/phone.lock protocol, with the new script:
+
+```
+python3 -I plans/devloop/dev.py plans/freeform/out/ff-daily-boot.img \
+  /usr/local/lib/bgmtl/bgmtl-inject.dylib=plans/lag/next-ff3/out-metal/bgmtl-inject.dylib \
+  /usr/local/lib/bgmtl/libchlorophyll.dylib=plans/lag/next-ff3/out-metal/libchlorophyll.dylib \
+  /usr/local/lib/bergamota-gl/bgl-launch=plans/lag/next-ff3/out-metal/bgl-launch \
+  --test ../../../freeform/selftest/freeform-handsfree --note ff-handsfree \
+  --pull /private/var/tmp/bgmtl-app.log --pull /private/var/tmp/ff-hf.txt \
+  --pull /private/var/tmp/ff-hf-app.log --pull /private/var/tmp/ff-hf-crash.ips \
+  --key 'SWEET EXEC: appmetal' --key 'SELFTEST: FF ' --key 'CRASH Freeform'
+python3 -u plans/smooth/run-smooth.py promote
+```
+
+Before it, check `shasum -a 256 plans/freeform/out/ff-daily-boot.img plans/freeform/selftest/freeform-handsfree.sh`. The answers must be `bb120a9d19b9...` and `b27c15db8d8b...`.
+
+The pass list under "Hands-free retry" stands, with three changes:
+
+- Item 2's pen position is now fixed. Look for `FF navigation complete, 5 strokes` instead.
+- The stroke frames are `ff-stroke1`, `ff-stroke2` and `ff-stroke5`, as before, and the pen frame is `ff-pen`.
+- A `REFUSED at` line means a navigation result, not a failure of the trial. Read its frame, and its counts in `ff-hf.txt`.
+
+Do not treat a `reset-unknown` as a hard reset until the root and the last frame have been checked, as above.
+
+### Audit brief: script delta 3bb4b893 to b27c15db
+
+Diff `plans/freeform/tests/old/freeform-handsfree-ast231.sh` against `plans/freeform/selftest/freeform-handsfree.sh`. It is a dev.py test body only. The image, kernel and dylibs are unchanged.
+
+1. Check the points against the ast231 frames in `ios-asteroids/logs/ast231-ff-handsfree/frames` (gitignored) and the table above.
+2. Check that `ff_grab` can only read. `sysctl -w kern.sweet_fb_shot_scale=3` is the one write, and `sweetshot` already makes it at every `shot`. The kernel handler refuses a write to `kern.sweet_fb_shot` and needs root, which the self-test has.
+3. Check that every loop is bounded: `ff_to_grid` makes at most 4 passes, `ff_count` covers fixed boxes, there are 5 strokes and at most 2 back taps. Every tool call goes through `timeout` or is a local file read.
+4. Check that no tap is sent when a check fails. Each check is followed by `|| return 1`, and the report runs after `ff_run`.
+5. New files in `/private/var/tmp`: `ff-hf.raw`, `ff-hf-board.raw` and their `.band` copies, about 4.5 MB, overwritten each run. Nothing on the phone is deleted.
+6. `renegade-firstboot.sh` grows from 13,544 to about 20,000 bytes. `06-hfs-put.py` allocated 1 block for ast231's growth and refuses a file that needs overflow extents, so a refusal would stop before boot.
+7. Run `sh plans/freeform/tests/handsfree_frames.sh` and `dash -n`, and use `dev.py --print-script ../../../freeform/selftest/freeform-handsfree`. That prints and touches no phone.
+
+## ast236: the hard reset after the pen tap (2026-11-06)
+
+ast236 ran `ff-daily-boot.img` (bb120a9d...) with `freeform-handsfree.sh` b27c15db (saved as `plans/freeform/tests/old/freeform-handsfree-ast236.sh`) and next-ff3's three files. The frame checks classed every screen right: grid, existing board, grid, new board. The pen tap worked, because frame `05-ff-pen` shows the pen palette with the pen raised. Then the phone hard-reset: `reset-unknown in 239 s`, dirty root, 0 recoveries. Line numbers below are in `ios-asteroids/logs/ast236-ff-handsfree3.txt`.
+
+### What the logs prove
+
+1. The tap came at about 188 s of uptime. `SELFTEST: step ff-pen` is line 12740, after the `up_s=185` stats line (12612). backboardd's log ends with 11 glass pipelines built from 187.99 to 188.29 s, two of them `variable_blur`. Those are routine, since the same pipelines were built in dozens of runs from ast100 on with no reset.
+2. Two 2-IB submissions followed the tap: fences 1063 and 1100, first IB 8191 dwords (lines 12745 and 12748). The log does not say which process sent them.
+3. The kernel ran for at least 4 s after that. The script took its pen frame, read `kern.sweet_fb_shot` twice and ran 68 of the about 244 `od` calls of the screen check. The `pen:` note never reached the log. The log ends at line 12825, just after a CPU governor line (about 190 s), with no stats line for 195 s.
+4. There is no stalled-fence kick after line 10791 (boot), and no RECOVERY, `watch:`, SMMU FAULT, hang report or panic text.
+5. The pulled app logs are stale, not short. `bgmtl-app.log` has 16 lines from this boot and stops at `alive for 15 s`. `ff-hf-app.log` and `ff-hf.txt` are older copies. dev.py read the root without replaying its journal, so it saw each file at its last journalled size.
+6. The kernel log loses its last 10 s on any stop. `sweet_log_thread` writes the ring every `ufslogsecs` seconds, 10 by default (`sweet_ufs.c:1355`). Only a panic writes it at once, and a panic flush is skipped if the UFS lock is held.
+7. A GPU hang that the kernel noticed would be on disk. `waitFence` (`SweetAdreno.cpp:440`) kicks the write pointer after 50 ms. After 1 s frozen with the hang bit up (`sweetgpufast=1000`), it calls `sweet_gpu_report` before any recovery. That runs `sweet_a810_hang_report`, which syncs the log (`sweet_a810.c:1467`). Nothing like that was written, so the recovery path did not start before the stop.
+8. The phone stayed silent much longer than an orderly end. These are seconds from the last stats line to fastboot:
+
+| Runs | Seconds |
+|---|---|
+| ast236, ast100, ast102 | 54, 53, 51 |
+| Runs ending in `DONE` with stats to the end, ast196 to ast246 | 2 to 23 |
+| End-of-run `reset-unknown` with a clean root (ast198, ast199, ast211, ast215, ast231, ast243) | 9 to 18 |
+| ast208, the Wi-Fi start whose kernel stopped (`plans/wifi/audit-w2b-brief.md`) | about 60 |
+
+9. This image arms no system watchdog. It has `wdt=-1` and no `sweetgwdt`. `sweetpanicfb=10` resets 10 s after a panic.
+10. No 3a log in about 245 runs holds a kernel panic text, and the forced-panic check in `plan-usb.md` step 4 has not been run. So it is unproven that a panic's text reaches disk on this phone.
+
+### The cause: not established, narrowed
+
+Inferred, most likely first:
+
+1. The whole system stopped within 10 s of the pen tap. That includes the log thread and every periodic kernel line, not just the GPU. Something below the kernel reset the SoC 30 to 45 s later, the same shape as ast208. A bus stall that wedges every CPU fits this. The only new work at that moment was Freeform's first real Metal work, through the palette and PencilKit getting ready to draw.
+2. A kernel panic whose text never reached disk. Step 10 leaves this open.
+
+Ruled out or not supported:
+
+- A GPU-only hang. In the 75 hangs analysed in `hangs.md`, the kernel stayed up, kicked, reported and recovered. Here the report path never wrote, and the system died.
+- A translator bug in PencilKit's compute. No stroke was drawn, so no paint or particle dispatch was due. Those kernels use no threadgroup memory, atomics or indirect dispatch (table above), and ast83 ran `sdfPen_kernel` correctly.
+- The pen palette's glass. backboardd drew it, and frame 05 shows it.
+
+Unknown: what Freeform submitted after the tap, which access stalled, and what reset the phone.
+
+The A810 recovery path is not why the system went down, because it never started. The per-client kill under "Containment" would act at the same point, after the 1 s watch verdict, so it would not have helped here. ast100 also stopped with no GPU submission all boot, though its stock backboardd makes it a weaker match.
+
+### Fix: see the last seconds next time
+
+No kernel or translator change is justified yet. Two changes need no kernel build:
+
+1. `plans/freeform/out/ff-daily-log1-boot.img` is ff-daily plus `ufslogsecs=1`, at 586 of 607 bytes. The ring then reaches disk every second, as in the A630 bring-up (`ios-asteroids/docs/GPU_A630_BRINGUP.md`). `build-images.sh --daily MANIFEST NAME EXTRA` builds it. The same recipe without EXTRA rebuilds bb120a9d byte for byte, and the two payloads differ only in the 13 bytes of the argument. The daily kernel f78dd695 has the argument, with the same `sweet_log_start` and `sweet_log_thread` as `xnu-local`.
+2. `freeform-handsfree.sh` (SHA256 956e5e93...) runs `ff_mirror` in the background from `ff_start`. Once a second it copies the app log's new whole lines to the console as `SELFTEST: FFAPP`. It drops `present:` lines, keeps at most 60 lines a second and logs a skipped count. It stops after 1200 passes, and the report step kills it. `plans/freeform/tests/handsfree_mirror.sh` checks it under dash: nothing from before `ff_start`, partial lines held back, the 60-line cap, a missing log, and no repeats. The frame checks pass unchanged. The composed `renegade-firstboot.sh` is 21,495 bytes and passes `dash -n`.
+
+The daily needs no containment. It has no `sweetappmetal`, and every reset so far needed it.
+
+### Next run
+
+Inside the /tmp/phone.lock protocol:
+
+```
+python3 -I plans/devloop/dev.py plans/freeform/out/ff-daily-log1-boot.img \
+  /usr/local/lib/bgmtl/bgmtl-inject.dylib=plans/lag/next-ff3/out-metal/bgmtl-inject.dylib \
+  /usr/local/lib/bgmtl/libchlorophyll.dylib=plans/lag/next-ff3/out-metal/libchlorophyll.dylib \
+  /usr/local/lib/bergamota-gl/bgl-launch=plans/lag/next-ff3/out-metal/bgl-launch \
+  --test ../../../freeform/selftest/freeform-handsfree --note ff-handsfree4 \
+  --pull /private/var/tmp/bgmtl-app.log --pull /private/var/tmp/ff-hf.txt \
+  --pull /private/var/tmp/ff-hf-app.log --pull /private/var/tmp/ff-hf-crash.ips \
+  --key 'SWEET EXEC: appmetal' --key 'SELFTEST: FF ' --key 'CRASH Freeform' \
+  --key 'SWEET A810: RECOVERY' --key 'SWEET GPU: (watch|A810 SMMU FAULT)'
+python3 -u plans/smooth/run-smooth.py promote
+```
+
+Check first: `shasum -a 256 plans/freeform/out/ff-daily-log1-boot.img plans/freeform/selftest/freeform-handsfree.sh` must give `017f904c...` and `956e5e93...`. If it resets again, the root is dirty and the promote spends one replay boot first.
+
+Read the last 2 s of the kernel log:
+
+| See | Means | Next |
+|---|---|---|
+| `FFAPP` commit or dispatch lines, then one kick or none, then nothing | A Freeform command buffer stops the SoC | Dump that command buffer with `bgmtl.faildump` and decode it with `plans/gpu-next/tools/decode_hangs.py` |
+| A kick or `watch:` line, then a hang report cut short | The CPU stopped inside the GPU report or recovery | Find the register the report or recovery touched last |
+| `panic(cpu` | A panic | Read it |
+| No `FFAPP` line after the tap, and the kernel stops | Freeform's Metal is not the trigger | Run the same steps without `sweetappmetal` |
+| Strokes drawn and no reset | Timing changed, or the reset is rare | Read the stroke frames as under "Hands-free retry" |
+
+### Audit brief: ast236 instrumentation (script 956e5e93, image 017f904c)
+
+1. Diff `plans/freeform/tests/old/freeform-handsfree-ast236.sh` against `plans/freeform/selftest/freeform-handsfree.sh`. Expect only the mirror block, its start after `ff_start` and its kill in the report step.
+2. Check that the mirror only reads `FF_LOG` and appends to `/dev/console`, that it is bounded (1200 passes of 1 s), and that no tap or check depends on it.
+3. Run `sh plans/freeform/tests/handsfree_mirror.sh` and `sh plans/freeform/tests/handsfree_frames.sh`. Compose the body against `ios-asteroids/logs/ast236-ff-handsfree3/renegade-firstboot.before` with `dev.py`'s `compose_script` and run `dash -n` on it.
+4. Run `dev.py --print-args` on both images. Expect `ufslogsecs=1` as the only difference. Check that `sweet_ufs.c:1539` accepts 1 (1 to 60), and that nothing else in the line changes. That keeps glass, `sweetfb_hz=60` and no `sweetpwrfast`.
+5. Check the `build-images.sh` change: the NAME check keeps output under `out/`, and the default `--daily` call still gives bb120a9d.
+6. Weigh the cost of a 1 s flush: one ring write, one header write and SYNCHRONIZE CACHE each second under `sweet_ufs_lock`. On the 3a it is untested.
+7. Expect the run to reset again. That is the point of it.
+
+## ast248: the reset again, and whether the frame check causes it (2026-11-06)
+
+ast248 ran `ff-daily-log1-boot.img` (017f904c) with `freeform-handsfree.sh` 956e5e93 and next-ff3's three files. It hard-reset like ast236: `reset-unknown in 238 s`, dirty root, 0 recoveries. The frame checks classed grid, existing board, grid and new board, and frame `05-ff-pen` shows the pen palette. Line numbers below are in `ios-asteroids/logs/ast248-ff-handsfree4.txt`. Kernel sources are in `research/xnu-daily-b0/dxb/xnu`, the tree that built f78dd695 (`plans/daily-data/c/README.md`).
+
+### What the 1 s log shows
+
+1. The last `FFAPP` line is at 11562, from Freeform's launch. ast231 shows that Freeform logs one `app commit` line per command buffer once it draws through app Metal, and the mirror passes those on. None came, so Freeform's own device submitted nothing between launch and the stop, except perhaps in the last 1 to 2 s the log can lose.
+2. There is no 2-IB submission after the tap. The last is fence 759 at boot (10706), so ast236's fences 1063 and 1100 are not needed for the reset.
+3. backboardd built the same palette pipelines at 187.1 to 187.4 s that ast236 built at 188.0 to 188.3 s, `variable_blur` and `glass_foreground` included.
+4. The pen tap is at 12646, between `up_s=184` and `up_s=194`. After it come `sweetshot`, the scale write and the raw read (12668 to 12672), then 257 toybox calls with the `up_s=194` stats line among them, and the log ends. The pen check makes 1 header `od`, 244 box `od` calls and 5 calls in `ff_changed`. The mirror adds one `wc` a second. The earlier checks of this boot show 252 to 255 calls between the read and their note. So the stop came at the end of the pen check, after `ff_changed` began and before the `pen:` note. That is about 11 s after the tap and 7 to 10 s after the last frame read.
+5. The FB timing lines stay in their usual range up to the end: `handler_us max=32275` in the last window against 40377 at `up_s=174`.
+
+### kern.sweet_fb_shot
+
+The handler is `sweet_fb_shot_sysctl` (`bsd/dev/sweet_fb.c:81`). It is `CTLFLAG_LOCKED`, so no sysctl lock is taken. It refuses writes, needs root, takes a 1,453,528-byte buffer with `kalloc_data`, calls `sweet_fb_shot_copy` and copies out 1,147,696 bytes. It does not read 6 MB.
+
+`sweet_fb_shot_copy` (`iokit/Kernel/arm/SweetFramebuffer.cpp:1364`) takes no lock and touches no register.
+
+- In zero-copy or scan-out mode it reads a pooled IOSurface held by a reference. ast248 has `zc_frames=0`, so it took the other branch.
+- In AST flip mode it reads `ast.va[ast.front]`. Those are permanent kernel mappings made in `astSetup` (`:2335` to `:2342`), `kIOMapWriteCombineCache` over `cont_splash_region`, 0x9dad00 bytes each. No code releases `fBufMap`.
+- The copy is 360 x 797 strided 4-byte CPU loads, every 3rd pixel of every 3rd row. That touches about 3.4 MB of the 10.3 MB front buffer.
+- A flip during the copy can only mix two frames, as its comment says (`:1357`). The plain load of `ast.front` races the same way.
+- The CPU path does not go through the SMMU. The MDP's scan-out and the GPU's writes use the same DRAM through their own masters, and a CPU read of normal non-cacheable memory cannot stall them.
+
+The compositor reads this memory far harder. Each copied frame is a 10.3 MB `memcpy` out of `ast.va[ast.front]` (`:4653`), at `copy_us avg=12919` over 617 copies by `up_s=194`. One shot is a fraction of one such frame.
+
+Each check makes 2 handler calls (`shot NAME check` through sweetshot, then `ff_grab`'s `sysctl -b`) and one write of the scale, which is already 3. Before the stop ast248 made 10 calls in about 70 s.
+
+### Conclusion
+
+Proven:
+
+- The handler holds no lock across the copy, maps nothing, writes no register and reads only memory that stays mapped.
+- The same handler ran 2,173 times in 180 logged runs through sweetshot, 14 of them in ast231 while Freeform held a Chlorophyll device. None of those runs reset at a shot.
+- In ast236 and ast248 the same check, with the same 2 reads and about 250 tool calls, passed 4 times in each boot before the pen check.
+- ast248 stopped 7 to 10 s after its last read, while `od` and `cmp` were reading regular files.
+- ast100 hard-reset with no sweetshot and no raw read.
+
+Inferred: the fb_shot read is not the cause, and it needs no kernel fix. passcode-t1 uses only sweetshot, and cc-check uses the same raw read, so they keep running as they are.
+
+Still open: the reset needs either something the pen tap starts, or the frame-check script as a whole. The script's process and file load includes `ff_changed`, which only the pen check runs: two 1.1 MB writes to `/private/var/tmp` and a `cmp -l`. Both are in ast236 and ast248, and both are absent from ast231. The two runs cannot separate them. ast248 makes a Freeform app-Metal command buffer unlikely as the trigger, by item 1.
+
+### The blind arm
+
+`plans/freeform/selftest/freeform-blind.sh`, SHA256 `cd6fc9a420378f781b451e0cd537d07864a304b4f8196153555f9a0444846d92`, uses the same image and files. It keeps 956e5e93's taps, waits, mirror, pid checks and report, and drops every frame check.
+
+- It makes no frame read from Freeform's launch until `shot ff-stroke5`. The hook's `shot settle` on the home screen comes after that.
+- It waits 15 s after the pen tap before stroke 1. That spans ast248's stop, about 11 s after the tap, with no tool running.
+- From `step ff-new-board`, a background `ff_beat` writes `SELFTEST: FF beat N` once a second, for at most 150 passes. With `ufslogsecs=1` the last beat on disk dates the stop to about 2 s. The report step kills it with the mirror.
+- A changed Freeform pid stops the strokes, with no swipe and no frame.
+
+The navigation is blind. ast236 and ast248 both reached grid, board, grid and board with these points, so the risk is a stroke in the wrong place inside Freeform. A crash cannot send strokes to the home screen, because of the pid check.
+
+On the host, a dash dry run with stub tools gave the taps in order: card, back, new, pen, 5 swipes and back. `shot ff-stroke5` was the only frame before `settle`, the beat stopped at the kill, and a crash after the pen tap stopped the strokes with no frame. The body composed onto `ast248-ff-handsfree4/renegade-firstboot.before` the way `compose_script` does it is 15,438 bytes, under ast248's 21,495, and passes `dash -n`. The same composition of 956e5e93 rebuilds ast248's `renegade-firstboot.sh` byte for byte.
+
+Inside the /tmp/phone.lock protocol:
+
+```
+python3 -I plans/devloop/dev.py plans/freeform/out/ff-daily-log1-boot.img \
+  /usr/local/lib/bgmtl/bgmtl-inject.dylib=plans/lag/next-ff3/out-metal/bgmtl-inject.dylib \
+  /usr/local/lib/bgmtl/libchlorophyll.dylib=plans/lag/next-ff3/out-metal/libchlorophyll.dylib \
+  /usr/local/lib/bergamota-gl/bgl-launch=plans/lag/next-ff3/out-metal/bgl-launch \
+  --test ../../../freeform/selftest/freeform-blind --note ff-blind \
+  --pull /private/var/tmp/bgmtl-app.log --pull /private/var/tmp/ff-hf.txt \
+  --pull /private/var/tmp/ff-hf-app.log --pull /private/var/tmp/ff-hf-crash.ips \
+  --key 'SWEET EXEC: appmetal' --key 'SELFTEST: FF (?!beat)' --key 'CRASH Freeform' \
+  --key 'SWEET A810: RECOVERY' --key 'SWEET GPU: (watch|A810 SMMU FAULT)'
+python3 -u plans/smooth/run-smooth.py promote
+```
+
+Check first: `shasum -a 256 plans/freeform/out/ff-daily-log1-boot.img plans/freeform/selftest/freeform-blind.sh` must give `017f904c...` and `cd6fc9a4...`. Afterwards, `grep 'FF beat' LOG | tail -1` gives the last second on disk.
+
+| Result | Means | Next |
+|---|---|---|
+| Dirty root, beats stop within about 20 s of `pen tapped`, no frame read before | The frame check is not needed for the reset. The pen tap is | Run the same arm without `sweetappmetal`, to split Freeform's device from backboardd's palette (row 4 of the ast236 table) |
+| `navigation complete, 5 strokes`, `selftest-done`, clean root | The check, or its timing, is needed. One clean run against two resets is weak | Run this arm once more. If it is clean again, run it with the pen check's `od` and `cmp` load on a copied file and no sysctl, to split the read from the load |
+| Clean or end-of-run `reset-unknown`, `settle` frame present | The ring lost its tail, as in ast231 | Read it as a clean run |
+| No strokes in `ff-stroke5`, no reset | Navigation drifted | Read the frame. Only the pen check has any info about this screen |
+
+### Audit brief: blind arm (script cd6fc9a4, image 017f904c)
+
+1. Diff `plans/freeform/selftest/freeform-handsfree.sh` against `freeform-blind.sh`. Expect the frame-check block, `ff_to_grid`, `ff_expect` and every `ff_grab` gone. Expect the taps, waits, stroke list, mirror block and report unchanged, apart from killing `$ff_beat_pid`.
+2. Check that nothing reads `kern.sweet_fb_shot` before `shot ff-stroke5`. That covers hook.sh's preamble.
+3. Check that `ff_beat` is bounded, writes only to the console, and that no tap depends on it.
+4. Check `ff_same` without its frame: a pid change still returns 1 before any swipe.
+5. Run `sh plans/freeform/tests/handsfree_mirror.sh` on the copied mirror block, or diff the block byte for byte. Compose the body and run `dash -n`.
+6. Check the `--key 'SELFTEST: FF (?!beat)'` regex against `dev.py`'s use of `re.search`.
+7. Expect a reset. That answers the question as well as a clean run does.
+
+## ast254: the blind arm resets after stroke 1 (2026-11-06)
+
+ast254 ran `ff-daily-log1-boot.img` (017f904c) with `freeform-blind.sh` cd6fc9a4 and next-ff3's three files. It made no frame read. The pen tap and the 15 s wait passed, stroke 1 drew (`PencilKit lines 0 -> 57`), and then the phone hard-reset: `reset-unknown in 250 s`, dirty root, 0 recoveries. Line numbers below are in `ios-asteroids/logs/ast254-ff-blind.txt`. Times are uptime. The app log's `at N ms` follows uptime to within about 1 s, because commit #7 (184871 ms) reached the console before the `up_s=185` stats line (13448).
+
+### What the logs prove
+
+1. The frame check is not needed for the reset. Nothing read `kern.sweet_fb_shot` in this boot before the stop.
+2. Freeform's GPU work ran from 184.1 s (commit #1) to 191.07 s (commit #49). That covers 3 `paint_kernel` dispatches, the sixChannelBlend and uber pipelines, and the copied write-backs of surfaces 188, 204 and 205.
+3. The GPU was idle and healthy for the last 15 s of the log. The last stalled-fence kick is line 13523, at about 188.5 s. No kick, `watch:`, RECOVERY, SMMU FAULT or hang report came after it. backboardd made 0 swaps between `up_s=195` and `up_s=205` (752 both times). The FB tick still ran at 60 Hz, with `repeated` going from 9305 to 9908.
+4. The kernel log ends at about 207.5 s. Beat 50 follows the `up_s=205` line, then beats 51 and 52 come, then `stroke 1`, then `exec ps` (the pid check before stroke 2).
+5. The system ran past that point. The pulled `bgmtl-app.log`, which next-ff3 fsyncs every line, ends with two lines the console never got: `slow: pipeline build A3Xghfc: 18736.4 ms`, then `render pipeline VfxXgh+A3Xghfc ... at 208978 ms`. Freeform's in-process CoreAnimation began that build at 190.24 s, logged as `pipeline path: newRenderPipelineState...options reflection (none)`, and it returned at 208.98 s. The stop came at or after 208.98 s, and before the kernel log's next flush, about 1 s later.
+6. ast102 shows the same sequence before its reset. Freeform loaded QuartzCore's metallib, built `VfxXh+BclrA3Xhf` and `VfxU10Xh+TcimA3Xhf_Isrc`, dumped `VfxU10Xh`, and logged `pipeline path ... reflection (none)`. Its app log ends on that line. ast231, the one Freeform run with app Metal that did not reset, never loaded QuartzCore in Freeform. Its only reflection-path build was RenderBox's `fa17fmha4`.
+7. backboardd builds `VfxXgh+A2Xghfc`, with the same binding masks (fragment buffers 0x1bf, textures 0x7ff8, samplers 0x3), 28,587 times across the logs. Its build times run from 137 ms to 44.4 s (`ast155`, `ast117`, `ast179`) with no reset. No process but Freeform in ast254 has built `A3Xghfc`.
+
+### The other suspects
+
+- `paint_kernel` cannot write past its buffers by rounding. `dispatchThreads` rounds up to whole groups (`next-ff3/Chlorophyll/src/bgmtl.m:2898`), but the AIR guards `gid + 1 < n` (table above). Its last dispatch was 18 s before the stop.
+- The GPU SMMU enforces. Bank 0 reads back SCTLR 0x167, with M on, faults terminated and the fault interrupt on (line 3456). sCR0 0x2c0406 has USFCFG set, so an unmatched stream faults instead of bypassing (line 2753). `smmu=untested` in the FB stats is the display's bypass test, `fSmmuA` (`SweetFramebuffer.cpp:1781`), not the GPU's. The GPU reaches only pages the kernel mapped, and `releaseGem` and the 64-submission quarantine keep those pages until they are unmapped (`SweetAdreno.cpp:651` to `:766`). The limits stand as documented: one GPU address space for all clients, GPU-writable ring and memptrs, and an unprotected CP.
+- The copied write-back is a userland `memcpy` under `IOSurfaceLock`, bounded by `bgCopiedPlain` (bytes per row at least width times 4, height within the surface) (`bgmtl.m:309`, `:3558`). The last one ran at 190.83 s. Freeform logged again at 199 s and 209 s, so it did not deadlock, and the kernel ran 18 s after it.
+- The GPU wait is high but not a hang. ast254 has 62 stalled-fence kicks, the same as ast253 (passcode-t1, no reset), and the last 25 runs range from 23 to 62. The app's longest wait was 531 ms, under the 1 s watch. The FB copy maximum of 277,613 us during the stroke is the largest in those 25 runs (the others are 70,919 or less), and the system ran on.
+- The stalled-fence lines are routine (above), and none came after 188.5 s.
+
+### The cause: not established, narrowed again
+
+Inferred: the first command buffer that draws with Freeform's in-process `VfxXgh+A3Xghfc`, or the end of its build, stops the SoC within about 1 s. That is too fast for the 50 ms kick and the 1 s watch to reach disk. ast254 fixes the time to within about 1 s of the build returning, and ast102 stops right after the same build began.
+
+Against it: ast248 mirrored no Freeform Metal line after launch and stopped about 11 s after the pen tap. That fits only if the whole QuartzCore sequence took under the 1 to 2 s the log can lose. That sequence took 0.8 s in ast254 before its build, and backboardd's sibling build often takes under 300 ms. ast100 and ast236 have no app log from the end.
+
+Unknown: what `A3Xghfc` is, whether its draw or its build is the trigger, and what stops the SoC.
+
+### Fix
+
+There is no fix yet. bgmtl already has the switch for this: `/private/var/tmp/bgmtl.refuse` lists fragment-function prefixes to refuse, and `bgmtl.refuse.build` still compiles and times them without drawing (`bgmtl.m:359`, `:1700`). It has never run on the phone. The reflection-free path that Freeform's CoreAnimation takes goes through that check (`bgmtl.m:1858`). The daily driver has no `sweetappmetal` and needs no containment.
+
+### Next run: the refuse arm
+
+`plans/freeform/selftest/freeform-refuse.sh`, SHA256 `ca4700a35ba4425f6fb9a862d7a7106ca2f0f5c29cba84e058eb0654395e4428`, is `freeform-blind.sh` with three changes.
+
+1. Before Freeform opens, it writes `A3Xghfc` to `bgmtl.refuse` and creates `bgmtl.refuse.build`. backboardd read the absent list at its first pipeline of this boot and keeps it, since the list is read once per process.
+2. The report notes the refused lines and the size of each AIR file in `/private/var/tmp/bgmtl-refused`.
+3. The report moves both switch files aside with `mv`, as the script already does for the kill switch.
+
+No dylib, kernel or image changes. A host dry run with stub tools, paths moved under /tmp, gave the switch before `openapp`, the same taps as the blind arm, then the refused count, the AIR list and both files moved aside. `dash -n` passes. The composed body should be about 16,100 bytes, against the blind arm's 15,438.
+
+Inside the /tmp/phone.lock protocol:
+
+```
+python3 -I plans/devloop/dev.py plans/freeform/out/ff-daily-log1-boot.img \
+  /usr/local/lib/bgmtl/bgmtl-inject.dylib=plans/lag/next-ff3/out-metal/bgmtl-inject.dylib \
+  /usr/local/lib/bgmtl/libchlorophyll.dylib=plans/lag/next-ff3/out-metal/libchlorophyll.dylib \
+  /usr/local/lib/bergamota-gl/bgl-launch=plans/lag/next-ff3/out-metal/bgl-launch \
+  --test ../../../freeform/selftest/freeform-refuse --note ff-refuse \
+  --pull /private/var/tmp/bgmtl-app.log --pull /private/var/tmp/ff-hf.txt \
+  --pull /private/var/tmp/ff-hf-app.log --pull /private/var/tmp/ff-hf-crash.ips \
+  --pull '/private/var/tmp/bgmtl-refused/VfxXgh+A3Xghfc.v.bc' \
+  --pull '/private/var/tmp/bgmtl-refused/VfxXgh+A3Xghfc.f.bc' \
+  --key 'SWEET EXEC: appmetal' --key 'SELFTEST: FF (?!beat)' --key 'CRASH Freeform' \
+  --key 'SWEET A810: RECOVERY' --key 'SWEET GPU: (watch|A810 SMMU FAULT)' \
+  --key 'refused pipeline|refused by bgmtl'
+python3 -u plans/smooth/run-smooth.py promote
+```
+
+Check first: `shasum -a 256 plans/freeform/out/ff-daily-log1-boot.img plans/freeform/selftest/freeform-refuse.sh plans/lag/next-ff3/out-metal/bgmtl-inject.dylib` must give `017f904c...`, `ca4700a3...` and `d24d22af...`.
+
+| Result | Means | Next |
+|---|---|---|
+| `refused pipeline ... built in N ms: ok`, 5 strokes, no reset (or an end-of-run `reset-unknown` with the settle frame) | Building `A3Xghfc` is harmless, and drawing it is needed for the reset | Read the pulled AIR on the Mac (`air2nir2 --report`, spills, bindings), then dump the first command buffer that draws it with `bgmtl.faildump` |
+| Dirty root, stop within about 2 s of the `built in` line | The build, or what follows it, is enough | Rerun without `bgmtl.refuse.build` |
+| Dirty root, no QuartzCore line from Freeform before the stop | `A3Xghfc` is not needed, as ast248 suggested | Run the blind arm without `sweetappmetal` (row 4 of the ast236 table) |
+| Freeform's pid changes at the refusal, with a crash report | CoreAnimation does not take a nil pipeline | Read the crash, then rerun with the refusal for the draw only |
+| No refused line and no reset | Freeform never asked for it this time | Run the arm once more |
+
+Freeform's CoreAnimation can also wait for good on the nil pipeline, as backboardd's did when it was answered nil with reflection asked (`bgmtl.m:1850`). That stalls only Freeform's in-process renderer, and it still answers the question, because nothing draws `A3Xghfc`.
+
+### Audit brief: refuse arm (script ca4700a3, image 017f904c, next-ff3 unchanged)
+
+1. Diff `freeform-blind.sh` against `freeform-refuse.sh`. Expect the header, the five setup lines before `ff_run` and three report lines. Taps, waits, mirror and beat are unchanged.
+2. Read `bg_refused`, `bg_refuse_dump` and the refuse block in `newRenderPipelineStateWithDescriptor:error:` (`bgmtl.m:359` to `:396`, `:1700` to `:1720`), and check the strings are in `out-metal/bgmtl-inject.dylib` (d24d22af). Confirm that the reflection-free method at `:1846` reaches it, and that the reflection-asked path backboardd uses does not.
+3. Confirm the list is read once per process (`dispatch_once`), so backboardd keeps the list it read at boot. Check that no bgmtl process except Freeform starts after the switch in a normal run. If one did, check that `A3Xghfc` never matches a backboardd fragment name: there are 0 builds in any log.
+4. Check that a leftover switch after a reset is harmless on the next boot (promote, daily). backboardd never builds `A3Xghfc`, and the files hold no other prefix.
+5. Check the writes: `bgmtl.refuse`, `bgmtl.refuse.build`, their `.saved.<date>` copies, and bgmtl's own `bgmtl-refused/` (one copy per pipeline). All are in `/private/var/tmp`. Nothing is deleted.
+6. Check the two `--pull` paths, which hold a `+`, against `sweet-hfs-pull.py`. It prints `not found` for a missing file and goes on.
+7. Run `dash -n` and the dry run. Compose the body onto `ast254-ff-blind/renegade-firstboot.before` the way `compose_script` does, and check its size against the 1-block growth `06-hfs-put.py` allows.
+8. Expect a reset in most outcomes. A clean run is the informative one.

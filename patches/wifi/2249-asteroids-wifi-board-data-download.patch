@@ -1,0 +1,766 @@
+diff --git a/bsd/dev/modem/QcomQrtr.c b/bsd/dev/modem/QcomQrtr.c
+index b92467949..fce3c7eb5 100644
+--- a/bsd/dev/modem/QcomQrtr.c
++++ b/bsd/dev/modem/QcomQrtr.c
+@@ -39,6 +39,30 @@ static int emit(QcomQrtr *q, uint32_t type, uint32_t from_port, uint32_t node, u
+     return 0;
+ }
+ 
++/* 2249 (W5): a data packet whose payload is already laid out behind its own 32-byte header in the caller's buffer, so a
++ * board data piece is not limited by MAX_PACKET. payload_length is the message's true length; the packet is padded to
++ * four bytes, as QRTR requires, so the caller's buffer must hold QCOM_QRTR_HEADER + align4(payload_length). The size in
++ * the header is payload_length, never the padded length: a reader that trusts it must see the message, not its padding.
++ * Returns 0 when queued. */
++int qcom_qrtr_send_data_prefixed(QcomQrtr *q, uint32_t from_port, uint32_t node, uint32_t port, uint8_t *packet,
++                                 uint32_t payload_length)
++{
++    if (!q || !packet || !payload_length) return -1;
++    const uint32_t padded = (payload_length + 3) & ~3u;
++    for (uint32_t i = payload_length; i < padded; ++i) packet[QCOM_QRTR_HEADER + i] = 0;
++    put32(packet, 1);
++    put32(packet + 4, QCOM_QRTR_DATA);
++    put32(packet + 8, q->local_node);
++    put32(packet + 12, from_port);
++    put32(packet + 16, 0);  /* confirm_rx: unchanged from emit */
++    put32(packet + 20, payload_length);
++    put32(packet + 24, node);
++    put32(packet + 28, port);
++    if (q->send(q->send_context, packet, QCOM_QRTR_HEADER + padded)) {q->tx_refused++; return -1;}
++    q->tx_packets++;
++    return 0;
++}
++
+ static int control(QcomQrtr *q, uint32_t command, const uint32_t words[4])
+ {
+     uint8_t pkt[CTRL_BYTES] = {0};
+diff --git a/bsd/dev/modem/QcomQrtr.h b/bsd/dev/modem/QcomQrtr.h
+index 9e37f8bdb..fe4bff2be 100644
+--- a/bsd/dev/modem/QcomQrtr.h
++++ b/bsd/dev/modem/QcomQrtr.h
+@@ -59,6 +59,11 @@ int qcom_qrtr_poll(QcomQrtr *q);
+ int qcom_qrtr_receive(QcomQrtr *q, const uint8_t *packet, uint32_t length);
+ /* A data packet from our port to the remote's node:port. capacity bounds the packet built on the stack. Returns 0 when queued. */
+ int qcom_qrtr_send_data(QcomQrtr *q, uint32_t from_port, uint32_t node, uint32_t port, const uint8_t *data, uint32_t length);
++/* 2249 (W5): the same, for a payload too large for the stack packet above. The caller lays the payload out at
++ * packet + QCOM_QRTR_HEADER and pads it to four bytes itself; this writes the 32-byte header in front of it and hands
++ * the whole thing to the send callback. Returns 0 when queued. */
++int qcom_qrtr_send_data_prefixed(QcomQrtr *q, uint32_t from_port, uint32_t node, uint32_t port, uint8_t *packet,
++                                 uint32_t payload_length);
+ /* Index of a remote service in the list, -1 when not announced. */
+ int qcom_qrtr_find_remote(const QcomQrtr *q, uint32_t service);
+ 
+diff --git a/bsd/dev/sweet_wpss.c b/bsd/dev/sweet_wpss.c
+index 23dce3e4f..d2b0f7048 100644
+--- a/bsd/dev/sweet_wpss.c
++++ b/bsd/dev/sweet_wpss.c
+@@ -32,6 +32,10 @@ static void wpss_worker(void *arg,wait_result_t wait){
+   /* 2248: W4. W3's edge, plus the WLFW QMI client: lookup, four requests, then the proven stop. */
+   printf("SWEET WIFI: W4 worker begin; WPSS start, the GLINK/QRTR edge and the WLFW client\n");sweet_log_sync();
+   printf("SWEET WIFI: W2 worker final_error=%d\n",wpss_run(WpssWlfw));
++ } else if(arg==(void *)WpssBdf){
++  /* 2249: W5. W4's exchange, then the regulatory database and one board data file, then fw_init_done. */
++  printf("SWEET WIFI: W5 worker begin; WPSS start, the edge, the WLFW client and the board data download\n");sweet_log_sync();
++  printf("SWEET WIFI: W2 worker final_error=%d\n",wpss_run(WpssBdf));
+  } else printf("SWEET WIFI: W2 worker final_error=%d\n",wpss_run(WpssStart));
+  sweet_log_sync();thread_terminate(current_thread());
+ }
+diff --git a/bsd/dev/wifi/WlfwQmi.h b/bsd/dev/wifi/WlfwQmi.h
+index 2288b1732..249b40ede 100644
+--- a/bsd/dev/wifi/WlfwQmi.h
++++ b/bsd/dev/wifi/WlfwQmi.h
+@@ -2,7 +2,7 @@
+  *
+  * WLFW is the Wi-Fi firmware's own QMI service, the one it announces on the WPSS's QRTR. This file holds the three
+  * requests stage 2 sends first (IND_REGISTER, HOST_CAP, and the two empty ones, CAP and DEVICE_INFO) and the replies'
+- * decoders. Nothing else: the board data download is the boot after this one.
++ * decoders. 2249 (W5) adds the board data download, BDF_DOWNLOAD, which carries a file from modem_a in pieces.
+  *
+  * Where every number comes from. Message ids, TLV numbers and field layouts are from ath11k (the Linux driver for this
+  * chip family, BSD-3-Clause-Clear), read as declarations only:
+@@ -47,12 +47,23 @@
+ #define WLFW_HOST_CAP_REQ 0x0034u
+ #define WLFW_CAP_REQ 0x0024u
+ #define WLFW_DEVICE_INFO_REQ 0x004Cu
++#define WLFW_BDF_DOWNLOAD_REQ 0x0025u      /* QMI_WLANFW_BDF_DOWNLOAD_REQ_V01 */
+ #define WLFW_FW_READY_IND 0x0021u          /* QMI_WLFW_FW_READY_IND_V01 */
+ #define WLFW_REQUEST_MEM_IND 0x0035u       /* QMI_WLFW_REQUEST_MEM_IND_V01 */
+ #define WLFW_FW_MEM_READY_IND 0x0037u      /* QMI_WLFW_FW_MEM_READY_IND_V01 */
+ #define WLFW_FW_INIT_DONE_IND 0x0038u      /* QMI_WLFW_FW_INIT_DONE_IND_V01 */
+ #define WLFW_COLD_BOOT_CAL_DONE_IND 0x003Eu /* QMI_WLFW_COLD_BOOT_CAL_DONE_IND_V01 */
+ 
++/* ---- the board data download's own numbers (ath11k qmi.h, qmi.c) ------------------------------------------- */
++/* QMI_WLANFW_MAX_DATA_SIZE_V01 6144: the most bytes one BDF_DOWNLOAD request carries. Each request repeats the file id,
++ * the bytes left (total_size), a segment number from 0 and the file's type, and sets end=1 only on the last piece. */
++#define WLFW_MAX_DATA 6144u
++/* enum ath11k_qmi_bdf_type: what the file is, as the firmware is told. A .bin board file is 0, an ELF one is 1 (the
++ * phone's bdwlan.eNN variants are ELF; bdwlan.bin is not), and the regulatory database is 4. */
++#define WLFW_BDF_TYPE_BIN 0u
++#define WLFW_BDF_TYPE_ELF 1u
++#define WLFW_BDF_TYPE_REGDB 4u
++
+ /* ---- TLV numbers, from the qmi_elem_info tables in ath11k qmi.c ------------------------------------------- */
+ #define WLFW_TLV_RESULT 0x02u          /* qmi_response_type_v01: u16 result, u16 error, in every response */
+ #define WLFW_TLV_FW_READY 0x10u        /* ind_register: u8 fw_ready_enable */
+@@ -68,6 +79,18 @@
+ #define WLFW_TLV_SOC_INFO 0x12u        /* cap response: u32 soc_id */
+ #define WLFW_TLV_BAR_ADDR 0x10u        /* device_info response: u64 bar_addr */
+ #define WLFW_TLV_BAR_SIZE 0x11u        /* device_info response: u32 bar_size */
++/* The board data download (ath11k qmi.c, qmi_wlanfw_bdf_download_req_msg_v01_ei). Every field is optional and every one
++ * is sent: 0x01 u8 valid=1, 0x10 u32 file_id (the CAP reply's board id), 0x11 u32 total_size (bytes still to come),
++ * 0x12 u32 seg_id from 0, 0x13 u16 length then that many bytes of data, 0x14 u8 end (1 on the last piece only),
++ * 0x15 u8 bdf_type. 0x13's value is a length-prefixed array, not a plain scalar: the two-byte count comes first, then
++ * the bytes. */
++#define WLFW_TLV_BDF_VALID 0x01u       /* bdf_download: u8 valid */
++#define WLFW_TLV_BDF_FILE_ID 0x10u     /* bdf_download: u32 file_id */
++#define WLFW_TLV_BDF_TOTAL 0x11u       /* bdf_download: u32 total_size */
++#define WLFW_TLV_BDF_SEG 0x12u         /* bdf_download: u32 seg_id */
++#define WLFW_TLV_BDF_DATA 0x13u        /* bdf_download: u16 length, then the bytes */
++#define WLFW_TLV_BDF_END 0x14u         /* bdf_download: u8 end */
++#define WLFW_TLV_BDF_TYPE 0x15u        /* bdf_download: u8 bdf_type */
+ /* The same TLV number means a different field in a different message: that is QMI, and it is why each name above says
+  * which message it belongs to. */
+ 
+@@ -159,6 +182,69 @@ static inline uint32_t wlfw_empty_request(uint8_t *out, uint32_t capacity, uint1
+     return at ? wlfw_end(out, at) : 0;
+ }
+ 
++/* BDF_DOWNLOAD (0x0025): one piece of a board data file. ath11k_qmi_load_file_target_mem builds it field by field from
++ * the file, so the values here are its own: file_id is the board id CAP reported (0xff when the firmware sent none, which
++ * is ath11k's fallback), total_size is what is LEFT of the file including this piece, seg_id counts from 0, end is 1 only
++ * on the last piece, and bdf_type says what the file is. The data TLV is length-prefixed (u16 count, then the bytes), so
++ * it is built here rather than through wlfw_tlv.
++ *
++ * Length: 4 (valid) + 7 (file_id) + 7 (total) + 7 (seg) + 3 + 2 + bytes (data) + 4 (end) + 4 (type). At the maximum
++ * 6144 bytes of data that is 7 + 33 + 3 + 2 + 6144 = 6189 bytes with the header, which is ath11k's own
++ * QMI_WLANFW_BDF_DOWNLOAD_REQ_MSG_V01_MAX_LEN 6182 plus the 7-byte header. Returns 0 when it does not fit, never a
++ * partial message. */
++static inline uint32_t wlfw_bdf_download(uint8_t *out, uint32_t capacity, uint16_t transaction, uint32_t file_id,
++                                         uint32_t total_size, uint32_t seg_id, const uint8_t *data, uint32_t bytes,
++                                         uint8_t end, uint8_t bdf_type)
++{
++    if (!out || bytes > WLFW_MAX_DATA || (bytes && !data)) return 0;
++    uint32_t at = wlfw_begin(out, capacity, WLFW_REQUEST, transaction, WLFW_BDF_DOWNLOAD_REQ);
++    if (!at) return 0;
++    uint8_t v[4];
++    const uint8_t one = 1;
++    if (!(at = wlfw_tlv(out, capacity, at, WLFW_TLV_BDF_VALID, &one, 1))) return 0;
++    wlfw_put32(v, file_id);
++    if (!(at = wlfw_tlv(out, capacity, at, WLFW_TLV_BDF_FILE_ID, v, 4))) return 0;
++    wlfw_put32(v, total_size);
++    if (!(at = wlfw_tlv(out, capacity, at, WLFW_TLV_BDF_TOTAL, v, 4))) return 0;
++    wlfw_put32(v, seg_id);
++    if (!(at = wlfw_tlv(out, capacity, at, WLFW_TLV_BDF_SEG, v, 4))) return 0;
++    /* The data TLV: type, the TLV length (2 for the count plus the bytes), the u16 count, then the bytes. A piece of zero
++     * bytes is still a TLV with a zero count, which is what a zero-length file would send. */
++    if (2u + bytes > 0xffffu || at + 3u + 2u + bytes > capacity) return 0;
++    out[at] = WLFW_TLV_BDF_DATA;
++    wlfw_put16(out + at + 1, 2u + bytes);
++    wlfw_put16(out + at + 3, bytes);
++    for (uint32_t i = 0; i < bytes; ++i) out[at + 5 + i] = data[i];
++    at += 3u + 2u + bytes;
++    if (!(at = wlfw_tlv(out, capacity, at, WLFW_TLV_BDF_END, &end, 1))) return 0;
++    if (!(at = wlfw_tlv(out, capacity, at, WLFW_TLV_BDF_TYPE, &bdf_type, 1))) return 0;
++    return wlfw_end(out, at);
++}
++
++/* The pieces a file of bytes takes at a piece size of piece: one per piece bytes, and never zero, so a zero-length file
++ * still sends one piece with end=1 (which the firmware then refuses, as it should: no board file is empty). The piece
++ * size is the link's, decided at run time, so a caller passes the one it is using; WLFW_MAX_DATA is only the ceiling. */
++static inline uint32_t wlfw_bdf_pieces(uint32_t bytes, uint32_t piece)
++{
++    if (!piece) return 1u;
++    return bytes ? (bytes + piece - 1u) / piece : 1u;
++}
++/* What the `bytes_left` of the piece at index of a file of size bytes is: the file's remaining bytes including this
++ * piece. ath11k sets total_size to `remaining` before subtracting, so the first piece carries the whole file. */
++static inline uint32_t wlfw_bdf_total(uint32_t bytes, uint32_t index)
++{
++    const uint32_t at = index * WLFW_MAX_DATA;
++    return at >= bytes ? 0u : bytes - at;
++}
++/* What this file is, by its first bytes: ELF when it starts with \177ELF, otherwise BIN. ath11k tests exactly this
++ * (qmi.c ath11k_qmi_load_bdf_qmi: memcmp(bd.data, ELFMAG, SELFMAG)), and the type decides whether the firmware treats
++ * the file as a flat board blob. The phone's bdwlan.eNN variants are ELF and bdwlan.bin is not. */
++static inline uint8_t wlfw_bdf_type(const uint8_t *data, uint32_t bytes)
++{
++    if (data && bytes >= 4 && data[0] == 0x7f && data[1] == 'E' && data[2] == 'L' && data[3] == 'F') return WLFW_BDF_TYPE_ELF;
++    return WLFW_BDF_TYPE_BIN;
++}
++
+ /* ---- decoding --------------------------------------------------------------------------------------------- */
+ typedef struct {
+     uint8_t type;
+@@ -262,6 +348,7 @@ static inline const char *wlfw_name(uint16_t message)
+     case WLFW_HOST_CAP_REQ: return "host_cap";
+     case WLFW_CAP_REQ: return "cap";
+     case WLFW_DEVICE_INFO_REQ: return "device_info";
++    case WLFW_BDF_DOWNLOAD_REQ: return "bdf_download";
+     default: return "unknown";
+     }
+ }
+diff --git a/bsd/dev/wifi/WpssGate.h b/bsd/dev/wifi/WpssGate.h
+index fb53db4ac..a7c927118 100644
+--- a/bsd/dev/wifi/WpssGate.h
++++ b/bsd/dev/wifi/WpssGate.h
+@@ -12,7 +12,10 @@
+  * and then the proven stop. It has exactly the W3 gate's rules, including the right to run beside a preset, because it
+  * is the same edge with a conversation on it. What it sends is four QMI requests and nothing else; no board data, no
+  * mode, no register window. */
+-enum {WpssOff=0,WpssSurvey=1,WpssStart=2,WpssPin=3,WpssGlink=4,WpssWlfw=5,WpssRefused=-1};
++/* 2249 (W5): sweetwbdf=1 is W4 plus the board data download: the regulatory database and one board data file, one
++ * QMI BDF_DOWNLOAD piece at a time, then the wait for fw_init_done. It has W4's rules exactly, and it is exclusive with
++ * W3 and W4 because two of them on one link is a boot none of them describes. */
++enum {WpssOff=0,WpssSurvey=1,WpssStart=2,WpssPin=3,WpssGlink=4,WpssWlfw=5,WpssBdf=6,WpssRefused=-1};
+ /* Refused in any form: the presets, the battery's own gates, and every modem, IPA and battery-test gate ModemGate.h lists
+  * (modem_cell_gates, modem_cell_refused, modem_daily_refused), so the list cannot fall behind it. */
+ static const char *const wpss_refused[5]={"sweetdaily","sweetcell","sweetbatt","sweetbmeter","sweetbprobe"};
+@@ -37,14 +40,15 @@ static inline int wpss_edge_gate(const char *args,int deadman,const char *self){
+     if(modem_arg_count(args,"sweetwprobe") || modem_arg_count(args,"sweetwpin") || modem_arg_count(args,"sweetwpss"))return WpssRefused;
+     if(!modem_same(self,"sweetwglink") && modem_arg_count(args,"sweetwglink"))return WpssRefused;
+     if(!modem_same(self,"sweetwlfw") && modem_arg_count(args,"sweetwlfw"))return WpssRefused;
++    if(!modem_same(self,"sweetwbdf") && modem_arg_count(args,"sweetwbdf"))return WpssRefused;
+     if(!modem_gate(args,"sweetfbarm") || !modem_gate(args,"sweetselftest") || deadman!=600)return WpssRefused;
+     return 0;
+ }
+ static inline int wpss_gate(const char *args,int deadman){
+     unsigned probe=modem_arg_count(args,"sweetwprobe"),start=modem_arg_count(args,"sweetwpss"),pin=modem_arg_count(args,"sweetwpin");
+-    unsigned glink=modem_arg_count(args,"sweetwglink"),wlfw=modem_arg_count(args,"sweetwlfw");
+-    if(!probe && !start && !pin && !glink && !wlfw)return WpssOff;
+-    if((probe!=0)+(start!=0)+(pin!=0)+(glink!=0)+(wlfw!=0)>1)return WpssRefused;
++    unsigned glink=modem_arg_count(args,"sweetwglink"),wlfw=modem_arg_count(args,"sweetwlfw"),bdf=modem_arg_count(args,"sweetwbdf");
++    if(!probe && !start && !pin && !glink && !wlfw && !bdf)return WpssOff;
++    if((probe!=0)+(start!=0)+(pin!=0)+(glink!=0)+(wlfw!=0)+(bdf!=0)>1)return WpssRefused;
+     /* 2246: W3 is the coexistence gate. It is the one Wi-Fi gate allowed beside a preset, because proving coexistence is its
+      * whole purpose, so sweetdaily=1 or sweetcell=1 may be present and the preset decides its own members. Every member and
+      * probe token named literally is refused instead: a preset plus one of its own members is an invalid preset
+@@ -59,6 +63,11 @@ static inline int wpss_gate(const char *args,int deadman){
+         if(wpss_edge_gate(args,deadman,"sweetwlfw"))return WpssRefused;
+         return WpssWlfw;
+     }
++    /* 2249: W5, the same rules again, with the board data download on top and mutual exclusion from W3 and W4. */
++    if(bdf){
++        if(wpss_edge_gate(args,deadman,"sweetwbdf"))return WpssRefused;
++        return WpssBdf;
++    }
+     if(wpss_conflict(args))return WpssRefused;
+     if(probe)return modem_arg_is(args,"sweetwprobe","1")?WpssSurvey:WpssRefused;
+     if(!modem_arg_is(args,pin?"sweetwpin":"sweetwpss","1") || !modem_gate(args,"sweetfbarm") || !modem_gate(args,"sweetselftest") || deadman!=600)
+diff --git a/bsd/dev/wifi/WpssRuntime.inc b/bsd/dev/wifi/WpssRuntime.inc
+index da3d0e246..bbc9682f4 100644
+--- a/bsd/dev/wifi/WpssRuntime.inc
++++ b/bsd/dev/wifi/WpssRuntime.inc
+@@ -50,10 +50,18 @@ static void w_glink_close(void);
+  * client announces nothing; its requests are addressed to the server's port, not to one of ours. */
+ #define W_WLFW_PORT 0x4001u
+ static void w_wlfw_close(void);
++/* 2248b: the dwell clamp every reply deadline goes through. Declared here because the board data step's own init_done
++ * bound (2249) uses it and sits above the definition. */
++static uint64_t w_w4_bound(uint64_t now,uint64_t ms);
+ /* 2248: the client's open and poll, used by w_glink_open and w_glink_poll before they are defined below. */
+ static int w_wlfw_open(void);
+ static void w_wlfw_poll(void);
+ 
++/* 2249 (W5): the board data download. The piece size is the link's, so the intent query and the size are declared here;
++ * the file opener is below them in the stage's own section and needs no forward declaration. */
++static uint32_t w_remote_intent_max(void);
++static uint32_t w_bdf_piece_size(void);
++
+ #define W_SM_PA 0x81d00000u
+ #define W_SM_SIZE 0x200000u
+ #define W_REMOTE 13u          /* qcom,remote-pid */
+@@ -103,14 +111,33 @@ static struct {
+   * held past a bound. wlfw_step is how far it got, and it is what the closing line reports. */
+  bool wlfw_asked,wlfw_sent,wlfw_opened;
+  uint32_t wlfw_step,wlfw_port,wlfw_rport,wlfw_node,wlfw_board,wlfw_chip,wlfw_family,wlfw_bar_size,wlfw_result,wlfw_error;
+- /* 2248b: wlfw_dwell_end is the handover-based end of the 20 s dwell, and every reply deadline is clamped to it, so the
++ /* 2249 (W5): whether CAP actually carried a board id, which is what decides the board data file. ast234's firmware sent
++  * none, so this is what makes the difference between ath11k's 0xff fallback and a variant named for a real id. */
++ bool wlfw_board_present;
++ /* 2248b: wlfw_dwell_end is the handover-based end of the dwell, and every reply deadline is clamped to it, so the
+   * exchange cannot run past the stop (W4 audit defect 3: the worst case was 23 s against a 20 s dwell). wlfw_sent_at is
+   * when the outstanding request went out, so the timeout line prints the wait that actually happened rather than the
+-  * constant. wlfw_replies counts accepted replies, which is what the close line reports as answered. */
++  * constant. wlfw_replies counts accepted replies, which is what the close line reports as answered. dwell_ms is this
++  * gate's dwell: W4's 20 s, or W5's 35 s because a board file is 41 pieces. */
+  uint64_t wlfw_bar_addr,wlfw_deadline,wlfw_next_try,wlfw_asked_at,wlfw_dwell_end,wlfw_sent_at;
++ uint32_t dwell_ms;
+  uint16_t wlfw_transaction;
+  unsigned wlfw_tx,wlfw_indications,wlfw_replies,wlfw_foreign,wlfw_unexpected,wlfw_mismatched;
+  uint8_t wlfw_buf[64];
++ /* 2249 (W5): the board data download. Two files from modem_a read one piece at a time, so nothing here holds a whole
++  * board file in memory. bdf_file is which of the two is being sent, bdf_cluster its FAT chain, bdf_bytes its size,
++  * bdf_sent how much has been accepted by the firmware, bdf_seg the piece number the next request carries, bdf_pieces how
++  * many pieces this file takes at the size the first one used, and bdf_piece_len the bytes the last request carried.
++  * bdf_msg is one whole QRTR packet: the header, then one encoded request. */
++ bool bdf_asked,bdf_init_done;
++ uint32_t bdf_file,bdf_cluster,bdf_bytes,bdf_sent,bdf_seg,bdf_pieces,bdf_type,bdf_accepted,bdf_piece_len;
++ /* 2249: what each file actually got through, kept as two totals because bdf_seg restarts at 0 for the second file and
++  * a run that stops in the middle must still say which file it stopped in. */
++ uint32_t bdf_regdb_pieces,bdf_board_pieces;
++ uint64_t bdf_started,bdf_done_at;
++ uint8_t bdf_msg[QCOM_QRTR_HEADER+WLFW_MAX_DATA+64u];  /* one QRTR packet: its header, then one encoded request */
++ uint8_t bdf_piece[WLFW_MAX_DATA];   /* one piece's bytes, read from modem_a and copied into bdf_msg */
++ struct wl_fat bdf_fat;
+  uint32_t desc_off,our_fifo_off,their_fifo_off;
+  uint64_t link_began,ch_up_at;
+  int master;
+@@ -611,9 +638,11 @@ static void w_glink_close(void){
+ #define W_W4_REPLY_MS 5000u  /* each request's reply, well inside ath11k's own 10 s QMI timeout */
+ #define W_W4_GAP_MS 50u      /* between requests: ath11k's event work queue is not instantaneous either */
+ /* The steps, in order, starting at 0 so that the cleared state and the first step are the same thing: a client that has
+- * not started yet is waiting for the lookup. Getting that wrong once already made the whole sequence skip silently. */
+-enum {W4Lookup=0,W4IndRegister,W4HostCap,W4Cap,W4DeviceInfo,W4Done};
+-static const char *const w4_step_name[]={"lookup","ind_register","host_cap","cap","device_info","done"};
++ * not started yet is waiting for the lookup. Getting that wrong once already made the whole sequence skip silently.
++ * 2249 (W5) adds the three after DEVICE_INFO: the regulatory database, the board data file, and the wait for
++ * FW_INIT_DONE_IND. W4Done stays the terminal state, so the close line reads `step=done` in both stages. */
++enum {W4Lookup=0,W4IndRegister,W4HostCap,W4Cap,W4DeviceInfo,W4Regdb,W4Board,W4InitDone,W4Done};
++static const char *const w4_step_name[]={"lookup","ind_register","host_cap","cap","device_info","regdb","board","init_done","done"};
+ #define W4_STEPS (sizeof(w4_step_name)/sizeof(w4_step_name[0]))
+ /* 2248b (W4 audit defect 1): every lookup of w4_step_name goes through this. The array has W4_STEPS entries and the step
+  * is a uint32_t that the receive path can, in principle, advance; a bare w4_step_name[w.wlfw_step] would read past the
+@@ -628,27 +657,41 @@ static uint16_t w4_step_message(uint32_t step){
+  case W4HostCap: return WLFW_HOST_CAP_REQ;
+  case W4Cap: return WLFW_CAP_REQ;
+  case W4DeviceInfo: return WLFW_DEVICE_INFO_REQ;
++ /* 2249: every board data piece is the same message id, and the transaction is what tells one piece from the next. */
++ case W4Regdb: case W4Board: return WLFW_BDF_DOWNLOAD_REQ;
+  default: return 0;
+  }
+ }
+ /* 2248b (W4 audit defect 1 and note 6): is this response the answer to the request that is outstanding? All four must
+  * hold, and each one alone is a way the firmware can be wrong:
+  *   sent         a request went out and has not been answered or timed out (a late reply has sent=false)
+- *   step         one of the four that sends a request (a reply after the timeout or the completion is not)
++ *   step         one of the steps that sends a request (a reply after the timeout or the completion is not)
+  *   id           the reply's message id is that step's request (a reply to a different message is not)
+  *   transaction  the reply's transaction is the request's (an older exchange's reply is not)
+  * Pure, so the test can assert every combination without staging a conversation; the receive path calls it with the
+- * live state. */
++ * live state. 2249 (W5) widens the range to the two board data steps; W4InitDone and W4Done still send nothing, so a
++ * board data reply that arrives after the last piece is dropped exactly as a repeated DEVICE_INFO reply was. */
+ static bool w4_reply_expected(bool sent,uint32_t step,uint16_t transaction,uint16_t message,uint16_t reply_transaction){
+- if(!sent || step<W4IndRegister || step>W4DeviceInfo)return false;
++ if(!sent || step<W4IndRegister || step>W4Board)return false;
+  return message==w4_step_message(step) && reply_transaction==transaction;
+ }
+ 
+-/* Sends one QMI request to the WLFW port. Returns 0 when it went out, or the QRTR/GLINK error. */
++/* Sends one QMI request to the WLFW port. Returns 0 when it went out, or the QRTR/GLINK error.
++ * 2249 (W5): a board data piece can be 6 KiB, larger than the stack packet qcom_qrtr_send_data builds, so it goes out
++ * through the prefixed path instead: its header is written into the same buffer the encoder filled, and the payload is
++ * padded to four bytes first, which QRTR requires and which the buffer has room for. */
+ static int w_wlfw_send(const uint8_t *message,uint32_t bytes){
+  if(!w.qr_started || !w.wlfw_rport)return -1;
+  return qcom_qrtr_send_data(&w.qr, w.wlfw_port, w.wlfw_node, w.wlfw_rport, message, bytes);
+ }
++static int w_wlfw_send_piece(uint32_t bytes){
++ if(!w.qr_started || !w.wlfw_rport)return -1;
++ const uint32_t padded=(bytes+3u)&~3u;
++ if(QCOM_QRTR_HEADER+padded>sizeof(w.bdf_msg))return -1;
++ /* The payload is already at bdf_msg + QCOM_QRTR_HEADER, where the encoder wrote it, so nothing has to move: the send
++  * writes the header in front of it and pads after it. */
++ return qcom_qrtr_send_data_prefixed(&w.qr,w.wlfw_port,w.wlfw_node,w.wlfw_rport,w.bdf_msg,bytes);
++}
+ /* One line per request: what it was, what the firmware answered, and the reply's length. Ids and result codes only. */
+ static void w_wlfw_result(uint16_t message,const WlfwMessage *m){
+  printf("SWEET WIFI: W4 wlfw %s result=%u error=%u bytes=%u\n",wlfw_name(message),
+@@ -656,6 +699,136 @@ static void w_wlfw_result(uint16_t message,const WlfwMessage *m){
+  sweet_log_sync();
+ }
+ 
++/* ---- 2249 (W5, stage 2 L2's second half): the board data download -------------------------------------------------
++ * W4 proved the firmware answers four requests. W5 sends the two files it needs before it will say it is initialised:
++ * the regulatory database (regdb.bin) and one board data file, in ath11k's order (qmi.c ath11k_qmi_event_load_bdf:
++ * regdb first when the chip supports it, then the board file, both through ath11k_qmi_load_bdf_qmi), then waits for
++ * FW_INIT_DONE_IND.
++ *
++ * THE BOARD FILE, AND WHY IT IS THE ONE IT IS. The CAP reply in ast234 carried no board id TLV at all
++ * (`W4 wlfw cap reply carries no board id (1); ath11k would take 0xff`), so ath11k's own fallback decides it: board id
++ * 0xff, which is also the file_id every BDF_DOWNLOAD request then carries. The vendor driver that ships on this phone
++ * makes the same choice explicitly: in icnss2.ko's icnss_wlfw_bdf_dnld_send_sync, a board file of BIN type is named
++ * `bdwlan.bin` exactly when the board id equals 0xff, `bdwlan.b%02x` for a board id below 0x100, and `bdwlan.%03x`
++ * above it (the string constants and the three compares are at 0x10090..0x10104 in that function, reached from
++ * icnss_driver_event_work after DEVICE_INFO). So on a phone whose firmware reports no board id, the stock software
++ * loads `bdwlan.bin`; modem_a holds it, 58180 bytes, and `bdwlan.bin` is not an ELF, so its bdf_type is BIN.
++ * The other 50-odd variants are for board ids this firmware never reports; none of them is chosen by guessing.
++ *
++ * NOTHING IS COMMITTED AND NOTHING IS WRITTEN. Both files are read from modem_a through the same read-only FAT reader
++ * the firmware chain uses, one piece at a time, and only counts, sizes, message ids and result codes are logged: no
++ * file contents, no name that identifies this device. The board file's name in the code is the vendor's own, the same
++ * one PLAN.md already records; the log names the variant class and the board id instead.
++ *
++ * THE PIECE SIZE IS THE LINK'S, NOT A CONSTANT. A GLINK message goes out in one receive intent the WPSS advertises, and
++ * QcomGlink refuses (QcomGlinkAgain) rather than splitting one. ath11k's QMI_WLANFW_MAX_DATA_SIZE_V01 is 6144, so a
++ * piece is min(6144, the largest idle remote intent - the 45 bytes of request overhead). The size is logged once, and a
++ * firmware that offers only small intents just gets more pieces.
++ *
++ * BOUNDS. Every piece waits for its own reply inside the dwell; a piece that cannot go out for want of an intent is
++ * retried for W_W4_REPLY_MS and then ends the stage with a line saying so. The dwell is longer for this gate only
++ * (W_BDF_DWELL_MS), because 41 pieces and a 10 s init_done wait do not fit in W4's 20 s; nothing else moves. */
++#define W_BDF_REGDB 0u
++#define W_BDF_BOARD 1u
++/* What one board data request costs on the wire beyond its bytes, counted from the layouts rather than guessed:
++ *   QRTR header                                                32
++ *   QMI header                                                  7
++ *   TLV 0x01 valid        type 1 + length 2 + value 1           4
++ *   TLV 0x10 file_id      type 1 + length 2 + value 4           7
++ *   TLV 0x11 total_size                                         7
++ *   TLV 0x12 seg_id                                             7
++ *   TLV 0x13 data         type 1 + length 2 + count 2           5
++ *   TLV 0x14 end                                                4
++ *   TLV 0x15 bdf_type                                           4
++ *                                                             ---
++ *                                                              77
++ * and the packet is padded to a multiple of four, so 80 is the bound a piece must leave free in the intent. The 2249
++ * draft had 48 here, which forgot the QRTR header: a 0x800 intent then took a 2000-byte piece whose packet was 2032
++ * bytes of payload plus 32 of header, and QcomGlink refused it for ever because no intent that size ever existed.
++ * The model's small-intent case caught it. */
++#define W_BDF_OVERHEAD 80u
++#define W_BDF_INIT_MS 10000u     /* FW_INIT_DONE_IND, ath11k's own ATH11K_QMI_WLANFW_TIMEOUT_MS */
++#define W_BDF_DWELL_MS 35000u    /* this gate's dwell: 41 pieces at ~50 ms plus a 10 s init_done wait */
++
++/* The largest receive intent the WPSS has advertised and is not using. 0 when none is free, which means "not now":
++ * QcomGlink would refuse the send and QcomQrtr counts a refusal without retrying it. */
++static uint32_t w_remote_intent_max(void){
++ uint32_t max=0;
++ if(!w.glch)return 0;
++ for(unsigned k=0;k<QCOM_GLINK_MAX_REMOTE_INTENTS;k++)
++  if(w.glch->remote[k].valid && !w.glch->remote[k].busy && w.glch->remote[k].size>max)max=w.glch->remote[k].size;
++ return max;
++}
++/* The piece size for one request, or 0 when no intent can take even a small one. */
++static uint32_t w_bdf_piece_size(void){
++ const uint32_t max=w_remote_intent_max();
++ if(max<=W_BDF_OVERHEAD)return 0;
++ return max-W_BDF_OVERHEAD>WLFW_MAX_DATA?WLFW_MAX_DATA:max-W_BDF_OVERHEAD;
++}
++/* Which variant this board id maps to, as the vendor driver maps it. Returns 0 and fills path, or -1 when this firmware
++ * reports an id no file on the phone is named for (then the stage says so rather than loading the wrong board data).
++ *
++ * The vendor's own rule, from icnss2.ko's icnss_wlfw_bdf_dnld_send_sync: board id 0xff takes `bdwlan.bin`; below 0x100
++ * it takes `bdwlan.b%02x`; above it, `bdwlan.%03x`. 0xff is both a real value the firmware can send and ath11k's
++ * fallback when the CAP reply carries no board id at all, and both mean the same file, so they are handled as one case
++ * and said apart in the log. */
++static int w_bdf_board_name(char *path,size_t size){
++ if(!w.wlfw_board_present || w.wlfw_board==0xffu){
++  /* ath11k's fallback (qmi.c: `ab->qmi.target.board_id = 0xFF`) and the vendor's own `board_id == 0xff` case. */
++  snprintf(path,size,"image/qca6750/bdwlan.bin");
++  return 0;
++ }
++ if(w.wlfw_board>=1 && w.wlfw_board<=0xfe){
++  snprintf(path,size,"image/qca6750/bdwlan.b%02x",(unsigned)w.wlfw_board);
++  return 0;
++ }
++ printf("SWEET WIFI: W5 bdf refused: the firmware reported board=%#x, and no bdwlan variant on this phone is named for it\n",
++  w.wlfw_board);
++ sweet_log_sync();
++ return -1;
++}
++/* Opens one of the two files and records what sending it needs. Returns 0, or the error that stopped it. */
++static int w_bdf_start(uint32_t file){
++ char path[48];
++ if(file==W_BDF_REGDB)snprintf(path,sizeof(path),"image/qca6750/regdb.bin");
++ else if(w_bdf_board_name(path,sizeof(path)))return EINVAL;
++ int rc=fat_mount(&w.bdf_fat,"modem_a");
++ if(rc){printf("SWEET WIFI: W5 bdf %s: modem_a will not mount (%d)\n",file==W_BDF_REGDB?"regdb":"board",rc);sweet_log_sync();return rc;}
++ uint32_t cluster=0,bytes=0;
++ rc=fat_open(&w.bdf_fat,path,&cluster,&bytes);
++ if(rc){
++  printf("SWEET WIFI: W5 bdf %s: the file is not on modem_a (%d)\n",file==W_BDF_REGDB?"regdb":"board",rc);sweet_log_sync();return rc;
++ }
++ if(!bytes || bytes>0x1000000u){
++  printf("SWEET WIFI: W5 bdf %s: %u bytes is not a size this stage will send\n",file==W_BDF_REGDB?"regdb":"board",bytes);
++  sweet_log_sync();return EINVAL;
++ }
++ /* The type, from the file's own first four bytes for a board file, and fixed for the regulatory database. */
++ uint8_t head[4]={0};uint32_t type=WLFW_BDF_TYPE_REGDB;
++ if(file==W_BDF_BOARD){
++  if((rc=fat_read_chain(&w.bdf_fat,cluster,0,head,sizeof(head)))){
++   printf("SWEET WIFI: W5 bdf board: the first bytes cannot be read (%d)\n",rc);sweet_log_sync();return rc;
++  }
++  type=wlfw_bdf_type(head,sizeof(head));
++ }
++ w.bdf_file=file;w.bdf_cluster=cluster;w.bdf_bytes=bytes;w.bdf_type=type;
++ w.bdf_sent=0;w.bdf_seg=0;w.bdf_piece_len=0;w.bdf_accepted=0;w.bdf_started=w_now();
++ if(file==W_BDF_BOARD)
++  printf("SWEET WIFI: W5 bdf board: board=%#x board_present=%u variant=%s bytes=%u type=%u\n",
++   w.wlfw_board,w.wlfw_board_present,
++   (!w.wlfw_board_present || w.wlfw_board==0xffu)?"default":"by-id",bytes,type);
++ else printf("SWEET WIFI: W5 bdf regdb: bytes=%u type=%u\n",bytes,type);
++ sweet_log_sync();
++ return 0;
++}
++/* One line when a file's last piece was accepted: what it was, how many pieces, how many bytes, how long. */
++static void w_bdf_file_done(void){
++ printf("SWEET WIFI: W5 bdf %s complete: pieces=%u accepted=%u bytes=%u in %llu ms\n",
++  w.bdf_file==W_BDF_REGDB?"regdb":"board",w.bdf_seg,w.bdf_accepted,w.bdf_sent,
++  (unsigned long long)(w_now()-w.bdf_started));
++ sweet_log_sync();
++}
++
+ /* A data packet for our WLFW port. Two checks before a byte is parsed.
+  *
+  * The sender, against what the announcement said: the port exists only for this conversation, so a packet from any other
+@@ -680,20 +853,29 @@ static void w_wlfw_receive(void *unused,QcomQrtr *qr,uint32_t port,uint32_t node
+  WlfwMessage m;
+  if(wlfw_parse(data,bytes,&m)){printf("SWEET WIFI: W4 wlfw malformed reply bytes=%u\n",bytes);sweet_log_sync();return;}
+  if(m.type==WLFW_INDICATION){
+-  /* The indications we registered for. Nothing is sent back: QMI indications are one-way. fw_init_done and cal_done
+-   * belong to the boots after this one, but they are named here so a firmware that volunteers one is not a mystery. */
++  /* The indications we registered for. Nothing is sent back: QMI indications are one-way. 2249 (W5): fw_init_done is
++   * now the thing the stage waits for after the last board piece, so it sets bdf_init_done and ends the wait; the other
++   * two are still only named, because cold-boot calibration is L3 and fw_ready arrives with the mode handshake. */
+   if(m.message==WLFW_FW_INIT_DONE_IND || m.message==WLFW_COLD_BOOT_CAL_DONE_IND || m.message==WLFW_FW_READY_IND){
+    w.wlfw_indications++;
+    printf("SWEET WIFI: W4 wlfw indication=%s id=%#x\n",wlfw_indication_name(m.message),m.message);
+    sweet_log_sync();
+   }
++  /* 2249: an init_done that arrives while the board data is still going out is the firmware speaking out of turn, and
++    * accepting it would hide a file that was never sent. It is only taken once the last piece has been answered. */
++  if(m.message==WLFW_FW_INIT_DONE_IND && w.wlfw_step==W4InitDone && w.bdf_sent>=w.bdf_bytes && !w.bdf_init_done){
++   w.bdf_init_done=true;
++   printf("SWEET WIFI: W5 bdf init_done=1 after %llu ms; board data accepted\n",
++    (unsigned long long)(w_now()-w.bdf_done_at));
++   sweet_log_sync();
++  }
+   return;
+  }
+  if(m.type!=WLFW_RESPONSE)return;
+  /* 2248b (defect 1 and note 6): is this the answer to the outstanding request? Nothing else advances the step. The
+   * three refusals are counted apart, so the log says which one it was. */
+  if(!w4_reply_expected(w.wlfw_sent,w.wlfw_step,w.wlfw_transaction,m.message,m.transaction)){
+-  if(!w.wlfw_sent || w.wlfw_step<W4IndRegister || w.wlfw_step>W4DeviceInfo)w.wlfw_unexpected++;
++  if(!w.wlfw_sent || w.wlfw_step<W4IndRegister || w.wlfw_step>W4Board)w.wlfw_unexpected++;
+   else w.wlfw_mismatched++;
+   if(w.wlfw_unexpected+w.wlfw_mismatched==1){
+    printf("SWEET WIFI: W4 wlfw dropped reply id=%#x tx=%u: the outstanding request is %s tx=%u, nothing advanced\n",
+@@ -710,9 +892,15 @@ static void w_wlfw_receive(void *unused,QcomQrtr *qr,uint32_t port,uint32_t node
+  w.wlfw_replies++;
+  w_wlfw_result(m.message,&m);
+  /* A non-zero result is a refusal: the run does not carry on to the next request. ath11k treats it the same way and
+-  * the stop still runs, which is the point of every stage since W2. */
++  * the stop still runs, which is the point of every stage since W2. 2249 (W5): a refusal in the middle of a file stops
++  * the file, and the count is kept so the close line and the grade can say how far it got. */
+  if(m.result_valid && m.result){
+   printf("SWEET WIFI: W4 wlfw refused at %s result=%u error=%u; the rest is not sent\n",w4_step_str(w.wlfw_step),m.result,m.error);
++  if(w.wlfw_step==W4Regdb || w.wlfw_step==W4Board){
++   printf("SWEET WIFI: W5 bdf %s stopped at piece=%u/%u after %u bytes of %u; the firmware refused it\n",
++    w.wlfw_step==W4Regdb?"regdb":"board",w.bdf_seg,w.bdf_pieces,w.bdf_sent,w.bdf_bytes);
++   sweet_log_sync();
++  }
+   w.wlfw_step=W4Done;w.wlfw_sent=false;return;
+  }
+  switch(m.message){
+@@ -725,6 +913,9 @@ static void w_wlfw_receive(void *unused,QcomQrtr *qr,uint32_t port,uint32_t node
+   int brc=wlfw_board_id(data,bytes,&board);
+   if(brc)printf("SWEET WIFI: W4 wlfw cap reply carries no board id (%d); ath11k would take 0xff\n",brc);
+   else w.wlfw_board=board;
++  /* 2249: whether the id was there at all is what picks the board data file, so it is remembered rather than inferred
++   * from a zero board id (a real board id of 0 is possible, and would be a different file). */
++  w.wlfw_board_present=brc==0;
+   int crc=wlfw_chip_info(data,bytes,&chip,&family);
+   if(!crc){w.wlfw_chip=chip;w.wlfw_family=family;}
+   printf("SWEET WIFI: W4 wlfw cap board=%#x board_present=%u chip=%#x family=%#x chip_present=%u\n",
+@@ -748,8 +939,40 @@ static void w_wlfw_receive(void *unused,QcomQrtr *qr,uint32_t port,uint32_t node
+  default: break;
+  }
+  w.wlfw_sent=false;
+- if(w.wlfw_step==W4DeviceInfo){w.wlfw_step=W4Done;printf("SWEET WIFI: W4 wlfw exchange complete: 4 requests answered\n");sweet_log_sync();}
+- else w.wlfw_step++;
++ /* 2249 (W5): a board data piece's reply. The piece is only counted once the firmware has accepted it, so bdf_sent is
++  * what the next request's total_size is computed from, and bdf_seg is the piece number that one carries. When the file
++  * is finished the step moves to the next file, or, after the board file, to the wait for init_done, which is the last
++  * thing this stage asks for. */
++ if(w.wlfw_step==W4Regdb || w.wlfw_step==W4Board){
++  const uint32_t end=(w.bdf_sent+w.bdf_piece_len>=w.bdf_bytes);
++  w.bdf_accepted++;w.bdf_sent+=w.bdf_piece_len;w.bdf_seg++;
++  if(w.wlfw_step==W4Regdb)w.bdf_regdb_pieces=w.bdf_seg; else w.bdf_board_pieces=w.bdf_seg;
++  if(end){
++   w_bdf_file_done();
++   if(w.wlfw_step==W4Regdb){
++    w.wlfw_step=W4Board;
++    printf("SWEET WIFI: W4 wlfw exchange continuing: the regulatory database is accepted, the board data is next\n");
++   } else {
++    w.wlfw_step=W4InitDone;w.bdf_done_at=w_now();
++    w.wlfw_deadline=w_w4_bound(w_now(),W_BDF_INIT_MS);
++    printf("SWEET WIFI: W5 bdf board accepted; waiting up to %u ms for init_done\n",W_BDF_INIT_MS);
++   }
++  }
++  w.wlfw_deadline=w.wlfw_step==W4InitDone?w.wlfw_deadline:w_now()+W_W4_GAP_MS;
++  sweet_log_sync();
++  return;
++ }
++ if(w.wlfw_step==W4DeviceInfo){
++  /* 2249: the four answers are in and the board data is next, so the exchange line says how far the run got rather than
++   * claiming completion. W4's own line is kept word for word for the gate that stops after DEVICE_INFO. */
++  if(w.bdf_asked)printf("SWEET WIFI: W4 wlfw exchange complete: 4 requests answered; board data follows\n");
++  else printf("SWEET WIFI: W4 wlfw exchange complete: 4 requests answered\n");
++  sweet_log_sync();
++  w.wlfw_step=w.bdf_asked?W4Regdb:W4Done;
++  w.wlfw_deadline=w_now()+W_W4_GAP_MS;
++  return;
++ }
++ w.wlfw_step++;
+  w.wlfw_deadline=w_now()+W_W4_GAP_MS;
+ }
+ 
+@@ -772,6 +995,11 @@ static void w_wlfw_close(void){
+   * cleared on every accepted reply and which is false again by the time this runs. It printed 0 on every healthy run. */
+  printf("SWEET WIFI: W4 wlfw close: step=%s tx=%u indications=%u answered=%u dropped=%u+%u\n",w4_step_str(w.wlfw_step),
+   w.wlfw_tx,w.wlfw_indications,w.wlfw_replies,w.wlfw_unexpected,w.wlfw_mismatched);
++ /* 2249 (W5): the board data's own tally, so a run that stopped in the middle of a file says how far it got even when
++  * the step it was on is gone. Only counts: no bytes, no file contents. */
++ if(w.bdf_asked)
++  printf("SWEET WIFI: W5 bdf close: regdb_pieces=%u board_pieces=%u init_done=%u\n",
++   w.bdf_regdb_pieces,w.bdf_board_pieces,w.bdf_init_done);
+  sweet_log_sync();
+ }
+ 
+@@ -791,9 +1019,9 @@ static uint64_t w_w4_bound(uint64_t now,uint64_t ms){
+ }
+ /* Records where the exchange must end, from the handover that starts the dwell. Called once, at handover. */
+ static void w_w4_note_dwell(uint64_t handover){
+- w.wlfw_dwell_end=handover+W_DWELL_MS-W_W4_STOP_RESERVE_MS;
++ w.wlfw_dwell_end=handover+w.dwell_ms-W_W4_STOP_RESERVE_MS;
+  printf("SWEET WIFI: W4 exchange bounded to end %u ms after handover, %u ms before the stop\n",
+-  W_DWELL_MS-W_W4_STOP_RESERVE_MS,W_W4_STOP_RESERVE_MS);
++  w.dwell_ms-W_W4_STOP_RESERVE_MS,W_W4_STOP_RESERVE_MS);
+  sweet_log_sync();
+ }
+ 
+@@ -841,6 +1069,18 @@ static void w_wlfw_poll(void){
+   return;
+  }
+  if(w.wlfw_step==W4Done)return;
++ /* 2249 (W5): the wait for FW_INIT_DONE_IND. It sends nothing, so it has no request of its own; it is the deadline the
++ * last board piece set. A late or repeated piece reply is already dropped by the guard, because W4InitDone is past the
++ * last step that sends a request. */
++ if(w.wlfw_step==W4InitDone){
++  if(w.bdf_init_done)return;   /* the indication set it in w_wlfw_receive, which logged it */
++  if(now>=w.wlfw_deadline){
++   printf("SWEET WIFI: W5 bdf init_done=0 after %llu ms; the firmware did not say it was initialised\n",
++    (unsigned long long)(now-w.bdf_done_at));
++   sweet_log_sync();w.wlfw_step=W4Done;
++  }
++  return;
++ }
+  if(now<w.wlfw_deadline)return;
+  if(w.wlfw_sent){
+   /* 2248b (defect 1): clear wlfw_sent with the step. A timeout that left it set is what let a late reply past the
+@@ -861,28 +1101,93 @@ static void w_wlfw_poll(void){
+  }
+  {
+   uint32_t bytes=0;
++  const uint8_t *message=w.wlfw_buf;   /* 2249: a board data piece is built in bdf_msg, everything else in wlfw_buf */
+   switch(w.wlfw_step){
+   case W4IndRegister: bytes=wlfw_ind_register(w.wlfw_buf,sizeof(w.wlfw_buf),w.wlfw_transaction=1);break;
+   case W4HostCap: bytes=wlfw_host_cap(w.wlfw_buf,sizeof(w.wlfw_buf),w.wlfw_transaction=2);break;
+   case W4Cap: bytes=wlfw_empty_request(w.wlfw_buf,sizeof(w.wlfw_buf),w.wlfw_transaction=3,WLFW_CAP_REQ);break;
+   case W4DeviceInfo: bytes=wlfw_empty_request(w.wlfw_buf,sizeof(w.wlfw_buf),w.wlfw_transaction=4,WLFW_DEVICE_INFO_REQ);break;
++  case W4Regdb: case W4Board: {
++   /* 2249 (W5): one piece of the current file. A file is started here rather than in the receive path, so that every
++    * buffer is filled in one place and a refusal cannot leave half a file open. bdf_sent counting up to bdf_bytes is how
++    * "that file is finished" is known: the last piece's end=1 and the firmware's own reply are both required. */
++   const uint32_t file=w.wlfw_step==W4Regdb?W_BDF_REGDB:W_BDF_BOARD;
++   if(w.bdf_sent>=w.bdf_bytes && w_bdf_start(file)){w.wlfw_step=W4Done;return;}
++   /* 2249: the first piece is also where the piece count is fixed, because it is the first request's size that every
++    * piece after it uses; only the last one can be smaller. */
++   if(!w.bdf_seg){
++    const uint32_t max=w_bdf_piece_size();
++    w.bdf_pieces=max?wlfw_bdf_pieces(w.bdf_bytes,max):1u;
++   }
++   /* The piece size is the link's: one GLINK message, one receive intent, and QcomGlink will not split one. A size of 0
++    * means no intent can take a piece yet; that is not an error, it is "not this poll", and the step's own deadline
++    * turns it into an honest line if it never frees. */
++   const uint32_t take_max=w_bdf_piece_size();
++   if(!take_max){
++    if(now>=w.wlfw_deadline){
++     printf("SWEET WIFI: W5 bdf %s piece=%u: no receive intent could carry it within %u ms; the rest is not sent\n",
++      file==W_BDF_REGDB?"regdb":"board",w.bdf_seg,W_W4_REPLY_MS);
++     sweet_log_sync();w.wlfw_step=W4Done;
++    }
++    return;
++   }
++   /* 2247's note: our own receive intents are advertised at 0x800 eight times, which is a different direction from this.
++    * This piece is limited by THEIR intent, which ast234's log shows the WPSS advertising large enough for 0x4400. */
++   if(!w.bdf_seg)printf("SWEET WIFI: W5 bdf %s first piece size=%u (the WPSS's largest idle intent minus %u)\n",
++    file==W_BDF_REGDB?"regdb":"board",take_max,W_BDF_OVERHEAD);
++   const uint32_t left=w.bdf_bytes-w.bdf_sent;
++   const uint32_t take=left<take_max?left:take_max;
++   const int rrc=fat_read_chain(&w.bdf_fat,w.bdf_cluster,w.bdf_sent,w.bdf_piece,take);
++   if(rrc){
++    printf("SWEET WIFI: W5 bdf %s piece=%u: modem_a read failed (%d); the rest is not sent\n",
++     file==W_BDF_REGDB?"regdb":"board",w.bdf_seg,rrc);
++    sweet_log_sync();w.wlfw_step=W4Done;return;
++   }
++   const uint8_t end=(w.bdf_sent+take>=w.bdf_bytes)?1:0;
++   w.bdf_piece_len=take;
++   /* 2249: the request is encoded at bdf_msg + QCOM_QRTR_HEADER, so the QRTR header can be written in front of it
++    * without moving a 6 KiB payload. That is why bdf_msg is sized with room for it. */
++   bytes=wlfw_bdf_download(w.bdf_msg+QCOM_QRTR_HEADER,sizeof(w.bdf_msg)-QCOM_QRTR_HEADER,(uint16_t)(++w.wlfw_transaction),
++    w.wlfw_board_present?w.wlfw_board:0xffu,w.bdf_bytes-w.bdf_sent,w.bdf_seg,w.bdf_piece,take,end,(uint8_t)w.bdf_type);
++   message=w.bdf_msg+QCOM_QRTR_HEADER;
++   break;
++  }
+   default: w.wlfw_step=W4Done;return;
+   }
+   /* 2248b (W4 audit note 4): these two lines are named `step=…` so the grader's hard-fail strings match what is printed.
+    * They were plain `W4 wlfw encode failed` / `send failed`, which the grader looked for and never saw. */
+   if(!bytes){printf("SWEET WIFI: W4 wlfw step=%s encode failed\n",w4_step_str(w.wlfw_step));sweet_log_sync();w.wlfw_step=W4Done;return;}
+-  int rc=w_wlfw_send(w.wlfw_buf,bytes);
+-  if(rc){printf("SWEET WIFI: W4 wlfw step=%s send failed %d\n",w4_step_str(w.wlfw_step),rc);sweet_log_sync();w.wlfw_step=W4Done;return;}
++  /* 2249: a board data piece is too large for the stack packet, so it goes out through its own buffer. Everything else
++   * still uses w_wlfw_send, unchanged from W4. A piece that QRTR or GLINK refuses for want of a free intent is not a
++   * failure: it is "not this poll". The step's own deadline bounds the retry, and only then does it become a line. */
++  const int rc=(w.wlfw_step==W4Regdb || w.wlfw_step==W4Board)?w_wlfw_send_piece(bytes):w_wlfw_send(message,bytes);
++  if(rc){
++   if(w.wlfw_step==W4Regdb || w.wlfw_step==W4Board){w.wlfw_deadline=w_w4_bound(now,W_W4_REPLY_MS);return;}
++   printf("SWEET WIFI: W4 wlfw step=%s send failed %d\n",w4_step_str(w.wlfw_step),rc);sweet_log_sync();w.wlfw_step=W4Done;return;
++  }
+   w.wlfw_sent=true;w.wlfw_sent_at=now;w.wlfw_tx++;w.wlfw_deadline=w_w4_bound(now,W_W4_REPLY_MS);
+-  printf("SWEET WIFI: W4 wlfw %s request bytes=%u transaction=%u\n",w4_step_str(w.wlfw_step),bytes,w.wlfw_transaction);
++  /* 2249: a board data piece is logged by file, piece number, bytes and whether it is the last. A whole message of bytes
++   * per piece would be noise; where a refusal happened is the thing a reader needs. */
++  if(w.wlfw_step==W4Regdb || w.wlfw_step==W4Board)
++   printf("SWEET WIFI: W5 bdf %s piece=%u/%u bytes=%u end=%u transaction=%u\n",
++    w.wlfw_step==W4Regdb?"regdb":"board",w.bdf_seg,w.bdf_pieces,w.bdf_piece_len,
++    (w.bdf_sent+w.bdf_piece_len>=w.bdf_bytes)?1u:0u,w.wlfw_transaction);
++  else printf("SWEET WIFI: W4 wlfw %s request bytes=%u transaction=%u\n",w4_step_str(w.wlfw_step),bytes,w.wlfw_transaction);
+   sweet_log_sync();
+  }
+ }
+ 
+ static int wpss_run(int gate){
+  memset(&w,0,sizeof(w));w.master=-1;
+- /* 2248: W4 opens the edge too, because its client needs it. W3 is the plain edge; W2 is the start alone. */
+- w.link_asked=(gate==WpssGlink || gate==WpssWlfw);w.wlfw_asked=(gate==WpssWlfw);struct wl_fat f;
++ /* 2248: W4 opens the edge too, because its client needs it. W3 is the plain edge; W2 is the start alone.
++  * 2249 (W5): sweetwbdf=1 is the same client with the board data download after DEVICE_INFO. */
++ w.link_asked=(gate==WpssGlink || gate==WpssWlfw || gate==WpssBdf);
++ w.wlfw_asked=(gate==WpssWlfw || gate==WpssBdf);
++ w.bdf_asked=(gate==WpssBdf);
++ /* 2249: this gate's dwell. W4's 20 s is what its audit sized; a board file is 41 pieces plus a 10 s init_done wait, so
++  * W5's own dwell is 35 s. It is set here, before any deadline can read it, and nothing else changes. */
++ w.dwell_ms=w.bdf_asked?W_BDF_DWELL_MS:W_DWELL_MS;
++ struct wl_fat f;
+  int rc=w_open_image(&f);if(rc)goto out;
+  /* 2243: the sleep clock before any WPSS work (Fairphone's mainline enablement: without it the WPSS keeps crashing). */
+  if((rc=wpss_gpio5_set()))goto out;
+@@ -919,14 +1224,13 @@ static int wpss_run(int gate){
+    handover=now;printf("SWEET WIFI: W2 handover; shared cx/mx/xo votes kept\n");
+    /* 2248b: the dwell starts here, so this is where the exchange's own end is fixed. Before this point a request
+     * bound is the plain constant; the exchange cannot start before it, because w_wlfw_poll needs w.qr_started. */
+-   if(w.wlfw_asked)w_w4_note_dwell(handover);
+-   /* 2246: the edge is opened only once the DSP is up. Before handover the DSP has not made its FIFO and GLINK would just
++   if(w.wlfw_asked)w_w4_note_dwell(handover);   /* 2246: the edge is opened only once the DSP is up. Before handover the DSP has not made its FIFO and GLINK would just
+     * spin on a missing item. A failure here is the W3 answer and ends the run through the normal verified stop. */
+    if(w.link_asked && (rc=w_glink_open())){printf("SWEET WIFI: W3 glink open failed error=%d\n",rc);break;}
+   }
+   if(!ready && now-start>W_READY_MS){rc=ETIMEDOUT;break;}
+   if(ready && !handover && now-ready>W_HANDOVER_MS){rc=ETIMEDOUT;break;}
+-  if(handover && now-handover>=W_DWELL_MS){rc=0;break;}
++  if(handover && now-handover>=w.dwell_ms){rc=0;break;}
+   w_sleep(2);
+  }
+ out:

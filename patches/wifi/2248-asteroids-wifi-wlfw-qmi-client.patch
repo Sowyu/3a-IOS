@@ -1,0 +1,857 @@
+diff --git a/bsd/dev/modem/QcomQrtr.c b/bsd/dev/modem/QcomQrtr.c
+index b876b5d08..b92467949 100644
+--- a/bsd/dev/modem/QcomQrtr.c
++++ b/bsd/dev/modem/QcomQrtr.c
+@@ -98,6 +98,46 @@ int qcom_qrtr_find_remote(const QcomQrtr *q, uint32_t service)
+     return -1;
+ }
+ 
++/* 2248 (L1): the name service, asked from the client side.
++ * Linux's qmi_add_lookup() builds a control packet of {cmd = NEW_LOOKUP, server.service, server.instance} and sends it to
++ * node 0, port QRTR_PORT_CTRL, from a socket on our own node and port (qmi_interface.c qmi_send_new_lookup).
++ * `server.node` and `server.port` are zero: we are asking, not announcing. That is the whole layout: cmd, service,
++ * instance, and two zero words. The payload is 20 bytes because every QRTR control packet here is the command and four
++ * words (CTRL_BYTES), which is what control() sends; the two zero words are the same padding an announcement has.
++ * (2248b: this comment said 12 bytes, which was Linux's three-word payload, not the 20 this code sends — W4 audit note 9.)
++ * The answer arrives as an ordinary NEW_SERVER from the remote's own name service, which remote_server() already
++ * records, so there is no second table here to keep in step. */
++int qcom_qrtr_lookup(QcomQrtr *q, uint32_t service, uint32_t instance)
++{
++    /* No hello from the remote yet means no node to address: a packet sent to the broadcast node would go nowhere and
++     * count as a refusal. Say so by refusing here, so the caller retries when the remote speaks. */
++    if (q->remote_node == QCOM_QRTR_NODE_BROADCAST) return -1;
++    const uint32_t words[4] = {service, instance, 0, 0};  /* the last two: node and port, zero when asking */
++    return control(q, QCOM_QRTR_NEW_LOOKUP, words);
++}
++int qcom_qrtr_lookup_found(const QcomQrtr *q, uint32_t service, uint32_t instance, uint32_t *node, uint32_t *port)
++{
++    for (uint32_t i = 0; i < q->remote_count; ++i) {
++        if (q->remote[i].service != service) continue;
++        if (instance && q->remote[i].instance != instance) continue;
++        if (node) *node = q->remote[i].node;
++        if (port) *port = q->remote[i].port;
++        return 1;
++    }
++    return 0;
++}
++int qcom_qrtr_remove_service(QcomQrtr *q, uint32_t port)
++{
++    for (uint32_t i = 0; i < q->local_count; ++i) {
++        if (q->local[i].port != port) continue;
++        /* Keep the list dense: the last entry takes this slot, exactly as remote_server() drops one. */
++        q->local[i] = q->local[--q->local_count];
++        q->local[q->local_count] = (typeof(q->local[0])){0};
++        return 0;
++    }
++    return -1;
++}
++
+ static void remote_server(QcomQrtr *q, const uint8_t *w, int add)
+ {
+     const uint32_t service = le32(w), instance = le32(w + 4), node = le32(w + 8), port = le32(w + 12);
+diff --git a/bsd/dev/modem/QcomQrtr.h b/bsd/dev/modem/QcomQrtr.h
+index 60664c7de..9e37f8bdb 100644
+--- a/bsd/dev/modem/QcomQrtr.h
++++ b/bsd/dev/modem/QcomQrtr.h
+@@ -62,6 +62,21 @@ int qcom_qrtr_send_data(QcomQrtr *q, uint32_t from_port, uint32_t node, uint32_t
+ /* Index of a remote service in the list, -1 when not announced. */
+ int qcom_qrtr_find_remote(const QcomQrtr *q, uint32_t service);
+ 
++/* ---- the name service, for when we are the client (2248, L1) ------------------------------------------------ */
++/* Asks the remote's name service which node and port carry a service, by sending NEW_LOOKUP to the control port. The
++ * answer is not a reply: it is the ordinary NEW_SERVER the service announces, which remote_server() already records, so
++ * the owner looks for the result with qcom_qrtr_lookup_found(). instance is the ANNOUNCED form (version | instance << 8),
++ * which is what Linux's qmi_interface.c sends and what our NEW_SERVER lines print.
++ * Returns 0 when the request was queued, -1 when it could not be (no hello yet from the remote, so no node to ask).
++ * Waiting, and saying so when nothing comes back, is the owner's: this never blocks. */
++int qcom_qrtr_lookup(QcomQrtr *q, uint32_t service, uint32_t instance);
++/* 1 and the node and port when the asked-for service is in the remote list, 0 when it is not. instance as announced;
++ * pass 0 to accept any. */
++int qcom_qrtr_lookup_found(const QcomQrtr *q, uint32_t service, uint32_t instance, uint32_t *node, uint32_t *port);
++/* Drops one of our services from the list, so its port stops being polled. 0, or -1 when it was not there. Nothing is
++ * announced or sent: a client port (service 0) was never announced to the remote, so there is nothing to withdraw. */
++int qcom_qrtr_remove_service(QcomQrtr *q, uint32_t port);
++
+ /* ---- QMI messages carried in data packets: a 7-byte header (type, transaction, message id, length) and TLVs ---- */
+ #define QCOM_QMI_HEADER 7u
+ enum {QCOM_QMI_REQUEST = 0, QCOM_QMI_RESPONSE = 2, QCOM_QMI_INDICATION = 4};
+diff --git a/bsd/dev/sweet_wpss.c b/bsd/dev/sweet_wpss.c
+index 5373a7066..23dce3e4f 100644
+--- a/bsd/dev/sweet_wpss.c
++++ b/bsd/dev/sweet_wpss.c
+@@ -28,6 +28,10 @@ static void wpss_worker(void *arg,wait_result_t wait){
+   /* 2246: W3. Same start as W2b, plus the GLINK and QRTR edge, nothing sent on it. */
+   printf("SWEET WIFI: W3 worker begin; WPSS start plus the GLINK/QRTR edge\n");sweet_log_sync();
+   printf("SWEET WIFI: W2 worker final_error=%d\n",wpss_run(WpssGlink));
++ } else if(arg==(void *)WpssWlfw){
++  /* 2248: W4. W3's edge, plus the WLFW QMI client: lookup, four requests, then the proven stop. */
++  printf("SWEET WIFI: W4 worker begin; WPSS start, the GLINK/QRTR edge and the WLFW client\n");sweet_log_sync();
++  printf("SWEET WIFI: W2 worker final_error=%d\n",wpss_run(WpssWlfw));
+  } else printf("SWEET WIFI: W2 worker final_error=%d\n",wpss_run(WpssStart));
+  sweet_log_sync();thread_terminate(current_thread());
+ }
+diff --git a/bsd/dev/wifi/WlfwQmi.h b/bsd/dev/wifi/WlfwQmi.h
+new file mode 100644
+index 000000000..2288b1732
+--- /dev/null
++++ b/bsd/dev/wifi/WlfwQmi.h
+@@ -0,0 +1,282 @@
++/* 2248 (W4): the WLFW QMI messages, encoded and decoded here from scratch.
++ *
++ * WLFW is the Wi-Fi firmware's own QMI service, the one it announces on the WPSS's QRTR. This file holds the three
++ * requests stage 2 sends first (IND_REGISTER, HOST_CAP, and the two empty ones, CAP and DEVICE_INFO) and the replies'
++ * decoders. Nothing else: the board data download is the boot after this one.
++ *
++ * Where every number comes from. Message ids, TLV numbers and field layouts are from ath11k (the Linux driver for this
++ * chip family, BSD-3-Clause-Clear), read as declarations only:
++ *   drivers/net/wireless/ath/ath11k/qmi.h   the QMI_WLANFW_*_REQ_V01 / QMI_WLFW_*_IND_V01 ids, the service id, version
++ *                                          and instance, QMI_WLANFW_CLIENT_ID, and the message structures
++ *   drivers/net/wireless/ath/ath11k/qmi.c   the qmi_elem_info tables, which say which TLV number each field rides in,
++ *                                          and ath11k_qmi_fw_ind_register_send() / ath11k_qmi_host_cap_send() for which
++ *                                          fields are filled for a chip with fixed firmware memory
++ *   drivers/net/wireless/ath/ath11k/core.c  the "wcn6750 hw1.0" entry: fixed_fw_mem = true, internal_sleep_clock = false,
++ *                                          fw_mem_mode = 0, qmi_service_ins_id = 0x03
++ * No code, table or comment text is copied from ath11k or from any GPL file (Linux's qmi_encdec.c, qmi_interface.c or
++ * the reference port's drivers). Each function below is written against those declarations, and the bytes it produces
++ * are pinned by hand in 3a-IOS/tools/wifi/tests/wlfw.c.
++ *
++ * The framing is QMI version 1: a 7-byte header of type (1), transaction (2, little-endian), message id (2, LE) and
++ * payload length (2, LE), then type-length-value triples of type (1), length (2, LE) and value. The same framing this
++ * tree already speaks in qcom_servloc_answer() (modem/QcomQrtr.c), so it is not new protocol code.
++ *
++ * Every function is bounded by the caller's capacity and returns 0 rather than a partial message.
++ */
++#ifndef WLFW_QMI_H
++#define WLFW_QMI_H
++#include <stdint.h>
++#include <stddef.h>
++
++/* ---- the service, as the phone announces it --------------------------------------------------------------- */
++/* ath11k qmi.h: ATH11K_QMI_WLFW_SERVICE_ID_V01 0x45, ATH11K_QMI_WLFW_SERVICE_VERS_V01 0x01,
++ * ATH11K_QMI_WLFW_SERVICE_INS_ID_V01_WCN6750 0x03. Linux's QMI announces and looks up
++ * `version | instance << 8` (qmi_interface.c qmi_send_new_lookup), so the announced instance is 0x301. The ast222 W3
++ * boot printed exactly that: `W3 qrtr NEW_SERVER service=0x45 instance=0x301`. The plan's table said instance 1,
++ * which is QCA6390's value; the phone settles it. */
++#define WLFW_SERVICE 0x45u
++#define WLFW_VERSION 0x01u
++#define WLFW_INSTANCE 0x03u
++#define WLFW_ANNOUNCED (WLFW_VERSION | (WLFW_INSTANCE << 8))   /* 0x301 */
++
++/* ath11k qmi.h QMI_WLANFW_CLIENT_ID: the four bytes "LENK" little-endian, the host's own tag. */
++#define WLFW_CLIENT_ID 0x4b4e454cu
++
++/* ---- message ids (ath11k qmi.h) --------------------------------------------------------------------------- */
++#define WLFW_IND_REGISTER_REQ 0x0020u
++#define WLFW_HOST_CAP_REQ 0x0034u
++#define WLFW_CAP_REQ 0x0024u
++#define WLFW_DEVICE_INFO_REQ 0x004Cu
++#define WLFW_FW_READY_IND 0x0021u          /* QMI_WLFW_FW_READY_IND_V01 */
++#define WLFW_REQUEST_MEM_IND 0x0035u       /* QMI_WLFW_REQUEST_MEM_IND_V01 */
++#define WLFW_FW_MEM_READY_IND 0x0037u      /* QMI_WLFW_FW_MEM_READY_IND_V01 */
++#define WLFW_FW_INIT_DONE_IND 0x0038u      /* QMI_WLFW_FW_INIT_DONE_IND_V01 */
++#define WLFW_COLD_BOOT_CAL_DONE_IND 0x003Eu /* QMI_WLFW_COLD_BOOT_CAL_DONE_IND_V01 */
++
++/* ---- TLV numbers, from the qmi_elem_info tables in ath11k qmi.c ------------------------------------------- */
++#define WLFW_TLV_RESULT 0x02u          /* qmi_response_type_v01: u16 result, u16 error, in every response */
++#define WLFW_TLV_FW_READY 0x10u        /* ind_register: u8 fw_ready_enable */
++#define WLFW_TLV_CLIENT_ID 0x15u       /* ind_register: u32 client_id */
++#define WLFW_TLV_FW_INIT_DONE 0x18u    /* ind_register: u8 fw_init_done_enable */
++#define WLFW_TLV_CAL_DONE_ENABLE 0x1Bu /* ind_register: u8 cal_done_enable */
++#define WLFW_TLV_NUM_CLIENTS 0x10u     /* host_cap: u32 num_clients */
++#define WLFW_TLV_BDF_SUPPORT 0x14u     /* host_cap: u8 bdf_support */
++#define WLFW_TLV_HOST_CAL_DONE 0x1Au   /* host_cap: u8 cal_done, NOT 0x1B: in host_cap 0x1B is mem_bucket */
++#define WLFW_TLV_MEM_CFG_MODE 0x1Cu    /* host_cap: u8 mem_cfg_mode */
++#define WLFW_TLV_CHIP_INFO 0x10u       /* cap response: u32 chip_id, u32 chip_family */
++#define WLFW_TLV_BOARD_INFO 0x11u      /* cap response: u32 board_id */
++#define WLFW_TLV_SOC_INFO 0x12u        /* cap response: u32 soc_id */
++#define WLFW_TLV_BAR_ADDR 0x10u        /* device_info response: u64 bar_addr */
++#define WLFW_TLV_BAR_SIZE 0x11u        /* device_info response: u32 bar_size */
++/* The same TLV number means a different field in a different message: that is QMI, and it is why each name above says
++ * which message it belongs to. */
++
++#define WLFW_HEADER 7u
++enum {WLFW_REQUEST = 0, WLFW_RESPONSE = 2, WLFW_INDICATION = 4};
++
++/* ---- little-endian helpers -------------------------------------------------------------------------------- */
++static inline void wlfw_put16(uint8_t *p, uint32_t v) {p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);}
++static inline void wlfw_put32(uint8_t *p, uint32_t v) {wlfw_put16(p, v); wlfw_put16(p + 2, v >> 16);}
++static inline void wlfw_put64(uint8_t *p, uint64_t v) {wlfw_put32(p, (uint32_t)v); wlfw_put32(p + 4, (uint32_t)(v >> 32));}
++static inline uint32_t wlfw_get16(const uint8_t *p) {return (uint32_t)p[0] | (uint32_t)p[1] << 8;}
++static inline uint32_t wlfw_get32(const uint8_t *p) {return wlfw_get16(p) | wlfw_get16(p + 2) << 16;}
++static inline uint64_t wlfw_get64(const uint8_t *p) {return (uint64_t)wlfw_get32(p) | (uint64_t)wlfw_get32(p + 4) << 32;}
++
++/* ---- encoding --------------------------------------------------------------------------------------------- */
++/* Opens a message: header with a zero length, filled in by wlfw_end. Returns the offset for the first TLV, or 0. */
++static inline uint32_t wlfw_begin(uint8_t *out, uint32_t capacity, uint8_t type, uint16_t transaction, uint16_t message)
++{
++    if (!out || capacity < WLFW_HEADER) return 0;
++    out[0] = type;
++    wlfw_put16(out + 1, transaction);
++    wlfw_put16(out + 3, message);
++    wlfw_put16(out + 5, 0);
++    return WLFW_HEADER;
++}
++/* Closes it: the payload length is everything after the header. 0 when it cannot be a message. */
++static inline uint32_t wlfw_end(uint8_t *out, uint32_t at)
++{
++    if (!out || at < WLFW_HEADER || at - WLFW_HEADER > 0xffffu) return 0;
++    wlfw_put16(out + 5, at - WLFW_HEADER);
++    return at;
++}
++/* One TLV. value may be null for a run of zeros. Returns the next offset, or 0 when it does not fit. */
++static inline uint32_t wlfw_tlv(uint8_t *out, uint32_t capacity, uint32_t at, uint8_t type, const uint8_t *value,
++                                uint32_t bytes)
++{
++    if (!out || at < WLFW_HEADER || bytes > 0xffffu || at + 3 + bytes > capacity) return 0;
++    out[at] = type;
++    wlfw_put16(out + at + 1, bytes);
++    for (uint32_t i = 0; i < bytes; ++i) out[at + 3 + i] = value ? value[i] : 0;
++    return at + 3 + bytes;
++}
++
++/* IND_REGISTER (0x0020): the indications the host wants. ath11k_qmi_fw_ind_register_send fills exactly these four for a
++ * chip with fixed firmware memory: fw_ready_enable, client_id, fw_init_done_enable and cal_done_enable. It leaves
++ * request_mem_enable and fw_mem_ready_enable unset because WCN6750 has fixed firmware memory (core.c fixed_fw_mem =
++ * true), and pin_connect_result_enable unset. 26 bytes: 7 header, then 4, 7, 4 and 4. */
++static inline uint32_t wlfw_ind_register(uint8_t *out, uint32_t capacity, uint16_t transaction)
++{
++    uint32_t at = wlfw_begin(out, capacity, WLFW_REQUEST, transaction, WLFW_IND_REGISTER_REQ);
++    if (!at) return 0;
++    const uint8_t on = 1, zero[4] = {0};
++    uint8_t client[4];
++    wlfw_put32(client, WLFW_CLIENT_ID);
++    if (!(at = wlfw_tlv(out, capacity, at, WLFW_TLV_FW_READY, &on, 1))) return 0;
++    if (!(at = wlfw_tlv(out, capacity, at, WLFW_TLV_CLIENT_ID, client, 4))) return 0;
++    if (!(at = wlfw_tlv(out, capacity, at, WLFW_TLV_FW_INIT_DONE, &on, 1))) return 0;
++    if (!(at = wlfw_tlv(out, capacity, at, WLFW_TLV_CAL_DONE_ENABLE, &on, 1))) return 0;
++    (void)zero;
++    return wlfw_end(out, at);
++}
++
++/* HOST_CAP (0x0034): what the host can do. From ath11k_qmi_host_cap_send with this chip's parameters: num_clients 1,
++ * bdf_support 1, cal_done 0 (cold boot calibration has not run yet), mem_cfg_mode = target_mem_mode = fw_mem_mode = 0.
++ * m3_support is not set (m3_fw_support false) and nm_modem is not set (internal_sleep_clock false), so neither rides
++ * on this wire. 26 bytes: 7 header, then 7, 4, 4 and 4.
++ *
++ * cal_done rides TLV 0x1A here, not 0x1B: in host_cap 0x1B is mem_bucket (a u32) and 0x1C is mem_cfg_mode. Getting
++ * that one number wrong would put a byte where the firmware reads a four-byte bucket, so it has its own name above. */
++static inline uint32_t wlfw_host_cap(uint8_t *out, uint32_t capacity, uint16_t transaction)
++{
++    uint32_t at = wlfw_begin(out, capacity, WLFW_REQUEST, transaction, WLFW_HOST_CAP_REQ);
++    if (!at) return 0;
++    const uint8_t on = 1, off = 0;
++    uint8_t clients[4];
++    wlfw_put32(clients, 1);
++    if (!(at = wlfw_tlv(out, capacity, at, WLFW_TLV_NUM_CLIENTS, clients, 4))) return 0;
++    if (!(at = wlfw_tlv(out, capacity, at, WLFW_TLV_BDF_SUPPORT, &on, 1))) return 0;
++    if (!(at = wlfw_tlv(out, capacity, at, WLFW_TLV_HOST_CAL_DONE, &off, 1))) return 0;
++    if (!(at = wlfw_tlv(out, capacity, at, WLFW_TLV_MEM_CFG_MODE, &off, 1))) return 0;
++    return wlfw_end(out, at);
++}
++
++/* CAP (0x0024) and DEVICE_INFO (0x004C): both requests are empty (their qmi_elem_info tables hold only the end
++ * marker), so 7 bytes and no TLV at all. */
++static inline uint32_t wlfw_empty_request(uint8_t *out, uint32_t capacity, uint16_t transaction, uint16_t message)
++{
++    const uint32_t at = wlfw_begin(out, capacity, WLFW_REQUEST, transaction, message);
++    return at ? wlfw_end(out, at) : 0;
++}
++
++/* ---- decoding --------------------------------------------------------------------------------------------- */
++typedef struct {
++    uint8_t type;
++    uint16_t transaction, message;
++    uint32_t length;          /* the header's payload length */
++    int result_valid;
++    uint16_t result, error;   /* TLV 0x02: 0 success, 0 no error */
++} WlfwMessage;
++
++/* Parses the header and validates the TLV chain, and lifts the result out. Returns 0, or -1 when the message is not a
++ * well-formed QMI message of exactly bytes length (a short one, a length that disagrees, a TLV that overruns). */
++static inline int wlfw_parse(const uint8_t *data, uint32_t bytes, WlfwMessage *m)
++{
++    if (!data || !m || bytes < WLFW_HEADER) return -1;
++    m->type = data[0];
++    m->transaction = (uint16_t)wlfw_get16(data + 1);
++    m->message = (uint16_t)wlfw_get16(data + 3);
++    m->length = wlfw_get16(data + 5);
++    m->result_valid = 0;
++    m->result = m->error = 0;
++    if (m->length != bytes - WLFW_HEADER) return -1;
++    for (uint32_t at = WLFW_HEADER; at < bytes;) {
++        if (bytes - at < 3) return -1;
++        const uint32_t n = wlfw_get16(data + at + 1);
++        if (n > bytes - at - 3) return -1;
++        if (data[at] == WLFW_TLV_RESULT) {
++            if (n != 4) return -1;
++            m->result_valid = 1;
++            m->result = (uint16_t)wlfw_get16(data + at + 3);
++            m->error = (uint16_t)wlfw_get16(data + at + 5);
++        }
++        at += 3 + n;
++    }
++    return 0;
++}
++
++/* The value of TLV type: 0 and its size in *size, 1 when there is no such TLV, -1 when the chain is malformed. */
++static inline int wlfw_tlv_find(const uint8_t *data, uint32_t bytes, uint8_t type, const uint8_t **value, uint32_t *size)
++{
++    if (!data || bytes < WLFW_HEADER) return -1;
++    if (wlfw_get16(data + 5) != bytes - WLFW_HEADER) return -1;
++    for (uint32_t at = WLFW_HEADER; at < bytes;) {
++        if (bytes - at < 3) return -1;
++        const uint32_t n = wlfw_get16(data + at + 1);
++        if (n > bytes - at - 3) return -1;
++        if (data[at] == type) {*value = data + at + 3; *size = n; return 0;}
++        at += 3 + n;
++    }
++    return 1;
++}
++
++/* The CAP response's board id (TLV 0x11, u32). 0 and the id in *board, 1 when the firmware sent none (the reference
++ * port's firmware sends none and ath11k then takes 0xff), -1 when the TLV is there but not four bytes. */
++static inline int wlfw_board_id(const uint8_t *data, uint32_t bytes, uint32_t *board)
++{
++    const uint8_t *v = 0;
++    uint32_t n = 0;
++    const int rc = wlfw_tlv_find(data, bytes, WLFW_TLV_BOARD_INFO, &v, &n);
++    if (rc) return rc;
++    if (n != 4) return -1;
++    *board = wlfw_get32(v);
++    return 0;
++}
++
++/* The CAP response's chip identity (TLV 0x10, two u32s: chip_id then chip_family). 0, 1 when absent, -1 when short. */
++static inline int wlfw_chip_info(const uint8_t *data, uint32_t bytes, uint32_t *chip, uint32_t *family)
++{
++    const uint8_t *v = 0;
++    uint32_t n = 0;
++    const int rc = wlfw_tlv_find(data, bytes, WLFW_TLV_CHIP_INFO, &v, &n);
++    if (rc) return rc;
++    if (n != 8) return -1;
++    *chip = wlfw_get32(v);
++    *family = wlfw_get32(v + 4);
++    return 0;
++}
++
++/* The DEVICE_INFO response's register window (TLV 0x10 u64 bar_addr, TLV 0x11 u32 bar_size). Recorded, never mapped:
++ * reading that window before mission mode ended the reference port's kernel (hakios.wifi.c:55-58). 0, or 1 when either
++ * is absent (both are optional), -1 when one is the wrong size. */
++static inline int wlfw_device_info(const uint8_t *data, uint32_t bytes, uint64_t *addr, uint32_t *size)
++{
++    const uint8_t *v = 0;
++    uint32_t n = 0;
++    int rc = wlfw_tlv_find(data, bytes, WLFW_TLV_BAR_ADDR, &v, &n);
++    if (rc) return rc;
++    if (n != 8) return -1;
++    *addr = wlfw_get64(v);
++    rc = wlfw_tlv_find(data, bytes, WLFW_TLV_BAR_SIZE, &v, &n);
++    if (rc) return rc;
++    if (n != 4) return -1;
++    *size = wlfw_get32(v);
++    return 0;
++}
++
++/* A request's name for the log, or "unknown". Ids only: nothing here is a name, an address or a byte of firmware. */
++static inline const char *wlfw_name(uint16_t message)
++{
++    switch (message) {
++    case WLFW_IND_REGISTER_REQ: return "ind_register";
++    case WLFW_HOST_CAP_REQ: return "host_cap";
++    case WLFW_CAP_REQ: return "cap";
++    case WLFW_DEVICE_INFO_REQ: return "device_info";
++    default: return "unknown";
++    }
++}
++
++/* An indication's name, for the same reason: so a firmware that volunteers one is not a number in the log. */
++static inline const char *wlfw_indication_name(uint16_t message)
++{
++    switch (message) {
++    case WLFW_FW_READY_IND: return "fw_ready";
++    case WLFW_REQUEST_MEM_IND: return "request_mem";
++    case WLFW_FW_MEM_READY_IND: return "fw_mem_ready";
++    case WLFW_FW_INIT_DONE_IND: return "fw_init_done";
++    case WLFW_COLD_BOOT_CAL_DONE_IND: return "cold_boot_cal_done";
++    default: return "unknown";
++    }
++}
++
++#endif
+diff --git a/bsd/dev/wifi/WpssGate.h b/bsd/dev/wifi/WpssGate.h
+index a0cc9d54f..fb53db4ac 100644
+--- a/bsd/dev/wifi/WpssGate.h
++++ b/bsd/dev/wifi/WpssGate.h
+@@ -8,7 +8,11 @@
+ /* 2246: sweetwglink=1 is W3, the WPSS edge with GLINK and QRTR up and nothing sent on them. It is the first Wi-Fi gate that
+  * is ALLOWED to run beside the daily preset, because proving coexistence is its whole purpose; it refuses the other Wi-Fi
+  * probes and nothing else. Every gate that starts the DSP still needs the same three safeguards. */
+-enum {WpssOff=0,WpssSurvey=1,WpssStart=2,WpssPin=3,WpssGlink=4,WpssRefused=-1};
++/* 2248: sweetwlfw=1 is W4, the WLFW QMI client on that edge: the lookup, IND_REGISTER, HOST_CAP, CAP and DEVICE_INFO,
++ * and then the proven stop. It has exactly the W3 gate's rules, including the right to run beside a preset, because it
++ * is the same edge with a conversation on it. What it sends is four QMI requests and nothing else; no board data, no
++ * mode, no register window. */
++enum {WpssOff=0,WpssSurvey=1,WpssStart=2,WpssPin=3,WpssGlink=4,WpssWlfw=5,WpssRefused=-1};
+ /* Refused in any form: the presets, the battery's own gates, and every modem, IPA and battery-test gate ModemGate.h lists
+  * (modem_cell_gates, modem_cell_refused, modem_daily_refused), so the list cannot fall behind it. */
+ static const char *const wpss_refused[5]={"sweetdaily","sweetcell","sweetbatt","sweetbmeter","sweetbprobe"};
+@@ -19,27 +23,42 @@ static inline int wpss_conflict(const char *args){
+     for(unsigned i=0;i<5;i++)if(modem_arg_count(args,modem_daily_refused[i]))return 1;
+     return 0;
+ }
++/* 2248: the rules the two edge gates share, and they must not drift apart: W4 is W3 plus a conversation, so anything W3
++ * refuses W4 refuses too. Returns WpssRefused when the line is not a valid edge boot of this kind. */
++static inline int wpss_edge_gate(const char *args,int deadman,const char *self){
++    if(!modem_arg_is(args,self,"1"))return WpssRefused;
++    if(modem_arg_count(args,"sweetdaily") && modem_arg_count(args,"sweetcell"))return WpssRefused;
++    if(modem_arg_count(args,"sweetbatt") || modem_arg_count(args,"sweetbmeter") || modem_arg_count(args,"sweetbprobe"))return WpssRefused;
++    for(unsigned i=0;i<14;i++)if(modem_arg_count(args,modem_cell_gates[i]))return WpssRefused;
++    for(unsigned i=0;i<8;i++)if(modem_arg_count(args,modem_cell_refused[i]))return WpssRefused;
++    for(unsigned i=0;i<5;i++)if(modem_arg_count(args,modem_daily_refused[i]))return WpssRefused;
++    /* The other Wi-Fi gates, each named: two of them at once is not a boot any of them describes. self is skipped:
++     * this function is called for the gate that is present. */
++    if(modem_arg_count(args,"sweetwprobe") || modem_arg_count(args,"sweetwpin") || modem_arg_count(args,"sweetwpss"))return WpssRefused;
++    if(!modem_same(self,"sweetwglink") && modem_arg_count(args,"sweetwglink"))return WpssRefused;
++    if(!modem_same(self,"sweetwlfw") && modem_arg_count(args,"sweetwlfw"))return WpssRefused;
++    if(!modem_gate(args,"sweetfbarm") || !modem_gate(args,"sweetselftest") || deadman!=600)return WpssRefused;
++    return 0;
++}
+ static inline int wpss_gate(const char *args,int deadman){
+     unsigned probe=modem_arg_count(args,"sweetwprobe"),start=modem_arg_count(args,"sweetwpss"),pin=modem_arg_count(args,"sweetwpin");
+-    unsigned glink=modem_arg_count(args,"sweetwglink");
+-    if(!probe && !start && !pin && !glink)return WpssOff;
+-    if((probe!=0)+(start!=0)+(pin!=0)+(glink!=0)>1)return WpssRefused;
++    unsigned glink=modem_arg_count(args,"sweetwglink"),wlfw=modem_arg_count(args,"sweetwlfw");
++    if(!probe && !start && !pin && !glink && !wlfw)return WpssOff;
++    if((probe!=0)+(start!=0)+(pin!=0)+(glink!=0)+(wlfw!=0)>1)return WpssRefused;
+     /* 2246: W3 is the coexistence gate. It is the one Wi-Fi gate allowed beside a preset, because proving coexistence is its
+      * whole purpose, so sweetdaily=1 or sweetcell=1 may be present and the preset decides its own members. Every member and
+      * probe token named literally is refused instead: a preset plus one of its own members is an invalid preset
+      * (ModemGate.h's modem_daily/modem_cell return 0 for it), so it must not be read as a valid daily boot either. Two
+      * presets at once are refused too. */
+     if(glink){
+-        if(!modem_arg_is(args,"sweetwglink","1"))return WpssRefused;
+-        if(modem_arg_count(args,"sweetdaily") && modem_arg_count(args,"sweetcell"))return WpssRefused;
+-        if(modem_arg_count(args,"sweetbatt") || modem_arg_count(args,"sweetbmeter") || modem_arg_count(args,"sweetbprobe"))return WpssRefused;
+-        for(unsigned i=0;i<14;i++)if(modem_arg_count(args,modem_cell_gates[i]))return WpssRefused;
+-        for(unsigned i=0;i<8;i++)if(modem_arg_count(args,modem_cell_refused[i]))return WpssRefused;
+-        for(unsigned i=0;i<5;i++)if(modem_arg_count(args,modem_daily_refused[i]))return WpssRefused;
+-        if(modem_arg_is(args,"sweetwprobe","1") || modem_arg_is(args,"sweetwpin","1") || modem_arg_is(args,"sweetwpss","1"))return WpssRefused;
+-        if(!modem_gate(args,"sweetfbarm") || !modem_gate(args,"sweetselftest") || deadman!=600)return WpssRefused;
++        if(wpss_edge_gate(args,deadman,"sweetwglink"))return WpssRefused;
+         return WpssGlink;
+     }
++    /* 2248: W4, the same rules, and it must name itself and nothing else of ours. */
++    if(wlfw){
++        if(wpss_edge_gate(args,deadman,"sweetwlfw"))return WpssRefused;
++        return WpssWlfw;
++    }
+     if(wpss_conflict(args))return WpssRefused;
+     if(probe)return modem_arg_is(args,"sweetwprobe","1")?WpssSurvey:WpssRefused;
+     if(!modem_arg_is(args,pin?"sweetwpin":"sweetwpss","1") || !modem_gate(args,"sweetfbarm") || !modem_gate(args,"sweetselftest") || deadman!=600)
+diff --git a/bsd/dev/wifi/WpssRuntime.inc b/bsd/dev/wifi/WpssRuntime.inc
+index 9a0568759..da3d0e246 100644
+--- a/bsd/dev/wifi/WpssRuntime.inc
++++ b/bsd/dev/wifi/WpssRuntime.inc
+@@ -38,11 +38,21 @@ extern int sweet_ufs_part_size(const char *,uint8_t *,uint64_t *);
+ /* 2246 (W3): the same GLINK and QRTR the battery and modem paths use, one instance on the WPSS edge. */
+ #include "../modem/QcomGlink.h"
+ #include "../modem/QcomQrtr.h"
++/* 2248 (W4): the WLFW client's messages, encoded and decoded here from the ath11k declarations (see that file). */
++#include "WlfwQmi.h"
+ #define ADSP_FW_LOG "SWEET WIFI"
+ #include "../battery/AdspFirmware.inc"
+ static int adsp_part_read(uint64_t off,void *dst,uint64_t bytes){return sweet_ufs_read_part("modem_a",off,dst,bytes);}
+ /* 2246: defined with the rest of the W3 link code further down; w_cleanup runs before it in the file. */
+ static void w_glink_close(void);
++/* 2248: one QRTR client port for the WLFW conversation. Service ids and port numbers above 0 are this side's own
++ * numbers; QcomQrtr's announce() skips whatever has service 0, so this port is never announced to the WPSS: a QMI
++ * client announces nothing; its requests are addressed to the server's port, not to one of ours. */
++#define W_WLFW_PORT 0x4001u
++static void w_wlfw_close(void);
++/* 2248: the client's open and poll, used by w_glink_open and w_glink_poll before they are defined below. */
++static int w_wlfw_open(void);
++static void w_wlfw_poll(void);
+ 
+ #define W_SM_PA 0x81d00000u
+ #define W_SM_SIZE 0x200000u
+@@ -88,6 +98,19 @@ static struct {
+  /* 2247: hello_waiting logs once when the link is up but the WPSS has advertised no intent to send into, so a boot
+   * where our HELLO never left cannot be mistaken for a silent firmware (W3 audit note 9). */
+  bool hello_waiting;
++ /* 2248 (W4): the WLFW QMI conversation. wlfw_asked is the gate, and it also opens the edge, because the client needs
++  * it. The steps run one at a time from the poll, each with its own deadline, so nothing here waits with the worker
++  * held past a bound. wlfw_step is how far it got, and it is what the closing line reports. */
++ bool wlfw_asked,wlfw_sent,wlfw_opened;
++ uint32_t wlfw_step,wlfw_port,wlfw_rport,wlfw_node,wlfw_board,wlfw_chip,wlfw_family,wlfw_bar_size,wlfw_result,wlfw_error;
++ /* 2248b: wlfw_dwell_end is the handover-based end of the 20 s dwell, and every reply deadline is clamped to it, so the
++  * exchange cannot run past the stop (W4 audit defect 3: the worst case was 23 s against a 20 s dwell). wlfw_sent_at is
++  * when the outstanding request went out, so the timeout line prints the wait that actually happened rather than the
++  * constant. wlfw_replies counts accepted replies, which is what the close line reports as answered. */
++ uint64_t wlfw_bar_addr,wlfw_deadline,wlfw_next_try,wlfw_asked_at,wlfw_dwell_end,wlfw_sent_at;
++ uint16_t wlfw_transaction;
++ unsigned wlfw_tx,wlfw_indications,wlfw_replies,wlfw_foreign,wlfw_unexpected,wlfw_mismatched;
++ uint8_t wlfw_buf[64];
+  uint32_t desc_off,our_fifo_off,their_fifo_off;
+  uint64_t link_began,ch_up_at;
+  int master;
+@@ -353,9 +376,13 @@ static void w_state_probe(void){
+  * The wait is also bounded by whether the DSP ever said it was up: a DSP that never reported ready cannot answer a
+  * stop request, so 3 s of waiting is 3 s of a wedged DSP still running with its watchdog armed. */
+ /* 2246: the link goes down before the DSP is asked to stop, so the DSP sees IPCRTR close first, as its own teardown
+- * order expects. Closing our side sends only the link's own bookkeeping; no payload is ever sent in W3. */
++ * order expects. Closing our side sends only the link's own bookkeeping; no payload is ever sent in W3.
++ * 2248 (W4): the WLFW client goes first, and it goes first for a protocol reason, not tidiness. Its port is one the
++ * remote knows about, so a reply that arrived before we dropped the port would be routed to a callback that no longer
++ * exists; dropping it stops that routing before the link does. w_wlfw_close sends nothing. */
+ static bool w_cleanup(void){
+  bool acked=false;
++ w_wlfw_close();
+  w_glink_close();
+  if(w.started && w.sp.out){
+   bool was_ready=!!(w.state&2);
+@@ -485,6 +512,9 @@ static int w_glink_open(void){
+  printf("SWEET WIFI: W3 glink opened desc=%#x our_fifo=%#x tx=%u our_intents=%u channel=%s; waiting for the WPSS's FIFO\n",
+   w.desc_off,w.our_fifo_off,W_GLINK_FIFO,W_GLINK_INTENT_COUNT,"IPCRTR");
+  sweet_log_sync();
++ /* 2248: the client's port is opened before QRTR starts, so it is in the table when the first reply lands. The
++  * conversation itself starts only when QRTR has said hello, which w_wlfw_poll checks. */
++ if(w.wlfw_asked){const int wrc=w_wlfw_open();if(wrc){printf("SWEET WIFI: W4 wlfw open failed error=%d\n",wrc);return wrc;}}
+  return 0;
+ }
+ /* 2247: how long the link may be up with no intent from the WPSS before we say the HELLO is waiting. The intent arrives a
+@@ -532,6 +562,9 @@ static void w_glink_poll(void){
+   }
+  }
+  if(w.qr_started && qcom_qrtr_poll(&w.qr)){printf("SWEET WIFI: W3 qrtr resume failed\n");sweet_log_sync();}
++ /* 2248: the WLFW conversation, one bounded step per poll, after QRTR has drained, so a reply that arrived in this
++  * same poll is already in the remote list when the lookup is checked. */
++ w_wlfw_poll();
+ }
+ /* Reports the link's counters on the way out, before the SMP2P stop.
+  * 2247: this does NOT send a GLINK CLOSE. `QcomGlink` has no close call, so the DSP never sees IPCRTR go down; the 2246
+@@ -541,6 +574,9 @@ static void w_glink_poll(void){
+  * It is a log line and a flag reset: no loop, so it cannot hang, and it returns at once when the link never opened. */
+ static void w_glink_close(void){
+  if(!w.link_started)return;
++ /* 2248: w_wlfw_close runs first, and this says so if it ever does not. A reply routed to a port that is already gone is
++  * the failure the order exists to prevent, and it would otherwise be silent. */
++ if(w.wlfw_opened)printf("SWEET WIFI: W4 wlfw close order wrong: the link closed while the client port was still open\n");
+  printf("SWEET WIFI: W3 glink close: up=%u rx_messages=%u tx_messages=%u rx_data=%u dropped=%u unknown_opens=%u broken=%u\n",
+   w.glink_up,w.gl.rx_messages,w.gl.tx_messages,w.gl.rx_data,w.gl.dropped,w.gl.unknown_opens,w.glink_broken);
+  if(w.gl.unknown_names[0])printf("SWEET WIFI: W3 glink unserved channels: %s\n",w.gl.unknown_names);
+@@ -550,8 +586,303 @@ static void w_glink_close(void){
+  if(!w.qr_started && w.glink_up)printf("SWEET WIFI: W3 qrtr hello never sent: no intent from the WPSS, so our side never spoke\n");
+  w.link_started=false;w.glink_up=false;w.hello_waiting=false;
+ }
++
++/* ---- 2248 (W4, stage 2 L1+L2's first exchange): the WLFW QMI client --------------------------------------------------
++ * The WPSS announces WLFW (service 0x45, instance 0x301) on its QRTR, and the firmware conversation happens over a data
++ * port on that service: we look the service up through the name service, open our own client port, and send QMI requests
++ * to the port the announcement gave. Four requests, in ath11k's order for this chip (qmi.c ath11k_qmi_event_server_arrive,
++ * ath11k_qmi_event_load_bdf and ath11k_qmi_request_device_info):
++ *
++ *   1. IND_REGISTER   which indications we want: fw_ready, fw_init_done, cal_done, and the client id
++ *   2. HOST_CAP       what the host can do: one client, board data support, no cold-boot calibration yet
++ *   3. CAP            empty; the reply carries the board id and the chip identity
++ *   4. DEVICE_INFO    empty; the reply carries the radio's register window, which is recorded and NEVER mapped
++ *
++ * Then it stops. The board data download (regdb and a bdwlan variant) is the boot after this one: those are pieces of
++ * modem_a and its acceptance is a different question from whether the firmware answers at all.
++ *
++ * Every step is bounded and every outcome is a line. A step that runs out of time says which step, leaves the rest
++ * unsent, and the run still ends in the W2b stop. Nothing here blocks the worker: each step is a poll iteration, and
++ * the deadline is checked against the same clock the dwell uses.
++ *
++ * What is NOT here, deliberately: no WLAN_MODE_REQ (mission mode is L3, its own plan and audit), no bdf download, no
++ * register window mapping, and nothing that writes a rail, a pin or a partition. */
++#define W_L1_MS 3000u        /* the name service, from the hello to the NEW_SERVER */
++#define W_W4_REPLY_MS 5000u  /* each request's reply, well inside ath11k's own 10 s QMI timeout */
++#define W_W4_GAP_MS 50u      /* between requests: ath11k's event work queue is not instantaneous either */
++/* The steps, in order, starting at 0 so that the cleared state and the first step are the same thing: a client that has
++ * not started yet is waiting for the lookup. Getting that wrong once already made the whole sequence skip silently. */
++enum {W4Lookup=0,W4IndRegister,W4HostCap,W4Cap,W4DeviceInfo,W4Done};
++static const char *const w4_step_name[]={"lookup","ind_register","host_cap","cap","device_info","done"};
++#define W4_STEPS (sizeof(w4_step_name)/sizeof(w4_step_name[0]))
++/* 2248b (W4 audit defect 1): every lookup of w4_step_name goes through this. The array has W4_STEPS entries and the step
++ * is a uint32_t that the receive path can, in principle, advance; a bare w4_step_name[w.wlfw_step] would read past the
++ * array in rodata on the close path and dereference whatever followed it. Clamped so no index can go out of bounds,
++ * whatever the step holds. */
++static const char *w4_step_str(uint32_t step){return w4_step_name[step<W4_STEPS?step:W4Done];}
++/* The message id a step's request carries. 0 for a step that sends nothing (the lookup and done): the receive path
++ * uses it to require that a reply is the answer to the request that is actually outstanding. */
++static uint16_t w4_step_message(uint32_t step){
++ switch(step){
++ case W4IndRegister: return WLFW_IND_REGISTER_REQ;
++ case W4HostCap: return WLFW_HOST_CAP_REQ;
++ case W4Cap: return WLFW_CAP_REQ;
++ case W4DeviceInfo: return WLFW_DEVICE_INFO_REQ;
++ default: return 0;
++ }
++}
++/* 2248b (W4 audit defect 1 and note 6): is this response the answer to the request that is outstanding? All four must
++ * hold, and each one alone is a way the firmware can be wrong:
++ *   sent         a request went out and has not been answered or timed out (a late reply has sent=false)
++ *   step         one of the four that sends a request (a reply after the timeout or the completion is not)
++ *   id           the reply's message id is that step's request (a reply to a different message is not)
++ *   transaction  the reply's transaction is the request's (an older exchange's reply is not)
++ * Pure, so the test can assert every combination without staging a conversation; the receive path calls it with the
++ * live state. */
++static bool w4_reply_expected(bool sent,uint32_t step,uint16_t transaction,uint16_t message,uint16_t reply_transaction){
++ if(!sent || step<W4IndRegister || step>W4DeviceInfo)return false;
++ return message==w4_step_message(step) && reply_transaction==transaction;
++}
++
++/* Sends one QMI request to the WLFW port. Returns 0 when it went out, or the QRTR/GLINK error. */
++static int w_wlfw_send(const uint8_t *message,uint32_t bytes){
++ if(!w.qr_started || !w.wlfw_rport)return -1;
++ return qcom_qrtr_send_data(&w.qr, w.wlfw_port, w.wlfw_node, w.wlfw_rport, message, bytes);
++}
++/* One line per request: what it was, what the firmware answered, and the reply's length. Ids and result codes only. */
++static void w_wlfw_result(uint16_t message,const WlfwMessage *m){
++ printf("SWEET WIFI: W4 wlfw %s result=%u error=%u bytes=%u\n",wlfw_name(message),
++  m&&m->result_valid?m->result:0xffffu,m&&m->result_valid?m->error:0xffffu,m?m->length:0u);
++ sweet_log_sync();
++}
++
++/* A data packet for our WLFW port. Two checks before a byte is parsed.
++ *
++ * The sender, against what the announcement said: the port exists only for this conversation, so a packet from any other
++ * node or port is not ours. 2248b (W4 audit note 5): said once, with a count, rather than on every packet — a firmware
++ * that answers from another port would otherwise fill the log at the packet rate.
++ *
++ * Then the reply itself (W4 audit defect 1 and note 6): a response is only accepted when a request is outstanding, the
++ * step is one that sends a request, and the message id AND transaction are the outstanding request's. Without this a
++ * late reply after the 5 s bound, or a repeated DEVICE_INFO reply after `exchange complete`, still matched on transaction
++ * alone and the switch below advanced wlfw_step past W4Done, whose name then indexed w4_step_name out of bounds in
++ * w_wlfw_close, inside w_cleanup, before the SMP2P stop and the PAS6 shutdown. So it is a guard, not a comment. */
++static void w_wlfw_receive(void *unused,QcomQrtr *qr,uint32_t port,uint32_t node,uint32_t from,const uint8_t *data,uint32_t bytes){
++ (void)unused;(void)qr;(void)port;
++ if(node!=w.wlfw_node || from!=w.wlfw_rport){
++  w.wlfw_foreign++;
++  if(w.wlfw_foreign==1){
++   printf("SWEET WIFI: W4 wlfw unexpected sender node=%u port=%u (announced %u/%u); counted, not parsed\n",node,from,w.wlfw_node,w.wlfw_rport);
++   sweet_log_sync();
++  }
++  return;
++ }
++ WlfwMessage m;
++ if(wlfw_parse(data,bytes,&m)){printf("SWEET WIFI: W4 wlfw malformed reply bytes=%u\n",bytes);sweet_log_sync();return;}
++ if(m.type==WLFW_INDICATION){
++  /* The indications we registered for. Nothing is sent back: QMI indications are one-way. fw_init_done and cal_done
++   * belong to the boots after this one, but they are named here so a firmware that volunteers one is not a mystery. */
++  if(m.message==WLFW_FW_INIT_DONE_IND || m.message==WLFW_COLD_BOOT_CAL_DONE_IND || m.message==WLFW_FW_READY_IND){
++   w.wlfw_indications++;
++   printf("SWEET WIFI: W4 wlfw indication=%s id=%#x\n",wlfw_indication_name(m.message),m.message);
++   sweet_log_sync();
++  }
++  return;
++ }
++ if(m.type!=WLFW_RESPONSE)return;
++ /* 2248b (defect 1 and note 6): is this the answer to the outstanding request? Nothing else advances the step. The
++  * three refusals are counted apart, so the log says which one it was. */
++ if(!w4_reply_expected(w.wlfw_sent,w.wlfw_step,w.wlfw_transaction,m.message,m.transaction)){
++  if(!w.wlfw_sent || w.wlfw_step<W4IndRegister || w.wlfw_step>W4DeviceInfo)w.wlfw_unexpected++;
++  else w.wlfw_mismatched++;
++  if(w.wlfw_unexpected+w.wlfw_mismatched==1){
++   printf("SWEET WIFI: W4 wlfw dropped reply id=%#x tx=%u: the outstanding request is %s tx=%u, nothing advanced\n",
++    m.message,m.transaction,w4_step_str(w.wlfw_step),w.wlfw_transaction);
++   sweet_log_sync();
++  }
++  return;
++ }
++ if(!m.result_valid){
++  /* A firmware that answers without the result TLV has still answered. Said plainly, not guessed at. */
++  printf("SWEET WIFI: W4 wlfw %s reply has no result TLV bytes=%u\n",wlfw_name(m.message),bytes);sweet_log_sync();
++ }
++ w.wlfw_result=m.result_valid?m.result:0u;w.wlfw_error=m.error;
++ w.wlfw_replies++;
++ w_wlfw_result(m.message,&m);
++ /* A non-zero result is a refusal: the run does not carry on to the next request. ath11k treats it the same way and
++  * the stop still runs, which is the point of every stage since W2. */
++ if(m.result_valid && m.result){
++  printf("SWEET WIFI: W4 wlfw refused at %s result=%u error=%u; the rest is not sent\n",w4_step_str(w.wlfw_step),m.result,m.error);
++  w.wlfw_step=W4Done;w.wlfw_sent=false;return;
++ }
++ switch(m.message){
++ case WLFW_IND_REGISTER_REQ:
++  /* Only logged (above). ath11k does not look at fw_status here either. */
++  break;
++ case WLFW_HOST_CAP_REQ: break;
++ case WLFW_CAP_REQ: {
++  uint32_t board=0,chip=0,family=0;
++  int brc=wlfw_board_id(data,bytes,&board);
++  if(brc)printf("SWEET WIFI: W4 wlfw cap reply carries no board id (%d); ath11k would take 0xff\n",brc);
++  else w.wlfw_board=board;
++  int crc=wlfw_chip_info(data,bytes,&chip,&family);
++  if(!crc){w.wlfw_chip=chip;w.wlfw_family=family;}
++  printf("SWEET WIFI: W4 wlfw cap board=%#x board_present=%u chip=%#x family=%#x chip_present=%u\n",
++   w.wlfw_board,brc==0,chip,family,crc==0);
++  sweet_log_sync();
++  break;
++ }
++ case WLFW_DEVICE_INFO_REQ: {
++  uint64_t addr=0;uint32_t size=0;
++  int rc=wlfw_device_info(data,bytes,&addr,&size);
++  if(rc)printf("SWEET WIFI: W4 wlfw device_info reply carries no register window (%d)\n",rc);
++  else{w.wlfw_bar_addr=addr;w.wlfw_bar_size=size;
++   /* Recorded, never mapped or read: reading this window outside mission mode ended the reference port's kernel
++    * (hakios.wifi.c:55-58, and the plan's risk 5). The address goes in the log because a survey needs it later. */
++   printf("SWEET WIFI: W4 wlfw device_info bar=%#llx bytes=%#x (recorded; not mapped, not read)\n",
++    (unsigned long long)addr,size);
++  }
++  sweet_log_sync();
++  break;
++ }
++ default: break;
++ }
++ w.wlfw_sent=false;
++ if(w.wlfw_step==W4DeviceInfo){w.wlfw_step=W4Done;printf("SWEET WIFI: W4 wlfw exchange complete: 4 requests answered\n");sweet_log_sync();}
++ else w.wlfw_step++;
++ w.wlfw_deadline=w_now()+W_W4_GAP_MS;
++}
++
++/* The client's port on our node: service 0 binds a client port that is never announced (QcomQrtr's announce() skips
++ * service 0), which is what a QMI client is: it sends to the server's port and announces nothing of its own. */
++static int w_wlfw_open(void){
++ if(w.wlfw_opened)return 0;
++ w.wlfw_port=W_WLFW_PORT;
++ if(qcom_qrtr_add_service(&w.qr,0,0,w.wlfw_port,w_wlfw_receive,0))return ENOMEM;
++ w.wlfw_opened=true;
++ printf("SWEET WIFI: W4 wlfw client port=%#x open; looking for service=%#x instance=%#x\n",W_WLFW_PORT,WLFW_SERVICE,WLFW_ANNOUNCED);
++ sweet_log_sync();
++ return 0;
++}
++static void w_wlfw_close(void){
++ if(!w.wlfw_opened)return;
++ qcom_qrtr_remove_service(&w.qr,W_WLFW_PORT);
++ w.wlfw_opened=false;
++ /* 2248b (W4 audit note 7): answered counts the replies the client accepted, not wlfw_sent, which the receive path
++  * cleared on every accepted reply and which is false again by the time this runs. It printed 0 on every healthy run. */
++ printf("SWEET WIFI: W4 wlfw close: step=%s tx=%u indications=%u answered=%u dropped=%u+%u\n",w4_step_str(w.wlfw_step),
++  w.wlfw_tx,w.wlfw_indications,w.wlfw_replies,w.wlfw_unexpected,w.wlfw_mismatched);
++ sweet_log_sync();
++}
++
++/* 2248b (W4 audit defect 3): the exchange must fit inside the dwell. The worst case was lookup 3 s + four replies at
++ * 5 s + three 50 ms gaps = about 23 s against W_DWELL_MS's 20 s from handover, so on a firmware that answers slowly the
++ * stop cut the exchange short. That was safe — the stop runs identically and the run grades as a request without a
++ * reply — but the brief claimed it fitted and it did not. Each bound is now clamped to a point just inside the dwell, so
++ * every request's timeout line is printed before the stop instead of being raced by the loop's break, and a request with
++ * no room left is not sent at all rather than going out with no time to be answered. The deadman is untouched and still
++ * covers anything this clamp cannot: 600 s against a 240 s body. */
++#define W_W4_STOP_RESERVE_MS 250u   /* the whole exchange ends at least this far before the stop */
++#define W_W4_MIN_BOUND_MS 1000u     /* a request is not sent unless the dwell still has this much left for it */
++static uint64_t w_w4_bound(uint64_t now,uint64_t ms){
++ const uint64_t want=now+ms;
++ if(!w.wlfw_dwell_end)return want;          /* handover not seen yet: the plain bound */
++ return want<w.wlfw_dwell_end?want:w.wlfw_dwell_end;   /* never later than the dwell allows */
++}
++/* Records where the exchange must end, from the handover that starts the dwell. Called once, at handover. */
++static void w_w4_note_dwell(uint64_t handover){
++ w.wlfw_dwell_end=handover+W_DWELL_MS-W_W4_STOP_RESERVE_MS;
++ printf("SWEET WIFI: W4 exchange bounded to end %u ms after handover, %u ms before the stop\n",
++  W_DWELL_MS-W_W4_STOP_RESERVE_MS,W_W4_STOP_RESERVE_MS);
++ sweet_log_sync();
++}
++
++/* One poll's worth of the conversation. Called from w_glink_poll after QRTR has drained, so a reply that arrived in the
++ * same poll is already in the remote list when the lookup is checked.
++ * Lookup first, once: the announcement we need is the one already in the list (ast222 saw `service=0x45 instance=0x301`
++ * arrive on its own), so the lookup is a confirmation, and its absence is reported after a bounded wait rather than
++ * assumed. The requests then go one at a time, each waiting for its own reply before the next: QMI transactions are
++ * allowed to be pipelined, but a firmware that refuses the first one should not be handed three more. */
++static void w_wlfw_poll(void){
++ if(!w.wlfw_asked || !w.qr_started)return;
++ const uint64_t now=w_now();
++ if(w.wlfw_step==W4Lookup){
++  /* The firmware announces WLFW unprompted on this phone (ast222), so look in the list before asking. Asking anyway is
++   * what L1 is for: it proves the name service answers, and it is what a firmware that announces nothing would need. */
++  if(qcom_qrtr_lookup_found(&w.qr,WLFW_SERVICE,WLFW_ANNOUNCED,&w.wlfw_node,&w.wlfw_rport)){
++   printf("SWEET WIFI: W3 lookup service=%#x instance=%#x found node=%u port=%u\n",WLFW_SERVICE,WLFW_ANNOUNCED,w.wlfw_node,w.wlfw_rport);
++   sweet_log_sync();
++   /* wlfw_sent belongs to the step, not to the conversation: the lookup may have used it, and the first request has
++    * not been sent yet. Leaving it set skipped ind_register entirely, silently, which the model caught. */
++   w.wlfw_sent=false;w.wlfw_step=W4IndRegister;w.wlfw_deadline=now;
++   return;
++  }
++  if(!w.wlfw_sent){
++   if(now<w.wlfw_next_try)return;
++   if(qcom_qrtr_lookup(&w.qr,WLFW_SERVICE,WLFW_ANNOUNCED)){
++    /* No hello from the WPSS yet, so there is no node to ask. Said once, then retried on a slow tick. */
++    if(!w.wlfw_asked_at){w.wlfw_asked_at=now;printf("SWEET WIFI: W3 lookup service=%#x instance=%#x waiting for the WPSS's hello\n",WLFW_SERVICE,WLFW_ANNOUNCED);sweet_log_sync();}
++    w.wlfw_next_try=now+250u;return;
++   }
++   w.wlfw_sent=true;w.wlfw_sent_at=now;w.wlfw_tx++;w.wlfw_deadline=w_w4_bound(now,W_L1_MS);
++   printf("SWEET WIFI: W3 lookup service=%#x instance=%#x asked\n",WLFW_SERVICE,WLFW_ANNOUNCED);sweet_log_sync();
++   return;
++  }
++  if(now>=w.wlfw_deadline){
++   /* L1's honest timeout, as the plan asks for: the name service did not answer with this service, so nothing else is
++    * sent. The link's counters and the remote list tell the next boot which of the two it was. */
++   printf("SWEET WIFI: W3 lookup timeout service=%#x instance=%#x after %llu ms; remote services=%u\n",
++    WLFW_SERVICE,WLFW_ANNOUNCED,(unsigned long long)(now-w.wlfw_sent_at),w.qr.remote_count);
++   for(unsigned i=0;i<w.qr.remote_count;i++)printf("SWEET WIFI: W3 lookup remote[%u] service=%#x instance=%#x node=%u port=%u\n",
++    i,w.qr.remote[i].service,w.qr.remote[i].instance,w.qr.remote[i].node,w.qr.remote[i].port);
++   sweet_log_sync();
++   w.wlfw_sent=false;w.wlfw_step=W4Done;
++  }
++  return;
++ }
++ if(w.wlfw_step==W4Done)return;
++ if(now<w.wlfw_deadline)return;
++ if(w.wlfw_sent){
++  /* 2248b (defect 1): clear wlfw_sent with the step. A timeout that left it set is what let a late reply past the
++   * transaction check and walked the step one past W4Done. The wait printed is the real one, which is shorter than
++   * W_W4_REPLY_MS whenever the dwell clamp in w_w4_bound cut it short. */
++  printf("SWEET WIFI: W4 wlfw %s no reply in %llu ms; the rest is not sent\n",w4_step_str(w.wlfw_step),
++   (unsigned long long)(now-w.wlfw_sent_at));
++  sweet_log_sync();w.wlfw_sent=false;w.wlfw_step=W4Done;
++  return;
++ }
++ /* 2248b (defect 3): a request is not sent when the dwell has no room left for even a short answer. Sending it would
++  * only produce a stop the firmware never had a chance to answer, which reads as a firmware defect rather than the
++  * dwell's limit. Named plainly, so the log cannot be misread either. */
++ if(w.wlfw_dwell_end && w.wlfw_dwell_end<now+W_W4_MIN_BOUND_MS){
++  printf("SWEET WIFI: W4 wlfw %s not sent: %llu ms of the dwell left, less than the %u ms a reply needs\n",
++   w4_step_str(w.wlfw_step),(unsigned long long)(w.wlfw_dwell_end>now?w.wlfw_dwell_end-now:0),W_W4_MIN_BOUND_MS);
++  sweet_log_sync();w.wlfw_step=W4Done;return;
++ }
++ {
++  uint32_t bytes=0;
++  switch(w.wlfw_step){
++  case W4IndRegister: bytes=wlfw_ind_register(w.wlfw_buf,sizeof(w.wlfw_buf),w.wlfw_transaction=1);break;
++  case W4HostCap: bytes=wlfw_host_cap(w.wlfw_buf,sizeof(w.wlfw_buf),w.wlfw_transaction=2);break;
++  case W4Cap: bytes=wlfw_empty_request(w.wlfw_buf,sizeof(w.wlfw_buf),w.wlfw_transaction=3,WLFW_CAP_REQ);break;
++  case W4DeviceInfo: bytes=wlfw_empty_request(w.wlfw_buf,sizeof(w.wlfw_buf),w.wlfw_transaction=4,WLFW_DEVICE_INFO_REQ);break;
++  default: w.wlfw_step=W4Done;return;
++  }
++  /* 2248b (W4 audit note 4): these two lines are named `step=…` so the grader's hard-fail strings match what is printed.
++   * They were plain `W4 wlfw encode failed` / `send failed`, which the grader looked for and never saw. */
++  if(!bytes){printf("SWEET WIFI: W4 wlfw step=%s encode failed\n",w4_step_str(w.wlfw_step));sweet_log_sync();w.wlfw_step=W4Done;return;}
++  int rc=w_wlfw_send(w.wlfw_buf,bytes);
++  if(rc){printf("SWEET WIFI: W4 wlfw step=%s send failed %d\n",w4_step_str(w.wlfw_step),rc);sweet_log_sync();w.wlfw_step=W4Done;return;}
++  w.wlfw_sent=true;w.wlfw_sent_at=now;w.wlfw_tx++;w.wlfw_deadline=w_w4_bound(now,W_W4_REPLY_MS);
++  printf("SWEET WIFI: W4 wlfw %s request bytes=%u transaction=%u\n",w4_step_str(w.wlfw_step),bytes,w.wlfw_transaction);
++  sweet_log_sync();
++ }
++}
++
+ static int wpss_run(int gate){
+- memset(&w,0,sizeof(w));w.master=-1;w.link_asked=(gate==WpssGlink);struct wl_fat f;
++ memset(&w,0,sizeof(w));w.master=-1;
++ /* 2248: W4 opens the edge too, because its client needs it. W3 is the plain edge; W2 is the start alone. */
++ w.link_asked=(gate==WpssGlink || gate==WpssWlfw);w.wlfw_asked=(gate==WpssWlfw);struct wl_fat f;
+  int rc=w_open_image(&f);if(rc)goto out;
+  /* 2243: the sleep clock before any WPSS work (Fairphone's mainline enablement: without it the WPSS keeps crashing). */
+  if((rc=wpss_gpio5_set()))goto out;
+@@ -586,6 +917,9 @@ static int wpss_run(int gate){
+   if(!ready && (w.state&2))ready=now;
+   if(!handover && (w.state&4)){
+    handover=now;printf("SWEET WIFI: W2 handover; shared cx/mx/xo votes kept\n");
++   /* 2248b: the dwell starts here, so this is where the exchange's own end is fixed. Before this point a request
++    * bound is the plain constant; the exchange cannot start before it, because w_wlfw_poll needs w.qr_started. */
++   if(w.wlfw_asked)w_w4_note_dwell(handover);
+    /* 2246: the edge is opened only once the DSP is up. Before handover the DSP has not made its FIFO and GLINK would just
+     * spin on a missing item. A failure here is the W3 answer and ends the run through the normal verified stop. */
+    if(w.link_asked && (rc=w_glink_open())){printf("SWEET WIFI: W3 glink open failed error=%d\n",rc);break;}

@@ -1,0 +1,319 @@
+SWEET AKS: keybagd's two-phase passcode change, committed at selector 5 (2324)
+
+With 2323 the kernel stores the right code at selector 15, and keybagd still
+reports failure. KBChangeSystemNonSeSecret (keybagd 0x10001ce48; MobileKeyBag
+0x1cb461ce8 is the same code) takes the "two" phase whenever lock-state bit 22,
+keybag_state_from_xart, is clear, which it is on any phone without a SEP. It then
+puts 4 in selector 15's scalar 1 and expects a temporary bag handle in scalar
+output 0, saves that bag (selector 3), makes it the system bag (selector 5,
+aks_set_system_with_opts {temp, device, new, len, acm}), runs the epilogue (105)
+and unloads it (selector 4). 2321 returned no handle, so keybagd logged "temp
+handle is invalid: 0" after the code was already stored.
+
+- Selector 15 with scalar 1 bit 0x4 runs every 2321 and 2323 check in the same
+  order, then only stages: the copied or resolved codes, the owner (the user
+  client) and a fresh temporary handle (1..0x7fffffff, never 0 or -1), returned
+  in scalar output 0. Nothing is hashed, counted or written.
+- Selector 3 on the staged handle answers "SWEET", the KeyBagKeys bytes the root
+  image's systembag.kb already holds. Every other handle stays Unsupported.
+- Selector 5 on the staged handle, from the same client, is the commit: the
+  entitlement, the device bag, the same kind of code, the same new code as
+  staged, the state known, then pc_do() exactly as 2321's selector 15 ran it,
+  with the live state decided at commit. A wrong old code is counted there, by
+  the core, before it is hashed. The stage is consumed whatever the outcome.
+- Selector 4 on the staged handle, clientClose and the next stage wipe it.
+- Selector 15 without the bit (MobileKeyBag in process), selector 5 on any other
+  handle, the stub mode and the lock state are unchanged. Bit 22 is never set.
+
+A crash or reboot between 15 and 5 leaves the old code: nothing reaches the disk
+before the commit.
+
+Needs 2321, 2322 and 2323. Security code: plans/passcode/audit-brief-2phase.md is
+the audit brief, and no image should boot until that audit is a GO.
+
+Check: python3 -I plans/passcode/tools/check-2phase.py XNU_DIR (35 checks, 19 negative controls)
+       python3 -I plans/passcode/tools/check-lock.py XNU_DIR (2321/2322)
+Apply: git apply -p1 in the kernel tree, after 2321, 2322 and 2323.
+diff --git a/iokit/Kernel/arm/SweetKeyStore.cpp b/iokit/Kernel/arm/SweetKeyStore.cpp
+--- a/iokit/Kernel/arm/SweetKeyStore.cpp
++++ b/iokit/Kernel/arm/SweetKeyStore.cpp
+@@ -119,6 +119,41 @@
+ /* 2323, SweetACM.cpp: false unless sweetacm=1 and the id names an exported context that holds a code. */
+ extern "C" bool sweet_acm_resolve(const uint8_t *id, uint8_t *out, size_t max, size_t *out_len);
+ 
++/*
++ * keybagd's two-phase change (2324). On a bag that is not in xART (lock-state bit 22, keybag_state_from_xart, which no
++ * phone without a SEP has), KBChangeSystemNonSeSecret (keybagd 0x10001ce48; MobileKeyBag 0x1cb461ce8 is the same code)
++ * puts 4 in selector 15's scalar 1 and expects a temporary bag handle back in scalar output 0. Then:
++ *   selector 3  {temp}                          save the temporary bag; keybagd writes it to systembag.kb
++ *   selector 5  {temp, device, new, len, acm}   aks_set_system_with_opts: the temporary bag becomes the system bag
++ *   selector 105 {device, new, len, acm}        the epilogue
++ *   selector 4  {temp}                          unload the temporary bag, on success and on every failure path
++ * A temporary handle of -1 or equal to the device handle is "temp handle is invalid" (0x10001d06c). So selector 15
++ * only stages here, and the code becomes effective at selector 5, through the same pc_do() as before. Nothing reaches
++ * the disk before that, so a crash anywhere between 15 and 5 leaves the old code exactly as it was.
++ */
++#define SWEET_AKS_PHASE_TWO             0x4u    /* scalar 1 of selector 15 (keybagd 0x10001ced0, w28) */
++#define SWEET_AKS_SET_ACM               0x1u    /* scalar 4 of selector 5: (params >> 2) & 1, keybagd 0x10001cf80 */
++/* Selector 3's bag: the KeyBagKeys bytes the root image's systembag.kb already holds ('U1dFRVQ=', mkiosroot.sh). */
++#define SWEET_AKS_BAG_BLOB              "SWEET"
++
++/*
++ * One staged change, guarded by sweet_pc_mtx. It holds the codes selector 15 copied or resolved, untested: the old one
++ * is proven at selector 5, by the core, with the count before the hash, exactly as 2321 proved it at selector 15. It is
++ * one-shot and belongs to the user client that staged it; it goes on commit, on unload of its handle, on the next
++ * stage and when that client closes or dies.
++ * ponytail: no deadline, add one if a stage is ever seen outliving its keybagd call
++ */
++struct sweet_aks_stage {
++	const void *owner;                      /* the staging AppleKeyStoreUserClient; NULL: no stage */
++	uint64_t    handle;                     /* the temporary bag handle selector 15 returned */
++	bool        acm;                        /* the codes came from ACM ids */
++	bool        had_old;                    /* a code was live at stage time, so an old code was copied */
++	size_t      old_len, new_len;
++	uint8_t     old_code[SPC_SECRET_MAX], new_code[SPC_SECRET_MAX];
++};
++static struct sweet_aks_stage sweet_stage;
++static uint32_t sweet_stage_last;               /* the last temporary handle issued; never 0 (the device bag) or -1 */
++
+ LCK_GRP_DECLARE(sweet_pc_grp, "sweet_passcode");
+ LCK_MTX_DECLARE(sweet_pc_mtx, &sweet_pc_grp);
+ 
+@@ -460,10 +495,14 @@
+ };
+ 
+ OSDefineMetaClassAndStructors(AppleKeyStoreUserClient, IOUserClient);
++
++static void sweet_aks_stage_drop(const void *owner, bool any_handle, uint64_t handle);
+ 
+ IOReturn
+ AppleKeyStoreUserClient::clientClose(void)
+ {
++	/* keybagd gone between selector 15 and 5 (a crash, a kill): its staged codes go with it, and nothing was set. */
++	sweet_aks_stage_drop(this, true, 0);
+ 	terminate();
+ 	return kIOReturnSuccess;
+ }
+@@ -791,13 +830,14 @@
+  * mismatch can only make a change fail, never set a code from a stray pointer.
+  */
+ static IOReturn
+-sweet_aks_change_secret(IOExternalMethodArguments *args)
++sweet_aks_change_secret(IOExternalMethodArguments *args, const void *owner, uint32_t out_scalars)
+ {
+ 	uint8_t old_code[SPC_SECRET_MAX], new_code[SPC_SECRET_MAX];
+ 	size_t old_len = 0, new_len = 0;
+ 	enum spc_try r;
+ 	bool changed = false;
+ 
++	args->scalarOutputCount = 0;
+ 	if (!sweet_aks_may_change()) {
+ 		printf("SWEET AKS: change refused, no %s\n", SWEET_AKS_CHANGE_ENTITLEMENT);
+ 		return kIOReturnNotPermitted;
+@@ -805,6 +845,11 @@
+ 	if (args->scalarInputCount < 12) {
+ 		return kIOReturnBadArgument;
+ 	}
++	/* A two-phase caller that cannot receive the temporary handle could never commit: refuse before anything else. */
++	bool two = (args->scalarInput[1] & SWEET_AKS_PHASE_TWO) != 0;
++	if (two && out_scalars < 1) {
++		return kIOReturnBadArgument;
++	}
+ 	if (sweet_aks_state_unknown()) {
+ 		/* The files could not be read, so a change here could overwrite a live code it cannot see. */
+ 		printf("SWEET AKS: change refused, passcode state unknown\n");
+@@ -850,6 +895,31 @@
+ 	if (acm) {
+ 		printf("SWEET AKS: change via ACM, contexts resolved\n");
+ 	}
++	if (two) {
++		/*
++		 * Stage, and hand back a temporary handle that is neither -1 nor the device bag's. Nothing is hashed, counted
++		 * or written here; selector 5 runs the core on exactly these bytes.
++		 */
++		lck_mtx_lock(&sweet_pc_mtx);
++		spc_wipe(&sweet_stage, sizeof(sweet_stage));
++		sweet_stage_last = sweet_stage_last >= 0x7fffffffu ? 1 : sweet_stage_last + 1;
++		sweet_stage.owner = owner;
++		sweet_stage.handle = sweet_stage_last;
++		sweet_stage.acm = acm;
++		sweet_stage.had_old = live;
++		sweet_stage.old_len = live ? old_len : 0;
++		sweet_stage.new_len = new_len;
++		memcpy(sweet_stage.old_code, old_code, sweet_stage.old_len);
++		memcpy(sweet_stage.new_code, new_code, new_len);
++		uint64_t handle = sweet_stage.handle;
++		lck_mtx_unlock(&sweet_pc_mtx);
++		spc_wipe(old_code, sizeof(old_code));
++		spc_wipe(new_code, sizeof(new_code));
++		args->scalarOutput[0] = handle;
++		args->scalarOutputCount = 1;
++		printf("SWEET AKS: change staged, temporary bag %llu, waiting for selector 5\n", handle);
++		return kIOReturnSuccess;
++	}
+ 	/*
+ 	 * Never forced while a code is live: root included, a change always proves the old one. With no code live there is
+ 	 * nothing to prove, which is the first-set case above.
+@@ -858,6 +928,122 @@
+ 	spc_wipe(old_code, sizeof(old_code));
+ 	spc_wipe(new_code, sizeof(new_code));
+ 	return sweet_aks_try_to_ret(r, &changed);
++}
++
++/* True when `owner` staged a change whose temporary handle is `handle`. */
++static bool
++sweet_aks_stage_is(const void *owner, uint64_t handle)
++{
++	lck_mtx_lock(&sweet_pc_mtx);
++	bool yes = sweet_stage.owner != NULL && sweet_stage.owner == owner && sweet_stage.handle == handle;
++	lck_mtx_unlock(&sweet_pc_mtx);
++	return yes;
++}
++
++/* Wipe `owner`'s stage: the one for `handle`, or any when `any_handle`. Someone else's stage is left alone. */
++static void
++sweet_aks_stage_drop(const void *owner, bool any_handle, uint64_t handle)
++{
++	bool dropped = false;
++
++	lck_mtx_lock(&sweet_pc_mtx);
++	if (sweet_stage.owner != NULL && sweet_stage.owner == owner && (any_handle || sweet_stage.handle == handle)) {
++		spc_wipe(&sweet_stage, sizeof(sweet_stage));
++		dropped = true;
++	}
++	lck_mtx_unlock(&sweet_pc_mtx);
++	if (dropped) {
++		printf("SWEET AKS: staged change dropped, nothing was set\n");
++	}
++}
++
++/*
++ * Selector 3, save_bag, for a staged temporary bag: { handle }, the blob in the output structure (libaks offers 0x8000,
++ * so it arrives as a descriptor). keybagd stores it as KeyBagKeys in /private/var/keybags/systembag.kb, which at boot is
++ * only opened for BackupKeyBagKeys because selector 14 answers with a handle. Any other handle is Unsupported, as
++ * before, so no other keybagd path starts writing that file.
++ */
++static IOReturn
++sweet_aks_save_bag(IOExternalMethodArguments *args, const void *owner)
++{
++	args->scalarOutputCount = 0;
++	if (args->scalarInputCount < 1 || !sweet_aks_stage_is(owner, args->scalarInput[0])) {
++		return kIOReturnUnsupported;
++	}
++	return sweet_aks_struct_out(args, SWEET_AKS_BAG_BLOB, (uint32_t)(sizeof(SWEET_AKS_BAG_BLOB) - 1));
++}
++
++/*
++ * Selector 5 for the staged temporary bag: { temp, device handle, new ptr, new len, acm }. The commit. Every 2321 rule
++ * applies as it did at selector 15: the entitlement, the state known, the old code proven by the core (counted before
++ * it is hashed) whenever one is live, never forced over a live code. On top, the code keybagd commits must be the one it
++ * staged. The stage is consumed whatever the outcome.
++ */
++static IOReturn
++sweet_aks_commit(IOExternalMethodArguments *args, const void *owner)
++{
++	struct sweet_aks_stage st;
++	uint8_t check[SPC_SECRET_MAX];
++	size_t check_len = 0;
++	enum spc_try r;
++	bool changed = false;
++	IOReturn ret = kIOReturnSuccess;
++
++	if (!sweet_aks_may_change()) {
++		printf("SWEET AKS: commit refused, no %s\n", SWEET_AKS_CHANGE_ENTITLEMENT);
++		return kIOReturnNotPermitted;
++	}
++	if (args->scalarInputCount < 5) {
++		return kIOReturnBadArgument;
++	}
++	lck_mtx_lock(&sweet_pc_mtx);
++	if (sweet_stage.owner == NULL || sweet_stage.owner != owner || sweet_stage.handle != args->scalarInput[0]) {
++		lck_mtx_unlock(&sweet_pc_mtx);
++		return kIOReturnNotFound;       /* staged elsewhere, dropped or replaced since the caller looked */
++	}
++	memcpy(&st, &sweet_stage, sizeof(st));
++	spc_wipe(&sweet_stage, sizeof(sweet_stage));
++	lck_mtx_unlock(&sweet_pc_mtx);
++
++	bool acm = (args->scalarInput[4] & SWEET_AKS_SET_ACM) != 0;
++	if (args->scalarInput[1] != SWEET_AKS_SYSTEM_HANDLE || acm != st.acm) {
++		printf("SWEET AKS: commit refused, not the device bag, or ids where codes were staged or the reverse\n");
++		ret = kIOReturnBadArgument;
++		goto out;
++	}
++	/* The new code again, read the way it was staged. An empty one is a removal and must have been staged as one. */
++	if (args->scalarInput[3] != 0 &&
++	    !sweet_aks_copy_secret(acm, args->scalarInput[2], args->scalarInput[3], check, sizeof(check), &check_len)) {
++		printf("SWEET AKS: commit refused, the new passcode did not resolve\n");
++		ret = kIOReturnBadArgument;
++		goto out;
++	}
++	if (check_len != st.new_len || (check_len != 0 && !spc_equal(check, st.new_code, check_len))) {
++		printf("SWEET AKS: commit refused, the new passcode is not the one staged\n");
++		ret = kIOReturnBadArgument;
++		goto out;
++	}
++	if (sweet_aks_state_unknown()) {
++		printf("SWEET AKS: commit refused, passcode state unknown\n");
++		ret = kIOReturnNotReady;
++		goto out;
++	}
++	{
++		/* Live is decided now, not at stage time: a code set in between must be proven like any other. */
++		bool live = !sweet_aks_no_code();
++		if (live && !st.had_old) {
++			printf("SWEET AKS: commit refused, a passcode is live and no old passcode was staged\n");
++			ret = kIOReturnNotPermitted;
++			goto out;
++		}
++		r = pc_do(1, live ? st.old_code : NULL, live ? st.old_len : 0, st.new_code, st.new_len, !live);
++		ret = sweet_aks_try_to_ret(r, &changed);
++		printf("SWEET AKS: commit %s\n", changed ? "done, the new passcode is live" : "refused by the lock");
++	}
++out:
++	spc_wipe(&st, sizeof(st));
++	spc_wipe(check, sizeof(check));
++	return ret;
+ }
+ 
+ /* Selector 5: set_system_with_passcode, the "turn a passcode on" path. Same gate as a change. */
+@@ -997,8 +1183,17 @@
+ 	}
+ 
+ 	switch (selector) {
+-	case kAKSOpen:
+ 	case kAKSUnloadBag:
++		/* keybagd unloads its temporary bag on success and on every failure path: that ends the stage. */
++		args->scalarOutputCount = 0;
++		if (in_scalars > 0) {
++			sweet_aks_stage_drop(this, false, arg0);
++		}
++		break;
++	case kAKSSaveBag:
++		ret = sweet_aks_save_bag(args, this);
++		break;
++	case kAKSOpen:
+ 	case kAKSAssertHold:
+ 	case kAKSAssertDrop:
+ 	case kAKSAssertConsume:
+@@ -1008,7 +1203,9 @@
+ 		break;
+ 	case kAKSSetSystem:
+ 		args->scalarOutputCount = 0;
+-		ret = sweet_aks_set_system(args);
++		/* The commit of a staged change is selector 5 on its temporary handle; anything else is 2321's selector 5. */
++		ret = in_scalars > 0 && sweet_aks_stage_is(this, arg0) ? sweet_aks_commit(args, this) :
++		    sweet_aks_set_system(args);
+ 		break;
+ 	case kAKSGetSystem:
+ 		if (out_scalars < 1) {
+@@ -1054,8 +1251,7 @@
+ 		ret = sweet_aks_device_state(args);
+ 		break;
+ 	case kAKSChangeSecret:
+-		args->scalarOutputCount = 0;
+-		ret = sweet_aks_change_secret(args);
++		ret = sweet_aks_change_secret(args, this, out_scalars);
+ 		break;
+ 	case kAKSChangeEpilogue:
+ 		/* The epilogue only seals the new secret into the SEP's stash. There is none: accept and move on. */

@@ -1,0 +1,215 @@
+diff --git a/bsd/dev/wifi/WpssRuntime.inc b/bsd/dev/wifi/WpssRuntime.inc
+index f1269fd1a..733905009 100644
+--- a/bsd/dev/wifi/WpssRuntime.inc
++++ b/bsd/dev/wifi/WpssRuntime.inc
+@@ -44,22 +44,38 @@ static int adsp_part_read(uint64_t off,void *dst,uint64_t bytes){return sweet_uf
+ #define W_REMOTE 13u          /* qcom,remote-pid */
+ #define W_IPCC 0x18u          /* IPCC client of the WPSS (mboxes = <ipcc 0x18 n>) */
+ #define W_SIG_SMP2P 2u
+-#define W_OUT 617u            /* qcom,smem = <0x269 0x268>: ours, then the WPSS's */
+-#define W_IN 616u
++/* 2244: qcom,smem = <0x269 0x268> = <617 616>. Linux reads that array straight into smp2p->smem_items[],
++ * whose index 0 is SMP2P_INBOUND and index 1 is SMP2P_OUTBOUND (drivers/soc/qcom/smp2p.c), so 617 is the
++ * WPSS's own item, the one it writes and we read, and 616 is ours to allocate. The ADSP edge (<443 429>:
++ * m_item(443) reads, m_alloc(429) writes) and the modem edge (<435 428>: m_item(435), m_alloc(428)) in this
++ * tree follow the same rule. W2 had them the other way round: it allocated 617, which is the WPSS's item, and
++ * polled 616, which nobody ever writes, so ready could never arrive. */
++#define W_IN 617u             /* the WPSS's item: we read it, it owns it */
++#define W_OUT 616u            /* ours: we allocate it before the start and set the stop bit in it */
+ #define W_PAS 6u
+ #define W_BASE 0x9bb00000ull
+ #define W_BYTES 0x1900000ull
+ #define W_META_MAX 65536u
+ #define W_STEM "qca6750/wpss"
+-#define W_READY_MS 10000u     /* ready after auth_and_reset, as the ADSP */
++/* 2244: Linux waits 5 s for the ready interrupt in adsp_start (qcom_q6v5_wait_for_start(&adsp->q6v5,
++ * msecs_to_jiffies(5000))), but that is a driver on a phone where the WPSS was already running its image at
++ * boot. W2 waited 10 s and gave up while the DSP had only just been authenticated, and the phone then reset.
++ * The reference port, on the same chip family, waits 40 s for a DSP "still on its way up ... half a minute at
++ * the most" before it gives up (hakios.wifi.c:4156, the 40000 ms loop above dsp_shutdown). 40 s also fits the
++ * 240 s selftest body and the 600 s deadman: the whole run is still under 110 s. */
++#define W_READY_MS 40000u     /* ready after auth_and_reset; Linux 5 s, the reference port 40 s */
+ #define W_HANDOVER_MS 10000u  /* handover after ready */
+ #define W_DWELL_MS 20000u     /* stays up with no fatal bit, then the stop */
++/* The WPSS crash-reason item: the firmware writes a line of text here when it gives up (vendor
++ * volcano_wpss_resource .crash_reason_smem = 626). Read only, in the global partition. */
++#define W_CRASH 626u
+ 
+ static struct {
+  vm_offset_t smem,mutex,ipcc,qmpmem,rsc,db;
+  QcomSmem sm;QcomSmemPartition part;QcomSmp2p sp;QcomQmp qp;
+  uint32_t state,rail_addr[2],rail_index[2],xo_addr;
+  bool fatal,voted,vote_uncertain,qmp_owed,owed,started;
++ bool smp_absent,smp_valid;
+  int master;
+  uint8_t *mdt;uint32_t mdt_bytes;
+  vm_offset_t mapping,metadata;uint64_t meta_pa;
+@@ -159,11 +175,28 @@ static int w_alloc(uint16_t id,uint32_t bytes,uint32_t *off){
+   uint32_t actual=0;rc=rc!=QcomSmemOk && rc!=QcomSmemExists?EIO:w_item(id,bytes,off,&actual);}
+  sweet_smem_unlock();return rc;
+ }
++/* 2244: this used to return silently when the WPSS's item was not there, which is exactly what ast208 hid behind
++ * "run end error=60": a start whose item never appeared looked the same as one whose item was there and stayed
++ * zero. The first time the item is missing, and the first time an item that exists fails the header checks, are
++ * now logged once each. The poll runs every 2 ms, so nothing here repeats. */
+ static void w_smp_poll(void){
+  uint32_t off,bytes;
+- if(w_item(W_IN,QCOM_SMP2P_ITEM_BYTES,&off,&bytes))return;
++ if(w_item(W_IN,QCOM_SMP2P_ITEM_BYTES,&off,&bytes)){
++  if(!w.smp_absent){w.smp_absent=true;printf("SWEET WIFI: SMP2P item=%u not present yet (the WPSS has not written it)\n",W_IN);sweet_log_sync();}
++  return;
++ }
++ if(w.smp_absent){w.smp_absent=false;printf("SWEET WIFI: SMP2P item=%u appeared\n",W_IN);sweet_log_sync();}
+  w.sp.in=(volatile uint32_t *)(w.smem+off);
+  uint32_t value=0,changed=0;
++ /* Report the header once, whatever it says: a rejected item must not look like a silent one. */
++ if(!w.smp_valid){
++  w.smp_valid=true;
++  int bad=qcom_smp2p_check_in(w.sp.in,QCOM_SMEM_HOST_APPS,W_REMOTE);
++  printf("SWEET WIFI: SMP2P item=%u magic=%#x version=%u pids=%#x counts=%#x header=%s rc=%d\n",
++   W_IN,w.sp.in[0],w.sp.in[1]&0xffu,w.sp.in[2],w.sp.in[3],bad?"INVALID":"ok",bad);
++  if(bad)printf("SWEET WIFI: SMP2P item=%u rejected: -1 magic, -2 version, -3 pids, -4 counts\n",W_IN);
++  sweet_log_sync();
++ }
+  if(qcom_smp2p_service(&w.sp,"slave-kernel",&value,&changed))w_ring(W_IPCC,W_SIG_SMP2P);
+  if(changed){w.state=value;printf("SWEET WIFI: SMP2P slave=%#x fatal=%u ready=%u handover=%u stop_ack=%u\n",value,value&1,!!(value&2),!!(value&4),!!(value&8));sweet_log_sync();}
+  if(value&1)w.fatal=true;
+@@ -239,19 +272,87 @@ static int w_load_image(struct wl_fat *f){
+ }
+ /* io_map maps trunc_page(pa) for round_page(bytes+offset) and returns the offset address (2197, ast188). */
+ static void w_unmap(vm_offset_t va,vm_size_t bytes){vm_offset_t off=va&PAGE_MASK;ml_io_unmap(va-off,round_page(bytes+off));}
++
++/* 2244: read-only state, taken before giving up, so the next boot does not have to guess. None of this writes or
++ * clears anything: the GIC distributor is read through the same window the modem path reads (ModemRuntime.inc), and
++ * reading IGROUPR/ISPENDR/ISACTIVER on a non-secure GIC is what that path already does. */
++#define W_GICD_PA 0x17100000ull
++#define W_GICD_BYTES 0x1000u
++#define W_WDOG_SPI 579u       /* DT wpss_pas interrupts-extended = <&intc 0 0x243 1 ...>: SPI 0x243 = 579 */
++/* The WPSS crash reason (vendor volcano_wpss_resource .crash_reason_smem = 626): a line of text the firmware leaves
++ * in a global SMEM item when it gives up. Read only, word by word (SMEM is device memory and must not be
++ * byte-addressed), and never interpreted: it is the firmware's own words for the log. */
++static void wpss_crash_reason(void){
++ QcomSmemPartition global;
++ if(qcom_smem_partition(&w.sm,QCOM_SMEM_HOST_GLOBAL,QCOM_SMEM_HOST_GLOBAL,&global)){
++  printf("SWEET WIFI: crash reason: no global SMEM partition\n");sweet_log_sync();return;
++ }
++ uint32_t coff=0,cbytes=0;int rc=qcom_smem_find(&w.sm,&global,W_CRASH,&coff,&cbytes);
++ if(rc!=QcomSmemOk || !cbytes){printf("SWEET WIFI: crash reason item=%u rc=%d (nothing left)\n",W_CRASH,rc);sweet_log_sync();return;}
++ char text[81];uint32_t n=cbytes<sizeof(text)-1?cbytes:(uint32_t)(sizeof(text)-1);
++ for(uint32_t i=0;i<n;i++)text[i]=(char)(qcom_smem_read32(&w.sm,coff+4*(i/4))>>(8*(i%4)));
++ text[n]=0;
++ bool printable=true;for(uint32_t i=0;i<n;i++){unsigned char c=(unsigned char)text[i];if(c && (c<0x20 || c>0x7e))printable=false;}
++ if(printable)printf("SWEET WIFI: crash reason item=%u bytes=%u text=\"%s\"\n",W_CRASH,cbytes,text);
++ else printf("SWEET WIFI: crash reason item=%u bytes=%u present, not text\n",W_CRASH,cbytes);
++ sweet_log_sync();
++}
++static void w_state_probe(void){
++ /* The WPSS watchdog (SPI 579) as the GIC sees it now. A pending-and-not-enabled interrupt is a bite we did not take. */
++ vm_offset_t gic=ml_io_map_unmappable(W_GICD_PA,W_GICD_BYTES,VM_WIMG_IO);
++ if(!gic){printf("SWEET WIFI: W2 probe: GIC mapping failed\n");sweet_log_sync();return;}
++ unsigned word=W_WDOG_SPI/32u,bit=W_WDOG_SPI%32u;
++ uint32_t group=w_rd(gic,0x080u+4u*word),enable=w_rd(gic,0x100u+4u*word);
++ uint32_t pending=w_rd(gic,0x200u+4u*word),active=w_rd(gic,0x300u+4u*word);
++ printf("SWEET WIFI: W2 probe: wdog spi=%u group1=%u enabled=%u pending=%u active=%u (read only)\n",
++  W_WDOG_SPI,!!(group&(1u<<bit)),!!(enable&(1u<<bit)),!!(pending&(1u<<bit)),!!(active&(1u<<bit)));
++ if(pending&(1u<<bit))printf("SWEET WIFI: W2 probe: WPSS WATCHDOG HAS FIRED (spi %u pending, not taken by us)\n",W_WDOG_SPI);
++ w_unmap(gic,W_GICD_BYTES);
++ /* Our SMP2P item as the WPSS would see it, and the WPSS's item as we see it. */
++ uint32_t off=0,bytes=0;
++ int inrc=w_item(W_IN,QCOM_SMP2P_ITEM_BYTES,&off,&bytes);
++ printf("SWEET WIFI: W2 probe: smp2p in item=%u rc=%d",W_IN,inrc);
++ if(!inrc){
++  uint32_t snapshot[QCOM_SMP2P_ITEM_BYTES/4];for(unsigned i=0;i<sizeof(snapshot)/4;i++)snapshot[i]=qcom_smem_read32(&w.sm,off+4*i);
++  int valid=qcom_smp2p_check_in(snapshot,QCOM_SMEM_HOST_APPS,W_REMOTE);QcomSmp2p view={0};view.in=snapshot;
++  int index=valid?-1:qcom_smp2p_find_in(&view,"slave-kernel");
++  uint32_t value=index>=0?qcom_smp2p_in_value(&view,index):0;
++  printf(" magic=%#x version=%u valid=%d",snapshot[0],snapshot[1]&0xffu,valid);
++  if(index>=0)printf(" slave=%#x (fatal=%u ready=%u handover=%u stop_ack=%u)",value,value&1,!!(value&2),!!(value&4),!!(value&8));
++  else printf(" no slave-kernel entry");
++ }
++ printf("; last seen state=%#x\n",w.state);sweet_log_sync();
++ wpss_crash_reason();
++}
+ /* Linux's order and the reference port's lesson: ask the DSP to stop over SMP2P and wait for its ack before TrustZone
+- * shuts it down. A stop that is not verified keeps the image memory, the metadata, the QMP load state and the votes. */
++ * shuts it down. A stop that is not verified keeps the image memory, the metadata, the QMP load state and the votes.
++ *
++ * 2244 (ast208): every line here is flushed as it is written. In ast208 the run printed "run end error=60" and then
++ * nothing: the stop-ack line and the PAS6 shutdown line were both lost because the flush interval is 10 s and the
++ * kernel did not survive the next second. A cleanup whose evidence can be swallowed is a cleanup nobody can grade.
++ * The wait is also bounded by whether the DSP ever said it was up: a DSP that never reported ready cannot answer a
++ * stop request, so 3 s of waiting is 3 s of a wedged DSP still running with its watchdog armed. */
+ static bool w_cleanup(void){
++ bool acked=false;
+  if(w.started && w.sp.out){
+-  qcom_smp2p_update(&w.sp,w.master,1,1);w_ring(W_IPCC,W_SIG_SMP2P);uint64_t end=w_now()+3000;
+-  while(w_now()<end){w_smp_poll();if(w.state&8)break;w_sleep(10);}
++  bool was_ready=!!(w.state&2);
++  qcom_smp2p_update(&w.sp,w.master,1,1);w_ring(W_IPCC,W_SIG_SMP2P);
++  unsigned wait_ms=was_ready?3000u:500u;
++  uint64_t end=w_now()+wait_ms;
++  while(w_now()<end){w_smp_poll();if(w.state&8){acked=true;break;}w_sleep(10);}
+   qcom_smp2p_update(&w.sp,w.master,1,0);w_ring(W_IPCC,W_SIG_SMP2P);
+-  printf("SWEET WIFI: W2 stop request cleared ack=%u\n",!!(w.state&8));
++  acked=acked||!!(w.state&8);
++  printf("SWEET WIFI: W2 stop request cleared ack=%u waited_ms=%u ready_when_asked=%u\n",acked,wait_ms,was_ready);
++  sweet_log_sync();
++ } else if(w.owed){
++  printf("SWEET WIFI: W2 stop request skipped: the WPSS never started, so it has nothing to acknowledge\n");
++  sweet_log_sync();
+  }
+  if(w.owed){
+   int rc=EIO;for(unsigned retry=0;retry<50;retry++){rc=w_pas(QCOM_SCM_PAS_SHUTDOWN,qcom_scm_args(1,0,0,0),0,0);if(rc!=-EINVAL)break;w_sleep(100);}
+   if(rc){printf("SWEET WIFI: W2 STOP UNVERIFIED PAS6; retaining memory, QMP state and power\n");sweet_log_sync();return false;}
+   w.owed=false;
++  printf("SWEET WIFI: W2 PAS6 shutdown done; owed cleared\n");sweet_log_sync();
+  }
+  if(w.vote_uncertain){printf("SWEET WIFI: W2 cleanup incomplete: TCS ownership uncertain\n");sweet_log_sync();return false;}
+  if(w.qmp_owed){if(w_qsend(false)){printf("SWEET WIFI: W2 cleanup incomplete: QMP release\n");sweet_log_sync();return false;}w.qmp_owed=false;}
+@@ -281,7 +382,10 @@ static int wpss_run(void){
+  if(qcom_smem_partition(&w.sm,QCOM_SMEM_HOST_APPS,W_REMOTE,&w.part)){rc=EIO;goto out;}
+  if(((w_rd(w.rsc,0)>>16)&255)!=3){rc=ENOTSUP;goto out;}
+  if((rc=w_power_inspect()))goto out;
+- /* The WPSS makes item 616 when it runs. Present before our start means it ran since SMEM was laid out: refuse. */
++ /* The WPSS makes item 617 when it runs: that is its own item (qcom,smem = <inbound outbound>). Present before our start
++  * means the WPSS ran since SMEM was laid out, so refuse. 2244: W2 tested 616 here, which is our own item and which
++  * nothing else ever creates, so the refusal could never fire; and W2 then allocated 617, the WPSS's live item, which
++  * would have overwritten a WPSS that was already up. Both are now on the right item. */
+  uint32_t prior,bytes;
+  if(qcom_smem_find(&w.sm,&w.part,W_IN,&prior,&bytes)!=QcomSmemMissing){printf("SWEET WIFI: W2 refused: WPSS SMP2P item present\n");rc=EBUSY;goto out;}
+  uint32_t outoff;if((rc=w_alloc(W_OUT,QCOM_SMP2P_ITEM_BYTES,&outoff)))goto out;
+@@ -304,6 +408,10 @@ static int wpss_run(void){
+  }
+ out:
+  printf("SWEET WIFI: W2 run end error=%d ready=%u handover=%u fatal=%u\n",rc,!!(w.state&2),!!(w.state&4),w.fatal);sweet_log_sync();
++ /* 2244: before giving up, read what the hardware says, so the next boot does not have to guess whether the DSP bit
++  * its watchdog or simply never spoke. Read only: no GIC write, no SMEM write, no PAS call. Only after a start was
++  * attempted, and only when something went wrong. */
++ if(rc || !(w.state&2))w_state_probe();
+  if(!w_cleanup())rc=EIO;
+  return rc;
+ }
+@@ -319,10 +427,13 @@ static void wpss_survey(void){
+  int rc=qcom_smem_partition(&w.sm,QCOM_SMEM_HOST_APPS,W_REMOTE,&w.part);
+  printf("SWEET WIFI: W1 partition 0-%u rc=%d offset=%#x bytes=%#x\n",W_REMOTE,rc,w.part.offset,w.part.size);
+  if(!rc){
+-  static const uint16_t ids[]={W_IN,W_OUT,478,479,480,626};
++  /* 2244: 617 is the WPSS's item and 616 is ours (qcom,smem = <inbound outbound>), so each is named. Item 626, the
++   * crash reason, is a global item, not one of this partition's: it is reported by wpss_crash_reason() below. */
++  static const uint16_t ids[]={W_IN,W_OUT,478,479,480};
+   for(unsigned i=0;i<sizeof(ids)/sizeof(ids[0]);i++){
+    uint32_t off=0,bytes=0;int found=qcom_smem_find(&w.sm,&w.part,ids[i],&off,&bytes);
+-   printf("SWEET WIFI: W1 item=%u rc=%d offset=%#x bytes=%u\n",ids[i],found,off,bytes);
++   printf("SWEET WIFI: W1 item=%u rc=%d offset=%#x bytes=%u%s\n",ids[i],found,off,bytes,
++    i==0?" (wpss-in)":i==1?" (wpss-out)":"");
+    if(ids[i]==W_IN && !w_item(W_IN,QCOM_SMP2P_ITEM_BYTES,&off,&bytes)){
+     /* Snapshot the bounded item before parsing remote state. */
+     uint32_t snapshot[QCOM_SMP2P_ITEM_BYTES/4];for(unsigned j=0;j<sizeof(snapshot)/4;j++)snapshot[j]=qcom_smem_read32(&w.sm,off+4*j);
+@@ -332,6 +443,7 @@ static void wpss_survey(void){
+    }
+   }
+  }
++ wpss_crash_reason();
+  printf("SWEET WIFI: W1 power inspect error=%d\n",w_power_inspect());
+  printf("SWEET WIFI: W1 firmware error=%d\n",w_open_image(&f));
+ out:

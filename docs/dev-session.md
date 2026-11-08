@@ -40,3 +40,52 @@ Priority runs SIM/modem first, then battery, then everything else.
 - If the phone is in iOS with no dev.py running, the owner has it. Wait.
 - `plans/phone-queue.sh JOBFILE` runs queued jobs only when no `wants` file exists.
 - Never put the string `devloop/dev.py` in a long-running waiter's command line. Wait on pids.
+
+## P0: the passcode dev session (owner present, about 15 minutes)
+
+P0 is the passcode series' first look at iOS 26's own Passcode flow. It exists because the selector numbers are
+Inferred from the iOS 16.7 map, and P0 on 2026-11-04 already caught one: selector 42 is five scalars with no structure
+input, so a handler that read `structureInput` answered Unsupported for every verify and the pane backed out. P0 is
+also how a later change is checked the same way.
+
+**This is a security-sensitive session.** Read `plans/passcode/audit-brief.md` first. The image needs a Sonnet 5.5 GO
+for its exact hash before it boots, because 2321 is the only thing between a stranger and the phone.
+
+**Image:** `plans/usb/gadget/out-v5/usb-dev-t-boot.img` with `--key 'SWEET AKS'`, about 11 minutes with deadman 960 s.
+The short image, so the session cannot outlast the owner's patience.
+
+**Runner duties (before and after):**
+
+1. Back up everything keybagd and profiled keep under `/private/var` before the owner touches Settings:
+   - `/private/var/keybags/` (the system bag, and any per-user bags)
+   - `/private/var/mobile/Library/Preferences/` (profiled writes its configuration here)
+   - `/private/var/protected/` if it exists
+   Save the tar and its SHA-256 under `plans/passcode/p0-backup/`, which is git-ignored. Never commit the tar: it
+   contains device state.
+2. Start the session, wait for the interface, and confirm the log is flowing before the owner arrives. A capture that
+   starts late misses the only interesting seconds.
+3. Watch `dmesg` for `SWEET AKS:` lines and keep the raw stream, not a filtered one. The first P0 lost the pane's own
+   errors because only kernel lines were kept.
+
+**The owner's part, in their words:** open Settings > Passcode. Try either "Turn Passcode On" or "Change Passcode" with
+a throwaway code, something they have never used and do not care about. Then lock the phone with the side button and
+wake it. That is all. About two minutes of tapping, then they can hand the phone back.
+
+Say plainly, before they start: nothing is encrypted, the code is a throwaway, and the session ends in 11 minutes no
+matter what.
+
+**After the owner is done:**
+
+1. Check that nothing persisted: compare the tar from step 1 with a fresh one. The P0 on 2026-11-04 showed no changes,
+   and that is the expected result for `usb-dev-t`, which does not carry the passcode patch.
+2. If something did persist, put back the files keybagd and profiled own with
+   `tools/devloop/06-hfs-put.py` from recovery, before the next boot. Name the exact paths that changed in the log.
+3. End the session with `ssh ... touch /private/var/tmp/usbdev.stop` and let `usbdev.stop` do its own teardown. Do not
+   kill the session by hand.
+4. Move the captures into `plans/passcode/p0-backup/` with the date in the name, and keep them local.
+
+**What to read out of the capture:** every `sel` number with its scalar and structure counts, in order, with the
+process name. That is the iOS 26 selector map for the passcode flow, which is the thing this session exists to
+produce. The 2026-11-04 run gave `42 in 5/0`, `31 in 1/0 out 0/32768` and SpringBoard polling `26`/`27` about twice a
+second; a session with 2321 in the kernel should show `42` succeeding and `31` returning a dictionary instead of
+`0xe00002c7`.

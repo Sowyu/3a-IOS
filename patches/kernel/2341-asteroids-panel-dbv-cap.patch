@@ -1,0 +1,13 @@
+--- a/bsd/dev/sweet_dsi_asteroids.c
++++ b/bsd/dev/sweet_dsi_asteroids.c
+@@ -55,7 +55,9 @@
+ #define DSI_TPG_CMD_DMA_INIT    0x17cu
+ #define DSI_TPG_DMA_FIFO_RESET  0x1ecu
+ 
+-#define PANEL_MAX_LEVEL         4095u
++#define PANEL_MAX_LEVEL         3515u   /* 2341: the panel init's own 51 0d bb, as 2340's brightness-nits cap; every DCS 51
++                                         * write is clamped here, so the plain brightness and IODisplayParameters paths of
++                                         * AppleARMBacklight::setProperties can't reach the outdoor range either */
+ #define PANEL_MIN_LEVEL         10u
+ #define PANEL_TIMEOUT_US        50000u
+ 

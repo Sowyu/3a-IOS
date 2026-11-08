@@ -1,0 +1,837 @@
+SWEET ACM: a context store so iOS 26 can set a passcode, and selector 15 resolving it (2323)
+
+iOS 26 never hands keybag the new passcode. profiled puts it in an ACM context
+(ACMContextCreate, ACMContextSetData type 7), exports the context's 16-byte id
+(ACMContextGetExternalForm) and calls MKBKeyBagChangeSystemSecretWithACM with the
+ids. MobileKeyBag sets 0x4 in the params word, keybagd passes the ids and the word
+through untouched, and libaks puts them in selector 15's scalars 3/4, 5/6 and 11.
+With no AppleCredentialManager in the kernel the very first ACM call fails with -5,
+so no code can be set (plans/passcode/TURNON-ast228.md, "The second wall"). If the
+ids did reach 2321 it would hash the id, and the lock screen, which sends the code
+in the clear, could never unlock it.
+
+- AppleCredentialManager, an IOResources service, exists only with sweetacm=1. Off,
+  start() fails and every ACMLib call answers -5 exactly as before.
+- AppleCredentialManagerUserClient (the class name the sandbox profiles allow) opens
+  only for com.apple.private.applecredentialmanager.allow, is pinned to the task
+  that opened it, and takes ACMLib's 'DRCS' commands inband on selector 0:
+  create (0x24, 0x34, 0x01), set data (0x28), export (0x13), import (0x25, 0x12),
+  get data (0x29) and delete (0x02). Everything else answers -5.
+- The store (bsd/dev/SweetACMStore.c, compiled unchanged by the Mac host test):
+  random 16-byte ids, type 7 only, 1..128 bytes, 16 contexts per connection and 64
+  in all, fixed storage. Only the creating connection may set, read, export or
+  delete a context; another may import an exported id and learns nothing else.
+  Data is wiped on replace, delete, close and free. Nothing is logged.
+- Selector 15: with 0x4 in scalar 11 the codes are 16-byte ids, resolved through
+  the store to the bytes profiled stored (exported contexts that hold data only).
+  Anything that does not resolve is refused before the core runs, so it is neither
+  hashed nor counted, and an id never becomes an empty, clearing code. Without the
+  bit nothing changes. Every 2321 check is unchanged.
+
+Not done: selector 5 (set_system) and the change epilogue with ACM ids. keybagd's
+two-phase change still fails after selector 15 on this kernel; see the audit brief.
+
+Needs 2321 and 2322. Security code: plans/passcode/audit-brief-acm.md is the
+audit brief, and no image should boot until that audit is a GO.
+
+Check: python3 -I plans/passcode/tools/check-acm.py XNU_DIR (31 checks, 20 negative controls)
+       python3 -I plans/passcode/tools/check-lock.py XNU_DIR (2321/2322, unchanged: 56 checks)
+Apply: git apply -p1 in the kernel tree, after 2321 and 2322.
+diff --git a/iokit/Kernel/arm/SweetKeyStore.cpp b/iokit/Kernel/arm/SweetKeyStore.cpp
+--- a/iokit/Kernel/arm/SweetKeyStore.cpp
++++ b/iokit/Kernel/arm/SweetKeyStore.cpp
+@@ -107,6 +107,18 @@
+ /* The entitlement Settings changes the code with. Root is allowed too: it can rewrite the file anyway. */
+ #define SWEET_AKS_CHANGE_ENTITLEMENT    "com.apple.keystore.device"
+ 
++/*
++ * Selector 15's scalar 11 is keybagd's params word. MobileKeyBag's MKBKeyBagChangeSystemSecretWithACM sets 0x4
++ * (__MKBKeyBagChangeSystemSecretOpts, mkb.dis 0x1cb4629f8), keybagd passes it through untouched (KBChangeSystemNonSeSecret,
++ * keybagd 0x10001cee0), and _aks_change_secret_with_kek puts it in scalar 11. With it set, scalars 3/4 and 5/6 are
++ * ACM context ids (16 bytes, ACMContextGetExternalForm), not codes.
++ */
++#define SWEET_AKS_PARAM_ACM             0x4u
++#define SWEET_AKS_ACM_REF_LEN           16u
++
++/* 2323, SweetACM.cpp: false unless sweetacm=1 and the id names an exported context that holds a code. */
++extern "C" bool sweet_acm_resolve(const uint8_t *id, uint8_t *out, size_t max, size_t *out_len);
++
+ LCK_GRP_DECLARE(sweet_pc_grp, "sweet_passcode");
+ LCK_MTX_DECLARE(sweet_pc_mtx, &sweet_pc_grp);
+ 
+@@ -544,7 +556,35 @@
+ 	return true;
+ }
+ 
++/*
++ * Selector 15's codes. Without SWEET_AKS_PARAM_ACM they are the code itself, as before. With it they are ACM context
++ * ids, and hashing an id would store a code nobody can type: the lock screen sends the code in the clear
++ * (SBFUserAuthenticationController _evaluatePasscodeAttempt: dataUsingEncoding:4, then MKBUnlockDevice). So an id is
++ * resolved through the ACM store to the bytes profiled put there, and anything that does not resolve is refused. It
++ * is never read as a code, and an id that resolves to nothing is never an empty code, which would clear the lock.
++ */
+ static bool
++sweet_aks_copy_secret(bool acm, uint64_t ptr, uint64_t len, uint8_t *dst, size_t max, size_t *out_len)
++{
++	uint8_t id[SWEET_AKS_ACM_REF_LEN];
++	bool ok;
++
++	if (!acm) {
++		return sweet_aks_copy_code(ptr, len, dst, max, out_len);
++	}
++	*out_len = 0;
++	if (ptr == 0 || len != sizeof(id) || copyin((user_addr_t)ptr, id, sizeof(id)) != 0) {
++		return false;
++	}
++	ok = sweet_acm_resolve(id, dst, max, out_len) && *out_len != 0;
++	spc_wipe(id, sizeof(id));
++	if (!ok) {
++		*out_len = 0;
++	}
++	return ok;
++}
++
++static bool
+ sweet_aks_may_change(void)
+ {
+ 	if (kauth_getuid() == 0) {
+@@ -778,14 +818,18 @@
+ 	 * same fact through `force`.
+ 	 */
+ 	bool live = !sweet_aks_no_code();
++	bool acm = (args->scalarInput[11] & SWEET_AKS_PARAM_ACM) != 0;
+ 	if (live) {
+ 		if (args->scalarInput[3] == 0 || args->scalarInput[4] == 0) {
+ 			printf("SWEET AKS: change refused, no old passcode supplied\n");
+ 			return kIOReturnNotPermitted;
+ 		}
+-		if (!sweet_aks_copy_code(args->scalarInput[3], args->scalarInput[4], old_code, sizeof(old_code),
++		if (!sweet_aks_copy_secret(acm, args->scalarInput[3], args->scalarInput[4], old_code, sizeof(old_code),
+ 		    &old_len)) {
+ 			spc_wipe(old_code, sizeof(old_code));
++			if (acm) {
++				printf("SWEET AKS: change refused, the old passcode's ACM context did not resolve\n");
++			}
+ 			return kIOReturnBadArgument;
+ 		}
+ 	}
+@@ -794,11 +838,18 @@
+ 	 * not an error.
+ 	 */
+ 	if (args->scalarInput[6] != 0 &&
+-	    !sweet_aks_copy_code(args->scalarInput[5], args->scalarInput[6], new_code, sizeof(new_code), &new_len)) {
++	    !sweet_aks_copy_secret(acm, args->scalarInput[5], args->scalarInput[6], new_code, sizeof(new_code),
++	    &new_len)) {
+ 		spc_wipe(old_code, sizeof(old_code));
+ 		spc_wipe(new_code, sizeof(new_code));
++		if (acm) {
++			printf("SWEET AKS: change refused, the new passcode's ACM context did not resolve\n");
++		}
+ 		return kIOReturnBadArgument;
+ 	}
++	if (acm) {
++		printf("SWEET AKS: change via ACM, contexts resolved\n");
++	}
+ 	/*
+ 	 * Never forced while a code is live: root included, a change always proves the old one. With no code live there is
+ 	 * nothing to prove, which is the first-set case above.
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -53,6 +53,11 @@
+     "     'IOMatchCategory' = AppleKeyStore;"
+     "   },"
+     "   {"
++    "     'IOClass'         = AppleCredentialManager;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = AppleCredentialManager;"
++    "   },"
++    "   {"
+     "     'IOClass'         = IOWatchdog;"
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = IOWatchdog;"
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -11,6 +11,7 @@
+ iokit/Kernel/arm/SweetCPU.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/SweetEntitlements.cpp                           optional iokitcpp
+ iokit/Kernel/arm/SweetKeyStore.cpp                               optional iokitcpp
++iokit/Kernel/arm/SweetACM.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -111,6 +111,7 @@
+ bsd/dev/sweet_dsi_asteroids.c		standard
+ bsd/dev/sweet_rtc_asteroids.c		standard
+ bsd/dev/SweetPasscode.c			standard
++bsd/dev/SweetACMStore.c			standard
+ bsd/dev/sweet_thermal_asteroids.c	standard
+ bsd/dev/sweet_power_survey.c		standard
+ bsd/dev/sweet_a810.c			standard
+diff --git a/bsd/dev/SweetACMStore.h b/bsd/dev/SweetACMStore.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/SweetACMStore.h
+@@ -0,0 +1,109 @@
++/*
++ * SWEET ACM context store core (2323): the part of AppleCredentialManager that iOS 26 needs to set a passcode.
++ *
++ * profiled does not hand keybag the passcode. It puts the code into an ACM context (ACMContextCreate, then
++ * ACMContextSetData with type 7), exports the context's 16-byte id (ACMContextGetExternalForm), and passes that id
++ * through MobileKeyBag and keybagd to AppleKeyStore selector 15 with bit 0x4 set in scalar 11. With no
++ * AppleCredentialManager in the kernel every one of those calls fails with -5 and no code can be set
++ * (plans/passcode/TURNON-ast228.md). This is the store behind those calls, and the resolver the AKS shim uses to turn
++ * the id back into the bytes the lock screen will later send in the clear.
++ *
++ * It is a core in the same sense as SweetPasscode.c: no locks, no IOKit, no logging. The kernel file (SweetACM.cpp)
++ * takes the mutex, checks the entitlement and the calling task, and passes the inband command buffer here. The Mac
++ * host test (plans/passcode/tools/test_acm.c) runs this same file.
++ *
++ * The rules, all enforced here:
++ *   - A context belongs to the client (one IOUserClient connection) that created it. Only that client may set its
++ *     data, read its data, export it or delete it. Another client may import an exported id, which proves the id is
++ *     live and nothing else: it never makes the importer an owner.
++ *   - Only data type 7 (the passcode, as ManagedConfiguration stores it) is kept, at most SPC_SECRET_MAX bytes, one
++ *     value per context. Every other type and command answers -5, which is what ACMLib got before 2323 existed.
++ *   - At most SACM_PER_CLIENT contexts per client and SACM_MAX in all. Fixed storage: nothing is allocated.
++ *   - The data is wiped when it is replaced, when its context is deleted and when its client goes away.
++ *   - The in-kernel resolver reads only exported contexts that hold data.
++ */
++#ifndef SWEET_ACM_STORE_H
++#define SWEET_ACM_STORE_H
++
++#include <stdint.h>
++#include <stddef.h>
++#include <stdbool.h>
++
++#include "SweetPasscode.h"              /* SPC_SECRET_MAX, spc_wipe, spc_equal: one cap and one wipe for both */
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define SACM_ID_LEN             16u     /* ACMContextGetExternalForm hands out exactly these 16 bytes */
++#define SACM_SECRET_MAX         SPC_SECRET_MAX
++#define SACM_PER_CLIENT         16u
++#define SACM_MAX                64u
++#define SACM_TYPE_PASSCODE      7u      /* +[MCExtractablePasscodeContextWrapper contextWrapperForExtractablePasscode:] */
++#define SACM_LOG_LEVEL          0x46u   /* ACMLib's log threshold, sent back on create: errors only */
++#define SACM_HDR                8u      /* 'DRCS', command, 0, 0, version 2 (_LibCall_BuildCommand) */
++#define SACM_OUT_MAX            SACM_SECRET_MAX
++
++/* Boot arg (PE_parse_boot_argn): the service exists only with sweetacm=1. */
++#define SACM_ARG                "sweetacm"
++
++/* What ACMLib's _performCommand returns: the IOConnectCallStructMethod result, unchanged. */
++#define SACM_OK                 0
++#define SACM_ERR_PARAM          (-3)    /* malformed, unknown id, or not the caller's context */
++#define SACM_ERR_NOMEM          (-4)    /* a limit was reached */
++#define SACM_ERR_UNSUPPORTED    (-5)    /* what every ACM call answered before 2323 */
++
++/* Command bytes (header byte 4), from the LibCall_ACMContext* functions in LocalAuthenticationCore. */
++enum {
++	SACM_CMD_CREATE_V1      = 0x01, /* no payload; reply id[16], log level */
++	SACM_CMD_DELETE         = 0x02, /* id[16]; ACMContextDelete(ctx, destroy = 1) */
++	SACM_CMD_IMPORT_V1      = 0x12, /* id[16]; reply u32 tracking, log level */
++	SACM_CMD_EXPORT         = 0x13, /* id[16]; ACMContextGetExternalForm */
++	SACM_CMD_CREATE         = 0x24, /* no payload; reply id[16], log level, u32 tracking */
++	SACM_CMD_IMPORT         = 0x25, /* id[16]; reply u32 tracking, log level, 4 zero bytes */
++	SACM_CMD_SET_DATA       = 0x28, /* id[16], u32 type, u32 len, data[len], u32 scope count (0) */
++	SACM_CMD_GET_DATA       = 0x29, /* id[16], u32 type, u8 size only, u32 scope count (0) */
++	SACM_CMD_CREATE_FLAGS   = 0x34, /* ACMContextCreateWithFlags(.., 1): as 0x24 */
++};
++
++struct sacm_ctx {
++	uint64_t owner;                 /* the creating client; 0 marks a free slot */
++	uint32_t tracking;
++	uint8_t  id[SACM_ID_LEN];
++	uint8_t  exported;
++	uint8_t  has_data;
++	uint8_t  data_len;
++	uint8_t  data[SACM_SECRET_MAX];
++};
++
++struct sacm_store {
++	struct sacm_ctx ctx[SACM_MAX];
++	uint32_t next_tracking;
++	void (*random)(void *arg, uint8_t *buf, size_t n);
++	void *random_arg;
++};
++
++void sacm_init(struct sacm_store *s, void (*random)(void *arg, uint8_t *buf, size_t n), void *random_arg);
++
++/*
++ * One DRCS command from `client` (never 0). `*out_len` is the caller's output capacity on entry and the reply length
++ * on return; it is 0 whenever the answer is not SACM_OK. `out` must hold SACM_OUT_MAX bytes.
++ */
++int sacm_command(struct sacm_store *s, uint64_t client, const uint8_t *in, size_t in_len, uint8_t *out,
++    size_t *out_len);
++
++/* The client's connection closed or its process died: wipe and free everything it created. */
++void sacm_client_gone(struct sacm_store *s, uint64_t client);
++
++/* For the AKS shim only: the data of an exported context, copied into out. False leaves out_len 0. */
++bool sacm_resolve(const struct sacm_store *s, const uint8_t id[SACM_ID_LEN], uint8_t *out, size_t max,
++    size_t *out_len);
++
++/* Live contexts owned by `client`, or all of them for client 0. */
++unsigned sacm_count(const struct sacm_store *s, uint64_t client);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* SWEET_ACM_STORE_H */
+diff --git a/bsd/dev/SweetACMStore.c b/bsd/dev/SweetACMStore.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/SweetACMStore.c
+@@ -0,0 +1,319 @@
++/*
++ * SWEET ACM context store core (2323). Compiled into XNU on SWEET and, unchanged, into the Mac host test
++ * (plans/passcode/tools/test_acm.c). See SweetACMStore.h for the rules; this file only enforces them.
++ *
++ * Nothing here logs. A passcode passes through sacm_command() on its way in, sits in one fixed slot until it is
++ * replaced, deleted or its client goes, and leaves only through sacm_resolve() to the AKS shim in the same kernel.
++ * The id is never derived from anything: it is 16 bytes of the kernel RNG, and an RNG that fails yields no context.
++ */
++#if !defined(KERNEL) || defined(ARM64_BOARD_CONFIG_SWEET)
++#ifdef KERNEL
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <string.h>
++#else
++#include <string.h>
++#endif
++#include "SweetACMStore.h"
++
++#define SACM_VERSION    2u
++#define SACM_ID_TRIES   4
++
++static uint32_t
++get32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
++}
++
++static void
++put32(uint8_t *p, uint32_t v)
++{
++	p[0] = (uint8_t)v;
++	p[1] = (uint8_t)(v >> 8);
++	p[2] = (uint8_t)(v >> 16);
++	p[3] = (uint8_t)(v >> 24);
++}
++
++static void
++ctx_free(struct sacm_ctx *c)
++{
++	spc_wipe(c, sizeof(*c));        /* the data, the id and the owner: a freed slot is all zero */
++}
++
++void
++sacm_init(struct sacm_store *s, void (*random)(void *arg, uint8_t *buf, size_t n), void *random_arg)
++{
++	spc_wipe(s, sizeof(*s));
++	s->next_tracking = 1;
++	s->random = random;
++	s->random_arg = random_arg;
++}
++
++/* A free slot never matches: its id is all zero and its owner is 0, and only live slots are compared. */
++static struct sacm_ctx *
++find(const struct sacm_store *s, const uint8_t *id)
++{
++	for (unsigned i = 0; i < SACM_MAX; i++) {
++		const struct sacm_ctx *c = &s->ctx[i];
++		if (c->owner != 0 && spc_equal(c->id, id, SACM_ID_LEN)) {
++			return (struct sacm_ctx *)(uintptr_t)c;
++		}
++	}
++	return NULL;
++}
++
++/* The caller's own live context, or NULL. "Unknown" and "someone else's" are one answer, so neither is an oracle. */
++static struct sacm_ctx *
++find_own(struct sacm_store *s, uint64_t client, const uint8_t *id)
++{
++	struct sacm_ctx *c = find(s, id);
++	return c != NULL && c->owner == client ? c : NULL;
++}
++
++unsigned
++sacm_count(const struct sacm_store *s, uint64_t client)
++{
++	unsigned n = 0;
++	for (unsigned i = 0; i < SACM_MAX; i++) {
++		if (s->ctx[i].owner != 0 && (client == 0 || s->ctx[i].owner == client)) {
++			n++;
++		}
++	}
++	return n;
++}
++
++static bool
++id_usable(const struct sacm_store *s, const uint8_t *id)
++{
++	uint8_t any = 0;
++	for (unsigned i = 0; i < SACM_ID_LEN; i++) {
++		any |= id[i];
++	}
++	return any != 0 && find(s, id) == NULL;
++}
++
++static int
++cmd_create(struct sacm_store *s, uint64_t client, uint8_t cmd, size_t n, uint8_t *out, size_t cap, size_t *out_len)
++{
++	size_t need = cmd == SACM_CMD_CREATE_V1 ? SACM_ID_LEN + 1 : SACM_ID_LEN + 5;
++	struct sacm_ctx *slot = NULL;
++	uint8_t id[SACM_ID_LEN];
++	int tries;
++
++	if (n != 0 || cap < need) {
++		return SACM_ERR_PARAM;
++	}
++	if (sacm_count(s, client) >= SACM_PER_CLIENT) {
++		return SACM_ERR_NOMEM;
++	}
++	for (unsigned i = 0; i < SACM_MAX; i++) {
++		if (s->ctx[i].owner == 0) {
++			slot = &s->ctx[i];
++			break;
++		}
++	}
++	if (slot == NULL || s->random == NULL) {
++		return SACM_ERR_NOMEM;
++	}
++	for (tries = 0; tries < SACM_ID_TRIES; tries++) {
++		memset(id, 0, sizeof(id));
++		s->random(s->random_arg, id, sizeof(id));
++		if (id_usable(s, id)) {
++			break;
++		}
++	}
++	if (tries == SACM_ID_TRIES) {
++		return SACM_ERR_NOMEM;  /* the RNG answered zeros or repeats: issue nothing rather than a guessable id */
++	}
++	ctx_free(slot);
++	slot->owner = client;
++	memcpy(slot->id, id, SACM_ID_LEN);
++	slot->tracking = s->next_tracking++;
++	if (s->next_tracking == 0) {
++		s->next_tracking = 1;   /* 0 is ACMLib's "not found" in an import reply */
++	}
++	memcpy(out, id, SACM_ID_LEN);
++	out[SACM_ID_LEN] = SACM_LOG_LEVEL;
++	if (need > SACM_ID_LEN + 1) {
++		put32(out + SACM_ID_LEN + 1, slot->tracking);
++	}
++	*out_len = need;
++	return SACM_OK;
++}
++
++static int
++cmd_import(struct sacm_store *s, uint8_t cmd, const uint8_t *p, size_t n, uint8_t *out, size_t cap, size_t *out_len)
++{
++	size_t need = cmd == SACM_CMD_IMPORT_V1 ? 5 : 9;
++	struct sacm_ctx *c;
++
++	if (n != SACM_ID_LEN || cap < need) {
++		return SACM_ERR_PARAM;
++	}
++	c = find(s, p);
++	if (c == NULL || !c->exported) {
++		return SACM_ERR_PARAM;
++	}
++	memset(out, 0, need);
++	put32(out, c->tracking);
++	out[4] = SACM_LOG_LEVEL;
++	*out_len = need;
++	return SACM_OK;
++}
++
++static int
++cmd_set_data(struct sacm_store *s, uint64_t client, const uint8_t *p, size_t n)
++{
++	struct sacm_ctx *c;
++	uint32_t type, len;
++
++	if (n < SACM_ID_LEN + 12) {
++		return SACM_ERR_PARAM;
++	}
++	type = get32(p + SACM_ID_LEN);
++	len = get32(p + SACM_ID_LEN + 4);
++	/* len is bounded before it is added to anything, so n == 28 + len cannot wrap. */
++	if (len == 0 || len > SACM_SECRET_MAX || n != SACM_ID_LEN + 12 + (size_t)len ||
++	    get32(p + SACM_ID_LEN + 8 + len) != 0) {
++		return SACM_ERR_PARAM;
++	}
++	if (type != SACM_TYPE_PASSCODE) {
++		return SACM_ERR_UNSUPPORTED;
++	}
++	c = find_own(s, client, p);
++	if (c == NULL) {
++		return SACM_ERR_PARAM;
++	}
++	spc_wipe(c->data, sizeof(c->data));
++	memcpy(c->data, p + SACM_ID_LEN + 8, len);
++	c->data_len = (uint8_t)len;
++	c->has_data = 1;
++	return SACM_OK;
++}
++
++static int
++cmd_get_data(struct sacm_store *s, uint64_t client, const uint8_t *p, size_t n, uint8_t *out, size_t cap,
++    size_t *out_len)
++{
++	struct sacm_ctx *c;
++	uint8_t size_only;
++
++	if (n != SACM_ID_LEN + 9) {
++		return SACM_ERR_PARAM;
++	}
++	size_only = p[SACM_ID_LEN + 4];
++	if (size_only > 1 || get32(p + SACM_ID_LEN + 5) != 0) {
++		return SACM_ERR_PARAM;
++	}
++	if (get32(p + SACM_ID_LEN) != SACM_TYPE_PASSCODE) {
++		return SACM_ERR_UNSUPPORTED;
++	}
++	c = find_own(s, client, p);
++	if (c == NULL || !c->has_data) {
++		return SACM_ERR_PARAM;
++	}
++	if (size_only) {
++		if (cap < 4) {
++			return SACM_ERR_PARAM;
++		}
++		put32(out, c->data_len);
++		*out_len = 4;
++		return SACM_OK;
++	}
++	if (cap < c->data_len) {
++		return SACM_ERR_PARAM;
++	}
++	memcpy(out, c->data, c->data_len);
++	*out_len = c->data_len;
++	return SACM_OK;
++}
++
++int
++sacm_command(struct sacm_store *s, uint64_t client, const uint8_t *in, size_t in_len, uint8_t *out, size_t *out_len)
++{
++	size_t cap = *out_len;
++	const uint8_t *p;
++	size_t n;
++	struct sacm_ctx *c;
++
++	*out_len = 0;
++	if (cap > SACM_OUT_MAX) {
++		cap = SACM_OUT_MAX;
++	}
++	if (client == 0 || in == NULL || out == NULL || in_len < SACM_HDR) {
++		return SACM_ERR_PARAM;
++	}
++	if (in[0] != 'D' || in[1] != 'R' || in[2] != 'C' || in[3] != 'S' || in[7] != SACM_VERSION) {
++		return SACM_ERR_PARAM;
++	}
++	switch (in[4]) {
++	case SACM_CMD_CREATE_V1: case SACM_CMD_DELETE: case SACM_CMD_IMPORT_V1: case SACM_CMD_EXPORT:
++	case SACM_CMD_CREATE: case SACM_CMD_IMPORT: case SACM_CMD_SET_DATA: case SACM_CMD_GET_DATA:
++	case SACM_CMD_CREATE_FLAGS:
++		break;
++	default:
++		return SACM_ERR_UNSUPPORTED;    /* policy, credentials, environment: as before 2323 */
++	}
++	if (in[5] != 0 || in[6] != 0) {
++		return SACM_ERR_PARAM;          /* ACMLib writes 0 in both for every command above */
++	}
++	p = in + SACM_HDR;
++	n = in_len - SACM_HDR;
++
++	switch (in[4]) {
++	case SACM_CMD_CREATE_V1:
++	case SACM_CMD_CREATE:
++	case SACM_CMD_CREATE_FLAGS:
++		return cmd_create(s, client, in[4], n, out, cap, out_len);
++	case SACM_CMD_IMPORT_V1:
++	case SACM_CMD_IMPORT:
++		return cmd_import(s, in[4], p, n, out, cap, out_len);
++	case SACM_CMD_SET_DATA:
++		return cmd_set_data(s, client, p, n);
++	case SACM_CMD_GET_DATA:
++		return cmd_get_data(s, client, p, n, out, cap, out_len);
++	}
++	/* DELETE and EXPORT: the payload is the id and nothing else, and only the owner may do either. */
++	if (n != SACM_ID_LEN) {
++		return SACM_ERR_PARAM;
++	}
++	c = find_own(s, client, p);
++	if (c == NULL) {
++		return SACM_ERR_PARAM;
++	}
++	if (in[4] == SACM_CMD_EXPORT) {
++		c->exported = 1;
++	} else {
++		ctx_free(c);
++	}
++	return SACM_OK;
++}
++
++void
++sacm_client_gone(struct sacm_store *s, uint64_t client)
++{
++	if (client == 0) {
++		return;
++	}
++	for (unsigned i = 0; i < SACM_MAX; i++) {
++		if (s->ctx[i].owner == client) {
++			ctx_free(&s->ctx[i]);
++		}
++	}
++}
++
++bool
++sacm_resolve(const struct sacm_store *s, const uint8_t id[SACM_ID_LEN], uint8_t *out, size_t max, size_t *out_len)
++{
++	const struct sacm_ctx *c = find(s, id);
++
++	*out_len = 0;
++	if (c == NULL || !c->exported || !c->has_data || c->data_len == 0 || c->data_len > max) {
++		return false;
++	}
++	memcpy(out, c->data, c->data_len);
++	*out_len = c->data_len;
++	return true;
++}
++
++#endif /* !KERNEL || ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/Kernel/arm/SweetACM.cpp b/iokit/Kernel/arm/SweetACM.cpp
+new file mode 100644
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetACM.cpp
+@@ -0,0 +1,220 @@
++/*
++ * Built-in AppleCredentialManager for SWEET: the ACM context store that iOS 26 needs to set a passcode (2323).
++ *
++ * LocalAuthenticationCore's ACMLib opens IOServiceMatching("AppleCredentialManager") with type 0 and sends every ACM
++ * call as one IOConnectCallStructMethod(conn, 0, cmd, ...) whose input starts 'DRCS', command, 0, 0, 2. profiled
++ * stores a new passcode in a context and passes the context's 16-byte id to keybag instead of the code
++ * (plans/passcode/TURNON-ast228.md, "The second wall"). Without this service every such call fails with -5.
++ *
++ * This file is a SHIM, like SweetKeyStore.cpp. The store, the command parser and every rule about who may touch
++ * which context are in bsd/dev/SweetACMStore.c, which the Mac host test runs. What is here is what only a kernel can
++ * do: the boot arg, the mutex, the entitlement gate at open, pinning a connection to the task that opened it, and the
++ * resolver SweetKeyStore.cpp calls for selector 15.
++ *
++ * Off unless the boot line says sweetacm=1. Off, start() fails, nothing is registered, and every ACMLib call answers
++ * -5 exactly as it did before this file existed.
++ *
++ * Nothing here logs a command's payload, a context id or a length.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOBSD.h>
++#include <libkern/crypto/rand.h>
++#include <sys/proc.h>
++#include <kern/locks.h>
++#include <pexpert/pexpert.h>
++
++#include "../../../bsd/dev/SweetACMStore.h"
++
++/* Every process that talks to ACM on iOS 26.6.2 holds it: profiled, keybagd, coreauthd, SpringBoard, Preferences. */
++#define SWEET_ACM_ENTITLEMENT   "com.apple.private.applecredentialmanager.allow"
++
++/* ACMLib's commands are small and always inband; anything larger is not one of them. */
++#define SWEET_ACM_IN_MAX        4096u
++
++LCK_GRP_DECLARE(sweet_acm_grp, "sweet_acm");
++LCK_MTX_DECLARE(sweet_acm_mtx, &sweet_acm_grp);
++
++/* Everything below is guarded by sweet_acm_mtx. */
++static struct sacm_store sweet_acm;
++static bool sweet_acm_on;
++static uint64_t sweet_acm_next_client = 1;
++
++static void
++acm_random(void *arg, uint8_t *buf, size_t n)
++{
++	(void)arg;
++	if (random_buf(buf, n) != 0) {
++		memset(buf, 0, n);      /* the store refuses an all-zero id, so a failed RNG makes no context */
++	}
++}
++
++class AppleCredentialManager : public IOService {
++	OSDeclareDefaultStructors(AppleCredentialManager);
++
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(AppleCredentialManager, IOService);
++
++bool
++AppleCredentialManager::start(IOService *provider)
++{
++	int on = 0;
++
++	(void)PE_parse_boot_argn(SACM_ARG, &on, sizeof(on));
++	if (on != 1) {
++		IOLog("SWEET ACM: off (sweetacm=1 to enable): ACM calls answer -5 as before\n");
++		return false;
++	}
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	lck_mtx_lock(&sweet_acm_mtx);
++	sacm_init(&sweet_acm, acm_random, NULL);
++	sweet_acm_on = true;
++	lck_mtx_unlock(&sweet_acm_mtx);
++	setProperty(kIOUserClientClassKey, "AppleCredentialManagerUserClient");
++	registerService();
++	IOLog("SWEET ACM: AppleCredentialManager registered, %u contexts, %u per connection, passcode data only\n",
++	    SACM_MAX, SACM_PER_CLIENT);
++	return true;
++}
++
++/*
++ * The class name is the one the sandbox profiles allow (com.apple.security.iokit-user-client-class lists
++ * "AppleCredentialManagerUserClient" in profiled, SpringBoard and Preferences), so it must not change.
++ */
++class AppleCredentialManagerUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(AppleCredentialManagerUserClient);
++
++	task_t   fTask;
++	uint64_t fClient;               /* the store's owner token for this connection; 0 once closed */
++
++	void forget(void);
++
++public:
++	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	void free(void) APPLE_KEXT_OVERRIDE;
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(AppleCredentialManagerUserClient, IOUserClient);
++
++bool
++AppleCredentialManagerUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
++{
++	char name[32];
++
++	if (owningTask == NULL || !IOTaskHasEntitlement(owningTask, SWEET_ACM_ENTITLEMENT)) {
++		proc_selfname(name, sizeof(name));
++		IOLog("SWEET ACM: open refused for %s, no %s\n", name, SWEET_ACM_ENTITLEMENT);
++		return false;
++	}
++	if (!IOUserClient::initWithTask(owningTask, securityID, type)) {
++		return false;
++	}
++	lck_mtx_lock(&sweet_acm_mtx);
++	if (!sweet_acm_on) {
++		lck_mtx_unlock(&sweet_acm_mtx);
++		return false;
++	}
++	fTask = owningTask;
++	fClient = sweet_acm_next_client++;
++	lck_mtx_unlock(&sweet_acm_mtx);
++	return true;
++}
++
++/* The connection is gone (closed, or its process died): every context it created is wiped and freed. */
++void
++AppleCredentialManagerUserClient::forget(void)
++{
++	lck_mtx_lock(&sweet_acm_mtx);
++	sacm_client_gone(&sweet_acm, fClient);
++	fClient = 0;
++	lck_mtx_unlock(&sweet_acm_mtx);
++}
++
++IOReturn
++AppleCredentialManagerUserClient::clientClose(void)
++{
++	forget();
++	terminate();
++	return kIOReturnSuccess;
++}
++
++void
++AppleCredentialManagerUserClient::free(void)
++{
++	forget();                       /* a second call finds fClient 0 and frees nothing */
++	IOUserClient::free();
++}
++
++IOReturn
++AppleCredentialManagerUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target, __unused void *reference)
++{
++	uint8_t out[SACM_OUT_MAX];
++	size_t out_len;
++	int st;
++
++	/* A connection is its task's: a send right passed to another process does not carry the contexts with it. */
++	if (selector != 0 || current_task() != fTask) {
++		return kIOReturnNotPermitted;
++	}
++	/* Inband in and out, no scalars. Never a descriptor: ACMLib does not send one, and an unwired one panics. */
++	if (args->scalarInputCount != 0 || args->structureInputDescriptor != NULL ||
++	    args->structureOutputDescriptor != NULL || args->structureInput == NULL ||
++	    args->structureInputSize > SWEET_ACM_IN_MAX) {
++		return kIOReturnBadArgument;
++	}
++	out_len = args->structureOutput != NULL ? args->structureOutputSize : 0;
++	if (out_len > sizeof(out)) {
++		out_len = sizeof(out);
++	}
++	lck_mtx_lock(&sweet_acm_mtx);
++	if (fClient == 0) {
++		st = SACM_ERR_PARAM;
++		out_len = 0;
++	} else {
++		st = sacm_command(&sweet_acm, fClient, (const uint8_t *)args->structureInput, args->structureInputSize,
++		    out, &out_len);
++	}
++	lck_mtx_unlock(&sweet_acm_mtx);
++	if (st == SACM_OK && out_len != 0) {
++		memcpy(args->structureOutput, out, out_len);
++	}
++	args->structureOutputSize = st == SACM_OK ? (uint32_t)out_len : 0;
++	args->scalarOutputCount = 0;
++	spc_wipe(out, sizeof(out));
++	/* ACMLib reads the IOConnectCallStructMethod result as its own status: 0, -3, -4 or -5. */
++	return (IOReturn)st;
++}
++
++/*
++ * For SweetKeyStore.cpp's selector 15 only. The id is keybagd's copy of what profiled exported; the bytes that come
++ * back are the code profiled stored, which is the same UTF-8 the lock screen later passes to MKBUnlockDevice.
++ */
++extern "C" bool
++sweet_acm_resolve(const uint8_t *id, uint8_t *out, size_t max, size_t *out_len)
++{
++	bool ok = false;
++
++	*out_len = 0;
++	lck_mtx_lock(&sweet_acm_mtx);
++	if (sweet_acm_on) {
++		ok = sacm_resolve(&sweet_acm, id, out, max, out_len);
++	}
++	lck_mtx_unlock(&sweet_acm_mtx);
++	return ok;
++}
++
++#endif /* SWEET */

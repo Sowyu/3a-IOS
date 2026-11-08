@@ -1,0 +1,29 @@
+diff --git a/bsd/dev/wifi/WpssGate.h b/bsd/dev/wifi/WpssGate.h
+index a93f9af80..5dc4f7a2f 100644
+--- a/bsd/dev/wifi/WpssGate.h
++++ b/bsd/dev/wifi/WpssGate.h
+@@ -5,13 +5,21 @@
+ #define WPSS_GATE_H
+ #include "../modem/ModemGate.h"
+ enum {WpssOff=0,WpssSurvey=1,WpssStart=2,WpssRefused=-1};
+-static const char *const wpss_refused[9]={"sweetdaily","sweetcell","sweetbatt","sweetmpss","sweetbadsp","sweetbprobe",
+-    "sweetipa","sweetipaprobe","sweetmprobe"};
++/* Refused in any form: the presets, the battery's own gates, and every modem, IPA and battery-test gate ModemGate.h lists
++ * (modem_cell_gates, modem_cell_refused, modem_daily_refused), so the list cannot fall behind it. */
++static const char *const wpss_refused[5]={"sweetdaily","sweetcell","sweetbatt","sweetbmeter","sweetbprobe"};
++static inline int wpss_conflict(const char *args){
++    for(unsigned i=0;i<5;i++)if(modem_arg_count(args,wpss_refused[i]))return 1;
++    for(unsigned i=0;i<14;i++)if(modem_arg_count(args,modem_cell_gates[i]))return 1;
++    for(unsigned i=0;i<8;i++)if(modem_arg_count(args,modem_cell_refused[i]))return 1;
++    for(unsigned i=0;i<5;i++)if(modem_arg_count(args,modem_daily_refused[i]))return 1;
++    return 0;
++}
+ static inline int wpss_gate(const char *args,int deadman){
+     unsigned probe=modem_arg_count(args,"sweetwprobe"),start=modem_arg_count(args,"sweetwpss");
+     if(!probe && !start)return WpssOff;
+     if(probe && start)return WpssRefused;
+-    for(unsigned i=0;i<9;i++)if(modem_arg_count(args,wpss_refused[i]))return WpssRefused;
++    if(wpss_conflict(args))return WpssRefused;
+     if(probe)return modem_arg_is(args,"sweetwprobe","1")?WpssSurvey:WpssRefused;
+     if(!modem_arg_is(args,"sweetwpss","1") || !modem_gate(args,"sweetfbarm") || !modem_gate(args,"sweetselftest") || deadman!=600)
+         return WpssRefused;

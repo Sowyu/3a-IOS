@@ -1,0 +1,125 @@
+--- a/bsd/dev/battery/BatteryRead.h
++++ b/bsd/dev/battery/BatteryRead.h
+@@ -17,4 +17,14 @@
+  * (owner 32778, type 2, opcode 7, 16 bytes; Linux qcom_battmgr). A notification carries no value we use. */
+ int battery_msg_header(const uint8_t *,uint32_t,uint32_t *owner,uint32_t *type,uint32_t *opcode);
+ int battery_notify_parse(const uint8_t *,uint32_t,uint32_t *code);
++/* 2296: the USB-online probe, GET 0x32 property 0, which the full cycle already sends as its field 6.
++ * receive: 1 matched (online in *online), -1 matched with an error code, 0 not this reply. */
++uint32_t battery_probe_request(uint8_t out[24]);
++int battery_probe_receive(const uint8_t *,uint32_t,int32_t *online);
++uint32_t battery_read_request(const BatteryRead *,uint8_t out[24]);
++int battery_read_allowed(const uint8_t *,uint32_t);
++int battery_read_sent(BatteryRead *);
++int battery_read_receive(BatteryRead *,const uint8_t *,uint32_t);
++void battery_read_timeout(BatteryRead *);
++int battery_read_valid(const BatteryRead *);
+ #endif
+--- a/bsd/dev/battery/BatteryRead.c
++++ b/bsd/dev/battery/BatteryRead.c
+@@ -48,3 +48,15 @@
+  if(code)*code=get32(p+12);
+  return 1;
+ }
++uint32_t battery_probe_request(uint8_t p[24]){
++ if(!p)return 0;
++ put32(p,32778);put32(p+4,1);put32(p+8,0x32);put32(p+12,0);put32(p+16,0);put32(p+20,0);
++ return battery_read_allowed(p,24)?24:0;
++}
++int battery_probe_receive(const uint8_t *p,uint32_t n,int32_t *online){
++ if(!p || n!=24 || get32(p)!=32778 || get32(p+4)!=1 || get32(p+8)!=0x32 || get32(p+12)!=0)return 0;
++ if(get32(p+20))return -1;
++ int32_t v=(int32_t)get32(p+16);if(v!=0 && v!=1)return -1;
++ if(online)*online=v;
++ return 1;
++}
+--- a/bsd/dev/battery/AdspRuntime.inc
++++ b/bsd/dev/battery/AdspRuntime.inc
+@@ -49,6 +49,7 @@
+  int master;
+  BatteryRead read;bool reads,daily,meter;uint64_t cycle_started,request_sent,cycle_due,read_quiet_until;unsigned read_failures,cycles;int32_t last_status,last_online;
+  bool refresh_pending,notify_pending;uint64_t last_trigger,last_notify_cycle,settle_until;unsigned unmatched,notifies;
++ bool probing;uint64_t probe_sent,online_due;unsigned online_ms;int32_t known_online;
+  struct adsp_image images[2];
+ } m;
+ static uint64_t m_now(void);
+@@ -67,6 +68,10 @@
+  * shows quickly. */
+ #define B_NOTIFY_MIN_MS 5000u
+ #define B_TRIGGER_MIN_MS 1000u
++/* 2296 sweetbonline=MS (daily mode, default 1000, 0 off, 250..10000): between full cycles, GET only USB online
++ * (0x32/0, already the cycle's field 6) every MS; a change starts a full read at once. One request at a time:
++ * a probe is sent only with no cycle in flight, and a cycle starts only with no probe outstanding. */
++#define B_ONLINE_DEFAULT_MS 1000u
+ #define B_SETTLE_MS 30000u
+ #define B_SETTLE_CYCLE_MS 2000u
+ #define B_READ_FAILURES 5u
+@@ -101,6 +106,15 @@
+  if(!m.reads || m_now()<m.read_quiet_until)return;
+  /* A battery-manager notification is only a cue: values still come from GET replies. */
+  uint32_t code;
++ if(m.probing){
++  int32_t online=0;int pr=battery_probe_receive(data,bytes,&online);
++  if(pr<0){printf("SWEET BATTERY: B7 probe error\n");m.probing=false;adsp_read_fail();return;}
++  if(pr>0){
++   m.probing=false;
++   if(online!=m.known_online){printf("SWEET BATTERY: B7 online %d -> %d\n",m.known_online,online);m.known_online=online;adsp_refresh_soon();}
++   return;
++  }
++ }
+  if(battery_notify_parse(data,bytes,&code)){
+   if(m.notifies++<16 || !(m.notifies%64))printf("SWEET BATTERY: B7 notify #%u code=%#x\n",m.notifies-1,code);
+   if(m.daily)m.notify_pending=true;
+@@ -119,7 +133,7 @@
+     m.read.value[0],m.read.value[1],m.read.value[2],m.read.value[3],m.read.value[4],m.read.value[5],m.read.value[6],valid,m.cycles);
+    sweet_log_sync();
+   }
+-  m.cycles++;m.last_status=m.read.value[0];m.last_online=m.read.value[6];
++  m.cycles++;m.last_status=m.read.value[0];m.last_online=m.read.value[6];m.known_online=m.read.value[6];
+   if(!valid){adsp_read_fail();return;}
+   battery_snapshot_publish(&m.read,m_now());m.read_failures=0;
+   if(m.meter){
+@@ -136,10 +150,25 @@
+  uint64_t now=m_now();
+  if(now<m.read_quiet_until)return;
+  if(battery_read_complete(&m.read)){
++  if(m.probing){
++   if(now-m.probe_sent>=2000){m.probing=false;printf("SWEET BATTERY: B7 probe timeout\n");adsp_read_fail();}
++   return;
++  }
+   bool changed=m.refresh_pending && now>=m.last_trigger+B_TRIGGER_MIN_MS;
+   bool notified=m.notify_pending && now>=m.last_notify_cycle+B_NOTIFY_MIN_MS;
+   bool triggered=changed || notified;
+-  if(now<m.cycle_due && !triggered)return;
++  if(now<m.cycle_due && !triggered){
++   if(m.daily && m.online_ms && m.cycles && now>=m.online_due){
++    uint8_t probe[24];uint32_t pn=battery_probe_request(probe);
++    /* Same final sender boundary as the cycle. */
++    if(!pn || !battery_read_allowed(probe,pn)){m.failed=true;return;}
++    int prc=qcom_glink_send(&m.gl,m.battery,probe,pn);
++    if(prc==QcomGlinkAgain)return;
++    if(prc){m.failed=true;battery_snapshot_clear();return;}
++    m.probing=true;m.probe_sent=now;m.online_due=now+m.online_ms;
++   }
++   return;
++  }
+   /* Any cycle that starts now reads the state after the cue, so both cues are spent. */
+   if(changed)m.last_trigger=now;
+   if(notified)m.last_notify_cycle=now;
+@@ -161,7 +190,7 @@
+  m.request_sent=now;
+ }
+ /* Inside a read cycle, waiting for its next request or reply. */
+-static bool adsp_read_busy(void){return m.reads && (m.read.waiting || (m.cycle_started && !battery_read_complete(&m.read)));}
++static bool adsp_read_busy(void){return m.reads && (m.probing || m.read.waiting || (m.cycle_started && !battery_read_complete(&m.read)));}
+ static int adsp_open_images(struct wl_fat *f){
+  int rc=sweet_ufs_part_size("modem_a",NULL,&adsp_partition_bytes);if(rc)return rc;
+  if((rc=fat_mount(f,"modem_a")))return rc;
+@@ -255,6 +284,7 @@
+ }
+ static int adsp_run(bool glink,bool reads,bool daily,bool meter){
+  memset(&m,0,sizeof(m));m.master=-1;m.glink=glink;m.reads=reads;m.daily=daily;m.meter=daily && meter;adsp_read_reset();struct wl_fat f;
++ {unsigned ms=B_ONLINE_DEFAULT_MS;(void)PE_parse_boot_argn("sweetbonline",&ms,sizeof(ms));m.online_ms=ms==0?0:ms<250?250:ms>10000?10000:ms;m.known_online=-1;}
+  int rc=adsp_open_images(&f);if(rc)goto out;
+  m.smem=ml_io_map_unmappable(0x81d00000,M_SM_SIZE,VM_WIMG_IO);
+  m.mutex=ml_io_map_unmappable(0x1f43000,0x1000,VM_WIMG_IO);

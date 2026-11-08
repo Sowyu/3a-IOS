@@ -1,0 +1,737 @@
+diff --git a/bsd/dev/sweet_wpss.c b/bsd/dev/sweet_wpss.c
+index ffe3462..2e66b09 100644
+--- a/bsd/dev/sweet_wpss.c
++++ b/bsd/dev/sweet_wpss.c
+@@ -40,6 +40,11 @@ static void wpss_worker(void *arg,wait_result_t wait){
+   /* 2250: W6. W5's whole exchange, then the cold-boot mode request and the two indications that answer it. */
+   printf("SWEET WIFI: W6 worker begin; WPSS start, the edge, the WLFW client, the board data and the cold-boot mode\n");sweet_log_sync();
+   printf("SWEET WIFI: W2 worker final_error=%d\n",wpss_run(WpssMode));
++ } else if(arg==(void *)WpssMission){
++  /* 2251: W7. W6's whole exchange, then WLAN_INI, WLAN_CFG and mission mode, a fixed hold, and a mode-off if it got
++   * there. Still no register window and no copy engine: the firmware is left waiting for a host data path. */
++  printf("SWEET WIFI: W7 worker begin; WPSS start, the edge, the WLFW client, the board data, the cold-boot mode and mission mode\n");sweet_log_sync();
++  printf("SWEET WIFI: W2 worker final_error=%d\n",wpss_run(WpssMission));
+  } else printf("SWEET WIFI: W2 worker final_error=%d\n",wpss_run(WpssStart));
+  sweet_log_sync();thread_terminate(current_thread());
+ }
+@@ -51,7 +56,7 @@ void sweet_wpss_start(void){
+  if(!PE_parse_boot_argn("sweetdeadman",&deadman,sizeof(deadman)))deadman=0;
+  int gate=wpss_gate(args,deadman);
+  if(gate==WpssOff)return;
+- if(gate==WpssRefused){printf("SWEET WIFI: refused: sweetwprobe=1 with no modem or battery gate, or one of sweetwpin=1, sweetwpss=1, sweetwglink=1, sweetwlfw=1, sweetwbdf=1 or sweetwmode=1 with sweetfbarm=1 sweetselftest=1 sweetdeadman=600 and no other gate\n");return;}
++ if(gate==WpssRefused){printf("SWEET WIFI: refused: sweetwprobe=1 with no modem or battery gate, or one of sweetwpin=1, sweetwpss=1, sweetwglink=1, sweetwlfw=1, sweetwbdf=1, sweetwmode=1 or sweetwmission=1 with sweetfbarm=1 sweetselftest=1 sweetdeadman=600 and no other gate\n");return;}
+  thread_t thread=THREAD_NULL;kern_return_t rc=kernel_thread_start(wpss_worker,(void *)(uintptr_t)gate,&thread);
+  if(rc==KERN_SUCCESS)thread_deallocate(thread);else printf("SWEET WIFI: thread failure %d\n",rc);
+ }
+diff --git a/bsd/dev/wifi/WlfwQmi.h b/bsd/dev/wifi/WlfwQmi.h
+index 2d049ed..ade56ff 100644
+--- a/bsd/dev/wifi/WlfwQmi.h
++++ b/bsd/dev/wifi/WlfwQmi.h
+@@ -49,6 +49,8 @@
+ #define WLFW_DEVICE_INFO_REQ 0x004Cu
+ #define WLFW_BDF_DOWNLOAD_REQ 0x0025u      /* QMI_WLANFW_BDF_DOWNLOAD_REQ_V01 */
+ #define WLFW_WLAN_MODE_REQ 0x0022u         /* QMI_WLANFW_WLAN_MODE_REQ_V01, 2250 (W6) */
++#define WLFW_WLAN_CFG_REQ 0x0023u          /* QMI_WLANFW_WLAN_CFG_REQ_V01, 2251 (W7) */
++#define WLFW_WLAN_INI_REQ 0x002Fu          /* QMI_WLANFW_WLAN_INI_REQ_V01, 2251 (W7) */
+ #define WLFW_FW_READY_IND 0x0021u          /* QMI_WLFW_FW_READY_IND_V01 */
+ #define WLFW_REQUEST_MEM_IND 0x0035u       /* QMI_WLFW_REQUEST_MEM_IND_V01 */
+ #define WLFW_FW_MEM_READY_IND 0x0037u      /* QMI_WLFW_FW_MEM_READY_IND_V01 */
+@@ -105,6 +107,16 @@
+  * is the "valid" bit) followed by the u8 value, so the TLV exists only because ath11k always sets hw_debug_valid = 1. */
+ #define WLFW_TLV_MODE 0x01u            /* wlan_mode: u32 mode */
+ #define WLFW_TLV_HW_DEBUG 0x10u        /* wlan_mode: u8 hw_debug */
++/* 2251 (W7): wlan_cfg (qmi_wlanfw_wlan_cfg_req_msg_v01_ei) and wlan_ini. Each of the three arrays rides under a
++ * QMI_DATA_LEN whose elem_size is sizeof(u8), so its payload is one count byte and then fixed-size records. 0x13 is the
++ * older shadow_reg (u16 id, u16 offset), which ath11k never sends (shadow_reg_valid = 0); 0x14 is shadow_reg_v2, one
++ * le32 address each. 0x10 host_version is a top-level QMI_STRING, so it has no length byte of its own. */
++#define WLFW_TLV_HOST_VERSION 0x10u    /* wlan_cfg: char[17] QMI_STRING, TLV length = strlen */
++#define WLFW_TLV_TGT_CFG 0x11u         /* wlan_cfg: u8 count, then 20-byte pipe records */
++#define WLFW_TLV_SVC_CFG 0x12u         /* wlan_cfg: u8 count, then 12-byte service records */
++#define WLFW_TLV_SHADOW 0x13u          /* wlan_cfg: u8 count, then {u16 id, u16 offset}: NOT sent */
++#define WLFW_TLV_SHADOW_V2 0x14u       /* wlan_cfg: u8 count, then u32 addresses */
++#define WLFW_TLV_FWLOG 0x10u           /* wlan_ini: u8 enablefwlog */
+ /* 2250: request_mem. TLV 0x01 is a u8 count followed by that many qmi_wlanfw_mem_seg_s_v01 records, each
+  * {u32 size, u32 type, u8 mem_cfg_len, mem_cfg_len x {u64 offset, u32 size, u8 secure_flag}}. Named here because W6
+  * decodes one rather than answering it; the numbers are ath11k's own. */
+@@ -266,6 +278,238 @@ static inline uint32_t wlfw_wlan_mode(uint8_t *out, uint32_t capacity, uint16_t
+     return wlfw_end(out, at);
+ }
+ 
++/* ---- 2251 (W7): WLAN_INI and WLAN_CFG, the two messages ath11k_qmi_firmware_start sends before mission mode -------
++ *
++ * THE ORDER, and where each message comes from. `ath11k_qmi_firmware_start(ab, mode)` is called from
++ * `ath11k_core_qmi_firmware_ready`, which is what the FW_READY event handler runs: the phone's W6 boot reached exactly
++ * that point. It sends, in this order:
++ *
++ *   1. WLAN_INI  (0x002F) enablefwlog = 1, when hw_params.fw_wmi_diag_event is true. core.c's "wcn6750 hw1.0" entry
++ *                sets fw_wmi_diag_event = true, so on this chip it is sent.
++ *   2. WLAN_CFG  (0x0023) host_version, tgt_cfg, svc_cfg and the shadow-register list.
++ *   3. WLAN_MODE (0x0022) mode 0 = ATH11K_FIRMWARE_MODE_NORMAL, which is mission mode.
++ *
++ * and only then does the driver touch the radio: `ath11k_core_qmi_firmware_ready` calls `ath11k_ce_init_pipes` after
++ * `ath11k_core_start_firmware` returns, and the register window is read from then on. So mission mode is the last thing
++ * that happens before the copy engines, which is exactly where W7 stops.
++ *
++ * WHAT THE FIRMWARE DOES WITH MISSION MODE AND NO HOST COPY ENGINES. It configures the pipes the host just described and
++ * starts waiting for the host to bring up the rings those pipes point at. Nothing arrives, so nothing is processed; the
++ * firmware does not fault on that. The reference port saw it from the other side: with the mode taken and the handle
++ * left open, the radio's registers answered (step 16) and the mode "off" was then taken; there was no crash and no
++ * timeout between the two. ath11k itself does not treat an idle post-mode firmware as an error either: its next step is
++ * to build the rings, and the firmware simply waits. What W7 must therefore prove is not "the firmware did something"
++ * but "the mode was taken, the firmware is in mission mode, and it came back out through a verified stop".
++ *
++ * THE MODE-OFF QUESTION, answered here because it decides the stop. `ath11k_qmi_firmware_stop` sends WLAN_MODE mode 4
++ * (ATH11K_FIRMWARE_MODE_OFF) before the rest of teardown, and the mode-off path in `ath11k_qmi_wlanfw_mode_send` treats
++ * a disconnected WLFW service (-ENETRESET) as success rather than an error. The reference port sent it after the
++ * cold-boot calibration, before any mission mode, and the firmware refused it with error 48; after mission mode it was
++ * taken. So W7 sends mode 4 only when mission mode was actually taken, and treats a refusal there as a finding rather
++ * than a blocker: the SMP2P stop and the PAS6 shutdown that follow are what actually stop this DSP, and they are proven
++ * since W2b. A boot where mission mode was never entered sends no OFF at all, so the stage cannot repeat the reference
++ * port's error 48 and cannot be misread as a clean mode-off that never happened.
++ */
++#define WLFW_HOST_VERSION "WIN"   /* ath11k qmi.h ATH11K_HOST_VERSION_STRING, three characters plus NUL */
++
++/* The copy-engine pipes, from ath11k_target_ce_config_wlan_qca6390 (hw.c), which core.c's "wcn6750 hw1.0" entry names
++ * as its target_ce_config with target_ce_count = 9. Each entry is {pipe_num, pipe_dir, nentries, nbytes_max, flags}.
++ * pipe_dir is the pipedir enum from ce.h, relative to the host: 1 = IN (target to host), 2 = OUT (host to target),
++ * 3 = INOUT (bidirectional), 4 = INOUT_H2H (bidirectional, host to host). flags is CE_ATTR_FLAGS | CE_ATTR_DIS_INTR
++ * where ath11k says so: CE_ATTR_FLAGS is 0 on a little-endian host and CE_ATTR_DIS_INTR is 8, and CE4, CE7 carry it.
++ * Entries 9 to 11 are the firmware's own description's tail ("used by MHI driver"), which ath11k never sends because
++ * target_ce_count is 9. */
++typedef struct {uint32_t pipe_num, pipe_dir, nentries, nbytes_max, flags;} WlfwCePipe;
++#define WLFW_CE_COUNT 9u
++static const WlfwCePipe wlfw_ce_pipes[WLFW_CE_COUNT] = {
++    {0, 2, 32, 2048, 0},    /* CE0 host->target HTC control and raw streams */
++    {1, 1, 32, 2048, 0},    /* CE1 target->host HTT + HTC control */
++    {2, 1, 32, 2048, 0},    /* CE2 target->host WMI */
++    {3, 2, 32, 2048, 0},    /* CE3 host->target WMI */
++    {4, 2, 256, 256, 8},    /* CE4 host->target HTT, no completion interrupt */
++    {5, 1, 32, 2048, 0},    /* CE5 target->host packet log */
++    {6, 3, 32, 16384, 0},   /* CE6 reserved for the target's autonomous hif_memcpy */
++    {7, 4, 0, 0, 8},        /* CE7 used only by the host, no ring and no interrupt */
++    {8, 3, 32, 16384, 0},   /* CE8 target->host, used only by IPA */
++};
++
++/* The service-to-pipe map, from ath11k_target_service_to_ce_map_wlan_qca6390 (hw.c), 14 entries per core.c's
++ * svc_to_ce_map_len: seven services, each with an OUT and an IN direction. The service ids are from htc.h's
++ * ATH11K_HTC_SVC_ID_* enum, which is SVC(group, idx) = (group << 8) | idx:
++ *   RSVD_CTRL        group 0, idx 1  = 0x0001
++ *   WMI_CONTROL      group 1, idx 0  = 0x0100
++ *   WMI_DATA_BE      group 1, idx 1  = 0x0101
++ *   WMI_DATA_BK      group 1, idx 2  = 0x0102
++ *   WMI_DATA_VI      group 1, idx 3  = 0x0103
++ *   WMI_DATA_VO      group 1, idx 4  = 0x0104
++ *   HTT_DATA_MSG     group 3, idx 0  = 0x0300
++ * ath11k's table is ordered DATA_VO, DATA_BK, DATA_BE, DATA_VI, WMI_CONTROL, RSVD_CTRL, HTT_DATA_MSG, and that order is
++ * kept here because it is what the table says, not because the firmware should care. */
++typedef struct {uint32_t service_id, pipe_dir, pipe_num;} WlfwCeService;
++#define WLFW_SVC_COUNT 14u
++static const WlfwCeService wlfw_ce_services[WLFW_SVC_COUNT] = {
++    {0x0104, 2, 3}, {0x0104, 1, 2},   /* WMI_DATA_VO */
++    {0x0102, 2, 3}, {0x0102, 1, 2},   /* WMI_DATA_BK */
++    {0x0101, 2, 3}, {0x0101, 1, 2},   /* WMI_DATA_BE */
++    {0x0103, 2, 3}, {0x0103, 1, 2},   /* WMI_DATA_VI */
++    {0x0100, 2, 3}, {0x0100, 1, 2},   /* WMI_CONTROL */
++    {0x0001, 2, 0}, {0x0001, 1, 2},   /* RSVD_CTRL: out on CE0, in on CE2 */
++    {0x0300, 2, 4}, {0x0300, 1, 1},   /* HTT_DATA_MSG: out on CE4, in on CE1 */
++};
++
++/* THE SHADOW REGISTER LIST. ath11k builds it at run time, not from a table: `ath11k_ce_get_shadow_config` calls
++ * `ath11k_hal_srng_shadow_config` and then `ath11k_ce_shadow_config`, and each `ath11k_hal_srng_update_shadow_config`
++ * appends one absolute register address to `hal->shadow_reg_addr[]`. The address is
++ *
++ *   srng_config->reg_start[HAL_HP_OFFSET_IN_REG_START] + reg_size[HAL_HP_OFFSET_IN_REG_START] * ring_num
++ *                                                        + (destination ring ? HAL_OFFSET_FROM_HP_TO_TP : 0)
++ *
++ * where HAL_HP_OFFSET_IN_REG_START is 1 (the ring's HP word), HAL_OFFSET_FROM_HP_TO_TP is 4, and reg_size is the
++ * distance between one CE's block and the next, 0x2000. `ath11k_hal_srng_create_config` sets the CE entries as:
++ *
++ *   HAL_CE_SRC         reg_start[1] = CE0_SRC_REG + HAL_CE_DST_RING_HP (0x400),  ring_dir = SRC  -> no +4
++ *   HAL_CE_DST         reg_start[1] = CE0_DST_REG + HAL_CE_DST_RING_HP (0x400),  ring_dir = SRC  -> no +4
++ *   HAL_CE_DST_STATUS  reg_start[1] = CE0_DST_REG + HAL_CE_DST_STATUS_RING_HP (0x408), ring_dir = DST -> +4
++ *
++ * Note the middle line: the CE_DST template entry is a SRC-direction ring, so its HP word is used as-is. Only the
++ * status ring, which really is a destination ring, takes the +4. Getting that backwards would send the firmware a word
++ * four bytes away from the one it has to shadow, which is the kind of mistake that looks like a firmware fault.
++ *
++ * The chip's bases are `wcn6750_regs` (hw.c): CE0_SRC at 0x01b80000, CE0_DST at 0x01b81000, each CE 0x2000 further.
++ * Both are WCSS-relative, which is what the firmware expects: the window's absolute base comes from the same DEVICE_INFO
++ * reply the host recorded in W4 (0x61e00000 in ast234), so a relative address is the only portable thing to send.
++ *
++ * THE LIST IS THE CE PART ONLY, and that is the whole of what this stage can honestly send. ath11k's list also holds
++ * every non-CE ring (REO, TCL, WBM, RXDMA), whose addresses are inside the radio's register window at 0x00a00000 and
++ * beyond. This kernel has not mapped that window, so it cannot compute them and must not pretend to; the CE entries are
++ * computable because they come from ath11k's per-chip register table, not from anything read out of the radio.
++ *
++ * WHICH PIPES: ath11k_ce_shadow_config asks `host_ce_config[i]`, the rings the HOST will build
++ * (`ath11k_host_ce_config_qca6390`, ce.c): CE0 16 src, CE1 512 dst, CE2 512 dst, CE3 32 src, CE4 2048 src with no
++ * interrupt, CE5 512 dst, CE6 and CE8 none, CE7 32 src. A pipe with a source ring contributes one word; a pipe with a
++ * destination ring contributes two, its TP and its status ring's TP. That is four source pipes (CE0, CE3, CE4, CE7) and
++ * three destination pipes (CE1, CE2, CE5), so 4 + 3 * 2 = 10 words, in pipe order. The count is derived by the function
++ * below and asserted in the host tests, not written down twice. */
++#define WLFW_CE_SRC_BASE 0x01b80000u   /* wcn6750_regs.hal_seq_wcss_umac_ce0_src_reg */
++#define WLFW_CE_DST_BASE 0x01b81000u   /* wcn6750_regs.hal_seq_wcss_umac_ce0_dst_reg */
++#define WLFW_CE_STRIDE 0x2000u         /* ce1_src - ce0_src, and ce1_dst - ce0_dst */
++#define WLFW_CE_HP 0x400u              /* HAL_CE_DST_RING_HP */
++#define WLFW_CE_DST_STATUS_HP 0x408u   /* HAL_CE_DST_STATUS_RING_HP */
++#define WLFW_HP_TO_TP 4u               /* HAL_OFFSET_FROM_HP_TO_TP */
++#define WLFW_SHADOW_MAX 36u            /* QMI_WLANFW_MAX_NUM_SHADOW_REG_V2_V01 */
++#define WLFW_SHADOW_COUNT 10u          /* what the derivation below produces; asserted, not assumed */
++
++/* Which of the host's pipes have a source ring and which a destination ring, from
++ * ath11k_host_ce_config_qca6390's src_nentries and dest_nentries. */
++static const uint8_t wlfw_ce_has_src[WLFW_CE_COUNT] = {1, 0, 0, 1, 1, 0, 0, 1, 0};
++static const uint8_t wlfw_ce_has_dst[WLFW_CE_COUNT] = {0, 1, 1, 0, 0, 1, 0, 0, 0};
++
++/* Builds the list exactly as ath11k_ce_shadow_config does: for each pipe in order, its source ring's HP when it has one,
++ * then its destination ring's TP and its status ring's TP when it has those. Returns how many words were written, or 0
++ * when capacity cannot hold the whole list (nothing partial: a truncated list is a different list to the firmware). */
++static inline uint32_t wlfw_shadow_config(uint32_t *out, uint32_t capacity)
++{
++    uint32_t n = 0;
++    if (!out) return 0;
++    for (uint32_t i = 0; i < WLFW_CE_COUNT; ++i) {
++        if (wlfw_ce_has_src[i]) {
++            if (n >= capacity || n >= WLFW_SHADOW_MAX) return 0;
++            out[n++] = WLFW_CE_SRC_BASE + WLFW_CE_STRIDE * i + WLFW_CE_HP;
++        }
++        if (wlfw_ce_has_dst[i]) {
++            if (n + 2 > capacity || n + 2 > WLFW_SHADOW_MAX) return 0;
++            out[n++] = WLFW_CE_DST_BASE + WLFW_CE_STRIDE * i + WLFW_CE_HP;
++            /* The status ring is a destination ring in ath11k's config table, so its TP address is HP + 4. */
++            out[n++] = WLFW_CE_DST_BASE + WLFW_CE_STRIDE * i + WLFW_CE_DST_STATUS_HP + WLFW_HP_TO_TP;
++        }
++    }
++    return n;
++}
++
++/* WLAN_INI (0x002F), 2251 (W7): the firmware's own logging. ath11k_qmi_wlanfw_wlan_ini_send fills exactly one field,
++ * `enablefwlog_valid = true` and `enablefwlog = 1`, and that is an OPT_FLAG plus a u8, so on the wire it is one TLV:
++ * type 0x10, length 1, value 1. Payload 4 bytes, which is ath11k's QMI_WLANFW_WLAN_INI_REQ_MSG_V01_MAX_LEN; the whole
++ * message is 7 + 4 = 11. */
++static inline uint32_t wlfw_wlan_ini(uint8_t *out, uint32_t capacity, uint16_t transaction, uint8_t enable)
++{
++    if (!out) return 0;
++    uint32_t at = wlfw_begin(out, capacity, WLFW_REQUEST, transaction, WLFW_WLAN_INI_REQ);
++    if (!at) return 0;
++    if (!(at = wlfw_tlv(out, capacity, at, WLFW_TLV_FWLOG, &enable, 1))) return 0;
++    return wlfw_end(out, at);
++}
++
++/* WLAN_CFG (0x0023), 2251 (W7): the copy engines and the shadow registers. ath11k_qmi_wlanfw_wlan_cfg_send fills four
++ * fields, and each is one TLV whose payload is a length byte followed by fixed-size records, because every array in that
++ * message is a VAR_LEN_ARRAY under a QMI_DATA_LEN whose elem_size is sizeof(u8):
++ *
++ *   0x10 host_version   a QMI_STRING at the top level, so NO length byte: the TLV's own length is strlen. "WIN" = 3.
++ *   0x11 tgt_cfg        u8 count, then count * qmi_wlanfw_ce_tgt_pipe_cfg_s_v01, 5 le32 = 20 bytes each.
++ *   0x12 svc_cfg        u8 count, then count * qmi_wlanfw_ce_svc_pipe_cfg_s_v01, 3 le32 = 12 bytes each.
++ *   0x14 shadow_reg_v2  u8 count, then count * qmi_wlanfw_shadow_reg_v2_cfg_s_v01, 1 le32 = 4 bytes each.
++ *
++ * TLV 0x13 (the older shadow_reg with u16 id and u16 offset) is NOT sent: ath11k sets `shadow_reg_valid = 0`
++ * unconditionally and uses only v2. The order below is the order of the elem_info table, and a firmware that reads by
++ * TLV number would not care, but a firmware that reads positionally would, so it is kept.
++ *
++ * Sizes with this chip's tables: 3 + 3 for host_version, 3 + 181 for 9 pipes, 3 + 169 for 14 services, 3 + 41 for 10
++ * shadow words = 406 of payload and 413 with the header, against ath11k's QMI_WLANFW_WLAN_CFG_REQ_MSG_V01_MAX_LEN of
++ * 803 (which holds the 12- and 24- and 36-entry maxima plus the older 0x13 TLV this chip does not use).
++ * Returns 0 rather than a partial message when anything does not fit. */
++static inline uint32_t wlfw_wlan_cfg(uint8_t *out, uint32_t capacity, uint16_t transaction)
++{
++    if (!out) return 0;
++    uint32_t at = wlfw_begin(out, capacity, WLFW_REQUEST, transaction, WLFW_WLAN_CFG_REQ);
++    if (!at) return 0;
++    const uint8_t version[] = WLFW_HOST_VERSION;
++
++    if (!(at = wlfw_tlv(out, capacity, at, WLFW_TLV_HOST_VERSION, version, sizeof(version) - 1))) return 0;
++
++    /* tgt_cfg: type, length, the u8 count, then the pipes. */
++    const uint32_t tgt_bytes = 1u + 20u * WLFW_CE_COUNT;
++    if (tgt_bytes > 0xffffu || at + 3u + tgt_bytes > capacity) return 0;
++    out[at] = WLFW_TLV_TGT_CFG;
++    wlfw_put16(out + at + 1, tgt_bytes);
++    out[at + 3] = (uint8_t)WLFW_CE_COUNT;
++    uint32_t p = at + 4;
++    for (uint32_t i = 0; i < WLFW_CE_COUNT; ++i, p += 20u) {
++        wlfw_put32(out + p + 0, wlfw_ce_pipes[i].pipe_num);
++        wlfw_put32(out + p + 4, wlfw_ce_pipes[i].pipe_dir);
++        wlfw_put32(out + p + 8, wlfw_ce_pipes[i].nentries);
++        wlfw_put32(out + p + 12, wlfw_ce_pipes[i].nbytes_max);
++        wlfw_put32(out + p + 16, wlfw_ce_pipes[i].flags);
++    }
++    at = p;
++
++    /* svc_cfg: type, length, the u8 count, then the services. */
++    const uint32_t svc_bytes = 1u + 12u * WLFW_SVC_COUNT;
++    if (svc_bytes > 0xffffu || at + 3u + svc_bytes > capacity) return 0;
++    out[at] = WLFW_TLV_SVC_CFG;
++    wlfw_put16(out + at + 1, svc_bytes);
++    out[at + 3] = (uint8_t)WLFW_SVC_COUNT;
++    p = at + 4;
++    for (uint32_t i = 0; i < WLFW_SVC_COUNT; ++i, p += 12u) {
++        wlfw_put32(out + p + 0, wlfw_ce_services[i].service_id);
++        wlfw_put32(out + p + 4, wlfw_ce_services[i].pipe_dir);
++        wlfw_put32(out + p + 8, wlfw_ce_services[i].pipe_num);
++    }
++    at = p;
++
++    /* shadow_reg_v2: type, length, the u8 count, then one le32 address each. A count of 0 is legal and is what a host
++     * with no shadow registers sends; the caller decides, and this writes whatever the builder above produced. */
++    uint32_t shadow[WLFW_SHADOW_MAX];
++    const uint32_t shadow_count = wlfw_shadow_config(shadow, WLFW_SHADOW_MAX);
++    if (!shadow_count) return 0;
++    const uint32_t shadow_bytes = 1u + 4u * shadow_count;
++    if (shadow_bytes > 0xffffu || at + 3u + shadow_bytes > capacity) return 0;
++    out[at] = WLFW_TLV_SHADOW_V2;
++    wlfw_put16(out + at + 1, shadow_bytes);
++    out[at + 3] = (uint8_t)shadow_count;
++    p = at + 4;
++    for (uint32_t i = 0; i < shadow_count; ++i, p += 4u) wlfw_put32(out + p, shadow[i]);
++    return wlfw_end(out, p);
++}
++
+ /* The pieces a file of bytes takes at a piece size of piece: one per piece bytes, and never zero, so a zero-length file
+  * still sends one piece with end=1 (which the firmware then refuses, as it should: no board file is empty). The piece
+  * size is the link's, decided at run time, so a caller passes the one it is using; WLFW_MAX_DATA is only the ceiling. */
+@@ -432,6 +676,8 @@ static inline const char *wlfw_name(uint16_t message)
+     case WLFW_DEVICE_INFO_REQ: return "device_info";
+     case WLFW_BDF_DOWNLOAD_REQ: return "bdf_download";
+     case WLFW_WLAN_MODE_REQ: return "wlan_mode";       /* 2250 (W6) */
++    case WLFW_WLAN_CFG_REQ: return "wlan_cfg";         /* 2251 (W7) */
++    case WLFW_WLAN_INI_REQ: return "wlan_ini";         /* 2251 (W7) */
+     default: return "unknown";
+     }
+ }
+diff --git a/bsd/dev/wifi/WpssGate.h b/bsd/dev/wifi/WpssGate.h
+index ae9920b..3984725 100644
+--- a/bsd/dev/wifi/WpssGate.h
++++ b/bsd/dev/wifi/WpssGate.h
+@@ -18,7 +18,11 @@
+ /* 2250 (W6): sweetwmode=1 is W5 plus the one thing the firmware asks for next: WLAN_MODE mode 7, cold-boot calibration,
+  * then the wait for cold_boot_cal_done and fw_ready. It sends no WLAN_CFG and no mission mode, and it never maps the
+  * radio's register window. Same rules, exclusive with W3, W4 and W5. */
+-enum {WpssOff=0,WpssSurvey=1,WpssStart=2,WpssPin=3,WpssGlink=4,WpssWlfw=5,WpssBdf=6,WpssMode=7,WpssRefused=-1};
++/* 2251 (W7): sweetwmission=1 is W6 plus the three messages ath11k's ath11k_qmi_firmware_start sends once the firmware is
++ * ready: WLAN_INI (log on), WLAN_CFG (the copy engines and the shadow-register list) and WLAN_MODE mode 0 (mission). It
++ * sends a mode-off only after mission mode was taken, and it never maps the radio's register window or touches a copy
++ * engine. Same rules, exclusive with W3, W4, W5 and W6. */
++enum {WpssOff=0,WpssSurvey=1,WpssStart=2,WpssPin=3,WpssGlink=4,WpssWlfw=5,WpssBdf=6,WpssMode=7,WpssMission=8,WpssRefused=-1};
+ /* Refused in any form: the presets, the battery's own gates, and every modem, IPA and battery-test gate ModemGate.h lists
+  * (modem_cell_gates, modem_cell_refused, modem_daily_refused), so the list cannot fall behind it. */
+ static const char *const wpss_refused[5]={"sweetdaily","sweetcell","sweetbatt","sweetbmeter","sweetbprobe"};
+@@ -45,15 +49,16 @@ static inline int wpss_edge_gate(const char *args,int deadman,const char *self){
+     if(!modem_same(self,"sweetwlfw") && modem_arg_count(args,"sweetwlfw"))return WpssRefused;
+     if(!modem_same(self,"sweetwbdf") && modem_arg_count(args,"sweetwbdf"))return WpssRefused;
+     if(!modem_same(self,"sweetwmode") && modem_arg_count(args,"sweetwmode"))return WpssRefused;
++    if(!modem_same(self,"sweetwmission") && modem_arg_count(args,"sweetwmission"))return WpssRefused;
+     if(!modem_gate(args,"sweetfbarm") || !modem_gate(args,"sweetselftest") || deadman!=600)return WpssRefused;
+     return 0;
+ }
+ static inline int wpss_gate(const char *args,int deadman){
+     unsigned probe=modem_arg_count(args,"sweetwprobe"),start=modem_arg_count(args,"sweetwpss"),pin=modem_arg_count(args,"sweetwpin");
+     unsigned glink=modem_arg_count(args,"sweetwglink"),wlfw=modem_arg_count(args,"sweetwlfw"),bdf=modem_arg_count(args,"sweetwbdf");
+-    unsigned mode=modem_arg_count(args,"sweetwmode");
+-    if(!probe && !start && !pin && !glink && !wlfw && !bdf && !mode)return WpssOff;
+-    if((probe!=0)+(start!=0)+(pin!=0)+(glink!=0)+(wlfw!=0)+(bdf!=0)+(mode!=0)>1)return WpssRefused;
++    unsigned mode=modem_arg_count(args,"sweetwmode"),mission=modem_arg_count(args,"sweetwmission");
++    if(!probe && !start && !pin && !glink && !wlfw && !bdf && !mode && !mission)return WpssOff;
++    if((probe!=0)+(start!=0)+(pin!=0)+(glink!=0)+(wlfw!=0)+(bdf!=0)+(mode!=0)+(mission!=0)>1)return WpssRefused;
+     /* 2246: W3 is the coexistence gate. It is the one Wi-Fi gate allowed beside a preset, because proving coexistence is its
+      * whole purpose, so sweetdaily=1 or sweetcell=1 may be present and the preset decides its own members. Every member and
+      * probe token named literally is refused instead: a preset plus one of its own members is an invalid preset
+@@ -79,6 +84,11 @@ static inline int wpss_gate(const char *args,int deadman){
+         if(wpss_edge_gate(args,deadman,"sweetwmode"))return WpssRefused;
+         return WpssMode;
+     }
++    /* 2251: W7, the same rules again, with the mission half on top of the cold-boot mode. */
++    if(mission){
++        if(wpss_edge_gate(args,deadman,"sweetwmission"))return WpssRefused;
++        return WpssMission;
++    }
+     if(wpss_conflict(args))return WpssRefused;
+     if(probe)return modem_arg_is(args,"sweetwprobe","1")?WpssSurvey:WpssRefused;
+     if(!modem_arg_is(args,pin?"sweetwpin":"sweetwpss","1") || !modem_gate(args,"sweetfbarm") || !modem_gate(args,"sweetselftest") || deadman!=600)
+diff --git a/bsd/dev/wifi/WpssRuntime.inc b/bsd/dev/wifi/WpssRuntime.inc
+index 7f3aa73..a17ee35 100644
+--- a/bsd/dev/wifi/WpssRuntime.inc
++++ b/bsd/dev/wifi/WpssRuntime.inc
+@@ -141,6 +141,19 @@ static struct {
+  bool mode_asked,mode_cal_done,mode_ready;
+  uint32_t mode_sent,request_mem_seen;
+  uint64_t mode_at,mode_cal_at,mode_ready_at;
++ /* 2251 (W7): the mission half. mission_asked is the gate; mission_sent counts the mode request that asked for mission
++  * mode (so a stage that never got there says sent=0 rather than implying it did); mission_taken is the firmware's own
++  * answer to it. mode_off_sent and mode_off_result are the stop's own step: the mode request that asks the firmware to
++  * come out of mission mode before the DSP is stopped, and what it answered. hold_until is where the fixed observation
++  * window after mission mode ends, which is the only part of W7 that waits without a request outstanding. */
++ bool mission_asked,mission_sent,mission_taken,mode_off_sent,mission_ini_done,mission_cfg_done;
++ uint32_t mode_off_result,mode_off_error,mission_indications;
++ uint64_t mission_at,mode_off_at,hold_until;
++ /* 2251: WLAN_CFG is 413 bytes with this chip's tables, far past wlfw_buf's 64 (which holds ind_register's 26, host_cap's
++  * 26 and the mode request's 18). Its own buffer, sized from the layout with room to spare: 3 + 3 host_version, 3 + 181
++  * tgt_cfg, 3 + 169 svc_cfg and 3 + 41 shadow, plus the 7-byte header is 413, and 512 leaves 99 for a bug to be visible as
++  * a refused encode rather than a truncated message. */
++ uint8_t cfg_buf[512];
+  /* 2249: what each file actually got through, kept as two totals because bdf_seg restarts at 0 for the second file and
+   * a run that stops in the middle must still say which file it stopped in. */
+  uint32_t bdf_regdb_pieces,bdf_board_pieces;
+@@ -654,10 +667,14 @@ static void w_glink_close(void){
+  * 2250 (W6) adds three more after W4InitDone: the cold-boot mode request, the wait for COLD_BOOT_CAL_DONE_IND, and the
+  * wait for FW_READY_IND. W4InitDone keeps its name and its meaning (the wait for init_done), so a W5 boot's close line
+  * reads the same as it always did.
++ * 2251 (W7) adds three after W4Ready: WLAN_INI, WLAN_CFG, and mission mode, then the wait for the mode's own reply
++ * before the optional mode-off. W4Mode keeps its meaning (the cold-boot request) and W7's mission request is its own
++ * step, so a W6 boot's close line is unchanged and the reply guard can be widened by exactly the three steps W7 sends.
+  */
+-enum {W4Lookup=0,W4IndRegister,W4HostCap,W4Cap,W4DeviceInfo,W4Regdb,W4Board,W4InitDone,W4Mode,W4CalDone,W4Ready,W4Done};
++enum {W4Lookup=0,W4IndRegister,W4HostCap,W4Cap,W4DeviceInfo,W4Regdb,W4Board,W4InitDone,W4Mode,W4CalDone,W4Ready,W4Ini,W4Cfg,
++ W4Mission,W4Observe,W4ModeOff,W4Done};
+ static const char *const w4_step_name[]={"lookup","ind_register","host_cap","cap","device_info","regdb","board","init_done",
+- "wlan_mode","cal_done","fw_ready","done"};
++ "wlan_mode","cal_done","fw_ready","wlan_ini","wlan_cfg","mission","mission_hold","mode_off","done"};
+ #define W4_STEPS (sizeof(w4_step_name)/sizeof(w4_step_name[0]))
+ /* 2248b (W4 audit defect 1): every lookup of w4_step_name goes through this. The array has W4_STEPS entries and the step
+  * is a uint32_t that the receive path can, in principle, advance; a bare w4_step_name[w.wlfw_step] would read past the
+@@ -677,6 +694,13 @@ static uint16_t w4_step_message(uint32_t step){
+  /* 2250 (W6): the mode request. The two waits after it send nothing, so they are not here and the reply guard refuses
+   * anything arriving while they are the step. */
+  case W4Mode: return WLFW_WLAN_MODE_REQ;
++ /* 2251 (W7): the three ath11k_qmi_firmware_start sends before mission mode, in its order. W4Observe sends nothing (it
++  * is the mission-mode hold), and W4ModeOff is the same message id as W4Mode but a different mode, which the reply guard
++  * cannot tell apart by id: the transaction is what distinguishes them, and the step bound is what keeps a late
++  * cold-boot reply from being taken as the mode-off's. */
++ case W4Ini: return WLFW_WLAN_INI_REQ;
++ case W4Cfg: return WLFW_WLAN_CFG_REQ;
++ case W4Mission: case W4ModeOff: return WLFW_WLAN_MODE_REQ;
+  default: return 0;
+  }
+ }
+@@ -692,12 +716,33 @@ static uint16_t w4_step_message(uint32_t step){
+  * 2250 (W6) widens it by exactly one, to the mode request. The two waits after it send nothing, so a mode reply that
+  * arrives once the step has moved on to cal_done or fw_ready is dropped, and a repeated one is dropped for the same
+  * reason: the step is past the last step that has a request outstanding. That is the same defect W4's audit found, one
+- * step further along, and it is why the upper bound is a step and not "everything the gate can reach". */
++ * step further along, and it is why the upper bound is a step and not "everything the gate can reach".
++ * 2251 (W7) widens it to the mode-off, the last step that sends a request. W4Observe is inside that range but sends
++ * nothing, so w4_step_message returns 0 for it and no real reply can match; and the `sent` half is what actually stops a
++ * reply at the hold, because the mission reply cleared it. The two mode requests (cold boot and off) share a message id,
++ * which is why the transaction and not the id is what tells their replies apart, and why the step bound has to be a step:
++ * lowering it to W4Mission would make a mode-off reply unroutable, and raising it past W4ModeOff would re-open W4's
++ * defect at the very end of the sequence. */
+ static bool w4_reply_expected(bool sent,uint32_t step,uint16_t transaction,uint16_t message,uint16_t reply_transaction){
+- if(!sent || step<W4IndRegister || step>W4Mode)return false;
++ if(!sent || step<W4IndRegister || step>W4ModeOff)return false;
++ if(!w4_step_message(step))return false;
+  return message==w4_step_message(step) && reply_transaction==transaction;
+ }
+ 
++/* ---- 2251 (W7): where the cold-boot pair leads ----------------------------------------------------------------
++ * Both of W6's indications are in. For W3 to W6 that is the stage's answer and the step goes to W4Done, exactly as those
++ * audits approved. For W7 it is the start of the mission half: ath11k's FW_READY handler calls
++ * ath11k_core_qmi_firmware_ready, whose first act is ath11k_qmi_firmware_start. One function decides, so the receive path
++ * and the poll cannot disagree about which gate is on. Sends nothing; the step's own poll iteration sends the next
++ * request, which keeps every send in one place. */
++static void w_mode_after_ready(uint64_t now){
++ w.wlfw_sent=false;
++ if(!w.mission_asked){w.wlfw_step=W4Done;return;}
++ w.wlfw_step=W4Ini;w.wlfw_deadline=now+W_W4_GAP_MS;
++ printf("SWEET WIFI: W7 mission next: fw log, the copy engine configuration, then mission mode\n");
++ sweet_log_sync();
++}
++
+ /* Sends one QMI request to the WLFW port. Returns 0 when it went out, or the QRTR/GLINK error.
+  * 2249 (W5): a board data piece can be 6 KiB, larger than the stack packet qcom_qrtr_send_data builds, so it goes out
+  * through the prefixed path instead: its header is written into the same buffer the encoder filled, and the payload is
+@@ -714,9 +759,14 @@ static int w_wlfw_send_piece(uint32_t bytes){
+   * writes the header in front of it and pads after it. */
+  return qcom_qrtr_send_data_prefixed(&w.qr,w.wlfw_port,w.wlfw_node,w.wlfw_rport,w.bdf_msg,bytes);
+ }
+-/* One line per request: what it was, what the firmware answered, and the reply's length. Ids and result codes only. */
+-static void w_wlfw_result(uint16_t message,const WlfwMessage *m){
+- printf("SWEET WIFI: W4 wlfw %s result=%u error=%u bytes=%u\n",wlfw_name(message),
++/* One line per request: what it was, what the firmware answered, and the reply's length. Ids and result codes only.
++ * 2251 (W7): the two new mode sends are named by their STEP rather than by their message, because three messages share
++ * wlan_mode's id (cold boot, mission and off) and a log that said `wlan_mode` for all three could not be graded without
++ * counting lines. Every earlier step keeps the message's own name, so W3 to W6's lines are byte for byte what their
++ * audits pinned: `bdf_download` stays `bdf_download` for the board data even though its step is called regdb or board. */
++static void w_wlfw_result(uint32_t step,uint16_t message,const WlfwMessage *m){
++ const char *label=(step==W4Mission || step==W4ModeOff)?w4_step_str(step):wlfw_name(message);
++ printf("SWEET WIFI: W4 wlfw %s result=%u error=%u bytes=%u\n",label,
+   m&&m->result_valid?m->result:0xffffu,m&&m->result_valid?m->error:0xffffu,m?m->length:0u);
+  sweet_log_sync();
+ }
+@@ -812,6 +862,46 @@ static void w_wlfw_result(uint16_t message,const WlfwMessage *m){
+ #define W_MODE_CAL_MS 20000u      /* COLD_BOOT_CAL_DONE: the reference port's took 6.7 s, ath11k waits 60 s at reset */
+ #define W_MODE_READY_MS 10000u    /* FW_READY: ath11k's own QMI timeout is 10 s, and it came 0.1 s after cal_done */
+ #define W_MODE_DWELL_MS 60000u    /* this gate's dwell: board data, then the mode and both of its indications */
++
++/* ---- 2251 (W7, stage 2 L3's second half): WLAN_INI, WLAN_CFG and mission mode ---------------------------------------
++ * W6 ended with the firmware ready: ast251's `cold_boot_cal_done=1 after 8673 ms` and `fw_ready=1 8790 ms after the mode
++ * request`, with `request_mem=0`. That is exactly the state in which ath11k's FW_READY event handler calls
++ * `ath11k_core_qmi_firmware_ready`, and that function's first act is `ath11k_core_start_firmware` ->
++ * `ath11k_qmi_firmware_start`, which sends WLAN_INI, then WLAN_CFG, then WLAN_MODE mode 0. So W7 is those three messages
++ * and nothing else.
++ *
++ * WHY THE COPY ENGINES' IRQs DO NOT HAVE TO BE UP FIRST. In ath11k the order is the other way round from what a data path
++ * might suggest: `ath11k_core_qmi_firmware_ready` sends the three QMI messages, and only after they have all been
++ * answered does it call `ath11k_ce_init_pipes`, build the rings and enable interrupts (its `ath11k_hif_irq_enable` comes
++ * later still, at the end of the core start). The firmware is therefore asked for mission mode while no host ring exists
++ * and no CE interrupt is wired, and it accepts that: the pipes it was just told about are descriptions it will use when
++ * the host brings its rings up, not something it needs already live. The reference port's phone confirms the outcome from
++ * the other direction: with the mode taken and no ring built, the firmware stayed up and answered the radio's registers,
++ * and its mode-off was then accepted. So W7 does not set up an interrupt, a ring or a doorbell before mission mode, and
++ * doing so would be inventing an order ath11k does not use.
++ *
++ * WHAT MISSION MODE MAKES THE FIRMWARE DO WITH NO HOST DATA PATH. It finishes its own bring-up, points its copy engines at
++ * the pipes it was configured with, and waits. With no host ring behind any of them there is nothing to copy, so it
++ * idles: it does not scan, associate or transmit, because WMI is a host-driven protocol and no WMI init has been sent.
++ * ath11k does not bound that idle state with a timeout, and neither the reference port nor this plan has seen one; there
++ * is no evidence for a firmware-side timeout and no evidence against, which is why W7 observes for a fixed window and then
++ * leaves rather than relying on the firmware to complain. What the window can show is a failure: an SMP2P fatal bit, a
++ * crash reason, a GLINK break or a watchdog bite. Any of those ends the stage through the normal verified stop, so every
++ * exit is still a stop.
++ *
++ * THE MODE-OFF QUESTION. `ath11k_qmi_firmware_stop` sends WLAN_MODE mode 4 before its teardown, and its mode-off branch
++ * treats a disconnected service as success. The reference port sent mode 4 *before* any mission mode and the firmware
++ * refused it, error 48; after mission mode the same message was accepted. So W7 sends mode 4 only when mission mode was
++ * actually taken, and what that reply says is a finding rather than a gate: this DSP is stopped by the SMP2P stop and the
++ * PAS6 shutdown that W2b proved, not by the mode request. A boot that never reached mission mode sends no OFF at all, so
++ * it cannot reproduce error 48 and cannot be read as a clean mode-off that never happened.
++ *
++ * THE DWELL. W6's 60 s holds the board data, the cold-boot mode and both indications with about 41 s to spare on ast251
++ * (init_done at about 3 s, cal_done at 12 s, fw_ready at 12.2 s). W7 adds three requests at 5 s each in the worst case
++ * and a 5 s observation window, so its own dwell is 75 s. The worst case becomes 30 + 40 + 10 + 75 + 8 s of stop = 163 s,
++ * inside the same 240 s body and 600 s deadman W4, W5 and W6 used. */
++#define W_MISSION_DWELL_MS 75000u   /* this gate's dwell: W6's work plus WLAN_INI, WLAN_CFG and mission mode */
++#define W_MISSION_HOLD_MS 5000u     /* the fixed observation window after mission mode, before the mode-off */
+ /* The largest receive intent the WPSS has advertised and is not using. 0 when none is free, which means "not now":
+  * QcomGlink would refuse the send and QcomQrtr counts a refusal without retrying it. */
+ static uint32_t w_remote_intent_max(void){
+@@ -932,6 +1022,10 @@ static void w_wlfw_receive(void *unused,QcomQrtr *qr,uint32_t port,uint32_t node
+   }
+   if(m.message==WLFW_FW_INIT_DONE_IND || m.message==WLFW_COLD_BOOT_CAL_DONE_IND || m.message==WLFW_FW_READY_IND){
+    w.wlfw_indications++;
++   /* 2251 (W7): after mission mode a firmware that volunteers an indication is worth counting separately, because W7's
++    * whole question is what an idle post-mission firmware does: silence is the expected answer, and anything else is
++    * evidence about it. */
++   if(w.mission_taken)w.mission_indications++;
+    printf("SWEET WIFI: W4 wlfw indication=%s id=%#x\n",wlfw_indication_name(m.message),m.message);
+    sweet_log_sync();
+   }
+@@ -946,7 +1040,9 @@ static void w_wlfw_receive(void *unused,QcomQrtr *qr,uint32_t port,uint32_t node
+   /* 2250 (W6): the two answers that close this stage. Each is taken only while the stage is waiting for the mode's
+    * outcome, which is the cal_done and fw_ready steps; a cold_boot_cal_done arriving before the mode request was sent, or
+    * after the stage is done, changes nothing. They are accepted in either order, because a firmware is free to send
+-   * fw_ready before cal_done and this chip's did the opposite; the pair, not the sequence, is what the stage needs. */
++   * fw_ready before cal_done and this chip's did the opposite; the pair, not the sequence, is what the stage needs.
++   * 2251 (W7): where the pair leads is one decision, made by w_mode_after_ready, so the receive path and the poll cannot
++   * disagree about it. W6's gates still end at W4Done; W7's go on to WLAN_INI. */
+   const bool mode_waiting = w.wlfw_step==W4CalDone || w.wlfw_step==W4Ready;
+   if(m.message==WLFW_COLD_BOOT_CAL_DONE_IND && mode_waiting && !w.mode_cal_done){
+    w.mode_cal_done=true;w.mode_cal_at=w_now();
+@@ -955,7 +1051,7 @@ static void w_wlfw_receive(void *unused,QcomQrtr *qr,uint32_t port,uint32_t node
+     * not already in. Doing this here rather than in the poll keeps the step and the deadline together, which is the rule
+     * the board data pieces follow too. */
+    if(!w.mode_ready){w.wlfw_step=W4Ready;w.wlfw_deadline=w_w4_bound(w_now(),W_MODE_READY_MS);}
+-   else{w.wlfw_step=W4Done;w.wlfw_sent=false;}
++   else w_mode_after_ready(w_now());
+    sweet_log_sync();
+   }
+   if(m.message==WLFW_FW_READY_IND && mode_waiting && !w.mode_ready){
+@@ -963,7 +1059,7 @@ static void w_wlfw_receive(void *unused,QcomQrtr *qr,uint32_t port,uint32_t node
+    printf("SWEET WIFI: W6 mode fw_ready=1 %llu ms after the mode request\n",(unsigned long long)(w.mode_ready_at-w.mode_at));
+    /* fw_ready is the stronger of the two, but the calibration's own word is still worth one bound: a firmware that sends
+     * ready first gets the fw_ready wait's remaining time for cal_done, and then the stage ends either way. */
+-   if(w.mode_cal_done){w.wlfw_step=W4Done;w.wlfw_sent=false;}
++   if(w.mode_cal_done)w_mode_after_ready(w_now());
+    else{w.wlfw_step=W4Ready;w.wlfw_deadline=w_w4_bound(w_now(),W_MODE_READY_MS);}
+    sweet_log_sync();
+   }
+@@ -973,7 +1069,10 @@ static void w_wlfw_receive(void *unused,QcomQrtr *qr,uint32_t port,uint32_t node
+  /* 2248b (defect 1 and note 6): is this the answer to the outstanding request? Nothing else advances the step. The
+   * three refusals are counted apart, so the log says which one it was. */
+  if(!w4_reply_expected(w.wlfw_sent,w.wlfw_step,w.wlfw_transaction,m.message,m.transaction)){
+-  if(!w.wlfw_sent || w.wlfw_step<W4IndRegister || w.wlfw_step>W4Board)w.wlfw_unexpected++;
++  /* 2251 (W7): the counter's own step range now runs to the mode-off, and the guard's `sent` half is what catches the
++   * hold: a reply arriving while W4Observe is the step has nothing outstanding. So the test below asks the guard's own
++   * question (does this step send anything at all) rather than a fixed step number that W7 would leave behind. */
++  if(!w.wlfw_sent || !w4_step_message(w.wlfw_step))w.wlfw_unexpected++;
+   else w.wlfw_mismatched++;
+   if(w.wlfw_unexpected+w.wlfw_mismatched==1){
+    printf("SWEET WIFI: W4 wlfw dropped reply id=%#x tx=%u: the outstanding request is %s tx=%u, nothing advanced\n",
+@@ -988,7 +1087,7 @@ static void w_wlfw_receive(void *unused,QcomQrtr *qr,uint32_t port,uint32_t node
+  }
+  w.wlfw_result=m.result_valid?m.result:0u;w.wlfw_error=m.error;
+  w.wlfw_replies++;
+- w_wlfw_result(m.message,&m);
++ w_wlfw_result(w.wlfw_step,m.message,&m);
+  /* A non-zero result is a refusal: the run does not carry on to the next request. ath11k treats it the same way and
+   * the stop still runs, which is the point of every stage since W2. 2249 (W5): a refusal in the middle of a file stops
+   * the file, and the count is kept so the close line and the grade can say how far it got. */
+@@ -999,6 +1098,17 @@ static void w_wlfw_receive(void *unused,QcomQrtr *qr,uint32_t port,uint32_t node
+     w.wlfw_step==W4Regdb?"regdb":"board",w.bdf_seg,w.bdf_pieces,w.bdf_sent,w.bdf_bytes);
+    sweet_log_sync();
+   }
++  /* 2251 (W7): a refused mode-off is a finding, not a gate. The stop that actually stops this DSP is the SMP2P request
++   * and the PAS6 shutdown, both proven since W2b; the reference port's firmware refused the same message before mission
++   * mode (error 48) and took it after, so a refusal here says something about this firmware's state, not about whether
++   * the stop will work. It is recorded for the close line and the grade, and the sequence ends as every other refusal
++   * does. */
++  if(w.wlfw_step==W4ModeOff){
++   w.mode_off_sent=true;w.mode_off_result=m.result;w.mode_off_error=m.error;
++   printf("SWEET WIFI: W7 mode off refused result=%u error=%u; the DSP is still stopped by the SMP2P request and PAS6\n",
++    m.result,m.error);
++   sweet_log_sync();
++  }
+   w.wlfw_step=W4Done;w.wlfw_sent=false;return;
+  }
+  switch(m.message){
+@@ -1079,6 +1189,44 @@ static void w_wlfw_receive(void *unused,QcomQrtr *qr,uint32_t port,uint32_t node
+   sweet_log_sync();
+   return;
+  }
++ /* 2251 (W7): WLAN_INI's and WLAN_CFG's replies. Both are the same shape: the result was checked above, so this only
++  * moves the step and names what the firmware accepted. The order is enforced here rather than by the encoder: INI's
++  * reply is what starts CFG, CFG's reply is what starts mission mode. A reply to either that arrived twice is dropped by
++  * the guard, because by then the step is past it. */
++ if(w.wlfw_step==W4Ini){
++  w.mission_ini_done=true;
++  w.wlfw_step=W4Cfg;w.wlfw_deadline=w_now()+W_W4_GAP_MS;
++  printf("SWEET WIFI: W7 mission fw log on accepted; the copy engine configuration is next\n");
++  sweet_log_sync();
++  return;
++ }
++ if(w.wlfw_step==W4Cfg){
++  w.mission_cfg_done=true;
++  w.wlfw_step=W4Mission;w.wlfw_deadline=w_now()+W_W4_GAP_MS;
++  printf("SWEET WIFI: W7 mission configuration accepted (%u pipes, %u services, %u shadow registers); mission mode is next\n",
++   WLFW_CE_COUNT,WLFW_SVC_COUNT,WLFW_SHADOW_COUNT);
++  sweet_log_sync();
++  return;
++ }
++ if(w.wlfw_step==W4Mission){
++  /* The firmware is in mission mode with no host data path: this is the stage's answer. The step then holds for a fixed
++   * window, so a fatal bit, a crash reason or a link break has somewhere to be noticed, and the mode-off (if this gate
++   * sends one) has a step of its own to wait on. */
++  w.mission_taken=true;w.mission_at=w_now();
++  w.wlfw_step=W4Observe;w.hold_until=w_now()+W_MISSION_HOLD_MS;
++  printf("SWEET WIFI: W7 mission taken %llu ms after the cold-boot mode; holding %u ms with no host copy engines\n",
++   (unsigned long long)(w.mission_at-w.mode_at),W_MISSION_HOLD_MS);
++  sweet_log_sync();
++  return;
++ }
++ if(w.wlfw_step==W4ModeOff){
++  /* The mode-off's reply. It is a finding, not a gate: the stop that matters is the SMP2P one and the PAS6 shutdown. */
++  w.mode_off_result=w.wlfw_result;w.mode_off_error=w.wlfw_error;
++  w.wlfw_step=W4Done;
++  printf("SWEET WIFI: W7 mode off answered result=%u error=%u; the stop follows\n",w.wlfw_result,w.wlfw_error);
++  sweet_log_sync();
++  return;
++ }
+  w.wlfw_step++;
+  w.wlfw_deadline=w_now()+W_W4_GAP_MS;
+ }
+@@ -1113,6 +1261,13 @@ static void w_wlfw_close(void){
+  if(w.mode_asked)
+   printf("SWEET WIFI: W6 mode close: sent=%u cal_done=%u fw_ready=%u request_mem=%u\n",
+    w.mode_sent,w.mode_cal_done,w.mode_ready,w.request_mem_seen);
++ /* 2251 (W7): the mission half's tally, in one line so the grade can tell "never got there" from "got there and it was
++  * refused". ini and cfg are the two configurations ath11k sends before the mode. mode_off is empty when mission mode was
++  * never taken, because that is exactly when this stage does not send it. */
++ if(w.mission_asked)
++  printf("SWEET WIFI: W7 mission close: ini=%u cfg=%u mission_sent=%u mission=%u mode_off_sent=%u mode_off=%d/%d indications=%u\n",
++   w.mission_ini_done,w.mission_cfg_done,w.mission_sent,w.mission_taken,w.mode_off_sent,
++   w.mode_off_sent?(int)w.mode_off_result:-1,w.mode_off_sent?(int)w.mode_off_error:-1,w.mission_indications);
+  sweet_log_sync();
+ }
+ 
+@@ -1211,7 +1366,13 @@ static void w_wlfw_poll(void){
+   * the other order leaves the stage waiting for whichever is still missing. So the line names the answer that is actually
+   * absent rather than the step's name: after fw_ready has been taken, a timeout here is cal_done's, not fw_ready's. */
+  if(w.wlfw_step==W4CalDone || w.wlfw_step==W4Ready){
+-  if(w.mode_cal_done && w.mode_ready)return;   /* both taken: the stage has its answer and the dwell ends it */
++  if(w.mode_cal_done && w.mode_ready){
++   /* 2251 (W7): both answers are in, which is where W6's stage ended and where ath11k's FW_READY handler begins. This
++    * gate goes on to WLAN_INI; every earlier gate still ends here, exactly as its audit approved. w_mode_after_ready is
++    * the same decision the receive path takes, so a pair that arrived together does not depend on which one was second. */
++   w_mode_after_ready(now);
++   return;
++  }
+   if(now<w.wlfw_deadline)return;
+   if(!w.mode_cal_done && w.wlfw_step==W4CalDone){
+    /* Calibration said nothing at all. fw_ready may still arrive, so the wait is not abandoned without giving it its own
+@@ -1236,6 +1397,22 @@ static void w_wlfw_poll(void){
+   sweet_log_sync();w.wlfw_step=W4Done;
+   return;
+  }
++ /* 2251 (W7): the fixed observation window after mission mode. Nothing is outstanding, so there is no reply to wait for;
++  * what this looks for is a failure signal arriving instead (an SMP2P fatal bit is caught by the main loop, a crash
++  * reason by the state probe, a broken link by w_glink_poll). When the window ends the mode-off is asked for, because the
++  * reference port's firmware took it only after mission mode and refused it before. */
++ if(w.wlfw_step==W4Observe){
++  if(now<w.hold_until)return;
++  w.wlfw_step=W4ModeOff;w.wlfw_deadline=now+W_W4_GAP_MS;
++  /* The claim this line can make is only what the run has seen: no SMP2P fatal bit (the main loop breaks on one before
++   * reaching this poll), no broken link, and the GLINK/QRTR counters still clean. It cannot say the firmware is "in mission
++   * mode" — nothing here measured that — so it does not. The elapsed time is printed rather than the constant, because a
++   * clamped window is shorter than 5 s and the log should say so. */
++  printf("SWEET WIFI: W7 mission held %llu ms with no host copy engines; no fatal bit, no crash reason, the link unbroken\n",
++   (unsigned long long)(now-w.mission_at));
++  sweet_log_sync();
++  return;
++ }
+  if(now<w.wlfw_deadline)return;
+  if(w.wlfw_sent){
+   /* 2248b (defect 1): clear wlfw_sent with the step. A timeout that left it set is what let a late reply past the
+@@ -1265,6 +1442,14 @@ static void w_wlfw_poll(void){
+   /* 2250 (W6): the cold-boot mode request. Transaction 5 + the board data's pieces, so it cannot collide with any piece
+    * of a conversation whose numbering is already in the log (ast246 ended at transaction 18). */
+   case W4Mode: bytes=wlfw_wlan_mode(w.wlfw_buf,sizeof(w.wlfw_buf),(uint16_t)(++w.wlfw_transaction),WLFW_MODE_COLD_BOOT);break;
++  /* 2251 (W7): the three ath11k_qmi_firmware_start sends, in its order. WLAN_CFG is 413 bytes with this chip's tables, so
++   * it goes through its own buffer; the other two fit wlfw_buf. The mission request is the same message as the cold-boot
++   * one with mode 0, and the mode-off is mode 4, so the mode number is what tells them apart on the wire. */
++  case W4Ini: bytes=wlfw_wlan_ini(w.wlfw_buf,sizeof(w.wlfw_buf),(uint16_t)(++w.wlfw_transaction),1);break;
++  case W4Cfg: bytes=wlfw_wlan_cfg(w.cfg_buf,sizeof(w.cfg_buf),(uint16_t)(++w.wlfw_transaction));message=w.cfg_buf;break;
++  case W4Mission: w.mission_sent=true;
++   bytes=wlfw_wlan_mode(w.wlfw_buf,sizeof(w.wlfw_buf),(uint16_t)(++w.wlfw_transaction),WLFW_MODE_NORMAL);break;
++  case W4ModeOff: bytes=wlfw_wlan_mode(w.wlfw_buf,sizeof(w.wlfw_buf),(uint16_t)(++w.wlfw_transaction),WLFW_MODE_OFF);break;
+   case W4Regdb: case W4Board: {
+    /* 2249 (W5): one piece of the current file. A file is started here rather than in the receive path, so that every
+     * buffer is filled in one place and a refusal cannot leave half a file open. bdf_sent counting up to bdf_bytes is how
+@@ -1326,6 +1511,9 @@ static void w_wlfw_poll(void){
+   /* 2250 (W6): the mode request is timed from here, not from where the step was entered, because this is the moment it
+    * went out. The two waits that follow report their own elapsed time against it. */
+   if(w.wlfw_step==W4Mode){w.mode_at=now;w.mode_sent=1;}
++  /* 2251 (W7): the mode-off is counted here for the same reason: the close line's mode_off_sent must mean "it went out",
++   * not "the step was reached". A send that QRTR or GLINK refuses is handled above and never reaches this line. */
++  if(w.wlfw_step==W4ModeOff)w.mode_off_sent=true;
+   w.wlfw_sent=true;w.wlfw_sent_at=now;w.wlfw_tx++;w.wlfw_deadline=w_w4_bound(now,W_W4_REPLY_MS);
+   /* 2249: a board data piece is logged by file, piece number, bytes and whether it is the last. A whole message of bytes
+    * per piece would be noise; where a refusal happened is the thing a reader needs. */
+@@ -1343,16 +1531,20 @@ static int wpss_run(int gate){
+  /* 2248: W4 opens the edge too, because its client needs it. W3 is the plain edge; W2 is the start alone.
+   * 2249 (W5): sweetwbdf=1 is the same client with the board data download after DEVICE_INFO.
+   * 2250 (W6): sweetwmode=1 is W5's whole exchange with the mode request after init_done, so it needs every part of it. */
+- w.link_asked=(gate==WpssGlink || gate==WpssWlfw || gate==WpssBdf || gate==WpssMode);
+- w.wlfw_asked=(gate==WpssWlfw || gate==WpssBdf || gate==WpssMode);
+- w.bdf_asked=(gate==WpssBdf || gate==WpssMode);
++ w.link_asked=(gate==WpssGlink || gate==WpssWlfw || gate==WpssBdf || gate==WpssMode || gate==WpssMission);
++ w.wlfw_asked=(gate==WpssWlfw || gate==WpssBdf || gate==WpssMode || gate==WpssMission);
++ w.bdf_asked=(gate==WpssBdf || gate==WpssMode || gate==WpssMission);
+  /* 2250 (W6): this gate adds the mode request and its two indications on top of W5's whole exchange. */
+- w.mode_asked=(gate==WpssMode);
++ w.mode_asked=(gate==WpssMode || gate==WpssMission);
++ /* 2251 (W7): this gate adds WLAN_INI, WLAN_CFG and mission mode on top of W6's cold-boot mode. It is not a separate line
++  * of work: without the cold-boot mode there is no fw_ready, and without fw_ready ath11k has nothing to start. */
++ w.mission_asked=(gate==WpssMission);
+  /* 2249: this gate's dwell. W4's 20 s is what its audit sized; a board file is 41 pieces plus a 10 s init_done wait, so
+   * W5's own dwell is 35 s. It is set here, before any deadline can read it, and nothing else changes.
+-  * 2250: W6's is 60 s, for the mode request after the board data and a calibration wait of up to 20 s. Each gate keeps
+-  * its own number, so no audited boot's timing moves. */
+- w.dwell_ms=w.mode_asked?W_MODE_DWELL_MS:(w.bdf_asked?W_BDF_DWELL_MS:W_DWELL_MS);
++  * 2250: W6's is 60 s, for the mode request after the board data and a calibration wait of up to 20 s. 2251 (W7): 75 s,
++  * for the same plus three requests and a 5 s observation window. Each gate keeps its own number, so no audited boot's
++  * timing moves. */
++ w.dwell_ms=w.mission_asked?W_MISSION_DWELL_MS:(w.mode_asked?W_MODE_DWELL_MS:(w.bdf_asked?W_BDF_DWELL_MS:W_DWELL_MS));
+  struct wl_fat f;
+  int rc=w_open_image(&f);if(rc)goto out;
+  /* 2243: the sleep clock before any WPSS work (Fairphone's mainline enablement: without it the WPSS keeps crashing). */

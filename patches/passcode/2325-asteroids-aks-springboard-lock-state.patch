@@ -1,0 +1,133 @@
+SWEET AKS: tell SpringBoard a passcode is set, so the lock screen demands it (2325)
+
+ast253 set a code through Settings, the kernel stored and committed it, Settings showed "Turn Passcode Off", the
+screen locked and a wake plus a swipe opened Settings with no keypad. SpringBoard made 0 keybag lock calls that boot
+(selectors 8 and 32) and 0 assertions (26/27), against 11, 2 and 27 on the 0038 stub. It never learned a passcode
+exists, because the one message 2321 sent on a change is delivered to a framework that does not feed it.
+
+Why 0xd010 was not enough. Two frameworks subscribe to this service and MobileKeyBag's own aksNotificationCB
+(0x1cb44e7bc, registered by MKBEventsRegister at 0x1cb44ecec) understands only two message types: 0xd00d as MKB
+event 1 and 0xd00f as event 0. Every other type returns at 0x1cb44e870. SpringBoardFoundation's SBFMobileKeyBag is an
+    10|MKBEvents client (-[SBFMobileKeyBag init], 0x1c16fa3fc), and the only thing outside init that refreshes its cached
+has-passcode byte (+0x30) is -_queue_handleKeybagStatusChanged (0x1c16ec1c4), reached only from MKB event 1. So
+
+
+That byte gates everything. -[SBFMobileKeyBag hasPasscodeSet] (0x1c16adf6c) returns it. The lock-screen keypad is
+-[SBLockScreenManager lockScreenViewControllerDidPresent]'s block (0x224befa4c), which calls setPasscodeVisible: only
+when it is 1. The keybag lock is -[SBFUserAuthenticationController _revokeAuthenticationImmediately:] (0x1c170c5b0),
+which returns early when it is 0, so the lockSkippingGracePeriod: at 0x1c170c6e0 that is the only caller of
+MKBLockDevice (0x1cb4529a0) never runs. A byte stuck at 0 is the keypad that does not appear and the 0 lock calls.
+
+- SweetPasscode.c: a set that commits and leaves the session unlocked now raises SPC_EV_UNLOCKED as well as
+  SPC_EV_PASSCODE_CHANGED, and only when the session was not already unlocked. A change on an unlocked phone is not a
+    20|  lock-state change and sends only the passcode-changed message.
+- SweetKeyStore.cpp: the event map runs unlocked before passcode-changed, so the byte is true before anything reads the
+  change; 0xd00c is not sent at a set. The comment now names both buses, the two message types MobileKeyBag forwards,
+  and the byte and call sites the diagnosis rests on.
+
+Not changed: the stub, every selector's arguments, the two-phase stage and commit, the lock-state word (2324 already
+reports ss 4 / sls 0 after a set, and the stub boot proves sls 0 is enough for SpringBoard), and the entitlement, root
+and count-before-hash rules.
+
+Host: plans/passcode/tools/check-2325.py runs springboard_test.c against the real SweetKeyStore.cpp. It models
+SBFMobileKeyBag (the byte, init's selector-17 read and selector-7 bit 2), MobileKeyBag's two-type filter, the keypad
+decision and the lock path, then asserts: a set makes the byte 1 and the lock call selector 8; the keypad test is
+    30|true; a reboot with a code set reads it from init; turning the code off clears it; a set sends exactly unlocked then
+passcode-changed; selector 7 reads 4, 4, 1, 4 across no-code, set, locked, verified. 51 assertions, 6 tests, 7
+negative controls, every one caught, and 2324's 147 two-phase plus 89 selector checks unchanged.
+
+Needs 2321, 2322, 2323, 2323b and 2324. Security code: plans/passcode/audit-brief-lock.md is the audit brief, and no
+image should boot until that audit is a GO.
+
+Check: python3 -I plans/passcode/tools/check-2325.py XNU_DIR (14 checks)
+       python3 -I plans/passcode/tools/check-lock.py XNU_DIR (2321/2322)
+       python3 -I plans/passcode/tools/check-2phase.py XNU_DIR (2324)
+Apply: git apply -p1 in the kernel tree, after 2321, 2322, 2323, 2323b and 2324.
+diff --git a/bsd/dev/SweetPasscode.c b/bsd/dev/SweetPasscode.c
+--- a/bsd/dev/SweetPasscode.c
++++ b/bsd/dev/SweetPasscode.c
+@@ -866,9 +866,15 @@
+ 	/*
+ 	 * Whoever just set or changed the code is holding the phone and proved they may. Leaving the session locked
+ 	 * would make `sls` read 1 on a phone that is open in their hand, and the lock screen would appear from nowhere.
+-	 */
+-	if (l->have_code) {
++	 *
++	 * 2325: and it must tell SpringBoard so. A real keystore's lock state changes at this point, and every
++	 * SBFMobileKeyBag client (SpringBoard, Preferences, LocalAuthentication) refreshes its cached has-passcode byte
++	 * from a MobileKeyBag "unlocked" event, so the set reports unlocked as well as "passcode changed". Without the
++	 * unlocked half the byte stays 0 and the lock screen never asks for the code (ast253).
++	 */
++	if (l->have_code && !l->unlocked) {
+ 		l->unlocked = true;
++		ev->on[SPC_EV_UNLOCKED] = true;
+ 	}
+ 	ev->on[SPC_EV_PASSCODE_CHANGED] = true;
+ 	return SPC_TRY_OK;
+diff --git a/iokit/Kernel/arm/SweetKeyStore.cpp b/iokit/Kernel/arm/SweetKeyStore.cpp
+--- a/iokit/Kernel/arm/SweetKeyStore.cpp
++++ b/iokit/Kernel/arm/SweetKeyStore.cpp
+@@ -90,8 +90,47 @@
+ #define SWEET_AKS_UNLOCKED_SINCE 0x4u
+ 
+ /*
+- * Lock-state interest messages. aksNotificationCB (AppleKeyStore.framework) maps these to MobileKeyBag's lock-state
+- * notifications, which is how SpringBoard learns the phone locked. The stub never sent one.
++ * Lock-state interest messages, and the two subscribers that read them.
++ *
++ * AppleKeyStore.framework's aksNotificationCB (0x1e4ae4418) registers the interest on this service and understands
++ * all of these, turning each into an AKSEvents callback for AKSEventsRegister clients. Its numbering, from the
++ * comparison chain at 0x1e4ae45f4:
++ *
++ *   0xd00c locked      -> AKSEvent 4
++ *   0xd00d unlocked    -> AKSEvent 1
++ *   0xd00f first unlock-> AKSEvent 0, and it reads the message argument
++ *   0xd010 changed     -> AKSEvent 3
++ *   0xd011 failed      -> AKSEvent 2
++ *   0xd012 backoff     -> AKSEvent 5
++ *
++ * MobileKeyBag.framework's own aksNotificationCB (0x1cb44e7bc), registered by MKBEventsRegister (0x1cb44ecec),
++ * understands only two types and drops the rest at 0x1cb44e870: 0xd00d as MKB event 1 and 0xd00f as MKB event 0.
++ *
++ * SpringBoardFoundation's SBFMobileKeyBag registers with AKSEventsRegister in -[SBFMobileKeyBag init]
++ * (0x1c16fa4f4) and its interest block (0x1c16ec08c) switches on `w21`, the event number: 0 sets the +0x31
++ * "been unlocked" byte and calls -_queue_firstUnlockOccurred, 1 calls -_queue_handleKeybagStatusChanged, anything
++ * else returns. Those are AKSEvent 0 and 1, which are the numbers AppleKeyStore.framework produces for 0xd00f and
++ * 0xd00d above, so the numbers line up on both sides.
++ *
++ * -_queue_handleKeybagStatusChanged (0x1c16ec1c4) is the only call site outside init that runs
++ * -_queue_setHasPasscodeIfNecessary: (0x1c16ec364), which stores `lockState != 3` into the byte at +0x30.
++ * -[SBFMobileKeyBag hasPasscodeSet] (0x1c16adf6c) returns that byte.
++ *
++ * So 0xd010, which is what a change sent, is AKSEvent 3: it reaches the block, takes the `cmp w21,#1` branch at
++ * 0x1c16ec0c4 and returns. The byte is not refreshed and stays 0 for the whole boot. Everything that decides whether
++ * to show a keypad or lock the keybag reads it:
++ *
++ *   -[SBLockScreenManager lockScreenViewControllerDidPresent]'s block (0x224befa4c) calls setPasscodeVisible: only
++ *   when it is set. ast253: the lock screen appeared with a live code and no keypad came up.
++ *   -[SBLockScreenManager lockUIFromSource:withOptions:completion:] (0x224bee92c) and
++ *   -[SBLockScreenManager _relockUIForButtonlikeSource:] (0x224bf1b24) skip their revokeAuthentication when it is 0.
++ *   -[SBFUserAuthenticationController _revokeAuthenticationImmediately:] (0x1c170c5b0) returns early, so the
++ *   lockSkippingGracePeriod: at 0x1c170c6e0 never runs. That is the only route to MKBLockDevice (0x1cb4529a0) and
++ *   so the only route to selectors 8 and 32: 0 and 0 in ast253, against 11 and 2 on the stub, where sls read 0
++ *   (SPC_LS_UNLOCKED, so the byte was 1 from init) rather than 3.
++ *
++ * A set that commits therefore sends 0xd00d as well as 0xd010. 0xd00c is not sent at that moment: nothing is locked,
++ * and the cover sheet is driven in-process.
+  */
+ #define SWEET_AKS_MSG_LOCKED            0xe3ffd00cu
+ #define SWEET_AKS_MSG_UNLOCKED          0xe3ffd00du
+@@ -296,6 +335,13 @@
+ 
+ /* ---- notifications ---- */
+ 
++/*
++ * 2325: order matters on this path, and only for one pair. SBFMobileKeyBag refreshes its cached has-passcode byte
++ * only from the interest event that runs -_queue_handleKeybagStatusChanged, which is 0xd00d's event, so a set that
++ * reports both "unlocked" and "passcode changed" must send unlocked first: the byte has to be true before anything
++ * downstream reads it. The map is walked in order, so SPC_EV_UNLOCKED is listed before SPC_EV_PASSCODE_CHANGED, and
++ * the host check asserts the order rather than leaving it to the table's layout.
++ */
+ static void
+ pc_send_events(uint32_t bits)
+ {

@@ -1,0 +1,33 @@
+diff --git a/bsd/dev/battery/AdspFirmware.inc b/bsd/dev/battery/AdspFirmware.inc
+index 6bc7c4b06..9ae262b83 100644
+--- a/bsd/dev/battery/AdspFirmware.inc
++++ b/bsd/dev/battery/AdspFirmware.inc
+@@ -14,6 +14,9 @@
+ #include <sys/systm.h>
+ #include <sys/errno.h>
+ #endif
++#ifndef ADSP_FW_LOG
++#define ADSP_FW_LOG "SWEET BATTERY"  /* 2240: the Wi-Fi includer logs as SWEET WIFI */
++#endif
+ static uint64_t adsp_partition_bytes;
+ static int adsp_part_read(uint64_t off,void *dst,uint64_t length);
+ static int adsp_read(const char *part,uint64_t off,void *dst,uint64_t length){
+@@ -283,7 +286,8 @@ adsp_mdt(const uint8_t *b, uint32_t len, const struct wl_fat *f, const char *ste
+         le16(b + 42) != 32) return EINVAL;
+     uint32_t off = le32(b + 28), count = le16(b + 44);
+     if (!count || count > 64 || off < 52 || off > len || count > (len - off) / 32) return EINVAL;
+-    unsigned machine=!strcmp(stem,"adsp")?164:!strcmp(stem,"adsp_dtb")?1:0;
++    /* 2240: the WPSS image (Wi-Fi DSP, qca6750/wpss.mdt) is Hexagon too. */
++    unsigned machine=!strcmp(stem,"adsp")?164:!strcmp(stem,"adsp_dtb")?1:!strcmp(stem,"qca6750/wpss")?164:0;
+     if (!machine || le16(b+16)!=2 || le16(b+18)!=machine) return EINVAL;
+     const uint8_t *first=b+off;
+     uint32_t header=off+count*32, hash_bytes=0;
+@@ -320,7 +324,7 @@ adsp_mdt(const uint8_t *b, uint32_t len, const struct wl_fat *f, const char *ste
+         bytes += size; loads++;
+     }
+     if (!hash_bytes || header>len || hash_bytes!=len-header || !loads || hashes != 1 || (lo & 4095) || ((hi + 4095) & ~4095ull) - lo > carveout) return EINVAL;
+-    printf("SWEET BATTERY: firmware preflight PASS loads=%u bytes=%llu span=%#llx\n",
++    printf(ADSP_FW_LOG ": firmware preflight PASS loads=%u bytes=%llu span=%#llx\n",
+         loads, (unsigned long long)bytes, (unsigned long long)(((hi + 4095) & ~4095ull) - lo));
+     return 0;
+ }

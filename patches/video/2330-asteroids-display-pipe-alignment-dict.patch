@@ -1,0 +1,42 @@
+Patch 2330 (video V0, plans/video/PLAN.md): AppleCLCD publishes DisplayPipePlaneBaseAlignment as the dictionary
+{PlaneBaseAlignmentLinear: 64} instead of the number 64 from 0046. iOS 26.6.2 VideoToolbox
+(FigGetAlignmentForIOSurfaceOutputToDisplayService, unslid 0x1904de380) and QuartzCore (0x18407096c) call
+CFDictionaryGetValue on it, so the number made mediaplaybackd abort in -[__NSCFNumber objectForKey:] during every
+AVPlayer setup. DisplayPipeStrideRequirements stays absent, which both readers handle. sweetfb_pbanum=1 publishes
+the old number. Applies on top of the A-noK5 series (research/xnu-daily-a0). One IOLog line at framebuffer start.
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1318,7 +1318,30 @@
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+-	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
++	/*
++	 * Patch 2330: iOS 26 reads DisplayPipePlaneBaseAlignment as a dictionary. VideoToolbox's
++	 * FigGetAlignmentForIOSurfaceOutputToDisplayService and QuartzCore both call CFDictionaryGetValue(it,
++	 * "PlaneBaseAlignmentLinear") and take a CFNumber, so the plain number from 0046 made mediaplaybackd throw
++	 * -[__NSCFNumber objectForKey:] in every AVPlayer setup. DisplayPipeStrideRequirements stays unpublished: both
++	 * readers keep their own default when it is absent (VideoToolbox's is 64). sweetfb_pbanum=1 brings the number back.
++	 */
++	{
++		int pbanum = 0;
++		PE_parse_boot_argn("sweetfb_pbanum", &pbanum, sizeof(pbanum));
++		OSDictionary *pba = pbanum ? NULL : OSDictionary::withCapacity(1);
++		OSNumber *lin = pba != NULL ? OSNumber::withNumber(64ULL, 32) : NULL;
++		const char *how = "not published, no memory";
++		if (pbanum) {
++			setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
++			how = "number 64 (sweetfb_pbanum)";
++		} else if (lin != NULL && pba->setObject("PlaneBaseAlignmentLinear", lin) &&
++		    setProperty("DisplayPipePlaneBaseAlignment", pba)) {
++			how = "{PlaneBaseAlignmentLinear 64}";
++		}
++		OSSafeReleaseNULL(lin);
++		OSSafeReleaseNULL(pba);
++		IOLog("SWEET FB: DisplayPipePlaneBaseAlignment %s (2330)\n", how);
++	}
+ 	registerService();
+ 	__atomic_store_n(&sweet_fb_shot_fb, this, __ATOMIC_RELEASE);     /* kern.sweet_fb_shot (patch 0224) */
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u, vsync %u us, copy every %u, scale %u (pad %d,%d), direct %d early %d\n",

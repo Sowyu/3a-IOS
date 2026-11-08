@@ -1,0 +1,128 @@
+--- a/osfmk/kern/processor.c
++++ b/osfmk/kern/processor.c
+@@ -885,6 +885,95 @@
+ 	return idle_time;
+ }
+ 
++/*
++ * 2293 sweetcputop=N (bsd/dev/sweet_battery.c runs it every N seconds): which threads used the CPU. Logs each
++ * CPU's busy share and the six threads with the most CPU time since the last call, with task, thread name, tid,
++ * base priority, last CPU and continuation (symbolize with the logged kernel slide). Read-only diagnostic for
++ * the power work; off unless the boot-arg is set. One scan holds tasks_threads_lock for a few ms.
++ */
++#define SCT_MAX 3072u
++static struct { uint64_t tid, t; } sct_prev[SCT_MAX], sct_cur[SCT_MAX];
++static unsigned sct_nprev;
++static uint64_t sct_idle[MAX_CPUS], sct_wall;
++void sweet_cputop_log(void);
++void
++sweet_cputop_log(void)
++{
++	struct { uint64_t tid, d; int pri, cpu; uintptr_t cont; char task[24], name[24]; } top[6];
++	unsigned ntop = 0, ncur = 0, total = 0;
++	uint64_t now = mach_absolute_time(), wall = sct_wall ? now - sct_wall : 0;
++	char line[512];
++	uint64_t wall_ns;
++	absolutetime_to_nanoseconds(wall, &wall_ns);
++	int n = snprintf(line, sizeof(line), "SWEET CPUTOP: window_ms=%llu slide=%#lx busy%%", (unsigned long long)(wall_ns / NSEC_PER_MSEC),
++	    (unsigned long)vm_kernel_slide);
++	for (int c = 0; c < MAX_CPUS && n < (int)sizeof(line) - 16; c++) {
++		uint64_t idle = sweet_processor_idle_time(c);
++		if (idle == ~0ULL) {
++			continue;
++		}
++		if (wall) {
++			uint64_t d = idle - sct_idle[c];
++			n += snprintf(line + n, sizeof(line) - n, " %d:%llu", c, d >= wall ? 0ULL : (unsigned long long)((wall - d) * 100 / wall));
++		}
++		sct_idle[c] = idle;
++	}
++	sct_wall = now;
++	lck_mtx_lock(&tasks_threads_lock);
++	thread_t thread;
++	queue_iterate(&threads, thread, thread_t, threads) {
++		total++;
++		uint64_t t = recount_thread_time_mach(thread), tid = thread_tid(thread), d = t;
++		for (unsigned i = 0; i < sct_nprev; i++) {
++			if (sct_prev[i].tid == tid) {
++				d = t >= sct_prev[i].t ? t - sct_prev[i].t : 0;
++				break;
++			}
++		}
++		if (ncur < SCT_MAX) {
++			sct_cur[ncur].tid = tid;
++			sct_cur[ncur++].t = t;
++		}
++		if (!wall || !d) {
++			continue;
++		}
++		/* Insertion into the six largest, kept sorted. */
++		unsigned at = ntop;
++		while (at > 0 && top[at - 1].d < d) {
++			at--;
++		}
++		if (at < 6) {
++			for (unsigned k = ntop < 6 ? ntop : 5; k > at; k--) {
++				top[k] = top[k - 1];
++			}
++			top[at].tid = tid;
++			top[at].d = d;
++			top[at].pri = thread->base_pri;
++			top[at].cpu = thread->last_processor ? thread->last_processor->cpu_id : -1;
++			top[at].cont = (uintptr_t)thread->continuation;
++			task_t owner = get_threadtask(thread);
++			strlcpy(top[at].task, owner && get_bsdtask_info(owner) ? task_best_name(owner) : "?", sizeof(top[at].task));
++			char name[MAXTHREADNAMESIZE] = "";
++			thread_get_thread_name(thread, name);
++			strlcpy(top[at].name, name, sizeof(top[at].name));
++			if (ntop < 6) {
++				ntop++;
++			}
++		}
++	}
++	lck_mtx_unlock(&tasks_threads_lock);
++	memcpy(sct_prev, sct_cur, ncur * sizeof(sct_cur[0]));
++	sct_nprev = ncur;
++	printf("%s threads=%u\n", line, total);
++	for (unsigned i = 0; i < ntop; i++) {
++		uint64_t ns;
++		absolutetime_to_nanoseconds(top[i].d, &ns);
++		printf("SWEET CPUTOP: %u %s/%s tid=%llu pri=%d cpu=%d cont=%#lx ms=%llu\n", i + 1, top[i].task,
++		    top[i].name[0] ? top[i].name : "-", (unsigned long long)top[i].tid, top[i].pri, top[i].cpu,
++		    (unsigned long)top[i].cont, (unsigned long long)(ns / NSEC_PER_MSEC));
++	}
++}
++
+ kern_return_t
+ processor_info(
+ 	processor_t     processor,
+--- a/bsd/dev/sweet_battery.c
++++ b/bsd/dev/sweet_battery.c
+@@ -80,8 +80,27 @@
+     sweet_log_sync();
+     thread_terminate(current_thread());
+ }
++/* 2293 sweetcputop=N, 10..600 s: osfmk/kern/processor.c logs per-CPU busy and the top threads every N s. */
++extern void sweet_cputop_log(void);
++static unsigned cputop_s;
++static void cputop_thread(void *unused, wait_result_t result)
++{
++    (void)unused; (void)result;
++    for(;;){
++        sweet_cputop_log();
++        uint64_t deadline;
++        clock_interval_to_deadline(cputop_s, NSEC_PER_SEC, &deadline);
++        assert_wait_deadline(&cputop_s, THREAD_UNINT, deadline);
++        thread_block(THREAD_CONTINUE_NULL);
++    }
++}
+ void sweet_battery_start(void)
+ {
++    unsigned s=0;
++    if(PE_parse_boot_argn("sweetcputop",&s,sizeof(s)) && s>=10 && s<=600){
++        cputop_s=s;thread_t t=THREAD_NULL;
++        if(kernel_thread_start(cputop_thread,NULL,&t)==KERN_SUCCESS){thread_deallocate(t);printf("SWEET CPUTOP: every %u s\n",s);}
++    }
+     if(!modem_gate(PE_boot_args(),"sweetbprobe"))return;
+     thread_t thread=THREAD_NULL;
+     kern_return_t rc=kernel_thread_start(battery_probe,NULL,&thread);

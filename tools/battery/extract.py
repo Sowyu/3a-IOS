@@ -4,7 +4,8 @@ import re
 import sys
 target = sys.argv[3] if len(sys.argv) > 3 else "bsd/dev/sweet_battery.c"
 source = []
-for path in sorted(Path(sys.argv[1]).glob('219*.patch')):
+# Battery series: 2190 to 2199, then 2290 and up.
+for path in sorted([*Path(sys.argv[1]).glob('219*.patch'),*Path(sys.argv[1]).glob('229*.patch')]):
     out, cursor, active, in_hunk = [], 0, False, False
     for line in path.read_text().splitlines(True):
         if line.startswith('--- '):

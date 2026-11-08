@@ -1,0 +1,8 @@
+# Build leftovers, not source
+tools/**/tests/out/
+*.o
+*.bc
+*.i
+*.s
+__pycache__/
+.DS_Store

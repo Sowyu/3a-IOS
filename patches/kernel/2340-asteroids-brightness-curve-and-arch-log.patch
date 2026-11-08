@@ -1,0 +1,119 @@
+--- a/osfmk/kern/host.c
++++ b/osfmk/kern/host.c
+@@ -428,6 +428,17 @@
+ 		if (sweet_ext && sweet_arm64e_enabled() && user_arch_info->cpu_type == CPU_TYPE_ARM64) {
+ 			user_arch_info->cpu_subtype = CPU_SUBTYPE_ARM64E;
+ 		}
++		/*
++		 * 2340: who asks, first 16 calls. MobileGestalt asks only when its cache has no CPUArchitecture, so a boot with
++		 * sweetext=1 and no SpringBoard line here means the cache on userdata still holds "arm64" (Control Center stays empty).
++		 */
++		static uint32_t sweet_arch_logged;
++		if (__atomic_fetch_add(&sweet_arch_logged, 1, __ATOMIC_RELAXED) < 16) {
++			extern void proc_selfname(char *buf, int size);
++			char name[32];
++			proc_selfname(name, sizeof(name));
++			printf("SWEET ARCH: %s preferred user arch subtype %d (sweetext=%d)\n", name, user_arch_info->cpu_subtype, sweet_ext);
++		}
+ 
+ 
+ 		*count = HOST_PREFERRED_USER_ARCH_COUNT;
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -443,6 +443,7 @@
+ #define SWEET_FB_PANEL_US               8333    /* 2153: the asteroids panel's own vsync period (BOE RM69220, 120 Hz video mode) */
+ #define SWEET_FB_DOT_PITCH              458     /* ppi, as the iPhone X panel */
+ #define SWEET_FB_BL_STEPS               12      /* vsyncs of backlight ramp */
++#define SWEET_PANEL_DBV_TOP             3515u   /* 2340: asteroids' brightest DBV, the panel init's own 51 0d bb */
+ #define SWEET_FB_STATS_MAX              1024    /* kern.sweet_fb line (bsd/dev/sweet_fb.c) */
+ #define SWEET_FB_HUD_ROWS               6       /* patch 0213: text rows of the performance HUD */
+ #define SWEET_FB_HUD_COLS               26      /* and columns (8x16 glyph cells) */
+@@ -1195,9 +1196,9 @@
+ 			}
+ 			OSSafeReleaseNULL(dp);
+ 			OSSafeReleaseNULL(br);
+-			int nits = 500;
++			int nits = 650;         /* 2340: a stock iPhone 11's top of the slider */
+ 			PE_parse_boot_argn("sweetfb_blnits", &nits, sizeof(nits));
+-			sweet_backlight_calibration(fBacklight, (nits >= 50 && nits <= 2000) ? (uint32_t)nits : 500u);
++			sweet_backlight_calibration(fBacklight, (nits >= 50 && nits <= 2000) ? (uint32_t)nits : 650u);
+ 			fBacklight->registerService();
+ 			IOLog("SWEET FB: asteroids backlight service published: DSI0 DCS brightness 0..4095, CoreBrightness calibration\n");
+ 		}
+@@ -3485,6 +3486,8 @@
+  * needs "backlight-marketing-table" (OSData of SInt32 16.16 nits at evenly spaced slider positions) or the display
+  * creation fails. The nits keys are optional. Values are synthetic but consistent with sweetfb_blnits (500 nits peak),
+  * which the brightness-nits mapping in setProperties assumes.
++ * 2340: the marketing table is now nits = 2 + (peak - 2) * s^2 for slider s, with peak 650 on asteroids. That is within
++ * about 20% of a stock iPhone 11's table in the middle (164 against 155 nits at half), where the old curve gave 64.
+  */
+ static void
+ sweet_backlight_calibration(IOService *bl, uint32_t peak)
+@@ -3500,8 +3503,7 @@
+ 	} keys[] = {
+ 		{ "current-for-max-backlight", SWEET_FX(20) }, { "current-for-mid-backlight", SWEET_FX(7) },
+ 		{ "hardware-max-current-limit", SWEET_FX(25) }, { "milliAmps2NitsScaleFactor", SWEET_FX(25) },
+-		{ "lMidProduct", SWEET_FX(140) }, { "lMinProduct", SWEET_FX(2) },
+-		{ "lMidPanel", SWEET_FX(140) }, { "lMinPanel", SWEET_FX(2) },
++		{ "lMinProduct", SWEET_FX(2) }, { "lMinPanel", SWEET_FX(2) },
+ 	};
+ 	for (unsigned i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+ 		OSNumber *n = OSNumber::withNumber((uint32_t)keys[i].value, 32);
+@@ -3517,14 +3519,20 @@
+ 	}
+ 	OSSafeReleaseNULL(mx);
+ 	OSSafeReleaseNULL(mxp);
+-	bl->setProperty("backlight-calibration-parameters", cal);
+-	cal->release();
+-	/* nits at slider 0, 1/16 .. 1: rising, the first equal to lMinPanel, the last the peak */
+-	static const uint16_t curve[17] = { 2, 4, 7, 11, 17, 25, 35, 48, 64, 85, 110, 140, 180, 230, 300, 390, 500 };
++	/* nits at slider 0, 1/16 .. 1: 2 + (peak - 2) * (i/16)^2, rising, the first equal to lMinPanel, the last the peak */
+ 	int32_t mkt[17];
+ 	for (unsigned i = 0; i < 17; i++) {
+-		mkt[i] = SWEET_FX((uint32_t)curve[i] * peak / 500u > 2u ? (uint32_t)curve[i] * peak / 500u : 2u);
++		mkt[i] = SWEET_FX(2) + (int32_t)(((uint64_t)(peak - 2u) << 16) * i * i / 256u);
+ 	}
++	OSNumber *md = OSNumber::withNumber((uint32_t)mkt[8], 32), *mdp = OSNumber::withNumber((uint32_t)mkt[8], 32);
++	if (md != NULL && mdp != NULL) {
++		cal->setObject("lMidProduct", md);
++		cal->setObject("lMidPanel", mdp);
++	}
++	OSSafeReleaseNULL(md);
++	OSSafeReleaseNULL(mdp);
++	bl->setProperty("backlight-calibration-parameters", cal);
++	cal->release();
+ 	bl->setProperty("backlight-marketing-table", (void *)mkt, sizeof(mkt));
+ 	int32_t v = SWEET_FX(2);
+ 	bl->setProperty("digital-dimming-min-nits", &v, sizeof(v));
+@@ -3567,7 +3575,30 @@
+ 			peak = (v >= 50 && v <= 2000) ? (uint32_t)v : 500;
+ 		}
+ 		int32_t fx = (int32_t)nits->unsigned32BitValue();
+-		uint64_t lvl = fx > 0 ? (((uint64_t)fx * 4095ULL) + ((uint64_t)peak << 15)) / ((uint64_t)peak << 16) : 0;
++		uint64_t lvl;
++		if (sweet_board_asteroids()) {
++			/*
++			 * 2340: the panel's DBV, taken as linear in nits up to the level its own init sequence writes (0x0dbb), which
++			 * is taken to be Android's manual maximum, about 740 nits measured (sweetfb_blpanel, the calibration knob).
++			 * Never above that level, so iOS cannot hold the panel in its outdoor range.
++			 * ponytail: linear DBV is inferred, a lookup table if a meter shows the panel is not linear.
++			 */
++			static uint32_t panel;
++			if (panel == 0) {
++				int v = 740;
++				PE_parse_boot_argn("sweetfb_blpanel", &v, sizeof(v));
++				panel = (v >= 100 && v <= 2000) ? (uint32_t)v : 740;
++			}
++			lvl = fx > 0 ? (((uint64_t)fx * SWEET_PANEL_DBV_TOP) + ((uint64_t)panel << 15)) / ((uint64_t)panel << 16) : 0;
++			lvl = lvl > SWEET_PANEL_DBV_TOP ? SWEET_PANEL_DBV_TOP : lvl;
++			static uint32_t shown = 0xffffffffu;
++			if (shown == 0xffffffffu || (lvl > shown ? lvl - shown : shown - lvl) >= 64) {
++				shown = (uint32_t)lvl;
++				IOLog("SWEET BL: %u.%02u nits -> DBV %u\n", (uint32_t)fx >> 16, (((uint32_t)fx & 0xffffu) * 100u) >> 16, shown);
++			}
++		} else {
++			lvl = fx > 0 ? (((uint64_t)fx * 4095ULL) + ((uint64_t)peak << 15)) / ((uint64_t)peak << 16) : 0;
++		}
+ 		fFB->blRequest(lvl > 4095 ? 4095 : (uint32_t)lvl);
+ 		return kIOReturnSuccess;
+ 	}

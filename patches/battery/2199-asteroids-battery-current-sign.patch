@@ -1,0 +1,12 @@
+--- a/bsd/dev/battery/BatterySnapshot.inc
++++ b/bsd/dev/battery/BatterySnapshot.inc
+@@ -13,7 +13,8 @@
+  if(!battery_read_valid(b)){battery_snapshot_clear();return;}
+  BatterySnapshot s={
+   .percent=(b->value[2]+50)/100,.millivolts=b->value[3]/1000,
+-  .milliamps=-(b->value[4]/1000),.temperature=b->value[5],
++  /* ADSP current is positive into the battery (ast192), as iOS InstantAmperage expects. */
++  .milliamps=b->value[4]/1000,.temperature=b->value[5],
+   .external=b->value[6]!=0,.charging=b->value[6]!=0 && b->value[0]==1,
+   .full=b->value[0]==4,.sampled_ms=now
+  };

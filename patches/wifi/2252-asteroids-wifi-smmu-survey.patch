@@ -1,0 +1,263 @@
+diff --git a/bsd/dev/sweet_wpss.c b/bsd/dev/sweet_wpss.c
+index 2e66b09..91d8117 100644
+--- a/bsd/dev/sweet_wpss.c
++++ b/bsd/dev/sweet_wpss.c
+@@ -45,6 +45,11 @@ static void wpss_worker(void *arg,wait_result_t wait){
+    * there. Still no register window and no copy engine: the firmware is left waiting for a host data path. */
+   printf("SWEET WIFI: W7 worker begin; WPSS start, the edge, the WLFW client, the board data, the cold-boot mode and mission mode\n");sweet_log_sync();
+   printf("SWEET WIFI: W2 worker final_error=%d\n",wpss_run(WpssMission));
++ } else if(arg==(void *)WpssSmmu){
++  /* 2252: W8's survey. W7's whole run, with apps_smmu read (never written) before the start, after the mission sequence
++   * and after the verified stop, for the WLAN streams the copy engines will use. */
++  printf("SWEET WIFI: W8 worker begin; W7's whole run plus read-only apps_smmu snapshots for the WLAN streams 0x1400/0x1401\n");sweet_log_sync();
++  printf("SWEET WIFI: W2 worker final_error=%d\n",wpss_run(WpssSmmu));
+  } else printf("SWEET WIFI: W2 worker final_error=%d\n",wpss_run(WpssStart));
+  sweet_log_sync();thread_terminate(current_thread());
+ }
+@@ -56,7 +61,7 @@ void sweet_wpss_start(void){
+  if(!PE_parse_boot_argn("sweetdeadman",&deadman,sizeof(deadman)))deadman=0;
+  int gate=wpss_gate(args,deadman);
+  if(gate==WpssOff)return;
+- if(gate==WpssRefused){printf("SWEET WIFI: refused: sweetwprobe=1 with no modem or battery gate, or one of sweetwpin=1, sweetwpss=1, sweetwglink=1, sweetwlfw=1, sweetwbdf=1, sweetwmode=1 or sweetwmission=1 with sweetfbarm=1 sweetselftest=1 sweetdeadman=600 and no other gate\n");return;}
++ if(gate==WpssRefused){printf("SWEET WIFI: refused: sweetwprobe=1 with no modem or battery gate, or one of sweetwpin=1, sweetwpss=1, sweetwglink=1, sweetwlfw=1, sweetwbdf=1, sweetwmode=1, sweetwmission=1 or sweetwsmmu=1 with sweetfbarm=1 sweetselftest=1 sweetdeadman=600 and no other gate\n");return;}
+  thread_t thread=THREAD_NULL;kern_return_t rc=kernel_thread_start(wpss_worker,(void *)(uintptr_t)gate,&thread);
+  if(rc==KERN_SUCCESS)thread_deallocate(thread);else printf("SWEET WIFI: thread failure %d\n",rc);
+ }
+diff --git a/bsd/dev/wifi/WpssGate.h b/bsd/dev/wifi/WpssGate.h
+index 3984725..2e2b4c4 100644
+--- a/bsd/dev/wifi/WpssGate.h
++++ b/bsd/dev/wifi/WpssGate.h
+@@ -22,7 +22,10 @@
+  * ready: WLAN_INI (log on), WLAN_CFG (the copy engines and the shadow-register list) and WLAN_MODE mode 0 (mission). It
+  * sends a mode-off only after mission mode was taken, and it never maps the radio's register window or touches a copy
+  * engine. Same rules, exclusive with W3, W4, W5 and W6. */
+-enum {WpssOff=0,WpssSurvey=1,WpssStart=2,WpssPin=3,WpssGlink=4,WpssWlfw=5,WpssBdf=6,WpssMode=7,WpssMission=8,WpssRefused=-1};
++/* 2252 (W8 survey): sweetwsmmu=1 is W7's whole run plus three read-only snapshots of apps_smmu (before the start, after
++ * the mission sequence, after the verified stop) for the WLAN streams 0x1400/0x1401. It writes no SMMU register, builds no
++ * context, maps no radio register and touches no copy engine. Same rules, exclusive with W3 to W7. */
++enum {WpssOff=0,WpssSurvey=1,WpssStart=2,WpssPin=3,WpssGlink=4,WpssWlfw=5,WpssBdf=6,WpssMode=7,WpssMission=8,WpssSmmu=9,WpssRefused=-1};
+ /* Refused in any form: the presets, the battery's own gates, and every modem, IPA and battery-test gate ModemGate.h lists
+  * (modem_cell_gates, modem_cell_refused, modem_daily_refused), so the list cannot fall behind it. */
+ static const char *const wpss_refused[5]={"sweetdaily","sweetcell","sweetbatt","sweetbmeter","sweetbprobe"};
+@@ -50,15 +53,16 @@ static inline int wpss_edge_gate(const char *args,int deadman,const char *self){
+     if(!modem_same(self,"sweetwbdf") && modem_arg_count(args,"sweetwbdf"))return WpssRefused;
+     if(!modem_same(self,"sweetwmode") && modem_arg_count(args,"sweetwmode"))return WpssRefused;
+     if(!modem_same(self,"sweetwmission") && modem_arg_count(args,"sweetwmission"))return WpssRefused;
++    if(!modem_same(self,"sweetwsmmu") && modem_arg_count(args,"sweetwsmmu"))return WpssRefused;
+     if(!modem_gate(args,"sweetfbarm") || !modem_gate(args,"sweetselftest") || deadman!=600)return WpssRefused;
+     return 0;
+ }
+ static inline int wpss_gate(const char *args,int deadman){
+     unsigned probe=modem_arg_count(args,"sweetwprobe"),start=modem_arg_count(args,"sweetwpss"),pin=modem_arg_count(args,"sweetwpin");
+     unsigned glink=modem_arg_count(args,"sweetwglink"),wlfw=modem_arg_count(args,"sweetwlfw"),bdf=modem_arg_count(args,"sweetwbdf");
+-    unsigned mode=modem_arg_count(args,"sweetwmode"),mission=modem_arg_count(args,"sweetwmission");
+-    if(!probe && !start && !pin && !glink && !wlfw && !bdf && !mode && !mission)return WpssOff;
+-    if((probe!=0)+(start!=0)+(pin!=0)+(glink!=0)+(wlfw!=0)+(bdf!=0)+(mode!=0)+(mission!=0)>1)return WpssRefused;
++    unsigned mode=modem_arg_count(args,"sweetwmode"),mission=modem_arg_count(args,"sweetwmission"),smmu=modem_arg_count(args,"sweetwsmmu");
++    if(!probe && !start && !pin && !glink && !wlfw && !bdf && !mode && !mission && !smmu)return WpssOff;
++    if((probe!=0)+(start!=0)+(pin!=0)+(glink!=0)+(wlfw!=0)+(bdf!=0)+(mode!=0)+(mission!=0)+(smmu!=0)>1)return WpssRefused;
+     /* 2246: W3 is the coexistence gate. It is the one Wi-Fi gate allowed beside a preset, because proving coexistence is its
+      * whole purpose, so sweetdaily=1 or sweetcell=1 may be present and the preset decides its own members. Every member and
+      * probe token named literally is refused instead: a preset plus one of its own members is an invalid preset
+@@ -89,6 +93,11 @@ static inline int wpss_gate(const char *args,int deadman){
+         if(wpss_edge_gate(args,deadman,"sweetwmission"))return WpssRefused;
+         return WpssMission;
+     }
++    /* 2252: W8's survey, the same rules again: W7's run with the read-only SMMU snapshots around it. */
++    if(smmu){
++        if(wpss_edge_gate(args,deadman,"sweetwsmmu"))return WpssRefused;
++        return WpssSmmu;
++    }
+     if(wpss_conflict(args))return WpssRefused;
+     if(probe)return modem_arg_is(args,"sweetwprobe","1")?WpssSurvey:WpssRefused;
+     if(!modem_arg_is(args,pin?"sweetwpin":"sweetwpss","1") || !modem_gate(args,"sweetfbarm") || !modem_gate(args,"sweetselftest") || deadman!=600)
+diff --git a/bsd/dev/wifi/WpssRuntime.inc b/bsd/dev/wifi/WpssRuntime.inc
+index a17ee35..402c417 100644
+--- a/bsd/dev/wifi/WpssRuntime.inc
++++ b/bsd/dev/wifi/WpssRuntime.inc
+@@ -32,6 +32,10 @@ extern void sweet_smem_unlock(void);
+ extern void sweet_log_sync(void);
+ extern int sweet_ufs_read_part(const char *,uint64_t,void *,uint64_t);
+ extern int sweet_ufs_part_size(const char *,uint8_t *,uint64_t *);
++/* 2252 (W8 survey): the apps_smmu allocator claim that IPA (IpaRuntime.inc), touch and sweet_smmu.c take around their own
++ * SMMU writes. The survey only reads, but it holds the claim so it never reads a table half way through someone's update. */
++extern int sweet_apps_smmu_claim(void);
++extern void sweet_apps_smmu_release(void);
+ #endif
+ #include "../modem/QcomSmem.h"
+ #include "../modem/QcomSmp2p.h"
+@@ -154,6 +158,10 @@ static struct {
+   * tgt_cfg, 3 + 169 svc_cfg and 3 + 41 shadow, plus the 7-byte header is 413, and 512 leaves 99 for a bug to be visible as
+   * a refused encode rather than a truncated message. */
+  uint8_t cfg_buf[512];
++ /* 2252 (W8 survey): smmu_asked is the gate. Each of the three snapshots (before, mission, after) records whether it was
++  * taken and the global fault status it read; the rest is what the last snapshot found, for the close line. */
++ bool smmu_asked;
++ uint32_t smmu_taken,smmu_gfsr[3],smmu_wlan,smmu_valid,smmu_free_smr,smmu_free_cb,smmu_faulted;
+  /* 2249: what each file actually got through, kept as two totals because bdf_seg restarts at 0 for the second file and
+   * a run that stops in the middle must still say which file it stopped in. */
+  uint32_t bdf_regdb_pieces,bdf_board_pieces;
+@@ -417,6 +425,112 @@ static void w_state_probe(void){
+  printf("; last seen state=%#x\n",w.state);sweet_log_sync();
+  wpss_crash_reason();
+ }
++/* ---- 2252 (W8 survey): apps_smmu, read only, for the WLAN copy engines' streams ------------------------------------
++ * The live DT gives the WLAN node iommus = <&apps_smmu 0x1400 0x1>, so the copy engines' DMA arrives as stream 0x1400 or
++ * 0x1401, through the TBU whose range is 0x1400 to 0x17ff (pcie_qtb; pcie0 itself is disabled). Nothing in this kernel
++ * programs those streams. Every boot's ASTEROIDS USB probe lists the valid SMRs ABL leaves (0 to 4: 0x60, 0x540,
++ * 0x1c00/2, 0x40, 0x480) and sCR0 has USFCFG set, so a WLAN DMA today would be an unidentified-stream fault.
++ *
++ * What this reads, and why each read is safe: every offset below has already been read on this phone by our own code
++ * under this hypervisor. Global: sCR0 0x0, ID0-2 0x20-0x28, sGFSR 0x48 (ASTEROIDS USB, every boot). SMR 0x800+4n and S2CR
++ * 0xc00+4n for n below ID0's count (IPA's ipa_mmu_choose, 42 boots). CBAR 0x1000+4n and CBA2R 0x1800+4n, and for every
++ * bank SCTLR 0x0, TTBR0 0x20/0x24, TTBR1 0x28/0x2c and FSR 0x58 (IPA's CBsurvey, ast170, all 72 banks). TCR2 0x10, TCR
++ * 0x30, MAIR0 0x38 and MAIR1 0x3c (ipa_mmu_choose's saved set) only for a bank a WLAN SMR selects. Nothing is read past
++ * ID0's SMR count or ID1's bank count, and the tables are not read at all unless ID0, ID1 and ID2 are the values measured
++ * since ast159, because a different geometry is a different hypervisor build and none of these reads is proven there.
++ *
++ * Left out on purpose: sGFAR, sGFSYNR0-2, each bank's FAR and FSYNR, TLBSTATUS and ACTLR (never read on this phone, and
++ * the hypervisor emulates the global space: the boot shim once took an external abort reading SMR 7, cause unknown); the
++ * TBU at 0x16cd000 (never read, and its clock and power are not ours to assume); any write, including a fault clear. A
++ * recorded fault is reported by its status bits only, and sGFSR's USF bit is the one that says a stream without an SMR
++ * tried to move data. */
++#define W_SMMU_PA 0x15000000u
++#define W_SMMU_BYTES 0x100000u
++#define W_SMMU_ID0 0x4c017e72u      /* 114 SMRs, measured in ast159 and on every boot since */
++#define W_SMMU_ID1 0x60000048u      /* 72 banks, 4 KiB pages, 128 global pages: banks start at 0x80000 */
++#define W_SMMU_ID2 0x00005111u      /* 36-bit input and output */
++#define W_SMMU_NSMR 114u
++#define W_SMMU_NCB 72u
++#define W_SMMU_CB0 0x80000u
++#define W_WLAN_SID 0x1400u          /* live DT: iommus = <&apps_smmu 0x1400 0x1> */
++#define W_WLAN_SIDS 2u              /* mask 1: 0x1400 and 0x1401 */
++#define W_WLAN_TBU_LO 0x1400u       /* pcie_qtb qcom,stream-id-range = <0x1400 0x400> */
++#define W_WLAN_TBU_HI 0x17ffu
++#define W_SMMU_CLAIM_MS 100u
++static const char *const w_smmu_when[3]={"before","mission","after"};
++static bool w_smr_hits(uint32_t smr,unsigned sid){uint32_t mask=(smr>>16)&0x7fffu;return (smr>>31) && !((smr^sid)&0x7fffu&~mask);}
++static void w_smmu_survey(unsigned which){
++ if(!w.smmu_asked || which>2)return;
++ const char *when=w_smmu_when[which];
++ /* The claim, not a lock that blocks: a holder is writing, so wait a little and then report instead of reading. */
++ unsigned waited=0;
++ while(!sweet_apps_smmu_claim()){
++  if(waited>=W_SMMU_CLAIM_MS){printf("SWEET WIFI: W8 smmu %s: busy, another SMMU user held the claim for %u ms; not read\n",when,waited);sweet_log_sync();return;}
++  w_sleep(10);waited+=10;
++ }
++ vm_offset_t s=ml_io_map_unmappable(W_SMMU_PA,W_SMMU_BYTES,VM_WIMG_IO);
++ if(!s){sweet_apps_smmu_release();printf("SWEET WIFI: W8 smmu %s: mapping failed; not read\n",when);sweet_log_sync();return;}
++ uint32_t scr0=w_rd(s,0),id0=w_rd(s,0x20),id1=w_rd(s,0x24),id2=w_rd(s,0x28),gfsr=w_rd(s,0x48);
++ w.smmu_taken|=1u<<which;w.smmu_gfsr[which]=gfsr;
++ printf("SWEET WIFI: W8 smmu %s: sCR0=%#x (USFCFG=%u GFIE=%u GFRE=%u CLIENTPD=%u) ID0=%#x ID1=%#x ID2=%#x sGFSR=%#x read_only=1\n",
++  when,scr0,(scr0>>10)&1u,(scr0>>2)&1u,(scr0>>1)&1u,scr0&1u,id0,id1,id2,gfsr);
++ if(gfsr)printf("SWEET WIFI: W8 smmu %s: global fault recorded:%s%s%s%s%s%s%s%s%s%s (status bits only; sGFAR and sGFSYNR are not read)\n",when,
++  gfsr&1u?" ICF":"",gfsr&2u?" USF (a stream with no SMR moved data)":"",gfsr&4u?" SMCF":"",gfsr&8u?" UCBF":"",gfsr&16u?" UCIF":"",
++  gfsr&32u?" CAF":"",gfsr&64u?" EF":"",gfsr&128u?" PF":"",gfsr&256u?" UUT":"",gfsr&0x80000000u?" MULTI":"");
++ if(id0!=W_SMMU_ID0 || id1!=W_SMMU_ID1 || id2!=W_SMMU_ID2){
++  printf("SWEET WIFI: W8 smmu %s: geometry differs from the measured ID0=%#x ID1=%#x ID2=%#x; no table or bank read\n",when,W_SMMU_ID0,W_SMMU_ID1,W_SMMU_ID2);
++  goto out;
++ }
++ bool referenced[W_SMMU_NCB],wlanbank[W_SMMU_NCB];memset(referenced,0,sizeof(referenced));memset(wlanbank,0,sizeof(wlanbank));
++ unsigned valid=0,free_smr=0,firstfree[4]={0},nfree=0,hits[W_WLAN_SIDS]={0};
++ for(unsigned i=0;i<W_SMMU_NSMR;i++){
++  uint32_t smr=w_rd(s,0x800+4*i);
++  if(!(smr>>31)){if(nfree<4)firstfree[nfree++]=i;free_smr++;continue;}
++  uint32_t s2cr=w_rd(s,0xc00+4*i),type=(s2cr>>16)&3u,cb=s2cr&255u,id=smr&0x7fffu,mask=(smr>>16)&0x7fffu;valid++;
++  bool wlan=false;
++  for(unsigned k=0;k<W_WLAN_SIDS;k++)if(w_smr_hits(smr,W_WLAN_SID+k)){hits[k]++;wlan=true;}
++  if(type==0 && cb<W_SMMU_NCB){referenced[cb]=true;if(wlan)wlanbank[cb]=true;}
++  bool tbu=(id&~mask)<=W_WLAN_TBU_HI && (id|mask)>=W_WLAN_TBU_LO;
++  printf("SWEET WIFI: W8 smmu %s: smr %u raw=%#x id=%#x mask=%#x s2cr=%#x type=%s cb=%u%s%s\n",when,i,smr,id,mask,s2cr,
++   type==0?"translate":(type==1?"bypass":"fault"),cb,wlan?" WLAN":"",tbu?" (in the WLAN TBU range)":"");
++ }
++ printf("SWEET WIFI: W8 smmu %s: smrs valid=%u free=%u first_free=%u,%u,%u,%u\n",when,valid,free_smr,
++  nfree>0?firstfree[0]:0,nfree>1?firstfree[1]:0,nfree>2?firstfree[2]:0,nfree>3?firstfree[3]:0);
++ for(unsigned k=0;k<W_WLAN_SIDS;k++){
++  if(hits[k])printf("SWEET WIFI: W8 smmu %s: sid %#x matched by %u smr(s)%s\n",when,W_WLAN_SID+k,hits[k],hits[k]>1?" (a stream match conflict on its first DMA)":"");
++  else printf("SWEET WIFI: W8 smmu %s: sid %#x has no smr; with USFCFG=%u its DMA would be %s\n",when,W_WLAN_SID+k,(scr0>>10)&1u,
++   (scr0>>10)&1u?"an unidentified-stream fault":"passed through by sCR0's default");
++ }
++ unsigned free_cb=0,firstcb[8]={0},ncb=0,faulted=0,nref=0;
++ for(unsigned c=0;c<W_SMMU_NCB;c++){
++  unsigned b=W_SMMU_CB0+0x1000u*c;
++  uint32_t sctlr=w_rd(s,b),fsr=w_rd(s,b+0x58),cbar=w_rd(s,0x1000+4*c),cba2r=w_rd(s,0x1800+4*c);
++  if(referenced[c]){
++   nref++;
++   printf("SWEET WIFI: W8 smmu %s: cb %u%s CBAR=%#x CBA2R=%#x SCTLR=%#x (M=%u) TTBR0=%#x:%#x TTBR1=%#x:%#x FSR=%#x\n",when,c,
++    wlanbank[c]?" WLAN":"",cbar,cba2r,sctlr,sctlr&1u,w_rd(s,b+0x24),w_rd(s,b+0x20),w_rd(s,b+0x2c),w_rd(s,b+0x28),fsr);
++   if(wlanbank[c])printf("SWEET WIFI: W8 smmu %s: cb %u WLAN TCR=%#x TCR2=%#x MAIR0=%#x MAIR1=%#x\n",when,c,
++    w_rd(s,b+0x30),w_rd(s,b+0x10),w_rd(s,b+0x38),w_rd(s,b+0x3c));
++  } else if(!(sctlr&0xe1u) && !fsr && !cbar && !cba2r){if(ncb<8)firstcb[ncb++]=c;free_cb++;}
++  /* FSR bits 10:9 are the format field, not a fault: banks 0 to 4 read 0x400 on every boot. */
++  if(fsr&~0x600u){faulted++;printf("SWEET WIFI: W8 smmu %s: cb %u FSR=%#x: a fault is recorded in this bank\n",when,c,fsr);}
++ }
++ printf("SWEET WIFI: W8 smmu %s: banks referenced=%u free=%u (IPA's rule: unreferenced, SCTLR&0xe1=0, FSR=0, CBAR=0, CBA2R=0) first_free=%u,%u,%u,%u,%u,%u,%u,%u faulted=%u\n",
++  when,nref,free_cb,firstcb[0],firstcb[1],firstcb[2],firstcb[3],firstcb[4],firstcb[5],firstcb[6],firstcb[7],faulted);
++ w.smmu_wlan=hits[0]+hits[1];w.smmu_valid=valid;w.smmu_free_smr=free_smr;w.smmu_free_cb=free_cb;w.smmu_faulted=faulted;
++out:
++ w_unmap(s,W_SMMU_BYTES);sweet_apps_smmu_release();sweet_log_sync();
++}
++/* The close line: one place that says what the three snapshots saw, for the grader and for W8's ring stage to start from. */
++static void w_smmu_close(void){
++ if(!w.smmu_asked)return;
++ char g[3][12];
++ for(unsigned i=0;i<3;i++){if(w.smmu_taken&(1u<<i))snprintf(g[i],sizeof(g[i]),"%#x",w.smmu_gfsr[i]);else snprintf(g[i],sizeof(g[i]),"none");}
++ printf("SWEET WIFI: W8 smmu close: taken=%u%u%u sGFSR=%s/%s/%s wlan_smr=%u valid_smr=%u free_smr=%u free_cb=%u faulted_cb=%u mission=%u read_only=1\n",
++  w.smmu_taken&1u,(w.smmu_taken>>1)&1u,(w.smmu_taken>>2)&1u,g[0],g[1],g[2],w.smmu_wlan,w.smmu_valid,w.smmu_free_smr,w.smmu_free_cb,
++  w.smmu_faulted,(unsigned)w.mission_taken);
++ sweet_log_sync();
++}
+ /* Linux's order and the reference port's lesson: ask the DSP to stop over SMP2P and wait for its ack before TrustZone
+  * shuts it down. A stop that is not verified keeps the image memory, the metadata, the QMP load state and the votes.
+  *
+@@ -1531,14 +1645,16 @@ static int wpss_run(int gate){
+  /* 2248: W4 opens the edge too, because its client needs it. W3 is the plain edge; W2 is the start alone.
+   * 2249 (W5): sweetwbdf=1 is the same client with the board data download after DEVICE_INFO.
+   * 2250 (W6): sweetwmode=1 is W5's whole exchange with the mode request after init_done, so it needs every part of it. */
+- w.link_asked=(gate==WpssGlink || gate==WpssWlfw || gate==WpssBdf || gate==WpssMode || gate==WpssMission);
+- w.wlfw_asked=(gate==WpssWlfw || gate==WpssBdf || gate==WpssMode || gate==WpssMission);
+- w.bdf_asked=(gate==WpssBdf || gate==WpssMode || gate==WpssMission);
++ w.link_asked=(gate==WpssGlink || gate==WpssWlfw || gate==WpssBdf || gate==WpssMode || gate==WpssMission || gate==WpssSmmu);
++ w.wlfw_asked=(gate==WpssWlfw || gate==WpssBdf || gate==WpssMode || gate==WpssMission || gate==WpssSmmu);
++ w.bdf_asked=(gate==WpssBdf || gate==WpssMode || gate==WpssMission || gate==WpssSmmu);
+  /* 2250 (W6): this gate adds the mode request and its two indications on top of W5's whole exchange. */
+- w.mode_asked=(gate==WpssMode || gate==WpssMission);
++ w.mode_asked=(gate==WpssMode || gate==WpssMission || gate==WpssSmmu);
+  /* 2251 (W7): this gate adds WLAN_INI, WLAN_CFG and mission mode on top of W6's cold-boot mode. It is not a separate line
+   * of work: without the cold-boot mode there is no fw_ready, and without fw_ready ath11k has nothing to start. */
+- w.mission_asked=(gate==WpssMission);
++ w.mission_asked=(gate==WpssMission || gate==WpssSmmu);
++ /* 2252 (W8 survey): W7's run, plus three read-only apps_smmu snapshots. */
++ w.smmu_asked=(gate==WpssSmmu);
+  /* 2249: this gate's dwell. W4's 20 s is what its audit sized; a board file is 41 pieces plus a 10 s init_done wait, so
+   * W5's own dwell is 35 s. It is set here, before any deadline can read it, and nothing else changes.
+   * 2250: W6's is 60 s, for the mode request after the board data and a calibration wait of up to 20 s. 2251 (W7): 75 s,
+@@ -1546,6 +1662,9 @@ static int wpss_run(int gate){
+   * timing moves. */
+  w.dwell_ms=w.mission_asked?W_MISSION_DWELL_MS:(w.mode_asked?W_MODE_DWELL_MS:(w.bdf_asked?W_BDF_DWELL_MS:W_DWELL_MS));
+  struct wl_fat f;
++ /* 2252: the first snapshot, before anything of the WPSS is touched. It is also the canary for the later two: they make
++  * the same reads, so if any of them could abort, it aborts here, with no DSP running. */
++ w_smmu_survey(0);
+  int rc=w_open_image(&f);if(rc)goto out;
+  /* 2243: the sleep clock before any WPSS work (Fairphone's mainline enablement: without it the WPSS keeps crashing). */
+  if((rc=wpss_gpio5_set()))goto out;
+@@ -1591,6 +1710,9 @@ static int wpss_run(int gate){
+   if(handover && now-handover>=w.dwell_ms){rc=0;break;}
+   w_sleep(2);
+  }
++ /* 2252: the second snapshot, after the mission sequence (the hold and the mode-off are inside the dwell) and before the
++  * stop. Only on the healthy path: any failure goes straight to the stop, and the third snapshot still runs after it. */
++ if(!rc)w_smmu_survey(1);
+ out:
+  printf("SWEET WIFI: W2 run end error=%d ready=%u handover=%u fatal=%u\n",rc,!!(w.state&2),!!(w.state&4),w.fatal);sweet_log_sync();
+  /* 2244: before giving up, read what the hardware says, so the next boot does not have to guess whether the DSP bit
+@@ -1598,6 +1720,8 @@ out:
+   * attempted, and only when something went wrong. */
+  if(rc || !(w.state&2))w_state_probe();
+  if(!w_cleanup())rc=EIO;
++ /* 2252: the third snapshot, after the verified stop (or the unverified one: reading the SMMU changes nothing either way). */
++ w_smmu_survey(2);w_smmu_close();
+  return rc;
+ }
+ /* 2240 sweetwprobe=1: maps only SMEM and cmd-db and reads them; reads and validates the firmware chain from modem_a.

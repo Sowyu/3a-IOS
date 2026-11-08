@@ -1,0 +1,138 @@
+diff --git a/bsd/dev/wifi/WpssRuntime.inc b/bsd/dev/wifi/WpssRuntime.inc
+index 97d70bd25..9a0568759 100644
+--- a/bsd/dev/wifi/WpssRuntime.inc
++++ b/bsd/dev/wifi/WpssRuntime.inc
+@@ -85,8 +85,11 @@ static struct {
+   * link_asked is the gate: only sweetwglink=1 sets it, so every earlier boot behaves exactly as it did. */
+  QcomGlink gl;QcomQrtr qr;QcomGlinkChannel *glch;
+  bool link_asked,link_started,glink_up,qr_started,glink_broken;
++ /* 2247: hello_waiting logs once when the link is up but the WPSS has advertised no intent to send into, so a boot
++  * where our HELLO never left cannot be mistaken for a silent firmware (W3 audit note 9). */
++ bool hello_waiting;
+  uint32_t desc_off,our_fifo_off,their_fifo_off;
+- uint64_t link_began;
++ uint64_t link_began,ch_up_at;
+  int master;
+  uint8_t *mdt;uint32_t mdt_bytes;
+  vm_offset_t mapping,metadata;uint64_t meta_pa;
+@@ -395,12 +398,15 @@ static int wpss_gpio5_set(void);
+ #define W_GLINK_DESC 478u
+ #define W_GLINK_OUR_FIFO 479u
+ #define W_GLINK_THEIR_FIFO 480u
++#define GLINK_DESC_BYTES 32u   /* 2247: two head/tail pairs, the size Linux allocates and the size W1 measured */
+ #define W_SIG_GLINK 0u
+-/* The WPSS's intents, from qcom,wpss_qrtr: 0x800 five times, 0x2000 three times, 0x4400 twice. We advertise the largest,
+- * because a QRTR packet is small and one intent size keeps the bookkeeping simple. */
++/* The receive intents we advertise, from the DT's qcom,wpss_qrtr: 0x800 five times, 0x2000 three times, 0x4400 twice.
++ * 2247: those are OURS to advertise, not the WPSS's. Linux's qcom_glink_announce_create reads `qcom,intents` and
++ * advertises them from the host side (W3 audit note 24; the 2246 comment had this backwards). W3 advertises 8 of the
++ * smallest size, which is enough because W3 only ever receives control packets. When L2 starts taking firmware replies,
++ * use the DT's sizes: a reply can be larger than 0x800 and would otherwise be dropped. */
+ #define W_GLINK_INTENT 0x800u
+ #define W_GLINK_INTENT_COUNT 8u
+-#define W_GLINK_TX 0x2000u
+ static uint8_t w_glink_rx[W_GLINK_INTENT*W_GLINK_INTENT_COUNT];
+ /* Our transmit ring lives in SMEM item 479, which is 16 KiB: half for each direction is the battery's split. */
+ #define W_GLINK_FIFO 0x4000u
+@@ -415,6 +421,7 @@ static int w_qrtr_send(void *unused,const uint8_t *packet,uint32_t length){
+ }
+ static void w_glink_state(void *unused,QcomGlinkChannel *ch,int up){
+  (void)unused;(void)ch;w.glink_up=up!=0;
++ if(up)w.ch_up_at=w_now();
+  printf("SWEET WIFI: W3 glink IPCRTR up=%d after %llu ms\n",up,(unsigned long long)(w_now()-w.link_began));
+  sweet_log_sync();
+ }
+@@ -435,18 +442,32 @@ static void w_qrtr_trace(const uint8_t *packet,uint32_t bytes){
+  else if(type==QCOM_QRTR_BYE)printf("SWEET WIFI: W3 qrtr BYE\n");
+  sweet_log_sync();
+ }
++/* 2247: the descriptor's four words, named as Linux's qcom_glink_smem.c uses them (W3 audit note 3). The layout is
++ * `tx_pipe->tail = &descs[0]`, `tx_pipe->head = &descs[1]`, `rx_pipe->tail = &descs[2]`, `rx_pipe->head = &descs[3]`,
++ * and `QcomGlinkFifo` is {head, tail}. So:
++ *   word 0  the DSP's read index into our FIFO   (our tx tail: the DSP moves it)
++ *   word 1  our write index into our FIFO        (our tx head: we move it, cleared by qcom_glink_init)
++ *   word 2  our read index into the DSP's FIFO   (our rx tail: we move it, cleared by qcom_glink_init)
++ *   word 3  the DSP's write index into its FIFO  (our rx head: the DSP moves it)
++ * 2246 printed these as head/tail/their_head/their_tail, which reads as a mirrored order to anyone who trusts the
++ * labels. The values were always right; only the names were wrong. */
++static void w_glink_show_desc(void){
++ printf("SWEET WIFI: W3 glink descriptor item=%u dsp_read(w0)=%#x our_write(w1)=%#x our_read(w2)=%#x dsp_write(w3)=%#x (as left)\n",
++  W_GLINK_DESC,w_rd(w.smem,w.desc_off),w_rd(w.smem,w.desc_off+4),w_rd(w.smem,w.desc_off+8),w_rd(w.smem,w.desc_off+12));
++}
+ /* Brings the link up: reads what the bootloader left, waits for the WPSS's FIFO, then lets GLINK do its handshake. */
+ static int w_glink_open(void){
+  uint32_t off=0,bytes=0;
+- if(w_item(W_GLINK_DESC,16,&off,&bytes)){
+-  /* 478 is the one item W1 found already present on this edge. If it is missing, make it: GLINK owns it, not the DSP. */
+-  if(w_alloc(W_GLINK_DESC,16,&off))return EIO;
++ if(w_item(W_GLINK_DESC,GLINK_DESC_BYTES,&off,&bytes)){
++  /* 478 is the one item W1 found already present on this edge. If it is missing, make it: GLINK owns it, not the DSP.
++   * 2247: Linux allocates and checks 32 bytes for this item (two head/tail pairs); 2246 asked for 16, which would be
++   * refused or give a half descriptor. W1 measured 32, so this branch should never run, but it is now the same size. */
++  if(w_alloc(W_GLINK_DESC,GLINK_DESC_BYTES,&off))return EIO;
+   w.desc_off=off;
+-  printf("SWEET WIFI: W3 glink descriptor item=%u was absent; allocated\n",W_GLINK_DESC);
++  printf("SWEET WIFI: W3 glink descriptor item=%u was absent; allocated %u bytes\n",W_GLINK_DESC,GLINK_DESC_BYTES);
+  } else {
+   w.desc_off=off;
+-  printf("SWEET WIFI: W3 glink descriptor item=%u head=%#x tail=%#x their_head=%#x their_tail=%#x (as left)\n",W_GLINK_DESC,
+-   w_rd(w.smem,w.desc_off),w_rd(w.smem,w.desc_off+4),w_rd(w.smem,w.desc_off+8),w_rd(w.smem,w.desc_off+12));
++  w_glink_show_desc();
+  }
+  if(w_alloc(W_GLINK_OUR_FIFO,W_GLINK_FIFO,&off))return EIO;
+  w.our_fifo_off=off;
+@@ -466,6 +487,17 @@ static int w_glink_open(void){
+  sweet_log_sync();
+  return 0;
+ }
++/* 2247: how long the link may be up with no intent from the WPSS before we say the HELLO is waiting. The intent arrives a
++ * few milliseconds after the channel comes up on a healthy link, so an immediate line would cry wolf on every good boot;
++ * 250 ms is far longer than that gap and still well inside the 20 s dwell. */
++#define W_HELLO_GRACE_MS 250u
++/* 2247: how many of the WPSS's receive intents we hold, and how many are free to send into. Counts only: the intent
++ * sizes and ids are the DSP's business and do not identify anything. */
++static void print_intents(void){
++ unsigned valid=0,idle=0;
++ if(w.glch)for(unsigned k=0;k<QCOM_GLINK_MAX_REMOTE_INTENTS;k++)if(w.glch->remote[k].valid){valid++;if(!w.glch->remote[k].busy)idle++;}
++ printf("SWEET WIFI: W3 glink intents from the WPSS: valid=%u idle=%u of %u slots\n",valid,idle,QCOM_GLINK_MAX_REMOTE_INTENTS);
++}
+ /* Polls the link. Bounded: called from the same 2 ms loop as the SMP2P poll. */
+ static void w_glink_poll(void){
+  if(!w.link_started)return;
+@@ -488,10 +520,25 @@ static void w_glink_poll(void){
+   for(unsigned k=0;k<QCOM_GLINK_MAX_REMOTE_INTENTS;k++)if(w.glch->remote[k].valid && !w.glch->remote[k].busy){can_send=true;break;}
+   if(can_send){qcom_qrtr_start(&w.qr);w.qr_started=true;
+    printf("SWEET WIFI: W3 qrtr hello sent; remote services=%u\n",w.qr.remote_count);sweet_log_sync();}
++  /* 2247 (W3 audit note 9): say so when the link is up and our HELLO is still waiting for an intent from the WPSS.
++   * Without this line the only sign was a missing `hello sent`, and launch condition 5 has to grade "up=1 and no hello"
++   * as our side silent rather than a silent firmware. Logged once, and again if the channel drops and comes back. */
++  else if(!w.hello_waiting && w_now()-w.ch_up_at>=W_HELLO_GRACE_MS){
++   w.hello_waiting=true;
++   printf("SWEET WIFI: W3 qrtr hello waiting: the link is up %u ms and the WPSS has advertised no intent to send into\n",
++    (unsigned)(w_now()-w.ch_up_at));
++   print_intents();
++   sweet_log_sync();
++  }
+  }
+  if(w.qr_started && qcom_qrtr_poll(&w.qr)){printf("SWEET WIFI: W3 qrtr resume failed\n");sweet_log_sync();}
+ }
+-/* Closes the link before the DSP is asked to stop: the DSP should see IPCRTR go down first. */
++/* Reports the link's counters on the way out, before the SMP2P stop.
++ * 2247: this does NOT send a GLINK CLOSE. `QcomGlink` has no close call, so the DSP never sees IPCRTR go down; the 2246
++ * comment claiming it did was wrong (W3 audit note 13). What the DSP sees is the SMP2P stop that follows. Linux closes its
++ * channels before asking the DSP to stop, so if the DSP waits for a close, W3 shows ack=0 after 3 s and the PAS6 shutdown
++ * still runs, because it is owed either way. Launch condition 7 grades that case.
++ * It is a log line and a flag reset: no loop, so it cannot hang, and it returns at once when the link never opened. */
+ static void w_glink_close(void){
+  if(!w.link_started)return;
+  printf("SWEET WIFI: W3 glink close: up=%u rx_messages=%u tx_messages=%u rx_data=%u dropped=%u unknown_opens=%u broken=%u\n",
+@@ -500,7 +547,8 @@ static void w_glink_close(void){
+  printf("SWEET WIFI: W3 qrtr totals packets=%u data=%u bad=%u unrouted=%u refused=%u remote_services=%u\n",
+   w.qr.rx_packets,w.qr.rx_data,w.qr.rx_bad,w.qr.rx_unrouted,w.qr.tx_refused,w.qr.remote_count);
+  sweet_log_sync();
+- w.link_started=false;w.glink_up=false;
++ if(!w.qr_started && w.glink_up)printf("SWEET WIFI: W3 qrtr hello never sent: no intent from the WPSS, so our side never spoke\n");
++ w.link_started=false;w.glink_up=false;w.hello_waiting=false;
+ }
+ static int wpss_run(int gate){
+  memset(&w,0,sizeof(w));w.master=-1;w.link_asked=(gate==WpssGlink);struct wl_fat f;

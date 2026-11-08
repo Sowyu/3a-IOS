@@ -1,0 +1,118 @@
+SWEET ACM and AKS: the kernel PRNG for ids and salts, and room for 256 contexts (2323b)
+
+ast247 showed the Set Passcode sheet for the first time, and every
+ACMContextCreate on the phone still failed, now with -4 (it was -5 with no
+service). The cause is the RNG, not the protocol. Both shims called
+random_buf(), which is cc_rand_generate(), which answers -1 unless the corecrypto
+kext has registered g_crypto_funcs. SWEET loads no kexts and its own PRNG
+registers only the cckprng (osfmk/prng/prng_random.c), so on this kernel
+random_buf() fails on every call. acm_random() then zeroed the id, the store
+refused the all-zero id four times and cmd_create() answered SACM_ERR_NOMEM, -4.
+ACMLib returns that kernel status unchanged (LocalAuthenticationCore
+_performCommand 0x1b23503f8, ManagedConfiguration's copy 0x1a93d6ba0), so every
+caller logged "ACMContextCreate failed: -4". The host tests never saw it because
+their random_buf() stand-ins always succeeded.
+
+The same call fed 2321's salt: every passcode record written on SWEET so far had
+a 16-byte all-zero salt. Records keep their salt, so old ones still verify.
+
+- SweetACM.cpp acm_random() and SweetKeyStore.cpp pc_io_random() call
+  read_random(), the kernel PRNG itself. It cannot fail (a DRBG error panics).
+  The store still refuses an all-zero or repeated id.
+- SACM_MAX 64 -> 256. With create working, every LocalAuthentication client can
+  hold 16 contexts until it exits, and four of them would leave profiled none
+  (audit-acm-report.md, non-blocking finding 3). Per connection stays 16.
+
+Nothing else changes: the wire format, the entitlement gate, task pinning,
+ownership, selector 15's resolution and 2324's stage and commit are untouched.
+
+Needs 2321, 2322 and 2323. 2324 applies on top unchanged (offsets only).
+Audit brief: plans/passcode/audit-brief-acm2.md.
+
+Check: python3 -I plans/passcode/tools/check-acm.py XNU_DIR
+       python3 -I plans/passcode/tools/check-2phase.py XNU_DIR
+       python3 -I plans/passcode/tools/check-lock.py XNU_DIR
+Apply: git apply -p1 in the kernel tree, after 2323 and before 2324.
+diff --git a/bsd/dev/SweetACMStore.h b/bsd/dev/SweetACMStore.h
+index 7e52d32..0279edc 100644
+--- a/bsd/dev/SweetACMStore.h
++++ b/bsd/dev/SweetACMStore.h
+@@ -38,7 +38,10 @@ extern "C" {
+ #define SACM_ID_LEN             16u     /* ACMContextGetExternalForm hands out exactly these 16 bytes */
+ #define SACM_SECRET_MAX         SPC_SECRET_MAX
+ #define SACM_PER_CLIENT         16u
+-#define SACM_MAX                64u
++/* 256 in all (2323b, was 64). With ACMContextCreate working, every LocalAuthentication client can hold up to 16
++ * contexts until it exits (ctkd asked 102 times at boot in ast247), and four such connections would fill 64 and
++ * leave profiled none. Now 16 full connections are needed. 256 slots are 40 KB of static memory. */
++#define SACM_MAX                256u
+ #define SACM_TYPE_PASSCODE      7u      /* +[MCExtractablePasscodeContextWrapper contextWrapperForExtractablePasscode:] */
+ #define SACM_LOG_LEVEL          0x46u   /* ACMLib's log threshold, sent back on create: errors only */
+ #define SACM_HDR                8u      /* 'DRCS', command, 0, 0, version 2 (_LibCall_BuildCommand) */
+diff --git a/iokit/Kernel/arm/SweetACM.cpp b/iokit/Kernel/arm/SweetACM.cpp
+index 77f89bb..1400a67 100644
+--- a/iokit/Kernel/arm/SweetACM.cpp
++++ b/iokit/Kernel/arm/SweetACM.cpp
+@@ -24,7 +24,7 @@
+ #include <IOKit/IOKitKeys.h>
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOBSD.h>
+-#include <libkern/crypto/rand.h>
++#include <sys/random.h>
+ #include <sys/proc.h>
+ #include <kern/locks.h>
+ #include <pexpert/pexpert.h>
+@@ -45,13 +45,17 @@ static struct sacm_store sweet_acm;
+ static bool sweet_acm_on;
+ static uint64_t sweet_acm_next_client = 1;
+ 
++/*
++ * read_random, never random_buf (2323b). random_buf needs the corecrypto kext's g_crypto_funcs, which SWEET never
++ * registers, so it always failed here: every id came out all zero, the store refused it four times and every
++ * ACMContextCreate answered -4 (ast247). read_random is the kernel PRNG itself and cannot fail; a DRBG error panics.
++ * The store still refuses an all-zero or repeated id.
++ */
+ static void
+ acm_random(void *arg, uint8_t *buf, size_t n)
+ {
+ 	(void)arg;
+-	if (random_buf(buf, n) != 0) {
+-		memset(buf, 0, n);      /* the store refuses an all-zero id, so a failed RNG makes no context */
+-	}
++	read_random(buf, (unsigned int)n);
+ }
+ 
+ class AppleCredentialManager : public IOService {
+diff --git a/iokit/Kernel/arm/SweetKeyStore.cpp b/iokit/Kernel/arm/SweetKeyStore.cpp
+index ccba6b0..c5ed0b7 100644
+--- a/iokit/Kernel/arm/SweetKeyStore.cpp
++++ b/iokit/Kernel/arm/SweetKeyStore.cpp
+@@ -36,7 +36,7 @@
+ #include <IOKit/IOBSD.h>
+ #include <libkern/c++/OSString.h>
+ #include <libkern/crypto/sha2.h>
+-#include <libkern/crypto/rand.h>
++#include <sys/random.h>
+ #include <sys/proc.h>
+ #include <sys/fcntl.h>
+ #include <sys/stat.h>
+@@ -214,13 +214,16 @@ pc_io_clock(void *ctx, uint64_t *wall_sec, uint64_t *mono_ms)
+ 	*mono_ms = ns / 1000000ull;
+ }
+ 
++/*
++ * read_random, never random_buf (2323b). random_buf needs the corecrypto kext's g_crypto_funcs, and SWEET loads no
++ * kexts (osfmk/prng/prng_random.c registers only the PRNG), so on this kernel it always fails: until 2323b every salt
++ * was 16 zero bytes. read_random is the kernel PRNG itself and cannot fail; a DRBG error panics.
++ */
+ static void
+ pc_io_random(void *ctx, uint8_t *buf, size_t n)
+ {
+ 	(void)ctx;
+-	if (random_buf(buf, n) != 0) {
+-		memset(buf, 0, n);
+-	}
++	read_random(buf, (unsigned int)n);
+ }
+ 
+ static const struct spc_io sweet_pc_io = {

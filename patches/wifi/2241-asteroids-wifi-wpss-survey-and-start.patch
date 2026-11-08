@@ -1,0 +1,485 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index b0532f577..934edb666 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -729,3 +729,5 @@ bsd/dev/data/sweet_data_ipa.c standard
+ bsd/dev/sweet_battery.c standard
+ bsd/dev/sweet_adsp.c standard
+ bsd/dev/battery/BatteryRead.c standard
++# 2240: the Wi-Fi DSP (WPSS), stage 1; protocol code is the modem's
++bsd/dev/sweet_wpss.c standard
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 5eba5c41c..dfb93e07c 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -1,4 +1,5 @@
+ extern void sweet_adsp_start(void);
++extern void sweet_wpss_start(void);
+ extern void sweet_battery_start(void);
+ /*
+  * SWEET internal UFS root device.
+@@ -1331,6 +1332,8 @@ sweet_ufs_init(void)
+ 		sweet_battery_start();
+ 		sweet_adsp_start();
+ 		sweet_modem_start();
++		/* Wi-Fi DSP stage 1 (sweet_wpss.c, sweetwprobe=1 or sweetwpss=1, off by default) */
++		sweet_wpss_start();
+ 		printf("SWEET UFS: Nothing Phone (3a): no SM7150/SDM845 drivers (USB, charger, GPU, Wi-Fi)\n");
+ 		return 0;
+ 	}
+diff --git a/bsd/dev/sweet_wpss.c b/bsd/dev/sweet_wpss.c
+new file mode 100644
+index 000000000..70aaa1d07
+--- /dev/null
++++ b/bsd/dev/sweet_wpss.c
+@@ -0,0 +1,40 @@
++/* 2240/2241: the Wi-Fi DSP (WPSS), stage 1 of plans/wifi/PLAN.md. W1 sweetwprobe=1 is a read-only survey. W2 sweetwpss=1
++ * starts the WPSS through PAS6 once, keeps it up 20 s after handover, and stops it with a verified stop. Off by default. */
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(WPSS_HOST_TEST)
++#ifdef WPSS_HOST_TEST
++#include "wpss_host.h"
++#else
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/thread.h>
++#include <libkern/libkern.h>
++#include <pexpert/pexpert.h>
++#endif
++#include "wifi/WpssGate.h"
++#include "wifi/WpssRuntime.inc"
++extern kern_return_t thread_terminate(thread_t);
++void sweet_wpss_start(void);
++static void wpss_worker(void *arg,wait_result_t wait){
++ (void)wait;w_sleep(30000);
++ if(arg==(void *)WpssSurvey){
++  wpss_survey();
++  /* Last, so an SPMI surprise cannot hide the SMEM and firmware lines. */
++  wpss_gpio5_survey();
++  printf("SWEET WIFI: W1 survey complete; PAS6 untouched; no writes but the SPMI observer read command word\n");
++ } else printf("SWEET WIFI: W2 worker final_error=%d\n",wpss_run());
++ sweet_log_sync();thread_terminate(current_thread());
++}
++/* Once per boot: the WPSS is never started a second time in one boot. */
++static bool wpss_attempted;
++void sweet_wpss_start(void){
++ if(wpss_attempted)return;wpss_attempted=true;
++ const char *args=PE_boot_args();int deadman=0;
++ if(!PE_parse_boot_argn("sweetdeadman",&deadman,sizeof(deadman)))deadman=0;
++ int gate=wpss_gate(args,deadman);
++ if(gate==WpssOff)return;
++ if(gate==WpssRefused){printf("SWEET WIFI: refused: sweetwprobe=1 with no modem or battery gate, or sweetwpss=1 with sweetfbarm=1 sweetselftest=1 sweetdeadman=600 and no modem or battery gate\n");return;}
++ thread_t thread=THREAD_NULL;kern_return_t rc=kernel_thread_start(wpss_worker,(void *)(uintptr_t)gate,&thread);
++ if(rc==KERN_SUCCESS)thread_deallocate(thread);else printf("SWEET WIFI: thread failure %d\n",rc);
++}
++#endif
+diff --git a/bsd/dev/wifi/WpssGate.h b/bsd/dev/wifi/WpssGate.h
+new file mode 100644
+index 000000000..a93f9af80
+--- /dev/null
++++ b/bsd/dev/wifi/WpssGate.h
+@@ -0,0 +1,20 @@
++/* 2241: the Wi-Fi gates. sweetwprobe=1 is the read-only survey (W1). sweetwpss=1 is the bounded PAS6 start and
++ * verified stop (W2), a test boot only: it needs sweetfbarm=1, sweetselftest=1 and sweetdeadman=600. Both refuse every
++ * modem and battery gate and preset in any form, so Wi-Fi runs alone. Both use the exact-token rules of ModemGate.h. */
++#ifndef WPSS_GATE_H
++#define WPSS_GATE_H
++#include "../modem/ModemGate.h"
++enum {WpssOff=0,WpssSurvey=1,WpssStart=2,WpssRefused=-1};
++static const char *const wpss_refused[9]={"sweetdaily","sweetcell","sweetbatt","sweetmpss","sweetbadsp","sweetbprobe",
++    "sweetipa","sweetipaprobe","sweetmprobe"};
++static inline int wpss_gate(const char *args,int deadman){
++    unsigned probe=modem_arg_count(args,"sweetwprobe"),start=modem_arg_count(args,"sweetwpss");
++    if(!probe && !start)return WpssOff;
++    if(probe && start)return WpssRefused;
++    for(unsigned i=0;i<9;i++)if(modem_arg_count(args,wpss_refused[i]))return WpssRefused;
++    if(probe)return modem_arg_is(args,"sweetwprobe","1")?WpssSurvey:WpssRefused;
++    if(!modem_arg_is(args,"sweetwpss","1") || !modem_gate(args,"sweetfbarm") || !modem_gate(args,"sweetselftest") || deadman!=600)
++        return WpssRefused;
++    return WpssStart;
++}
++#endif
+diff --git a/bsd/dev/wifi/WpssRuntime.inc b/bsd/dev/wifi/WpssRuntime.inc
+new file mode 100644
+index 000000000..3630806fe
+--- /dev/null
++++ b/bsd/dev/wifi/WpssRuntime.inc
+@@ -0,0 +1,378 @@
++/* 2241 sweetwpss=1: the WPSS (the Wi-Fi DSP) started through PAS6 and stopped with a verified stop, stage 1 of
++ * plans/wifi/PLAN.md. Re-derived from our own ADSP lifecycle (battery/AdspRuntime.inc and AdspHelpers.inc, 2192 to 2290),
++ * with the values of the live device tree: remoteproc-wpss@9bb00000 (wpss_mem 0x9bb00000 + 0x1900000, qca6750/wpss.mdt,
++ * cx/mx supplies, xo, qcom,qmp), qcom,smp2p-wpss (SMEM items 617 out and 616 in, remote pid 13, IPCC client 0x18 signal 2)
++ * and aoss_qmp. The vendor volcano_wpss_resource gives PAS 6 and no DTB image.
++ * No GLINK, QRTR or radio access here: that is stage 2. Nothing writes a PMIC, a pin or the SMMU.
++ */
++#ifdef WPSS_HOST_TEST
++#include "wpss_host.h"
++#else
++#include <kern/clock.h>
++#include <kern/sched_prim.h>
++#include <kern/kalloc.h>
++#include <machine/machine_routines.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern_xnu.h>
++#include "../sweet_board.h"
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t,vm_size_t,unsigned int);
++extern void ml_io_unmap(vm_offset_t,vm_size_t);
++extern ppnum_t pmap_find_phys(pmap_t,addr64_t);
++extern void sweet_apps_rsc_lock(void);
++extern void sweet_apps_rsc_unlock(void);
++extern void sweet_scm_lock(void);
++extern void sweet_scm_unlock(void);
++extern void sweet_qmp_lock(void);
++extern void sweet_qmp_unlock(void);
++extern void sweet_smem_lock(void);
++extern void sweet_smem_unlock(void);
++extern void sweet_log_sync(void);
++extern int sweet_ufs_read_part(const char *,uint64_t,void *,uint64_t);
++extern int sweet_ufs_part_size(const char *,uint8_t *,uint64_t *);
++#endif
++#include "../modem/QcomSmem.h"
++#include "../modem/QcomSmp2p.h"
++#include "../modem/QcomQmp.h"
++#include "../modem/QcomRpmh.h"
++#include "../modem/QcomScm.h"
++#define ADSP_FW_LOG "SWEET WIFI"
++#include "../battery/AdspFirmware.inc"
++static int adsp_part_read(uint64_t off,void *dst,uint64_t bytes){return sweet_ufs_read_part("modem_a",off,dst,bytes);}
++
++#define W_SM_PA 0x81d00000u
++#define W_SM_SIZE 0x200000u
++#define W_REMOTE 13u          /* qcom,remote-pid */
++#define W_IPCC 0x18u          /* IPCC client of the WPSS (mboxes = <ipcc 0x18 n>) */
++#define W_SIG_SMP2P 2u
++#define W_OUT 617u            /* qcom,smem = <0x269 0x268>: ours, then the WPSS's */
++#define W_IN 616u
++#define W_PAS 6u
++#define W_BASE 0x9bb00000ull
++#define W_BYTES 0x1900000ull
++#define W_META_MAX 65536u
++#define W_STEM "qca6750/wpss"
++#define W_READY_MS 10000u     /* ready after auth_and_reset, as the ADSP */
++#define W_HANDOVER_MS 10000u  /* handover after ready */
++#define W_DWELL_MS 20000u     /* stays up with no fatal bit, then the stop */
++
++static struct {
++ vm_offset_t smem,mutex,ipcc,qmpmem,rsc,db;
++ QcomSmem sm;QcomSmemPartition part;QcomSmp2p sp;QcomQmp qp;
++ uint32_t state,rail_addr[2],rail_index[2],xo_addr;
++ bool fatal,voted,vote_uncertain,qmp_owed,owed,started;
++ int master;
++ uint8_t *mdt;uint32_t mdt_bytes;
++ vm_offset_t mapping,metadata;uint64_t meta_pa;
++} w;
++
++#ifndef WPSS_HOST_TEST
++static uint64_t w_now(void){uint64_t ns;absolutetime_to_nanoseconds(mach_absolute_time(),&ns);return ns/NSEC_PER_MSEC;}
++static void w_sleep(unsigned ms){uint64_t d;clock_interval_to_deadline(ms,NSEC_PER_MSEC,&d);assert_wait_deadline(&w,THREAD_UNINT,d);thread_block(THREAD_CONTINUE_NULL);}
++static uint32_t w_rd(vm_offset_t p,unsigned o){uint32_t v=*(volatile uint32_t *)(p+o);__asm__ volatile("dmb sy":::"memory");return v;}
++static void w_wr(vm_offset_t p,unsigned o,uint32_t v){__asm__ volatile("dmb sy":::"memory");*(volatile uint32_t *)(p+o)=v;__asm__ volatile("dsb sy":::"memory");}
++/* Preserve the original arguments and x6 session across interrupted calls (as m_smc_raw). */
++static void w_smc_raw(uint64_t r[8]){
++ register uint64_t x0 __asm__("x0")=r[0],x1 __asm__("x1")=r[1],x2 __asm__("x2")=r[2],x3 __asm__("x3")=r[3];
++ register uint64_t x4 __asm__("x4")=r[4],x5 __asm__("x5")=r[5],x6 __asm__("x6")=r[6],x7 __asm__("x7")=r[7];
++ __asm__ volatile("smc #0":"+r"(x0),"+r"(x1),"+r"(x2),"+r"(x3),"+r"(x4),"+r"(x5),"+r"(x6),"+r"(x7)::"x8","x9","x10","x11","x12","x13","x14","x15","x16","x17","cc","memory");
++ r[0]=x0;r[1]=x1;r[2]=x2;r[3]=x3;r[4]=x4;r[5]=x5;r[6]=x6;r[7]=x7;
++}
++#define W_BARRIER() __asm__ volatile("dsb sy":::"memory")
++#endif
++static void w_ring(unsigned client,unsigned signal){w_wr(w.ipcc,QCOM_IPCC_SEND,qcom_ipcc_id(client,signal));}
++static void w_qkick(void *unused){(void)unused;w_ring(QCOM_IPCC_CLIENT_AOP,0);}
++
++/* One whole yielding SiP call under the shared SCM lock (2280). */
++static int w_scm_locked(uint32_t fn,uint32_t info,uint64_t a,uint64_t b,uint64_t c,uint64_t *result){
++ for(unsigned busy=0;busy<4;busy++){
++  uint64_t function=fn,token=0;bool retry=false;
++  for(unsigned resume=0;resume<256;resume++){
++   uint64_t r[8]={function,info,a,b,c,0,token,0};w_smc_raw(r);
++   if((int64_t)r[0]==QCOM_SCM_INTERRUPTED){function=1;token=r[6];continue;}
++   if((int64_t)r[0]==QCOM_SCM_V2_EBUSY){retry=true;break;}
++   *result=r[1];return (int)r[0];
++  }
++  if(!retry)return ETIMEDOUT;
++  w_sleep(30);
++ }
++ return ETIMEDOUT;
++}
++static int w_pas(unsigned cmd,uint32_t info,uint64_t b,uint64_t c){
++ uint64_t result=~0ull;sweet_scm_lock();int rc=w_scm_locked(qcom_scm_fn(QCOM_SCM_SVC_PIL,cmd),info,W_PAS,b,c,&result);sweet_scm_unlock();
++ printf("SWEET WIFI: PAS%u cmd=%u status=%d result=%lld\n",W_PAS,cmd,rc,(long long)result);sweet_log_sync();
++ /* As m_pas: raw status logged, a failure never normalized to success, shutdown's transport failures mapped for the retry. */
++ if(cmd==QCOM_SCM_PAS_SHUTDOWN && rc<0){
++  switch(rc){case -1:return -EIO;case -4:return -ENOTSUP;case -5:return -ENOMEM;case -12:return -EBUSY;default:return -EINVAL;}
++ }
++ return rc?rc:(int)result;
++}
++
++/* CX and MX are shared with the application processor and the modem (which keeps cx.lvl at its table maximum and never
++ * lowers it, ModemRuntime.inc m_vote). RPMh keeps one vote per resource for our RSC, so a lower WPSS vote would replace
++ * a higher one. The WPSS therefore votes cx and mx at their table maximum and xo on, and never releases any of them:
++ * all three stay until the reset. ponytail: no release at handover; a shared per-resource aggregator when the WPSS must
++ * run all day (battery). */
++static int w_vote(void){
++ sweet_apps_rsc_lock();int chosen=-1,rc=ENODEV;unsigned base=0;
++ for(unsigned i=0;i<3;i++){
++  unsigned t=0xd00+i*0x2a0;
++  if(w_rd(w.rsc,t+0x28) && !w_rd(w.rsc,t+0x24) && !w_rd(w.rsc,t+0x2c) && !w_rd(w.rsc,t+0x20) && !(w_rd(w.rsc,0xd04)&(1u<<i))){chosen=i;base=t;break;}
++ }
++ if(chosen<0)goto out;
++ w.voted=true;
++ uint32_t bit=1u<<chosen,irq=w_rd(w.rsc,0xd00);w_wr(w.rsc,0xd00,irq&~bit);
++ for(unsigned i=0;i<3;i++){
++  uint32_t addr=i==2?w.xo_addr:w.rail_addr[i],value=i==2?3:w.rail_index[i];
++  w_wr(w.rsc,base+0x34+i*24,0x10108);w_wr(w.rsc,base+0x38+i*24,addr);w_wr(w.rsc,base+0x3c+i*24,value);
++ }
++ w_wr(w.rsc,base+0x20,7);w_wr(w.rsc,base+0x2c,7);w_wr(w.rsc,base+0x24,1u<<16);w_wr(w.rsc,base+0x24,(1u<<16)|(1u<<24));
++ rc=ETIMEDOUT;
++ for(unsigned us=0;us<100000;us++){
++  bool done=w_rd(w.rsc,base+0x28)!=0;
++  for(unsigned i=0;i<3;i++)done &= (w_rd(w.rsc,base+0x40+i*24)&0x10100)==0x10100;
++  if(done){rc=0;break;}delay(1);
++ }
++ if(!rc){w_wr(w.rsc,base+0x24,0);w_wr(w.rsc,base+0x2c,0);w_wr(w.rsc,base+0x20,0);w_wr(w.rsc,0xd08,bit);w_wr(w.rsc,0xd00,(w_rd(w.rsc,0xd00)&~bit)|(irq&bit));}
++ /* On timeout retain the owned TCS exactly as it is. Never reprogram it. */
++ if(rc==ETIMEDOUT)w.vote_uncertain=true;
++out:sweet_apps_rsc_unlock();printf("SWEET WIFI: RPMh cx/mx/xo on tcs=%d error=%d (kept until reset)\n",chosen,rc);sweet_log_sync();return rc;
++}
++static int w_qwait(unsigned timeout){uint64_t end=w_now()+timeout;do{int st=qcom_qmp_step(&w.qp);if(st==QcomQmpOpen)return 0;if(st<0)return EIO;w_sleep(1);}while(w_now()<end);return ETIMEDOUT;}
++static int w_qsend(bool on){
++ sweet_qmp_lock();int rc=EBUSY;
++ if(w.qp.state==QcomQmpOpen || !w_qwait(1000)){
++  rc=qcom_qmp_send(&w.qp,on?"{class: image, res: load_state, name: wpss, val: on}":"{class: image, res: load_state, name: wpss, val: off}");
++  rc=rc==QcomQmpSending?w_qwait(1000):EIO;
++ }
++ sweet_qmp_unlock();printf("SWEET WIFI: QMP wpss %s error=%d\n",on?"on":"off",rc);return rc;
++}
++static int w_item(uint16_t id,uint32_t minimum,uint32_t *off,uint32_t *bytes){
++ int rc=qcom_smem_find(&w.sm,&w.part,id,off,bytes);
++ if(rc || *bytes<minimum || *off>W_SM_SIZE || *bytes>W_SM_SIZE-*off || (*off&3))return ENOENT;
++ return 0;
++}
++/* The TCSR hardware mutex, inside the shared SMEM lock (2280, PLAN B-D8). */
++static int w_alloc(uint16_t id,uint32_t bytes,uint32_t *off){
++ sweet_smem_lock();int rc=EBUSY;bool locked=false;
++ for(unsigned us=0;us<100000;us++){w_wr(w.mutex,0,1);if(w_rd(w.mutex,0)==1){locked=true;break;}delay(1);}
++ if(locked){rc=qcom_smem_alloc(&w.sm,&w.part,id,bytes);w_wr(w.mutex,0,0);
++  uint32_t actual=0;rc=rc!=QcomSmemOk && rc!=QcomSmemExists?EIO:w_item(id,bytes,off,&actual);}
++ sweet_smem_unlock();return rc;
++}
++static void w_smp_poll(void){
++ uint32_t off,bytes;
++ if(w_item(W_IN,QCOM_SMP2P_ITEM_BYTES,&off,&bytes))return;
++ w.sp.in=(volatile uint32_t *)(w.smem+off);
++ uint32_t value=0,changed=0;
++ if(qcom_smp2p_service(&w.sp,"slave-kernel",&value,&changed))w_ring(W_IPCC,W_SIG_SMP2P);
++ if(changed){w.state=value;printf("SWEET WIFI: SMP2P slave=%#x fatal=%u ready=%u handover=%u stop_ack=%u\n",value,value&1,!!(value&2),!!(value&4),!!(value&8));sweet_log_sync();}
++ if(value&1)w.fatal=true;
++}
++/* cx.lvl and mx.lvl at their table maximum, xo.lvl on. */
++static int w_power_inspect(void){
++ static uint8_t dbcopy[0x20000];
++ for(unsigned i=0;i<sizeof(dbcopy);i+=4){uint32_t v=w_rd(w.db,i);memcpy(dbcopy+i,&v,4);}
++ int error=0;static const char *const rails[]={"cx.lvl","mx.lvl","xo.lvl"};
++ for(unsigned i=0;i<3;i++){
++  QcomRpmhResource r={0};int rc=qcom_cmd_db_find(dbcopy,sizeof(dbcopy),rails[i],&r);
++  printf("SWEET WIFI: resource=%s lookup=%d address=%#x levels=%u\n",rails[i],rc,r.address,r.level_count);
++  if(!rc)for(unsigned j=0;j<r.level_count && j<QCOM_RPMH_MAX_LEVELS;j++)printf("SWEET WIFI: resource=%s level %u=%u\n",rails[i],j,r.levels[j]);
++  if(rc || !r.address){error=EINVAL;continue;}
++  if(i==2){w.xo_addr=r.address;continue;}
++  /* The battery's table rule (AdspHelpers.inc m_power_inspect): starts at 0, never falls, no zero after the first. */
++  bool valid=r.level_count>=2 && r.levels[0]==0 && r.aux_bytes && !(r.aux_bytes&1) && r.aux_bytes<=sizeof(r.levels);
++  for(unsigned j=1;valid && j<r.level_count;j++)valid=r.levels[j]>=r.levels[j-1] && r.levels[j]!=0;
++  if(!valid){error=EINVAL;continue;}
++  w.rail_addr[i]=r.address;w.rail_index[i]=r.level_count-1;
++  printf("SWEET WIFI: resource=%s index=%u level=%u\n",rails[i],w.rail_index[i],r.levels[r.level_count-1]);
++ }
++ if(w.xo_addr==w.rail_addr[0] || w.xo_addr==w.rail_addr[1] || w.rail_addr[0]==w.rail_addr[1])error=EINVAL;
++ sweet_log_sync();return error;
++}
++static int w_open_image(struct wl_fat *f){
++ int rc=sweet_ufs_part_size("modem_a",NULL,&adsp_partition_bytes);if(rc)return rc;
++ if((rc=fat_mount(f,"modem_a")))return rc;
++ uint32_t cl;
++ if((rc=fat_open(f,"image/" W_STEM ".mdt",&cl,&w.mdt_bytes)))return rc;
++ if(!w.mdt_bytes || w.mdt_bytes>W_META_MAX)return EINVAL;
++ w.mdt=kalloc_data(w.mdt_bytes,Z_WAITOK|Z_ZERO);if(!w.mdt)return ENOMEM;
++ if((rc=fat_read_chain(f,cl,0,w.mdt,w.mdt_bytes)))return rc;
++ return adsp_mdt(w.mdt,w.mdt_bytes,f,W_STEM,W_BYTES);
++}
++/* PAS metadata in contiguous kernel memory, as 2290 does for the ADSP. */
++static int w_contig(void){
++ if(kmem_alloc_contig(kernel_map,&w.metadata,W_META_MAX,PAGE_MASK,0,0,KMA_DATA|KMA_ZERO,VM_KERN_MEMORY_IOKIT)!=KERN_SUCCESS){w.metadata=0;return ENOMEM;}
++ w.meta_pa=ptoa_64(pmap_find_phys(kernel_pmap,(addr64_t)w.metadata));
++ bool ok=w.meta_pa && w.meta_pa<(1ull<<36) && W_META_MAX<=(1ull<<36)-w.meta_pa;
++ for(vm_size_t off=0;ok && off<W_META_MAX;off+=PAGE_SIZE)ok=ptoa_64(pmap_find_phys(kernel_pmap,(addr64_t)(w.metadata+off)))==w.meta_pa+off;
++ if(!ok){kmem_free(kernel_map,w.metadata,W_META_MAX);w.metadata=0;w.meta_pa=0;return EINVAL;}
++ return 0;
++}
++static int w_load_image(struct wl_fat *f){
++ unsigned off=le32(w.mdt+28),count=le16(w.mdt+44);uint64_t low=UINT64_MAX,high=0;
++ for(unsigned i=0;i<count;i++){
++  const uint8_t *p=w.mdt+off+32*i;uint32_t mem=le32(p+20);
++  if(le32(p)!=1 || !mem || (le32(p+24)&(7u<<24))==(2u<<24))continue;
++  uint64_t addr=le32(p+12);if(addr<low)low=addr;if(addr+mem>high)high=addr+mem;
++ }
++ uint64_t span=((high+4095)&~4095ull)-low;
++ if(low!=W_BASE || !span || span>W_BYTES)return EINVAL;
++ int rc=w_contig();if(rc)return rc;
++ memcpy((void *)w.metadata,w.mdt,w.mdt_bytes);sweet_dma_sync_va((void *)w.metadata,W_META_MAX);
++ /* Shutdown is owed even if secure firmware returns an uncertain init result. */
++ w.owed=true;
++ if((rc=w_pas(QCOM_SCM_PAS_INIT_IMAGE,qcom_scm_args(2,QCOM_SCM_VAL,QCOM_SCM_RW,0),w.meta_pa,0)))return rc;
++ if((rc=w_pas(QCOM_SCM_PAS_MEM_SETUP,qcom_scm_args(3,0,0,0),W_BASE,span)))return rc;
++ w.mapping=ml_io_map_unmappable(W_BASE,W_BYTES,VM_WIMG_WCOMB);if(!w.mapping)return ENOMEM;
++ for(unsigned i=0;i<count;i++){
++  const uint8_t *p=w.mdt+off+32*i;uint32_t mem=le32(p+20),file=le32(p+16);
++  if(le32(p)!=1 || !mem || (le32(p+24)&(7u<<24))==(2u<<24))continue;
++  uint64_t at=(uint64_t)le32(p+12)-low;if(at>W_BYTES || mem>W_BYTES-at || file>mem)return EINVAL;
++  if(file){char path[32];uint32_t cl,actual;snprintf(path,sizeof(path),"image/" W_STEM ".b%02u",i);
++   if((rc=fat_open(f,path,&cl,&actual)))return rc;if(actual!=file)return EINVAL;
++   if((rc=fat_read_chain(f,cl,0,(void *)(w.mapping+at),file)))return rc;
++  }
++  if(mem>file)memset((void *)(w.mapping+at+file),0,mem-file);
++ }
++ W_BARRIER();
++ rc=w_pas(QCOM_SCM_PAS_AUTH_AND_RESET,qcom_scm_args(1,0,0,0),0,0);if(!rc)w.started=true;return rc;
++}
++/* io_map maps trunc_page(pa) for round_page(bytes+offset) and returns the offset address (2197, ast188). */
++static void w_unmap(vm_offset_t va,vm_size_t bytes){vm_offset_t off=va&PAGE_MASK;ml_io_unmap(va-off,round_page(bytes+off));}
++/* Linux's order and the reference port's lesson: ask the DSP to stop over SMP2P and wait for its ack before TrustZone
++ * shuts it down. A stop that is not verified keeps the image memory, the metadata, the QMP load state and the votes. */
++static bool w_cleanup(void){
++ if(w.started && w.sp.out){
++  qcom_smp2p_update(&w.sp,w.master,1,1);w_ring(W_IPCC,W_SIG_SMP2P);uint64_t end=w_now()+3000;
++  while(w_now()<end){w_smp_poll();if(w.state&8)break;w_sleep(10);}
++  qcom_smp2p_update(&w.sp,w.master,1,0);w_ring(W_IPCC,W_SIG_SMP2P);
++  printf("SWEET WIFI: W2 stop request cleared ack=%u\n",!!(w.state&8));
++ }
++ if(w.owed){
++  int rc=EIO;for(unsigned retry=0;retry<50;retry++){rc=w_pas(QCOM_SCM_PAS_SHUTDOWN,qcom_scm_args(1,0,0,0),0,0);if(rc!=-EINVAL)break;w_sleep(100);}
++  if(rc){printf("SWEET WIFI: W2 STOP UNVERIFIED PAS6; retaining memory, QMP state and power\n");sweet_log_sync();return false;}
++  w.owed=false;
++ }
++ if(w.vote_uncertain){printf("SWEET WIFI: W2 cleanup incomplete: TCS ownership uncertain\n");sweet_log_sync();return false;}
++ if(w.qmp_owed){if(w_qsend(false)){printf("SWEET WIFI: W2 cleanup incomplete: QMP release\n");sweet_log_sync();return false;}w.qmp_owed=false;}
++ if(w.mapping)w_unmap(w.mapping,W_BYTES);
++ if(w.metadata)kmem_free(kernel_map,w.metadata,W_META_MAX);
++ if(w.mdt)kfree_data(w.mdt,w.mdt_bytes);
++ if(w.db)w_unmap(w.db,0x20000);if(w.rsc)w_unmap(w.rsc,0x4000);
++ if(w.qmpmem)w_unmap(w.qmpmem,0x400);if(w.ipcc)w_unmap(w.ipcc,0x1000);
++ if(w.mutex)w_unmap(w.mutex,0x1000);if(w.smem)w_unmap(w.smem,W_SM_SIZE);
++ printf("SWEET WIFI: W2 STOP verified; cleanup=ok; cx/mx/xo votes retained until reset=%u\n",w.voted);
++ sweet_log_sync();return true;
++}
++static int wpss_run(void){
++ memset(&w,0,sizeof(w));w.master=-1;struct wl_fat f;
++ int rc=w_open_image(&f);if(rc)goto out;
++ w.smem=ml_io_map_unmappable(W_SM_PA,W_SM_SIZE,VM_WIMG_IO);
++ w.mutex=ml_io_map_unmappable(0x1f43000,0x1000,VM_WIMG_IO);
++ w.ipcc=ml_io_map_unmappable(0x405000,0x1000,VM_WIMG_IO);
++ w.qmpmem=ml_io_map_unmappable(0xc300000,0x400,VM_WIMG_IO);
++ w.rsc=ml_io_map_unmappable(0x17a20000,0x4000,VM_WIMG_IO);
++ w.db=ml_io_map_unmappable(0x81c60000,0x20000,VM_WIMG_IO);
++ if(!w.smem || !w.mutex || !w.ipcc || !w.qmpmem || !w.rsc || !w.db){rc=ENOMEM;goto out;}
++ w.sm=(QcomSmem){(volatile uint8_t *)w.smem,W_SM_SIZE};
++ if(qcom_smem_partition(&w.sm,QCOM_SMEM_HOST_APPS,W_REMOTE,&w.part)){rc=EIO;goto out;}
++ if(((w_rd(w.rsc,0)>>16)&255)!=3){rc=ENOTSUP;goto out;}
++ if((rc=w_power_inspect()))goto out;
++ /* The WPSS makes item 616 when it runs. Present before our start means it ran since SMEM was laid out: refuse. */
++ uint32_t prior,bytes;
++ if(qcom_smem_find(&w.sm,&w.part,W_IN,&prior,&bytes)!=QcomSmemMissing){printf("SWEET WIFI: W2 refused: WPSS SMP2P item present\n");rc=EBUSY;goto out;}
++ uint32_t outoff;if((rc=w_alloc(W_OUT,QCOM_SMP2P_ITEM_BYTES,&outoff)))goto out;
++ qcom_smp2p_init_out(&w.sp,(volatile uint32_t *)(w.smem+outoff),QCOM_SMEM_HOST_APPS,W_REMOTE);
++ w.master=qcom_smp2p_add_entry(&w.sp,"master-kernel");if(w.master<0){rc=EIO;goto out;}w_ring(W_IPCC,W_SIG_SMP2P);
++ sweet_qmp_lock();qcom_qmp_init(&w.qp,(volatile uint32_t *)w.qmpmem,0x400,w_qkick,0);rc=w_qwait(3000);sweet_qmp_unlock();
++ if(rc)goto out;w.qmp_owed=true;if((rc=w_qsend(true)))goto out;
++ if((rc=w_vote()))goto out;
++ if((rc=w_load_image(&f)))goto out;
++ uint64_t start=w_now(),ready=0,handover=0;
++ for(;;){
++  w_smp_poll();uint64_t now=w_now();
++  if(w.fatal){rc=EIO;break;}
++  if(!ready && (w.state&2))ready=now;
++  if(!handover && (w.state&4)){handover=now;printf("SWEET WIFI: W2 handover; shared cx/mx/xo votes kept\n");}
++  if(!ready && now-start>W_READY_MS){rc=ETIMEDOUT;break;}
++  if(ready && !handover && now-ready>W_HANDOVER_MS){rc=ETIMEDOUT;break;}
++  if(handover && now-handover>=W_DWELL_MS){rc=0;break;}
++  w_sleep(2);
++ }
++out:
++ printf("SWEET WIFI: W2 run end error=%d ready=%u handover=%u fatal=%u\n",rc,!!(w.state&2),!!(w.state&4),w.fatal);sweet_log_sync();
++ if(!w_cleanup())rc=EIO;
++ return rc;
++}
++/* 2240 sweetwprobe=1: maps only SMEM and cmd-db and reads them; reads and validates the firmware chain from modem_a.
++ * No PAS call, SMEM allocation, doorbell, QMP message or RPMh vote. */
++static void wpss_survey(void){
++ memset(&w,0,sizeof(w));w.master=-1;struct wl_fat f;
++ printf("SWEET WIFI: W1 read-only survey begin; PAS6 untouched\n");sweet_log_sync();
++ w.smem=ml_io_map_unmappable(W_SM_PA,W_SM_SIZE,VM_WIMG_IO);
++ w.db=ml_io_map_unmappable(0x81c60000,0x20000,VM_WIMG_IO);
++ if(!w.smem || !w.db){printf("SWEET WIFI: W1 mapping failed\n");goto out;}
++ w.sm=(QcomSmem){(volatile uint8_t *)w.smem,W_SM_SIZE};
++ int rc=qcom_smem_partition(&w.sm,QCOM_SMEM_HOST_APPS,W_REMOTE,&w.part);
++ printf("SWEET WIFI: W1 partition 0-%u rc=%d offset=%#x bytes=%#x\n",W_REMOTE,rc,w.part.offset,w.part.size);
++ if(!rc){
++  static const uint16_t ids[]={W_IN,W_OUT,478,479,480,626};
++  for(unsigned i=0;i<sizeof(ids)/sizeof(ids[0]);i++){
++   uint32_t off=0,bytes=0;int found=qcom_smem_find(&w.sm,&w.part,ids[i],&off,&bytes);
++   printf("SWEET WIFI: W1 item=%u rc=%d offset=%#x bytes=%u\n",ids[i],found,off,bytes);
++   if(ids[i]==W_IN && !w_item(W_IN,QCOM_SMP2P_ITEM_BYTES,&off,&bytes)){
++    /* Snapshot the bounded item before parsing remote state. */
++    uint32_t snapshot[QCOM_SMP2P_ITEM_BYTES/4];for(unsigned j=0;j<sizeof(snapshot)/4;j++)snapshot[j]=qcom_smem_read32(&w.sm,off+4*j);
++    QcomSmp2p view={0};view.in=snapshot;view.local_pid=QCOM_SMEM_HOST_APPS;view.remote_pid=W_REMOTE;
++    int valid=qcom_smp2p_check_in(snapshot,QCOM_SMEM_HOST_APPS,W_REMOTE);int index=valid?-1:qcom_smp2p_find_in(&view,"slave-kernel");
++    printf("SWEET WIFI: W1 SMP2P check=%d index=%d state=%#x\n",valid,index,index>=0?qcom_smp2p_in_value(&view,index):0);
++   }
++  }
++ }
++ printf("SWEET WIFI: W1 power inspect error=%d\n",w_power_inspect());
++ printf("SWEET WIFI: W1 firmware error=%d\n",w_open_image(&f));
++out:
++ if(w.mdt)kfree_data(w.mdt,w.mdt_bytes);
++ if(w.db)w_unmap(w.db,0x20000);
++ if(w.smem)w_unmap(w.smem,W_SM_SIZE);
++ memset(&w,0,sizeof(w));sweet_log_sync();
++}
++/* 2241: PMK8550 GPIO5 (SID 0, peripheral 0xbc, the alt_sleep_clk_default pin), read only through SPMI arbiter v7, the
++ * layout sweet_reboot.c's asteroids reader uses on this phone (live DT qcom,spmi@c42d000): the APID of a PPID is found in
++ * the map at core + 0x2000 + 4n (PPID in bits 19:8), its owner EE at cnfg + 4n; reads go through that APID's observer
++ * channel at 0x0c440000 + 0x20 * apid: CMD +0x00 = EXT_READL (1 << 27) | reg << 4 (one byte), STATUS +0x08 (bit 0 done,
++ * bits 1-3 failure), RDATA0 +0x18. Reads need no ownership; the owner is logged for a later write. Raw bytes, decoded on
++ * the desk. No channel write, no PMIC write. */
++#define W_SPMI_CORE 0x0c400000u
++#define W_SPMI_CNFG 0x0c42d000u
++#define W_SPMI_OBS 0x0c440000u
++#define W_GPIO5_PPID 0x0bcu
++static void wpss_gpio5_survey(void){
++ static const uint8_t regs[]={0x04,0x05,0x08,0x40,0x41,0x42,0x43,0x44,0x45,0x46};
++ vm_offset_t core=ml_io_map_unmappable(W_SPMI_CORE,0x3000,VM_WIMG_IO),cnfg=ml_io_map_unmappable(W_SPMI_CNFG,0x4000,VM_WIMG_IO),obs=0;
++ int apid=-1;unsigned owner=8;
++ if(!core || !cnfg){printf("SWEET WIFI: W1 SPMI mapping failed\n");goto out;}
++ uint32_t ver=w_rd(core,0),count=w_rd(core,4)&0x7ffu;
++ if(ver<0x70000000u || ver>=0x80000000u || !count || count>0x380u){printf("SWEET WIFI: W1 SPMI arbiter %#x with %u APIDs is not v7\n",ver,count);goto out;}
++ for(uint32_t n=0;n<count;n++){
++  uint32_t map=w_rd(core,0x2000+4*n);if(!map || ((map>>8)&0xfffu)!=W_GPIO5_PPID)continue;
++  unsigned o=w_rd(cnfg,4*n)&7u;printf("SWEET WIFI: W1 SPMI PPID 0x0bc APID %u owner EE %u\n",n,o);
++  if(apid<0 || (o==0 && owner!=0)){apid=(int)n;owner=o;}
++ }
++ if(apid<0){printf("SWEET WIFI: W1 SPMI PPID 0x0bc not in the arbiter map\n");goto out;}
++ obs=ml_io_map_unmappable(W_SPMI_OBS+0x20u*(uint32_t)apid,0x20,VM_WIMG_IO);
++ if(!obs){printf("SWEET WIFI: W1 SPMI observer mapping failed\n");goto out;}
++ for(unsigned i=0;i<sizeof(regs);i++){
++  int rc=ETIMEDOUT;uint32_t st=0,v=0;
++  w_wr(obs,0,(1u<<27)|((uint32_t)regs[i]<<4));
++  for(unsigned t=0;t<1000;t++){st=w_rd(obs,8);if(st&1u){rc=st&0x0eu?EIO:0;break;}delay(10);}
++  if(!rc)v=w_rd(obs,0x18)&0xffu;
++  printf("SWEET WIFI: W1 pmk8550 gpio5 reg=%#x rc=%d status=%#x value=%#x\n",0xbc00u|regs[i],rc,st,v);
++  if(rc==ETIMEDOUT)break; /* a command that never finished may still complete: do not reuse the channel */
++ }
++out:
++ if(obs)w_unmap(obs,0x20);
++ if(cnfg)w_unmap(cnfg,0x4000);
++ if(core)w_unmap(core,0x3000);
++ sweet_log_sync();
++}

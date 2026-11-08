@@ -61,5 +61,12 @@ int main(void){
   assert(!memcmp(saved,smem,sizeof(smem)));assert(!memcmp(saved_db,db,sizeof(db)));
  }
  valid_checks();
+ /* 2293: sweetcputop starts the sampler only for 10..600 s, independent of the probe gate. */
+ static const char *badtop[]={"sweetcputop=9","sweetcputop=601","sweetcputop","xsweetcputop=60"};
+ for(unsigned i=0;i<sizeof(badtop)/sizeof(badtop[0]);i++){args=(char *)badtop[i];starts=maps=0;cputop_calls=0;sweet_battery_start();assert(!starts && !cputop_calls && !maps);}
+ args="sweetcputop=60";starts=maps=0;cputop_calls=0;
+ if(!setjmp(cputop_escape))sweet_battery_start();
+ assert(starts==1 && cputop_calls==2 && !maps);
+ puts("PASS: sweetcputop starts one sampler for 10..600 s only and never maps SMEM");
  puts("PASS: exact opt-in gate, mapping failures unwind, corrupt SMEM is read-only");
 }

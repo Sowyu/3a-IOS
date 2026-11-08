@@ -1,0 +1,21 @@
+diff --git a/bsd/dev/wifi/WpssRuntime.inc b/bsd/dev/wifi/WpssRuntime.inc
+--- a/bsd/dev/wifi/WpssRuntime.inc
++++ b/bsd/dev/wifi/WpssRuntime.inc
+@@ -703,6 +703,7 @@
+  vm_offset_t s=ml_io_map_unmappable(W_SMMU_PA,W_SMMU_BYTES,VM_WIMG_IO);
+  if(!s){printf("SWEET WIFI: W9 dma: mapping failed; not installed\n");sweet_log_sync();goto out_release;}
+  w.dma_smmu=s;
++ w.dma_gfsr_before=w_smmu_rd(s,0x48);
+  uint32_t id0=w_smmu_rd(s,0x20),id1=w_smmu_rd(s,0x24),id2=w_smmu_rd(s,0x28);
+  /* The geometry gate W8 measured: a different ID set is a different hypervisor build, and nothing here is proven there. */
+  if(id0!=W_SMMU_ID0 || id1!=W_SMMU_ID1 || id2!=W_SMMU_ID2){
+@@ -888,7 +889,8 @@
+    printf("SWEET WIFI: W9 dma: bank %u records FSR=%#x at teardown (a fault reached this table); clearing it\n",w.dma_bank,fsr);
+    w_smmu_wr(w.dma_smmu,b+0x58,fsr);
+   }
+-  if(w_smmu_rd(w.dma_smmu,b+0x58)){printf("SWEET WIFI: W9 dma: FSR will not clear; the bank stays leased\n");sweet_log_sync();w.dma_verify_fail++;ok=false;goto out;}}
++  /* FSR bits 10:9 are the format field, not a fault (ast276 read 0x400 with CBA2R=1). */
++  if(w_smmu_rd(w.dma_smmu,b+0x58)&~0x600u){printf("SWEET WIFI: W9 dma: FSR will not clear; the bank stays leased\n");sweet_log_sync();w.dma_verify_fail++;ok=false;goto out;}}
+  /* Unhook the stream before restoring the slot's dormant route, as ipa_mmu_release does: prove the selector invalid first. */
+  w_smmu_wr(w.dma_smmu,0x800+4*s_,w.dma_smr_old);
+  if(w_smmu_rd(w.dma_smmu,0x800+4*s_)!=w.dma_smr_old){printf("SWEET WIFI: W9 dma: SMR will not go back to %#x; retained\n",w.dma_smr_old);sweet_log_sync();w.dma_verify_fail++;ok=false;goto out;}

@@ -1,0 +1,623 @@
+diff --git a/bsd/dev/sweet_wpss.c b/bsd/dev/sweet_wpss.c
+index 91d8117..42f683a 100644
+--- a/bsd/dev/sweet_wpss.c
++++ b/bsd/dev/sweet_wpss.c
+@@ -45,6 +45,12 @@ static void wpss_worker(void *arg,wait_result_t wait){
+    * there. Still no register window and no copy engine: the firmware is left waiting for a host data path. */
+   printf("SWEET WIFI: W7 worker begin; WPSS start, the edge, the WLFW client, the board data, the cold-boot mode and mission mode\n");sweet_log_sync();
+   printf("SWEET WIFI: W2 worker final_error=%d\n",wpss_run(WpssMission));
++ } else if(arg==(void *)WpssDma){
++  /* 2253: W9. W7's whole run with the WLAN device's own DMA translation installed before the firmware is read and released
++   * after the verified stop: one SMR, one bank, IPA's stage-1 tables, the ring page and the doorbell, all below 4 GiB. The
++   * first stage of this series that writes an SMMU register. */
++  printf("SWEET WIFI: W9 worker begin; WPSS start, the edge, the WLFW client, the board data, the cold-boot mode and mission mode, with the WLAN streams 0x1400/0x1401 translated\n");sweet_log_sync();
++  printf("SWEET WIFI: W2 worker final_error=%d\n",wpss_run(WpssDma));
+  } else if(arg==(void *)WpssSmmu){
+   /* 2252: W8's survey. W7's whole run, with apps_smmu read (never written) before the start, after the mission sequence
+    * and after the verified stop, for the WLAN streams the copy engines will use. */
+@@ -61,7 +67,7 @@ void sweet_wpss_start(void){
+  if(!PE_parse_boot_argn("sweetdeadman",&deadman,sizeof(deadman)))deadman=0;
+  int gate=wpss_gate(args,deadman);
+  if(gate==WpssOff)return;
+- if(gate==WpssRefused){printf("SWEET WIFI: refused: sweetwprobe=1 with no modem or battery gate, or one of sweetwpin=1, sweetwpss=1, sweetwglink=1, sweetwlfw=1, sweetwbdf=1, sweetwmode=1, sweetwmission=1 or sweetwsmmu=1 with sweetfbarm=1 sweetselftest=1 sweetdeadman=600 and no other gate\n");return;}
++ if(gate==WpssRefused){printf("SWEET WIFI: refused: sweetwprobe=1 with no modem or battery gate, or one of sweetwpin=1, sweetwpss=1, sweetwglink=1, sweetwlfw=1, sweetwbdf=1, sweetwmode=1, sweetwmission=1, sweetwsmmu=1 or sweetwdma=1 with sweetfbarm=1 sweetselftest=1 sweetdeadman=600 and no other gate\n");return;}
+  thread_t thread=THREAD_NULL;kern_return_t rc=kernel_thread_start(wpss_worker,(void *)(uintptr_t)gate,&thread);
+  if(rc==KERN_SUCCESS)thread_deallocate(thread);else printf("SWEET WIFI: thread failure %d\n",rc);
+ }
+diff --git a/bsd/dev/wifi/WpssGate.h b/bsd/dev/wifi/WpssGate.h
+index 2e2b4c4..2db621d 100644
+--- a/bsd/dev/wifi/WpssGate.h
++++ b/bsd/dev/wifi/WpssGate.h
+@@ -25,7 +25,11 @@
+ /* 2252 (W8 survey): sweetwsmmu=1 is W7's whole run plus three read-only snapshots of apps_smmu (before the start, after
+  * the mission sequence, after the verified stop) for the WLAN streams 0x1400/0x1401. It writes no SMMU register, builds no
+  * context, maps no radio register and touches no copy engine. Same rules, exclusive with W3 to W7. */
+-enum {WpssOff=0,WpssSurvey=1,WpssStart=2,WpssPin=3,WpssGlink=4,WpssWlfw=5,WpssBdf=6,WpssMode=7,WpssMission=8,WpssSmmu=9,WpssRefused=-1};
++/* 2253 (W9): sweetwdma=1 is the first stage that WRITES SMMU registers on this phone: one SMR for 0x1400 (mask 1) to one
++ * free context bank, a stage-1 table from the IPA driver's own builder, a private VMID, and the ring page and MSI doorbell
++ * mapped in a window below 4 GiB, installed before the firmware is read and released after the verified stop. W7's whole
++ * sequence runs with it in place. Same rules, exclusive with W3 to W8. */
++enum {WpssOff=0,WpssSurvey=1,WpssStart=2,WpssPin=3,WpssGlink=4,WpssWlfw=5,WpssBdf=6,WpssMode=7,WpssMission=8,WpssSmmu=9,WpssDma=10,WpssRefused=-1};
+ /* Refused in any form: the presets, the battery's own gates, and every modem, IPA and battery-test gate ModemGate.h lists
+  * (modem_cell_gates, modem_cell_refused, modem_daily_refused), so the list cannot fall behind it. */
+ static const char *const wpss_refused[5]={"sweetdaily","sweetcell","sweetbatt","sweetbmeter","sweetbprobe"};
+@@ -54,6 +58,7 @@ static inline int wpss_edge_gate(const char *args,int deadman,const char *self){
+     if(!modem_same(self,"sweetwmode") && modem_arg_count(args,"sweetwmode"))return WpssRefused;
+     if(!modem_same(self,"sweetwmission") && modem_arg_count(args,"sweetwmission"))return WpssRefused;
+     if(!modem_same(self,"sweetwsmmu") && modem_arg_count(args,"sweetwsmmu"))return WpssRefused;
++    if(!modem_same(self,"sweetwdma") && modem_arg_count(args,"sweetwdma"))return WpssRefused;
+     if(!modem_gate(args,"sweetfbarm") || !modem_gate(args,"sweetselftest") || deadman!=600)return WpssRefused;
+     return 0;
+ }
+@@ -61,8 +66,9 @@ static inline int wpss_gate(const char *args,int deadman){
+     unsigned probe=modem_arg_count(args,"sweetwprobe"),start=modem_arg_count(args,"sweetwpss"),pin=modem_arg_count(args,"sweetwpin");
+     unsigned glink=modem_arg_count(args,"sweetwglink"),wlfw=modem_arg_count(args,"sweetwlfw"),bdf=modem_arg_count(args,"sweetwbdf");
+     unsigned mode=modem_arg_count(args,"sweetwmode"),mission=modem_arg_count(args,"sweetwmission"),smmu=modem_arg_count(args,"sweetwsmmu");
+-    if(!probe && !start && !pin && !glink && !wlfw && !bdf && !mode && !mission && !smmu)return WpssOff;
+-    if((probe!=0)+(start!=0)+(pin!=0)+(glink!=0)+(wlfw!=0)+(bdf!=0)+(mode!=0)+(mission!=0)+(smmu!=0)>1)return WpssRefused;
++    unsigned dma=modem_arg_count(args,"sweetwdma");
++    if(!probe && !start && !pin && !glink && !wlfw && !bdf && !mode && !mission && !smmu && !dma)return WpssOff;
++    if((probe!=0)+(start!=0)+(pin!=0)+(glink!=0)+(wlfw!=0)+(bdf!=0)+(mode!=0)+(mission!=0)+(smmu!=0)+(dma!=0)>1)return WpssRefused;
+     /* 2246: W3 is the coexistence gate. It is the one Wi-Fi gate allowed beside a preset, because proving coexistence is its
+      * whole purpose, so sweetdaily=1 or sweetcell=1 may be present and the preset decides its own members. Every member and
+      * probe token named literally is refused instead: a preset plus one of its own members is an invalid preset
+@@ -98,6 +104,11 @@ static inline int wpss_gate(const char *args,int deadman){
+         if(wpss_edge_gate(args,deadman,"sweetwsmmu"))return WpssRefused;
+         return WpssSmmu;
+     }
++    /* 2253: W9, the same rules again, with the WLAN device's own DMA translation on top of W7's whole run. */
++    if(dma){
++        if(wpss_edge_gate(args,deadman,"sweetwdma"))return WpssRefused;
++        return WpssDma;
++    }
+     if(wpss_conflict(args))return WpssRefused;
+     if(probe)return modem_arg_is(args,"sweetwprobe","1")?WpssSurvey:WpssRefused;
+     if(!modem_arg_is(args,pin?"sweetwpin":"sweetwpss","1") || !modem_gate(args,"sweetfbarm") || !modem_gate(args,"sweetselftest") || deadman!=600)
+diff --git a/bsd/dev/wifi/WpssRuntime.inc b/bsd/dev/wifi/WpssRuntime.inc
+index 402c417..0321716 100644
+--- a/bsd/dev/wifi/WpssRuntime.inc
++++ b/bsd/dev/wifi/WpssRuntime.inc
+@@ -47,6 +47,17 @@ extern void sweet_apps_smmu_release(void);
+ #include "../modem/QcomQrtr.h"
+ /* 2248 (W4): the WLFW client's messages, encoded and decoded here from the ath11k declarations (see that file). */
+ #include "WlfwQmi.h"
++/* 2253 (W9): the IPA driver's own page-table builder (IpaSmmu.h) and its allocator (IpaMmu.h). W9 reuses them rather than
++ * writing a second copy of rules already proven on this phone (ast173 to ast184): its table comes from IpaSmmu.h's ipa_pt_*,
++ * its SMMU mode check and VMID lease are ipa_mmu_mode and ipa_mmu_vmid_free, and its free-bank predicate is
++ * ipa_mmu_choose's own, written once as w9_bank_free with its reasons. IpaMmu itself is a local in w9_install, so nothing
++ * of the IPA allocator's state is kept in the Wi-Fi runtime. */
++#include "../modem/IpaSmmu.h"
++#include "../modem/IpaMmu.h"
++/* Gunyah rejects load/store writeback forms on apps_smmu, so every SMMU access in this file is an explicit ldr/str. */
++#include "../modem/IpaMmio.h"
++/* IpaRuntime.inc's own name for the table's size; the header above has the two constants it is made of. */
++#define IPA_PT_BYTES (IPA_PT_PAGES*IPA_PT_PAGE)
+ #define ADSP_FW_LOG "SWEET WIFI"
+ #include "../battery/AdspFirmware.inc"
+ static int adsp_part_read(uint64_t off,void *dst,uint64_t bytes){return sweet_ufs_read_part("modem_a",off,dst,bytes);}
+@@ -162,6 +173,16 @@ static struct {
+   * taken and the global fault status it read; the rest is what the last snapshot found, for the close line. */
+  bool smmu_asked;
+  uint32_t smmu_taken,smmu_gfsr[3],smmu_wlan,smmu_valid,smmu_free_smr,smmu_free_cb,smmu_faulted;
++ /* 2253 (W9): dma_asked is the gate; the rest is the one SMR and bank this stage leases, what they held before, and every
++  * step the teardown has to be able to prove it undid. dma_bank and dma_smr are W9_NONE until a bank is installed, so a
++  * teardown that never installed anything does nothing at all. */
++ bool dma_asked;
++ vm_offset_t dma_smmu,dma_pt_v,dma_ring;
++ uint64_t dma_pt_pa,dma_ring_pa,dma_ttbr;
++ unsigned dma_bank,dma_smr,dma_vmid;
++ uint32_t dma_smr_raw,dma_sctl,dma_smr_old,dma_s2cr_old,dma_cbar_old,dma_cba2r_old;
++ bool dma_installed,dma_released,dma_checked,dma_fault_routed,dma_table_ok,dma_doorbell;
++ uint32_t dma_gfsr_before,dma_gfsr_mission,dma_gfsr_after,dma_fsr,dma_verify_fail;
+  /* 2249: what each file actually got through, kept as two totals because bdf_seg restarts at 0 for the second file and
+   * a run that stops in the middle must still say which file it stopped in. */
+  uint32_t bdf_regdb_pieces,bdf_board_pieces;
+@@ -457,6 +478,23 @@ static void w_state_probe(void){
+ #define W_WLAN_TBU_LO 0x1400u       /* pcie_qtb qcom,stream-id-range = <0x1400 0x400> */
+ #define W_WLAN_TBU_HI 0x17ffu
+ #define W_SMMU_CLAIM_MS 100u
++/* 2253 (W9): every SMMU access goes through these, which are IpaMmio.h's explicit ldr/str forms. Gunyah emulates apps_smmu
++ * and rejects load and store writeback forms, and -O2 once folded two plain reads into one in the boot shim (W8 audit
++ * finding 1).
++ *
++ * They are deliberately NOT inlined. Inlining let the compiler decide the instruction form, which is exactly the thing the
++ * audit could not check: a folded loop of accesses becomes one post-index load, and no source reading shows it. With a call
++ * per access the whole SMMU access path is one function per direction, one instruction wide, and `check-smmu-asm.py` can
++ * disassemble it and require the plain form outright. The cost is a call per register access on paths that sit behind
++ * multi-second firmware waits, which is nothing; the gain is that the property is provable from the binary rather than
++ * inferred from the source. */
++static __attribute__((noinline)) uint32_t w_smmu_rd(vm_offset_t s,unsigned off){return ipa_mmio_read32(s,off);}
++static __attribute__((noinline)) void w_smmu_wr(vm_offset_t s,unsigned off,uint32_t v){ipa_mmio_write32(s,off,v);}
++/* A 64-bit register as two 32-bit stores. The banks this code writes are disabled across every 64-bit write (SCTLR.M=0 at
++ * install and at teardown), so the split is not observable, and it keeps every store on the one path the host model can
++ * audit: a 64-bit store would bypass it. */
++static void w_smmu_wr64(vm_offset_t s,unsigned off,uint64_t v){w_smmu_wr(s,off,(uint32_t)v);w_smmu_wr(s,off+4,(uint32_t)(v>>32));}
++static uint64_t w_smmu_rd64(vm_offset_t s,unsigned off){return (uint64_t)w_smmu_rd(s,off)|((uint64_t)w_smmu_rd(s,off+4)<<32);}
+ static const char *const w_smmu_when[3]={"before","mission","after"};
+ static bool w_smr_hits(uint32_t smr,unsigned sid){uint32_t mask=(smr>>16)&0x7fffu;return (smr>>31) && !((smr^sid)&0x7fffu&~mask);}
+ static void w_smmu_survey(unsigned which){
+@@ -470,7 +508,7 @@ static void w_smmu_survey(unsigned which){
+  }
+  vm_offset_t s=ml_io_map_unmappable(W_SMMU_PA,W_SMMU_BYTES,VM_WIMG_IO);
+  if(!s){sweet_apps_smmu_release();printf("SWEET WIFI: W8 smmu %s: mapping failed; not read\n",when);sweet_log_sync();return;}
+- uint32_t scr0=w_rd(s,0),id0=w_rd(s,0x20),id1=w_rd(s,0x24),id2=w_rd(s,0x28),gfsr=w_rd(s,0x48);
++ uint32_t scr0=w_smmu_rd(s,0),id0=w_smmu_rd(s,0x20),id1=w_smmu_rd(s,0x24),id2=w_smmu_rd(s,0x28),gfsr=w_smmu_rd(s,0x48);
+  w.smmu_taken|=1u<<which;w.smmu_gfsr[which]=gfsr;
+  printf("SWEET WIFI: W8 smmu %s: sCR0=%#x (USFCFG=%u GFIE=%u GFRE=%u CLIENTPD=%u) ID0=%#x ID1=%#x ID2=%#x sGFSR=%#x read_only=1\n",
+   when,scr0,(scr0>>10)&1u,(scr0>>2)&1u,(scr0>>1)&1u,scr0&1u,id0,id1,id2,gfsr);
+@@ -484,9 +522,9 @@ static void w_smmu_survey(unsigned which){
+  bool referenced[W_SMMU_NCB],wlanbank[W_SMMU_NCB];memset(referenced,0,sizeof(referenced));memset(wlanbank,0,sizeof(wlanbank));
+  unsigned valid=0,free_smr=0,firstfree[4]={0},nfree=0,hits[W_WLAN_SIDS]={0};
+  for(unsigned i=0;i<W_SMMU_NSMR;i++){
+-  uint32_t smr=w_rd(s,0x800+4*i);
++  uint32_t smr=w_smmu_rd(s,0x800+4*i);
+   if(!(smr>>31)){if(nfree<4)firstfree[nfree++]=i;free_smr++;continue;}
+-  uint32_t s2cr=w_rd(s,0xc00+4*i),type=(s2cr>>16)&3u,cb=s2cr&255u,id=smr&0x7fffu,mask=(smr>>16)&0x7fffu;valid++;
++  uint32_t s2cr=w_smmu_rd(s,0xc00+4*i),type=(s2cr>>16)&3u,cb=s2cr&255u,id=smr&0x7fffu,mask=(smr>>16)&0x7fffu;valid++;
+   bool wlan=false;
+   for(unsigned k=0;k<W_WLAN_SIDS;k++)if(w_smr_hits(smr,W_WLAN_SID+k)){hits[k]++;wlan=true;}
+   if(type==0 && cb<W_SMMU_NCB){referenced[cb]=true;if(wlan)wlanbank[cb]=true;}
+@@ -504,13 +542,13 @@ static void w_smmu_survey(unsigned which){
+  unsigned free_cb=0,firstcb[8]={0},ncb=0,faulted=0,nref=0;
+  for(unsigned c=0;c<W_SMMU_NCB;c++){
+   unsigned b=W_SMMU_CB0+0x1000u*c;
+-  uint32_t sctlr=w_rd(s,b),fsr=w_rd(s,b+0x58),cbar=w_rd(s,0x1000+4*c),cba2r=w_rd(s,0x1800+4*c);
++  uint32_t sctlr=w_smmu_rd(s,b),fsr=w_smmu_rd(s,b+0x58),cbar=w_smmu_rd(s,0x1000+4*c),cba2r=w_smmu_rd(s,0x1800+4*c);
+   if(referenced[c]){
+    nref++;
+    printf("SWEET WIFI: W8 smmu %s: cb %u%s CBAR=%#x CBA2R=%#x SCTLR=%#x (M=%u) TTBR0=%#x:%#x TTBR1=%#x:%#x FSR=%#x\n",when,c,
+-    wlanbank[c]?" WLAN":"",cbar,cba2r,sctlr,sctlr&1u,w_rd(s,b+0x24),w_rd(s,b+0x20),w_rd(s,b+0x2c),w_rd(s,b+0x28),fsr);
++    wlanbank[c]?" WLAN":"",cbar,cba2r,sctlr,sctlr&1u,w_smmu_rd(s,b+0x24),w_smmu_rd(s,b+0x20),w_smmu_rd(s,b+0x2c),w_smmu_rd(s,b+0x28),fsr);
+    if(wlanbank[c])printf("SWEET WIFI: W8 smmu %s: cb %u WLAN TCR=%#x TCR2=%#x MAIR0=%#x MAIR1=%#x\n",when,c,
+-    w_rd(s,b+0x30),w_rd(s,b+0x10),w_rd(s,b+0x38),w_rd(s,b+0x3c));
++    w_smmu_rd(s,b+0x30),w_smmu_rd(s,b+0x10),w_smmu_rd(s,b+0x38),w_smmu_rd(s,b+0x3c));
+   } else if(!(sctlr&0xe1u) && !fsr && !cbar && !cba2r){if(ncb<8)firstcb[ncb++]=c;free_cb++;}
+   /* FSR bits 10:9 are the format field, not a fault: banks 0 to 4 read 0x400 on every boot. */
+   if(fsr&~0x600u){faulted++;printf("SWEET WIFI: W8 smmu %s: cb %u FSR=%#x: a fault is recorded in this bank\n",when,c,fsr);}
+@@ -531,6 +569,372 @@ static void w_smmu_close(void){
+   w.smmu_faulted,(unsigned)w.mission_taken);
+  sweet_log_sync();
+ }
++/* ---- 2253 (W9): the WLAN device's own DMA translation, the copy-engine rings' prerequisite --------------------------
++ *
++ * W8 (ast267) measured the ground this stands on. The streams the live DT gives this device (iommus = <&apps_smmu 0x1400
++ * 0x1>, so 0x1400 and 0x1401) have no SMR on any boot so far and nothing in this kernel programs them; 107 SMRs and 67
++ * banks are free, the first free banks being 5 to 12; the IPA driver leases two of those (ast174: "isolated SIDs AP=0x4a0
++ * CB=5 SMR=5 uC=0x4a2 CB=6 SMR=6") whenever it runs; sGFSR stayed 0 through W7's whole mission; USFCFG=1, so a stream with
++ * no SMR faults. Off the phone, ath11k on this bus limits host DMA to 32 bits (ahb.c: dma_set_mask_and_coherent with
++ * DMA_BIT_MASK(32)) and maps the MSI doorbell 0x17110040 into the device's own domain (ahb.c:877-890); Android's IOVA pool
++ * for this node is 0xb0000000 + 256 MiB (DT qcom,iommu-dma-addr-pool).
++ *
++ * This stage programs exactly what those facts allow and nothing more: one SMR (id 0x1400, mask 1, so it covers 0x1401
++ * too) to one free context bank, a stage-1 table built by the IPA driver's own builder (IpaSmmu.h's ipa_pt_*), a private
++ * VMID by the IPA driver's own lease rule, and two mappings in a window below 4 GiB: the ring page this stage allocates and
++ * the MSI doorbell page. No copy engine, no ring register, no radio register, and no host address is given to the firmware.
++ *
++ * How the bank is claimed so IPA can never collide with it. The allocator is one shared software claim,
++ * sweet_apps_smmu_claim (sweet_smmu.c), which IPA, touch and sweet_smmu.c all take around their own writes; this stage
++ * takes it for the whole install and the whole teardown. Under it, the two reusable parts of the IPA driver's own rule are
++ * reused, from IpaMmu.h: ipa_mmu_mode (the SMMU must be in IPA's translation mode) and ipa_mmu_vmid_free (the VMID must be
++ * absent from every bank's CBAR, even a disabled bank's). The bank must pass ipa_mmu_choose's own free-bank predicate,
++ * which is written once, in w9_bank_free, together with its reasons. The two cannot collide in either order: a bank this
++ * stage installs carries CBAR = 0x1f300 | vmid, the lease marker ipa_mmu_choose's predicate tests, so IPA refuses it on
++ * its next run; and a bank IPA is holding carries the same marker, so this stage's predicate refuses it. The same argument
++ * holds for the SMR: this stage takes the lowest invalid slot, and IPA's scan starts at 0 and takes the first invalid ones,
++ * so each skips whatever the other has made valid. Both run under the one claim, so neither can see a half-applied lease.
++ *
++ * Teardown, in IPA's order and for IPA's reasons (ipa_mmu_release): route the owned stream to a fault first, then disable
++ * the bank, invalidate its VMID, zero the TTBRs, unhook the SMR and only then restore its dormant route, then give CBAR and
++ * CBA2R back to the free values, then re-run the free predicate and require the bank to pass it. Only then are the tables
++ * and the ring page freed. Every step is read back; a step that will not read back stops the teardown and leaves the lease
++ * in place, which final_error reports as a cleanup failure.
++ *
++ * What this boot can and cannot show. It CAN show that the hypervisor accepts an SMR for 0x1400 and a translating stage-1
++ * bank for it on this phone, that every write reads back exactly (this is the first stage of the series that writes any
++ * SMMU register), that the bank and its table stay exactly as installed while W7's whole sequence runs mission mode with
++ * them live, that sGFSR stays 0 through that, and that the teardown restores the free state by read-back. It CANNOT show
++ * that the translation translates: no device moves data on 0x1400 in this boot, because the firmware is given no host
++ * address and the copy engines do not exist yet. The table is proven here by a CPU walk of its own entries and by the
++ * bank's read-back, not by the SMMU walking it. That is the ring stage, W10.
++ *
++ * Every access below goes through w_smmu_rd/w_smmu_wr, which are IpaMmio.h's explicit ldr/str forms: Gunyah rejects
++ * load/store writeback, and the W8 audit's finding 1 is that a plain dereference can be folded into one by the compiler. */
++#define W9_IOVA 0xb0000000u               /* Android's pool start; every IOVA below is this window and under 4 GiB */
++#define W9_RING_IOVA W9_IOVA
++#define W9_DOORBELL_IOVA (W9_IOVA+0x10000u)
++#define W9_DOORBELL_PA 0x17110000u        /* the page holding the MSI doorbell (DT reg = <0x17110040 ...>) */
++#define W9_DOORBELL_OFF 0x40u             /* 0x17110040 - 0x17110000: the address ath11k hands the copy engines */
++#define W9_RING_BYTES 0x4000u             /* one xnu page; the ring stage replaces this with the real rings */
++#define W9_DOORBELL_BYTES 0x1000u
++#define W9_LIMIT (1ull<<32)               /* ath11k's 32-bit host DMA mask: every address the device is given, below this */
++#define W9_SID 0x1400u                    /* the stream this stage routes; mask 1 covers 0x1401 with it */
++#define W9_NONE 0xffffffffu
++/* The lease marker ipa_mmu_install writes and ipa_mmu_release undoes, verbatim, so the state this stage leaves is the
++ * state IPA's own code would have left. */
++#define W9_CBAR 0x1f300u
++static uint32_t w9_read(void *ctx,unsigned off){(void)ctx;return w_smmu_rd(w.dma_smmu,off);}
++static void w9_write(void *ctx,unsigned off,uint32_t v){(void)ctx;w_smmu_wr(w.dma_smmu,off,v);}
++static void w9_write64(void *ctx,unsigned off,uint64_t v){(void)ctx;w_smmu_wr64(w.dma_smmu,off,v);}
++static void w9_delay(void *ctx){(void)ctx;delay(1);}
++/* ipa_alloc's rule: contiguous, zeroed, and below the 36-bit input the SMMU advertises. */
++static int w9_alloc(vm_offset_t *va,uint64_t *pa,vm_size_t size){
++ if(kmem_alloc_contig(kernel_map,va,size,PAGE_MASK,0,0,KMA_DATA|KMA_ZERO,VM_KERN_MEMORY_IOKIT)!=KERN_SUCCESS)return ENOMEM;
++ *pa=ptoa_64(pmap_find_phys(kernel_pmap,(addr64_t)*va));
++ if(!*pa || *pa>=(1ull<<36) || size>(1ull<<36)-*pa)return EINVAL;
++ for(vm_size_t off=0;off<size;off+=PAGE_SIZE)if(ptoa_64(pmap_find_phys(kernel_pmap,(addr64_t)(*va+off)))!=*pa+off)return EINVAL;
++ return 0;
++}
++/* Resolves one IOVA through our own entries, the way the SMMU's walker would, so the table can be checked on the CPU before
++ * anything points at it. 0 when the leaf is missing, or when an entry points outside the table this stage owns. */
++static uint64_t w9_walk(uint64_t iova,unsigned *attr){
++ uint64_t *t=(uint64_t *)w.dma_pt_v,e=t[(iova>>30)&511u];
++ if((e&3)!=3)return 0;
++ uint64_t l2;
++ {uint64_t pa=e&0x0000fffffffff000ull;if(pa<w.dma_pt_pa || pa>=w.dma_pt_pa+IPA_PT_BYTES)return 0;l2=(pa-w.dma_pt_pa)/4096u;}
++ e=t[l2*512u+((iova>>21)&511u)];if((e&3)!=3)return 0;
++ uint64_t l3;
++ {uint64_t pa=e&0x0000fffffffff000ull;if(pa<w.dma_pt_pa || pa>=w.dma_pt_pa+IPA_PT_BYTES)return 0;l3=(pa-w.dma_pt_pa)/4096u;}
++ e=t[l3*512u+((iova>>12)&511u)];if(!(e&1))return 0;
++ if(attr)*attr=(unsigned)((e>>2)&7u);
++ return (e&0x0000fffffffff000ull)|(iova&4095u);
++}
++/* The claim, with the survey's own patience: a holder is writing, so wait a little and then say so instead of reading or
++ * writing a table half way through its update. Each install and each teardown takes it once and gives it back once. */
++static bool w9_claim(void){
++ unsigned waited=0;
++ while(!sweet_apps_smmu_claim()){
++  if(waited>=W_SMMU_CLAIM_MS)return false;
++  w_sleep(10);waited+=10;
++ }
++ return true;
++}
++/* IPA's own used-bank map, computed for its own reason: a bank a translating SMR reaches is owned, and so is a bank one of
++ * those chains to as a stage-2 context. Here it is what the free predicate is allowed to look at. */
++static void w9_used(bool *used){
++ memset(used,0,W_SMMU_NCB*sizeof(bool));
++ for(unsigned i=0;i<W_SMMU_NSMR;i++){
++  if(!(w_smmu_rd(w.dma_smmu,0x800+4*i)>>31))continue;
++  uint32_t s2=w_smmu_rd(w.dma_smmu,0xc00+4*i);
++  if(((s2>>16)&3)==0 && (s2&255u)<W_SMMU_NCB)used[s2&255u]=true;
++ }
++ for(unsigned i=0;i<W_SMMU_NCB;i++)if(used[i] && ((w_smmu_rd(w.dma_smmu,0x1000+4*i)>>16)&3)==3){
++  unsigned second=(w_smmu_rd(w.dma_smmu,0x1000+4*i)>>8)&255u;
++  if(second<W_SMMU_NCB)used[second]=true;
++ }
++}
++/* Is this bank free by the predicate ipa_mmu_choose uses? One place, called by the install before it writes and by the
++ * teardown after it has finished, so "free" cannot mean two things. */
++static bool w9_bank_free(unsigned c,const bool *used){
++ unsigned b=ipa_cb(c);
++ return !used[c] && !(w_smmu_rd(w.dma_smmu,b)&0xe1u) && !w_smmu_rd(w.dma_smmu,b+0x58) &&
++   !w_smmu_rd(w.dma_smmu,0x1000+4*c) && !w_smmu_rd(w.dma_smmu,0x1800+4*c);
++}
++/* The five words that identify the lease, in one place, so the install, the mission check and the teardown cannot disagree
++ * about what "ours" means. */
++static bool w9_is_ours(void){
++ unsigned b=ipa_cb(w.dma_bank),s=w.dma_smr;
++ return w_smmu_rd(w.dma_smmu,0x800+4*s)==w.dma_smr_raw &&
++   w_smmu_rd(w.dma_smmu,0xc00+4*s)==(w.dma_bank|(3u<<8)) &&
++   w_smmu_rd(w.dma_smmu,0x1000+4*w.dma_bank)==(W9_CBAR|w.dma_vmid) &&
++   w_smmu_rd(w.dma_smmu,0x1800+4*w.dma_bank)==1 && w_smmu_rd(w.dma_smmu,b)==w.dma_sctl;
++}
++/* 2253 (W9) install. One SMR, one bank, one stage-1 table, two mappings, all below 4 GiB.
++ *
++ * The choice is the IPA driver's, not a second copy of its rules: an IpaMmu pointed at this window runs ipa_mmu_choose for
++ * SID 0x1400, whose scan of all 114 SMRs finds no match for 0x1400 or 0x1401 (or refuses, exactly as it would for IPA) and
++ * whose free-bank scan is IPA's predicate. The table is written and synced before anything points at it, the bank is
++ * enabled while nothing routes to it, then the S2CR, then the SMR, which is ipa_mmu_install's order. */
++static int w9_install(void){
++ if(!w.dma_asked || w.dma_bank!=W9_NONE || w.dma_installed)return EBUSY;
++ int rc=EIO;
++ if(!w9_claim()){printf("SWEET WIFI: W9 dma: busy, another SMMU user held the claim for %u ms; not installed\n",W_SMMU_CLAIM_MS);sweet_log_sync();return EBUSY;}
++ vm_offset_t s=ml_io_map_unmappable(W_SMMU_PA,W_SMMU_BYTES,VM_WIMG_IO);
++ if(!s){printf("SWEET WIFI: W9 dma: mapping failed; not installed\n");sweet_log_sync();goto out_release;}
++ w.dma_smmu=s;
++ uint32_t id0=w_smmu_rd(s,0x20),id1=w_smmu_rd(s,0x24),id2=w_smmu_rd(s,0x28);
++ /* The geometry gate W8 measured: a different ID set is a different hypervisor build, and nothing here is proven there. */
++ if(id0!=W_SMMU_ID0 || id1!=W_SMMU_ID1 || id2!=W_SMMU_ID2){
++  printf("SWEET WIFI: W9 dma: geometry differs from the measured ID0=%#x ID1=%#x ID2=%#x; not installed\n",W_SMMU_ID0,W_SMMU_ID1,W_SMMU_ID2);
++  sweet_log_sync();goto out_unmap;
++ }
++ /* W8's own finding, enforced before anything is allocated: if a stream this stage would claim is already matched, a second
++  * SMR would be a match conflict on the device's first DMA. ipa_mmu_choose refuses this case for IPA's own SIDs; the
++  * device's two are checked here, with the SMR mask honoured. */
++ {bool taken[W_WLAN_SIDS]={false};
++  for(unsigned i=0;i<W_SMMU_NSMR;i++){
++   uint32_t smr=w_smmu_rd(s,0x800+4*i);if(!(smr>>31))continue;
++   for(unsigned k=0;k<W_WLAN_SIDS;k++)if(!taken[k] && w_smr_hits(smr,W_WLAN_SID+k)){
++    taken[k]=true;printf("SWEET WIFI: W9 dma: sid %#x is already matched by SMR %u raw=%#x; not installed\n",W_WLAN_SID+k,i,smr);
++    sweet_log_sync();goto out_unmap;
++   }
++  }}
++ /* The ring page and the table, each contiguous, zeroed and below 2^36 (w9_alloc is ipa_alloc's own check). The ring page
++  * stands in for W10's rings: this stage proves the translation, not the rings. */
++ if((rc=w9_alloc(&w.dma_ring,&w.dma_ring_pa,W9_RING_BYTES))){printf("SWEET WIFI: W9 dma: ring page allocation failed error=%d\n",rc);sweet_log_sync();goto out_unmap;}
++ if((rc=w9_alloc(&w.dma_pt_v,&w.dma_pt_pa,IPA_PT_BYTES))){printf("SWEET WIFI: W9 dma: page table allocation failed error=%d\n",rc);sweet_log_sync();goto out_free;}
++ memset((void *)w.dma_ring,0,W9_RING_BYTES);sweet_dma_sync_va((void *)w.dma_ring,W9_RING_BYTES);
++ IpaPageTable pt;
++ if(ipa_pt_init(&pt,(uint64_t *)w.dma_pt_v,w.dma_pt_pa) ||
++    ipa_pt_map(&pt,W9_RING_IOVA,w.dma_ring_pa,W9_RING_BYTES) ||
++    ipa_pt_map_attr(&pt,W9_DOORBELL_IOVA,W9_DOORBELL_PA,W9_DOORBELL_BYTES,1)){
++  printf("SWEET WIFI: W9 dma: the page table builder refused; not installed\n");sweet_log_sync();rc=EINVAL;goto out_free;
++ }
++ /* The walk the SMMU will make, made on the CPU first: both IOVAs must resolve to the pages this stage owns, with the ring
++  * Normal-NC and the doorbell Device. If they do not, nothing is published and the table is freed. */
++ unsigned attr_ring=0xffffffffu,attr_bell=0xffffffffu;
++ {uint64_t ring_hit=w9_walk(W9_RING_IOVA,&attr_ring),bell_hit=w9_walk(W9_DOORBELL_IOVA+W9_DOORBELL_OFF,&attr_bell);
++  printf("SWEET WIFI: W9 dma: table walk iova=%#x -> %#llx (want %#llx attr %u), iova=%#x -> %#llx (want %#llx attr %u)\n",
++   W9_RING_IOVA,(unsigned long long)ring_hit,(unsigned long long)w.dma_ring_pa,attr_ring,
++   (unsigned)(W9_DOORBELL_IOVA+W9_DOORBELL_OFF),(unsigned long long)bell_hit,(unsigned long long)(W9_DOORBELL_PA+W9_DOORBELL_OFF),attr_bell);
++  w.dma_table_ok=ring_hit==w.dma_ring_pa && attr_ring==0;
++  w.dma_doorbell=bell_hit==W9_DOORBELL_PA+W9_DOORBELL_OFF && attr_bell==1;
++  if(!w.dma_table_ok || !w.dma_doorbell){
++   printf("SWEET WIFI: W9 dma: the table does not resolve as asked (ring=%u doorbell=%u); not installed\n",
++    (unsigned)w.dma_table_ok,(unsigned)w.dma_doorbell);sweet_log_sync();rc=EIO;goto out_free;
++  }
++ }
++ sweet_dma_sync_va((void *)w.dma_pt_v,IPA_PT_BYTES);
++ /* The choice. IPA's own allocator, ipa_mmu_choose, cannot make it: it is written for IPA's two SIDs (0x4a0/0x4a2), it
++  * refuses a device whose streams it does not own, and it requires exactly two free SMRs. So the two predicates that ARE
++  * reusable are the ones reused, from IpaMmu.h itself: ipa_mmu_mode (translation on, 8-bit VMIDs, ordinary stream ids) and
++  * ipa_mmu_vmid_free (a VMID absent from every bank's CBAR, even a disabled bank). The bank predicate is ipa_mmu_choose's
++  * inner loop, written out once in w9_bank_free with its reasons, and the SMR is the lowest invalid slot, which is the same
++  * slot ipa_mmu_choose's scan would stop at. This is the rule that keeps the two apart: a bank this stage installs carries
++  * IPA's lease marker in CBAR, so ipa_mmu_choose's own predicate refuses it on its next run. */
++ IpaMmu mmu;
++ memset(&mmu,0,sizeof(mmu));
++ mmu.io=(IpaMmuIo){0,w9_read,w9_write,w9_write64,w9_delay};
++ if(!ipa_mmu_mode(&mmu)){printf("SWEET WIFI: W9 dma: sCR0 is not IPA's translation mode; not installed\n");sweet_log_sync();rc=EIO;goto out_free;}
++ {unsigned candidate=0;
++  for(unsigned v=1;v<256 && !candidate;v++)if(ipa_mmu_vmid_free(&mmu,v))candidate=v;
++  if(!candidate){printf("SWEET WIFI: W9 dma: no free nonzero VMID by IPA's rule; not installed\n");sweet_log_sync();rc=EIO;goto out_free;}
++  w.dma_vmid=candidate;
++ }
++ /* ath11k on this bus sets a 32-bit DMA mask, so every address the device is given must be below 4 GiB. The SMMU itself
++  * would accept up to 2^36 (ID2=0x5111), so this bound is the host's to keep; it is stated here, before anything is mapped
++  * or written, rather than inferred from the constants above. */
++ if((uint64_t)W9_RING_IOVA+W9_RING_BYTES>W9_LIMIT || (uint64_t)(W9_DOORBELL_IOVA+W9_DOORBELL_BYTES)>W9_LIMIT){
++  printf("SWEET WIFI: W9 dma: the IOVA window %#llx..%#llx is not below 4 GiB (ath11k's 32-bit host DMA mask); not installed\n",
++   (unsigned long long)W9_RING_IOVA,(unsigned long long)(W9_DOORBELL_IOVA+W9_DOORBELL_BYTES));
++  sweet_log_sync();rc=EINVAL;goto out_free;
++ }
++ w.dma_smr_raw=0x80000000u|(1u<<16)|W9_SID;
++ w.dma_sctl=1u|2u|4u|0x20u|(3u<<22);
++ /* The slot and the bank. The SMR is the lowest invalid one (ipa_mmu_choose's scan stops at the first, and W8 measured
++  * the first four free as 5 to 8). The bank is the lowest that passes ipa_mmu_choose's predicate against IPA's used[] map,
++  * which is why IPA's own two leases (banks 5 and 6 in ast174) and every bank another SMR reaches are skipped here. */
++ {bool used[W_SMMU_NCB];w9_used(used);
++  for(unsigned i=0;i<W_SMMU_NSMR && w.dma_smr==W9_NONE;i++)if(!(w_smmu_rd(s,0x800+4*i)>>31))w.dma_smr=i;
++  if(w.dma_smr==W9_NONE){printf("SWEET WIFI: W9 dma: no free SMR of %u; not installed\n",W_SMMU_NSMR);sweet_log_sync();rc=EIO;goto out_free;}
++  for(unsigned c=0;c<W_SMMU_NCB && w.dma_bank==W9_NONE;c++)if(w9_bank_free(c,used))w.dma_bank=c;
++  if(w.dma_bank==W9_NONE){printf("SWEET WIFI: W9 dma: no free context bank by IPA's rule; not installed\n");sweet_log_sync();rc=EIO;goto out_free;}
++ }
++ /* What the two slots hold before this stage takes them: the SMR must read invalid and the bank's three lease words must
++  * read free. Anything else is not a slot this stage may take, and the install stops here rather than adopt it. */
++ w.dma_smr_old=w_smmu_rd(s,0x800+4*w.dma_smr);
++ w.dma_s2cr_old=w_smmu_rd(s,0xc00+4*w.dma_smr);
++ w.dma_cbar_old=w_smmu_rd(s,0x1000+4*w.dma_bank);
++ w.dma_cba2r_old=w_smmu_rd(s,0x1800+4*w.dma_bank);
++ if(w.dma_smr_old || w.dma_cbar_old || w.dma_cba2r_old){
++  printf("SWEET WIFI: W9 dma: slot %u or bank %u changed after the choice (smr=%#x cbar=%#x cba2r=%#x); not installed\n",
++   w.dma_smr,w.dma_bank,w.dma_smr_old,w.dma_cbar_old,w.dma_cba2r_old);
++  sweet_log_sync();rc=EAGAIN;goto out_free;
++ }
++ const unsigned b=ipa_cb(w.dma_bank);
++ /* The table goes in while the bank is disabled, exactly as ipa_mmu_install does, so a half-written table is never
++  * reachable by any stream. CBAR carries the lease marker IPA's predicate refuses to reuse. */
++ w_smmu_wr(s,b,0);
++ if(w_smmu_rd(s,b)){printf("SWEET WIFI: W9 dma: SCTLR will not clear; not installed\n");sweet_log_sync();rc=EIO;goto retain;}
++ w_smmu_wr(s,0x1800+4*w.dma_bank,1);
++ if(w_smmu_rd(s,0x1800+4*w.dma_bank)!=1){printf("SWEET WIFI: W9 dma: CBA2R will not take the 64-bit form; not installed\n");sweet_log_sync();rc=EIO;goto retain;}
++ w_smmu_wr(s,0x1000+4*w.dma_bank,W9_CBAR|w.dma_vmid);
++ if(w_smmu_rd(s,0x1000+4*w.dma_bank)!=(W9_CBAR|w.dma_vmid)){printf("SWEET WIFI: W9 dma: CBAR will not take stage 1 with VMID %u; not installed\n",w.dma_vmid);sweet_log_sync();rc=EIO;goto retain;}
++ w_smmu_wr(s,b+0x10,IPA_MMU_TCR2);w_smmu_wr(s,b+0x30,IPA_MMU_TCR);
++ if(w_smmu_rd(s,b+0x10)!=IPA_MMU_TCR2 || w_smmu_rd(s,b+0x30)!=IPA_MMU_TCR){printf("SWEET WIFI: W9 dma: TCR will not take IPA's geometry; not installed\n");sweet_log_sync();rc=EIO;goto retain;}
++ w.dma_ttbr=w.dma_pt_pa|((uint64_t)(w.dma_bank+1)<<48);
++ w_smmu_wr64(s,b+0x20,w.dma_ttbr);w_smmu_wr64(s,b+0x28,0);
++ w_smmu_wr(s,b+0x38,0x0444);w_smmu_wr(s,b+0x3c,0);
++ /* Every word read back with the bank still disabled: a bank that will not hold its configuration is not enabled. */
++ if(w_smmu_rd(s,b) || w_smmu_rd64(s,b+0x20)!=w.dma_ttbr || w_smmu_rd(s,b+0x30)!=IPA_MMU_TCR ||
++    w_smmu_rd(s,b+0x10)!=IPA_MMU_TCR2 || w_smmu_rd(s,b+0x38)!=0x0444 || w_smmu_rd(s,b+0x3c) || w_smmu_rd64(s,b+0x28)){
++  printf("SWEET WIFI: W9 dma: the disabled bank did not hold its configuration; not installed\n");sweet_log_sync();w.dma_verify_fail++;rc=EIO;goto retain;
++ }
++ w_smmu_wr(s,b+0x618,0);       /* the invalidate word ipa_mmu_install writes for a leased VMID */
++ w_smmu_wr(s,b,w.dma_sctl);
++ if(w_smmu_rd(s,b)!=w.dma_sctl){printf("SWEET WIFI: W9 dma: the bank will not enable; not installed\n");sweet_log_sync();w.dma_verify_fail++;rc=EIO;goto retain;}
++ /* Publication, last and in IPA's order: the S2CR, then the SMR that makes the stream reach it. */
++ w_smmu_wr(s,0xc00+4*w.dma_smr,w.dma_bank|(3u<<8));
++ if(w_smmu_rd(s,0xc00+4*w.dma_smr)!=(w.dma_bank|(3u<<8))){printf("SWEET WIFI: W9 dma: S2CR will not route to bank %u; not installed\n",w.dma_bank);sweet_log_sync();w.dma_verify_fail++;rc=EIO;goto retain;}
++ w_smmu_wr(s,0x800+4*w.dma_smr,w.dma_smr_raw);
++ if(!w9_is_ours()){printf("SWEET WIFI: W9 dma: the published SMR and bank do not read back as installed\n");sweet_log_sync();w.dma_verify_fail++;rc=EIO;goto retain;}
++ w.dma_installed=true;w.dma_fsr=w_smmu_rd(s,b+0x58);
++ printf("SWEET WIFI: W9 dma: installed smr=%u raw=%#x s2cr=%#x bank=%u cbar=%#x cba2r=1 vmid=%u sctlr=%#x\n",
++  w.dma_smr,(unsigned)w.dma_smr_raw,(unsigned)(w.dma_bank|(3u<<8)),w.dma_bank,(unsigned)(W9_CBAR|w.dma_vmid),w.dma_vmid,(unsigned)w.dma_sctl);
++ printf("SWEET WIFI: W9 dma: ttbr0=%#llx tcr=%#x tcr2=%#x mair0=%#x mair1=%#x; iova %#x+%#x -> pa %#llx (Normal NC), doorbell iova %#x+%#x -> pa %#x (Device); fsr=%#x sGFSR=%#x\n",
++  (unsigned long long)w.dma_ttbr,(unsigned)IPA_MMU_TCR,(unsigned)IPA_MMU_TCR2,(unsigned)0x0444,0u,
++  W9_RING_IOVA,W9_RING_BYTES,(unsigned long long)w.dma_ring_pa,(unsigned)(W9_DOORBELL_IOVA+W9_DOORBELL_OFF),W9_DOORBELL_OFF,W9_DOORBELL_PA,w.dma_fsr,w.dma_gfsr_before);
++ printf("SWEET WIFI: W9 dma: no copy engine, no ring register, no radio register, no host address given to the firmware\n");
++ sweet_log_sync();rc=0;goto out_release;
++retain:
++ /* A partial lease is not a known format (ipa_mmu_release's rule): leave every word as it is and let the teardown refuse to
++  * guess. The SMR was published last, so a failure before it leaves the stream unrouted and the bank leased and idle. */
++ printf("SWEET WIFI: W9 dma: install stopped part way; the bank and the tables are retained until reset\n");sweet_log_sync();
++ rc=EIO;goto out_release;
++out_free:
++ if(w.dma_pt_v){kmem_free(kernel_map,w.dma_pt_v,IPA_PT_BYTES);w.dma_pt_v=0;}
++ if(w.dma_ring){kmem_free(kernel_map,w.dma_ring,W9_RING_BYTES);w.dma_ring=0;}
++ w.dma_bank=w.dma_smr=W9_NONE;
++out_unmap:
++ w_unmap(s,W_SMMU_BYTES);w.dma_smmu=0;
++out_release:
++ sweet_apps_smmu_release();
++ return rc;
++}
++/* The read-only check that the lease is still exactly what was installed, taken while the firmware is in mission mode: the
++ * bank's own FSR, the global status, and the five words w9_is_ours reads. It writes no SMMU register, and it takes the same
++ * claim every other SMMU user takes, so it cannot read a table while IPA or touch is changing one. A claim that cannot be
++ * taken inside the bound is reported and the check is skipped; it is evidence, not a gate. */
++static void w9_check(void){
++ if(!w.dma_asked || !w.dma_installed)return;
++ if(!w9_claim()){printf("SWEET WIFI: W9 dma mission: busy, another SMMU user held the claim for %u ms; not checked\n",W_SMMU_CLAIM_MS);sweet_log_sync();return;}
++ w.dma_fsr=w_smmu_rd(w.dma_smmu,ipa_cb(w.dma_bank)+0x58);
++ w.dma_gfsr_mission=w_smmu_rd(w.dma_smmu,0x48);w.dma_checked=true;
++ bool ours=w9_is_ours();
++ if(!ours)w.dma_verify_fail++;
++ printf("SWEET WIFI: W9 dma mission: smr=%u bank=%u ours=%u sctlr=%#x cbar=%#x cba2r=%#x ttbr0=%#x:%#x fsr=%#x sGFSR=%#x\n",
++  w.dma_smr,w.dma_bank,(unsigned)ours,(unsigned)w_smmu_rd(w.dma_smmu,ipa_cb(w.dma_bank)),
++  (unsigned)w_smmu_rd(w.dma_smmu,0x1000+4*w.dma_bank),(unsigned)w_smmu_rd(w.dma_smmu,0x1800+4*w.dma_bank),
++  (unsigned)w_smmu_rd(w.dma_smmu,ipa_cb(w.dma_bank)+0x24),(unsigned)w_smmu_rd(w.dma_smmu,ipa_cb(w.dma_bank)+0x20),
++  w.dma_fsr,w.dma_gfsr_mission);
++ sweet_apps_smmu_release();
++ sweet_log_sync();
++}
++/* 2253 (W9) teardown: IPA's order, IPA's reasons (ipa_mmu_release). Route the owned stream to a fault first, so no request
++ * can reach a table that is about to go; disable the bank; invalidate the VMID and zero the TTBRs; unhook the SMR and only
++ * then restore its dormant route; give CBAR and CBA2R back to the free values, which is what hands the bank to IPA's next
++ * choice; and require the bank to pass the same free predicate the install used. Only then is anything freed. */
++static bool w9_release(bool stopped){
++ if(!w.dma_asked || w.dma_bank==W9_NONE)return true;
++ if(!stopped){printf("SWEET WIFI: W9 dma: the DSP stop is not verified; the lease, the tables and the ring page are retained until reset\n");sweet_log_sync();return false;}
++ if(!w.dma_installed){printf("SWEET WIFI: W9 dma: teardown refused, the install never completed; retained until reset\n");sweet_log_sync();return false;}
++ if(!w9_claim()){printf("SWEET WIFI: W9 dma: busy at teardown, the claim was not taken; retained until reset\n");sweet_log_sync();return false;}
++ unsigned b=ipa_cb(w.dma_bank),s_=w.dma_smr;bool ok=true;
++ if(!w9_is_ours()){printf("SWEET WIFI: W9 dma: the lease no longer reads back as ours; retained until reset\n");sweet_log_sync();w.dma_verify_fail++;ok=false;goto out;}
++ w_smmu_wr(w.dma_smmu,0xc00+4*s_,2u<<16);w.dma_fault_routed=true;
++ if(w_smmu_rd(w.dma_smmu,0xc00+4*s_)!=(2u<<16)){printf("SWEET WIFI: W9 dma: S2CR will not route to fault; retained\n");sweet_log_sync();w.dma_verify_fail++;ok=false;goto out;}
++ w_smmu_wr(w.dma_smmu,b,0);
++ if(w_smmu_rd(w.dma_smmu,b)){printf("SWEET WIFI: W9 dma: the bank will not disable; retained\n");sweet_log_sync();w.dma_verify_fail++;ok=false;goto out;}
++ w_smmu_wr(w.dma_smmu,b+0x618,0);
++ w_smmu_wr64(w.dma_smmu,b+0x20,0);w_smmu_wr64(w.dma_smmu,b+0x28,0);
++ if(w_smmu_rd64(w.dma_smmu,b+0x20) || w_smmu_rd64(w.dma_smmu,b+0x28)){printf("SWEET WIFI: W9 dma: TTBR will not zero; retained\n");sweet_log_sync();w.dma_verify_fail++;ok=false;goto out;}
++ /* A fault recorded in the bank is the one thing a disabled bank keeps, and the free predicate reads FSR. FSR is
++  * write-one-to-clear, so exactly the bits read are written back, and the result is checked. On a healthy boot this is no
++  * write at all: nothing moves data on 0x1400. */
++ {uint32_t fsr=w_smmu_rd(w.dma_smmu,b+0x58);
++  if(fsr&~0x600u){
++   w.dma_fsr=fsr;   /* kept for the close line: the fault this stage saw, not the zero it left behind */
++   printf("SWEET WIFI: W9 dma: bank %u records FSR=%#x at teardown (a fault reached this table); clearing it\n",w.dma_bank,fsr);
++   w_smmu_wr(w.dma_smmu,b+0x58,fsr);
++  }
++  if(w_smmu_rd(w.dma_smmu,b+0x58)){printf("SWEET WIFI: W9 dma: FSR will not clear; the bank stays leased\n");sweet_log_sync();w.dma_verify_fail++;ok=false;goto out;}}
++ /* Unhook the stream before restoring the slot's dormant route, as ipa_mmu_release does: prove the selector invalid first. */
++ w_smmu_wr(w.dma_smmu,0x800+4*s_,w.dma_smr_old);
++ if(w_smmu_rd(w.dma_smmu,0x800+4*s_)!=w.dma_smr_old){printf("SWEET WIFI: W9 dma: SMR will not go back to %#x; retained\n",w.dma_smr_old);sweet_log_sync();w.dma_verify_fail++;ok=false;goto out;}
++ w_smmu_wr(w.dma_smmu,0xc00+4*s_,w.dma_s2cr_old);
++ if(w_smmu_rd(w.dma_smmu,0xc00+4*s_)!=w.dma_s2cr_old){printf("SWEET WIFI: W9 dma: S2CR will not go back to %#x; retained\n",w.dma_s2cr_old);sweet_log_sync();w.dma_verify_fail++;ok=false;goto out;}
++ /* Hand the bank back: CBAR 0 and CBA2R 0 are the free state, and exactly what the predicate reads. */
++ w_smmu_wr(w.dma_smmu,0x1000+4*w.dma_bank,w.dma_cbar_old);w_smmu_wr(w.dma_smmu,0x1800+4*w.dma_bank,w.dma_cba2r_old);
++ if(w_smmu_rd(w.dma_smmu,0x1000+4*w.dma_bank)!=w.dma_cbar_old || w_smmu_rd(w.dma_smmu,0x1800+4*w.dma_bank)!=w.dma_cba2r_old){
++  printf("SWEET WIFI: W9 dma: CBAR/CBA2R will not go back to %#x/%#x; the bank stays leased\n",w.dma_cbar_old,w.dma_cba2r_old);
++  sweet_log_sync();w.dma_verify_fail++;ok=false;goto out;
++ }
++ {bool used[W_SMMU_NCB];w9_used(used);
++  if(!w9_bank_free(w.dma_bank,used)){printf("SWEET WIFI: W9 dma: bank %u does not pass the free predicate after the teardown; still leased\n",w.dma_bank);sweet_log_sync();w.dma_verify_fail++;ok=false;goto out;}}
++ w.dma_released=true;w.dma_gfsr_after=w_smmu_rd(w.dma_smmu,0x48);
++ printf("SWEET WIFI: W9 dma: released smr=%u back to %#x/%#x, bank=%u back to CBAR=%#x CBA2R=%#x sctlr=%#x fsr=%#x free=1 sGFSR=%#x\n",
++  s_,(unsigned)w.dma_smr_old,(unsigned)w.dma_s2cr_old,w.dma_bank,(unsigned)w.dma_cbar_old,(unsigned)w.dma_cba2r_old,
++  (unsigned)w_smmu_rd(w.dma_smmu,b),(unsigned)w_smmu_rd(w.dma_smmu,b+0x58),w.dma_gfsr_after);
++ sweet_log_sync();
++out:
++ if(ok){
++  /* Nothing can reach the table any more: the stream faults, the bank is disabled and its TTBRs are zero. */
++  w_unmap(w.dma_smmu,W_SMMU_BYTES);w.dma_smmu=0;
++  if(w.dma_pt_v){kmem_free(kernel_map,w.dma_pt_v,IPA_PT_BYTES);w.dma_pt_v=0;}
++  if(w.dma_ring){kmem_free(kernel_map,w.dma_ring,W9_RING_BYTES);w.dma_ring=0;}
++ }
++ sweet_apps_smmu_release();
++ return ok;
++}
++/* The close line: what this stage installed, what the mission check saw, and what the teardown gave back. One place for the
++ * grader, so a passing boot cannot be read from two lines that disagree. `leaked` is nonzero exactly when a bank, an SMR or
++ * a table is still ours until the next reset. */
++static void w9_close(void){
++ if(!w.dma_asked)return;
++ char g[3][12];
++ bool leased=w.dma_bank!=W9_NONE;
++ if(w.dma_installed)snprintf(g[0],sizeof(g[0]),"%#x",w.dma_gfsr_before);else snprintf(g[0],sizeof(g[0]),"none");
++ if(w.dma_checked)snprintf(g[1],sizeof(g[1]),"%#x",w.dma_gfsr_mission);else snprintf(g[1],sizeof(g[1]),"none");
++ if(w.dma_released)snprintf(g[2],sizeof(g[2]),"%#x",w.dma_gfsr_after);else snprintf(g[2],sizeof(g[2]),"none");
++ unsigned leaked=leased && !w.dma_released;
++ printf("SWEET WIFI: W9 dma close: gate=1 smr=%u bank=%u vmid=%u installed=%u released=%u leaked=%u table=%u doorbell=%u fault_routed=%u verify_fail=%u fsr=%#x sGFSR=%s/%s/%s iova=%#x/%#x\n",
++  leased?w.dma_smr:0u,leased?w.dma_bank:0u,w.dma_vmid,(unsigned)w.dma_installed,(unsigned)w.dma_released,leaked,
++  (unsigned)w.dma_table_ok,(unsigned)w.dma_doorbell,(unsigned)w.dma_fault_routed,w.dma_verify_fail,w.dma_fsr,g[0],g[1],g[2],
++  W9_RING_IOVA,W9_DOORBELL_IOVA);
++ sweet_log_sync();
++}
++
+ /* Linux's order and the reference port's lesson: ask the DSP to stop over SMP2P and wait for its ack before TrustZone
+  * shuts it down. A stop that is not verified keeps the image memory, the metadata, the QMP load state and the votes.
+  *
+@@ -1645,16 +2049,22 @@ static int wpss_run(int gate){
+  /* 2248: W4 opens the edge too, because its client needs it. W3 is the plain edge; W2 is the start alone.
+   * 2249 (W5): sweetwbdf=1 is the same client with the board data download after DEVICE_INFO.
+   * 2250 (W6): sweetwmode=1 is W5's whole exchange with the mode request after init_done, so it needs every part of it. */
+- w.link_asked=(gate==WpssGlink || gate==WpssWlfw || gate==WpssBdf || gate==WpssMode || gate==WpssMission || gate==WpssSmmu);
+- w.wlfw_asked=(gate==WpssWlfw || gate==WpssBdf || gate==WpssMode || gate==WpssMission || gate==WpssSmmu);
+- w.bdf_asked=(gate==WpssBdf || gate==WpssMode || gate==WpssMission || gate==WpssSmmu);
++ w.link_asked=(gate==WpssGlink || gate==WpssWlfw || gate==WpssBdf || gate==WpssMode || gate==WpssMission || gate==WpssSmmu ||
++     gate==WpssDma);
++ w.wlfw_asked=(gate==WpssWlfw || gate==WpssBdf || gate==WpssMode || gate==WpssMission || gate==WpssSmmu || gate==WpssDma);
++ w.bdf_asked=(gate==WpssBdf || gate==WpssMode || gate==WpssMission || gate==WpssSmmu || gate==WpssDma);
+  /* 2250 (W6): this gate adds the mode request and its two indications on top of W5's whole exchange. */
+- w.mode_asked=(gate==WpssMode || gate==WpssMission || gate==WpssSmmu);
++ w.mode_asked=(gate==WpssMode || gate==WpssMission || gate==WpssSmmu || gate==WpssDma);
+  /* 2251 (W7): this gate adds WLAN_INI, WLAN_CFG and mission mode on top of W6's cold-boot mode. It is not a separate line
+   * of work: without the cold-boot mode there is no fw_ready, and without fw_ready ath11k has nothing to start. */
+- w.mission_asked=(gate==WpssMission || gate==WpssSmmu);
++ w.mission_asked=(gate==WpssMission || gate==WpssSmmu || gate==WpssDma);
+  /* 2252 (W8 survey): W7's run, plus three read-only apps_smmu snapshots. */
+  w.smmu_asked=(gate==WpssSmmu);
++ /* 2253 (W9): W7's run again, with the WLAN device's own DMA translation installed for its whole length and released after
++  * the verified stop. W8's read-only snapshots are not part of it: they answer a question (what is free) that W9 has
++  * already used, and their `after` snapshot would read the SMMU after this stage's teardown, which the W9 close line's own
++  * free-predicate check already covers. */
++ w.dma_asked=(gate==WpssDma);
+  /* 2249: this gate's dwell. W4's 20 s is what its audit sized; a board file is 41 pieces plus a 10 s init_done wait, so
+   * W5's own dwell is 35 s. It is set here, before any deadline can read it, and nothing else changes.
+   * 2250: W6's is 60 s, for the mode request after the board data and a calibration wait of up to 20 s. 2251 (W7): 75 s,
+@@ -1662,10 +2072,19 @@ static int wpss_run(int gate){
+   * timing moves. */
+  w.dwell_ms=w.mission_asked?W_MISSION_DWELL_MS:(w.mode_asked?W_MODE_DWELL_MS:(w.bdf_asked?W_BDF_DWELL_MS:W_DWELL_MS));
+  struct wl_fat f;
++ /* 2253 (W9): the one SMR and bank this stage leases start as nothing, so a teardown on a failed install does nothing. */
++ w.dma_bank=w.dma_smr=W9_NONE;
++ int rc=0;
+  /* 2252: the first snapshot, before anything of the WPSS is touched. It is also the canary for the later two: they make
+   * the same reads, so if any of them could abort, it aborts here, with no DSP running. */
+  w_smmu_survey(0);
+- int rc=w_open_image(&f);if(rc)goto out;
++ /* 2253 (W9): the WLAN device's DMA translation, installed before the firmware is even read, so the whole run below happens
++  * with it in place: the start, the edge, the WLFW exchange, the board data, mission mode and the verified stop. Nothing
++  * here gives the firmware a host address, so the device stays off the bus; what the boot proves is that the hypervisor
++  * accepts the SMR and the bank, that the bank holds its configuration, and that the teardown gives all of it back. A
++  * failed install is a hard stop before any WPSS work: a run that continued would be one no stage describes. */
++ if(w.dma_asked && (rc=w9_install()))goto out;
++ if((rc=w_open_image(&f)))goto out;
+  /* 2243: the sleep clock before any WPSS work (Fairphone's mainline enablement: without it the WPSS keeps crashing). */
+  if((rc=wpss_gpio5_set()))goto out;
+  w.smem=ml_io_map_unmappable(W_SM_PA,W_SM_SIZE,VM_WIMG_IO);
+@@ -1713,15 +2132,23 @@ static int wpss_run(int gate){
+  /* 2252: the second snapshot, after the mission sequence (the hold and the mode-off are inside the dwell) and before the
+   * stop. Only on the healthy path: any failure goes straight to the stop, and the third snapshot still runs after it. */
+  if(!rc)w_smmu_survey(1);
++ /* 2253 (W9): the same point, the read-only check that the lease is still exactly what was installed while the firmware
++  * has been in mission mode. Its own line, so the bank's FSR and the global status are reported even if the survey above
++  * was skipped. */
++ if(!rc)w9_check();
+ out:
+  printf("SWEET WIFI: W2 run end error=%d ready=%u handover=%u fatal=%u\n",rc,!!(w.state&2),!!(w.state&4),w.fatal);sweet_log_sync();
+  /* 2244: before giving up, read what the hardware says, so the next boot does not have to guess whether the DSP bit
+   * its watchdog or simply never spoke. Read only: no GIC write, no SMEM write, no PAS call. Only after a start was
+   * attempted, and only when something went wrong. */
+  if(rc || !(w.state&2))w_state_probe();
+- if(!w_cleanup())rc=EIO;
++ bool stopped=w_cleanup();if(!stopped)rc=EIO;
+  /* 2252: the third snapshot, after the verified stop (or the unverified one: reading the SMMU changes nothing either way). */
+  w_smmu_survey(2);w_smmu_close();
++ /* 2253 (W9): the teardown, and only after the DSP's own stop is verified: a bank is not handed back while a device that
++  * routes through it may still be running. Its failure is a cleanup failure, which final_error reports. */
++ if(w.dma_asked && !w9_release(stopped))rc=EIO;
++ w9_close();
+  return rc;
+ }
+ /* 2240 sweetwprobe=1: maps only SMEM and cmd-db and reads them; reads and validates the firmware chain from modem_a.

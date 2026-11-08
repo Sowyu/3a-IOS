@@ -1,0 +1,181 @@
+2360: Sandbox op 4 (sandbox_container_path_for_pid) answers an app extension asking about itself.
+
+PlugInKit's -[PKService checkEnvironment:] (iOS 26.6) raises "plugin has invalid sandbox or container" in every
+app extension unless sandbox_container_path_for_pid(getpid()) succeeds with a non-empty path. Our Sandbox
+stand-in answered op 4 with ENOENT for everyone, so SweetShareAction aborted 15 ms after exec (ast240).
+Boot-arg sweetappexhome=1, default 0 (byte-for-byte the old ENOENT path). With it, only a self query from an
+executable inside an .appex under /private/var/containers/Bundle/Application/ is answered, with its own HOME
+from its argument area, and only if that HOME is /private/var/mobile/Containers/Data/PluginKitPlugin/<UUID>.
+Review: plans/apps/review-request-9.md. Base: research/xnu-daily-c0 (sweet_amfi.c identical in every daily tree).
+
+--- a/bsd/kern/sweet_amfi.c	2026-11-06 03:55:43
++++ b/bsd/kern/sweet_amfi.c	2026-11-06 04:17:51
+@@ -31,6 +31,8 @@
+ #include <sys/mount.h>
+ #include <sys/priv.h>
+ #include <sys/proc.h>
++#include <sys/proc_internal.h>
++#include <sys/proc_private.h>
+ #include <sys/persona.h>
+ #include <sys/systm.h>
+ #include <sys/ubc_internal.h>
+@@ -383,8 +385,148 @@
+ 	for (int i = 0; error == 0 && i < 2; i++) {
+ 		if (out[i] != 0) {
+ 			error = copyout(&zero, out[i], sizeof(zero));
++		}
++	}
++	return error;
++}
++
++/*
++ * Op 4, sandbox_container_path_for_pid/audit_token (libsystem_sandbox, iOS 26, disassembled): five 64-bit words,
++ * { pid (0: self), 0, buffer, size, 0 } or { token pid, token pidversion, buffer, size, 1 }. 0 with the NUL-ended
++ * path in the buffer means "in this container"; -1 (any error) means "not in a container".
++ *
++ * Boot-arg sweetappexhome=1 (default 0: every query gets ENOENT, as before). PlugInKit's
++ * -[PKService checkEnvironment:] runs in every app extension before it serves a request and raises "plugin has
++ * invalid sandbox or container: error %d path %s" unless its own query succeeds with a path longer than one
++ * byte (SweetShareAction, ast240). With the arg set, only a process asking about itself, whose executable is in
++ * an .appex under /private/var/containers/Bundle/Application/, gets an answer: its HOME as launchd started it,
++ * read from its own argument area, if HOME is a PluginKitPlugin data container. Every other query, including
++ * any about another process, still gets ENOENT. The answer only goes to the process it describes, which already
++ * has its HOME, so it grants nothing; the path checks only keep apps and system processes on the old answer.
++ */
++static TUNABLE(uint32_t, sweet_appex_home, "sweetappexhome", 0);
++
++#define SWEET_BUNDLE_APPS       "/private/var/containers/Bundle/Application/"
++#define SWEET_PLUGIN_HOME       "/private/var/mobile/Containers/Data/PluginKitPlugin/"
++#define SWEET_ARGS_MAX          (64 * 1024)
++
++/*
++ * .../X.app/PlugIns/Y.appex/<executable>: both parts, in that order, and the extension must be the
++ * directory the executable sits in. An app whose own name happens to contain ".appex/" (a bundle
++ * literally called Foo.appex.app, with its own PlugIns) cannot satisfy this on its own.
++ */
++static bool
++sweet_appex_path_ok(const char *path)
++{
++	if (strncmp(path, SWEET_BUNDLE_APPS, strlen(SWEET_BUNDLE_APPS)) != 0) {
++		return false;
++	}
++	const char *plug = strnstr(path, ".app/PlugIns/", MAXPATHLEN);
++	const char *appex = strnstr(path, ".appex/", MAXPATHLEN);
++	return plug != NULL && appex != NULL && plug < appex &&
++	    strchr(appex + strlen(".appex/"), '/') == NULL;
++}
++
++/* p's executable is .../Bundle/Application/<UUID>/X.app/PlugIns/Y.appex/Z (path of the vnode, not of argv). */
++static bool
++sweet_proc_is_appex(struct proc *p)
++{
++	vnode_t vp = proc_getexecutablevnode(p);
++	if (vp == NULLVP) {
++		return false;
++	}
++	char *path = zalloc(ZV_NAMEI);
++	int len = MAXPATHLEN;
++	bool ok = vn_getpath(vp, path, &len) == 0 && sweet_appex_path_ok(path);
++	zfree(ZV_NAMEI, path);
++	vnode_put(vp);
++	return ok;
++}
++
++/* "/private/var/mobile/Containers/Data/PluginKitPlugin/" followed by exactly one UUID. */
++static bool
++sweet_plugin_home_ok(const char *h)
++{
++	size_t n = strlen(SWEET_PLUGIN_HOME);
++	if (strncmp(h, SWEET_PLUGIN_HOME, n) != 0 || strlen(h) != n + 36) {
++		return false;
++	}
++	for (size_t i = 0; i < 36; i++) {
++		char c = h[n + i];
++		bool dash = i == 8 || i == 13 || i == 18 || i == 23;
++		if (dash ? c != '-' : !((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f'))) {
++			return false;
++		}
++	}
++	return true;
++}
++
++/*
++ * HOME from the caller's own argument area (exec_copyout_strings): "executable_path=..." and its padding NULs,
++ * then argc argv strings, then the environment and the apple strings. Copies at most SWEET_ARGS_MAX bytes into
++ * home (MAXPATHLEN). The caller is p itself, so copyin reads p's map.
++ */
++static bool
++sweet_own_home(struct proc *p, char *home)
++{
++	/* exec sets user_stack in create_unix_stack (kern_exec.c) and p_argslen/p_argc later in
++	 * exec_copyout_strings, each under its own proc_lock hold, so even one hold here can pair a new
++	 * stack with an old length (review 10, A3). The bound and the HOME parse below turn that into a
++	 * refusal (ENOENT, as before), never a wrong container. */
++	proc_lock(p);
++	user_addr_t stack = p->user_stack;
++	size_t len = p->p_argslen;
++	int argc = p->p_argc;
++	proc_unlock(p);
++	if (stack == 0 || len == 0 || len > SWEET_ARGS_MAX || argc < 0) {
++		return false;
++	}
++	char *a = kalloc_data(len + 1, Z_WAITOK | Z_ZERO);
++	if (a == NULL) {
++		return false;
++	}
++	bool found = false;
++	if (copyin(stack - len, a, len) == 0) {
++		a[len] = '\0';
++		size_t o = strnlen(a, len);
++		while (o < len && a[o] == '\0') {
++			o++;
+ 		}
++		for (int i = 0; i < argc && o < len; i++) {
++			o += strnlen(a + o, len - o) + 1;
++		}
++		while (o < len && !found) {
++			size_t n = strnlen(a + o, len - o);
++			if (n > 5 && n < MAXPATHLEN + 5 && strncmp(a + o, "HOME=", 5) == 0) {
++				strlcpy(home, a + o + 5, MAXPATHLEN);
++				found = true;
++			}
++			o += n + 1;
++		}
++	}
++	kfree_data(a, len + 1);
++	return found;
++}
++
++static int
++sweet_sandbox_container_path(struct proc *p, user_addr_t arg)
++{
++	uint64_t a[5];
++	if (!sweet_appex_home || copyin(arg, a, sizeof(a)) != 0) {
++		return ENOENT;
++	}
++	bool self = a[4] == 0 ? (a[0] == 0 || a[0] == (uint64_t)proc_pid(p)) :
++	    (a[4] == 1 && a[0] == (uint64_t)proc_pid(p) && a[1] == (uint64_t)proc_pidversion(p));
++	if (!self || a[2] == 0 || !sweet_proc_is_appex(p)) {
++		return ENOENT;
++	}
++	char *home = zalloc(ZV_NAMEI);
++	int error = ENOENT;
++	if (sweet_own_home(p, home) && sweet_plugin_home_ok(home)) {
++		size_t n = strlen(home) + 1;
++		error = n <= a[3] ? copyout(home, (user_addr_t)a[2], n) : ERANGE;
+ 	}
++	zfree(ZV_NAMEI, home);
+ 	return error;
+ }
+ 
+@@ -404,8 +524,8 @@
+ 		return sweet_sandbox_extension_consume(arg);
+ 	case SWEET_SBX_OP_CONTAINER_EXPECTED:
+ 		return sweet_sandbox_container_expected(arg);
+-	case 4:         /* container path (audit token / pid): "not in a container" */
+-		return ENOENT;
++	case 4:         /* container path (audit token / pid): "not in a container", except an extension asking about itself */
++		return sweet_sandbox_container_path(p, arg);
+ 	default:
+ 		return 0;
+ 	}

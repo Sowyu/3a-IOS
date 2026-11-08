@@ -1,0 +1,165 @@
+SWEET AKS: a turn-off tells SpringBoard too, so the keypad goes away (2325b)
+
+2325 made a set tell SpringBoard that a passcode exists: spc_lock_set raises SPC_EV_UNLOCKED as well as
+SPC_EV_PASSCODE_CHANGED when a set leaves the session unlocked, and 0xd00d (AKSEvent 1) is what makes
+SBFMobileKeyBag re-read the lock state. It missed the same change in the other direction. A turn-off runs
+spc_lock_set with an empty code, `l->have_code` becomes false, and the guard `l->have_code && !l->unlocked` is
+false, so only 0xd010 (AKSEvent 3) went out. SpringBoard's interest block returns on event 3 (0x1c16ec104), so its
+cached has-passcode byte at +0x30 stayed 1 and the lock screen kept asking for a code that no longer existed until
+SpringBoard restarted. On the phone that is a nuisance, not a lockout: any code opens it.
+
+The mechanism, from the 26.6.2 cache (dcache.py, DSC_DIR on research/ios26/dsc):
+
+  -_queue_handleKeybagStatusChanged (0x1c16ec1c4) is still the only writer of the byte outside init. It calls
+  -_queue_lockStateExtended: (a fresh kernel read, selector 17) and then -_queue_setHasPasscodeIfNecessary:
+  (0x1c16ec364), which is three instructions: objc_msgSend[lockState], `cmp x0,#3`, `cset w8,ne`, `strb w8,[x19,#0x30]`.
+  So the byte is `sls != 3`, and once the code is gone the kernel already answers sls 3 (SPC_LS_NO_PASSCODE). The
+  value is right; only the refresh is missing, which is the same defect 2325 fixed for a set.
+  SBFMobileKeyBag's interest block (0x1c16ec08c) reaches that method only through AKSEvent 1, which is 0xd00d.
+  AppleKeyStore.framework's chain (0x1e4ae45f4) maps 0xd00d -> 1 and 0xd010 -> 3, so 0xd010 cannot refresh the byte
+  whatever the state says. Reading the event table again, 0xd00f is event 0 and its arm only sets +0x31 and calls
+  -_queue_firstUnlockOccurred; it does not touch +0x30 either. 0xd00d is the only message that works, and it needs
+  no argument: the framework passes the client a dictionary it builds from the kernel, never the message payload.
+
+- SweetPasscode.c, spc_lock_set: a call that changes `have_code` in either direction now raises SPC_EV_UNLOCKED.
+  `had_code` is read before the write, next to `first`, so the clear compares the state before the write with the
+  state after it rather than with a value it has already changed. The clear also drops `l->unlocked`: with no code
+  there is no open session to describe, and leaving it true would make the next set's guard fail, so a set after a
+  turn-off would be silent and the byte would stay 0 on a phone with a brand-new code.
+- SweetPasscode.h: the contract above, on spc_lock_set's declaration.
+- SweetKeyStore.cpp: comments only, no code. The table and the event map are unchanged: the map already lists
+  SPC_EV_UNLOCKED before SPC_EV_PASSCODE_CHANGED, so the 0xd00d of a turn-off goes out before its 0xd010. The
+  comment block now names 0xd013 (event 6, the one type that does read its argument, which the kernel never sends),
+  drops the wrong claim that 0xd00f reads its argument, and says what a turn-off sends and why.
+
+The defect and this fix were both measured, not reasoned about. With `shim_msg_clear()` added before the turn-off,
+2325's own `sb_turn_off` test fails at line 364 (`!kb.has_passcode`) with the one message logged being 0xe3ffd010,
+AKSEvent 3. That is the audit's reproduction, and it is now a permanent control: check-2325.py rebuilds 2325's test
+verbatim, puts 2325's clear back, and requires the run to PASS, so the blindness cannot come back unnoticed.
+
+Host: check-2325.py runs springboard_test.c against the real SweetKeyStore.cpp. 76 assertions in 8 tests (was 59 in
+7): the turn-off clears the log first and asserts it sends exactly 0xd00d then 0xd010 and that the byte's writer ran
+once; a new `set off set` test proves the second set refreshes the byte again. 20 checks: 8 source, 11 negative
+controls and the blindness control, every one caught. 2324's 147 two-phase and 89 selector checks are unchanged.
+
+Not changed: the stub, every selector's arguments and answers, the two-phase stage and commit, the lock-state word,
+the entitlement, root, and the count-before-hash ordering. 2325's set path is byte-for-byte what it was except for
+the comment; the only new behaviour is on a call that changes `have_code` to false.
+
+Needs 2321, 2322, 2323, 2323b, 2324 and 2325. Security code: plans/passcode/audit-brief-lock2.md is the audit brief
+for the rebuilt image, and no image should boot until that audit is a GO.
+
+Check: python3 -I plans/passcode/tools/check-2325.py XNU_DIR (20 checks)
+       python3 -I plans/passcode/tools/check-lock.py XNU_DIR (2321/2322)
+       python3 -I plans/passcode/tools/check-2phase.py XNU_DIR (2324)
+       python3 -I plans/passcode/tools/test_turnon.py plans/passcode/tools/turnon.py (21 cases)
+Apply: git apply -p1 in the kernel tree, after 2321, 2322, 2323, 2323b, 2324 and 2325.
+diff --git a/bsd/dev/SweetPasscode.c b/bsd/dev/SweetPasscode.c
+--- a/bsd/dev/SweetPasscode.c
++++ b/bsd/dev/SweetPasscode.c
+@@ -816,6 +816,7 @@
+ 	struct spc_state next;
+ 	int err;
+ 	bool first;
++	bool had_code;
+ 
+ 	spc_lock_load(l);
+ 	if (new_len > SPC_SECRET_MAX) {
+@@ -851,6 +852,7 @@
+ 	}
+ 
+ 	first = !l->have_code && next.set;
++	had_code = l->have_code;
+ 	err = first ? lock_persist_state_both(l, &next) : lock_persist_state(l, &next);
+ 	if (err != 0) {
+ 		spc_wipe(&next, sizeof(next));
+@@ -869,12 +871,22 @@
+ 	 *
+ 	 * 2325: and it must tell SpringBoard so. A real keystore's lock state changes at this point, and every
+ 	 * SBFMobileKeyBag client (SpringBoard, Preferences, LocalAuthentication) refreshes its cached has-passcode byte
+-	 * from a MobileKeyBag "unlocked" event, so the set reports unlocked as well as "passcode changed". Without the
+-	 * unlocked half the byte stays 0 and the lock screen never asks for the code (ast253).
++	 * from the AKSEvents "unlocked" notification, so the set reports unlocked as well as "passcode changed". Without
++	 * the unlocked half the byte stays 0 and the lock screen never asks for the code (ast253).
++	 *
++	 * 2325b: a turn-off is the same lock-state change in the other direction, and it needs the same notification.
++	 * SBFMobileKeyBag's byte is `lockState != 3`, so once the code is gone it has to go back to 0, and only the
++	 * unlocked notification runs -_queue_handleKeybagStatusChanged, which is the only thing that re-reads it. A
++	 * clear that sent "passcode changed" alone (AKSEvent 3) left the byte at 1, so the lock screen kept asking for
++	 * a code that no longer existed. The clear also drops `unlocked`: with no code there is no session to be open,
++	 * and the next set has to report unlocked again, or the byte would stop being refreshed after a set-off-set.
+ 	 */
+ 	if (l->have_code && !l->unlocked) {
+ 		l->unlocked = true;
+ 		ev->on[SPC_EV_UNLOCKED] = true;
++	} else if (had_code && !l->have_code) {
++		l->unlocked = false;
++		ev->on[SPC_EV_UNLOCKED] = true;
+ 	}
+ 	ev->on[SPC_EV_PASSCODE_CHANGED] = true;
+ 	return SPC_TRY_OK;
+diff --git a/bsd/dev/SweetPasscode.h b/bsd/dev/SweetPasscode.h
+--- a/bsd/dev/SweetPasscode.h
++++ b/bsd/dev/SweetPasscode.h
+@@ -204,6 +204,10 @@
+  * Set (new_len > 0) or clear (new_len == 0) the code. With a code already set, the old one has to verify unless
+  * `force` is set, which the kernel passes only for uid 0. The new record is built in a local copy and swapped in only
+  * after the write succeeds, so memory and disk cannot disagree.
++ *
++ * 2325b: a call that changes `have_code` in either direction raises SPC_EV_UNLOCKED, because that is the event whose
++ * handler re-reads the lock state, and SpringBoard's cached has-passcode byte is derived from it. A turn-off that
++ * only raised SPC_EV_PASSCODE_CHANGED left that byte at 1 and the lock screen kept asking for a code that was gone.
+  */
+ enum spc_try spc_lock_set(struct spc_lock *l, const uint8_t *old, size_t old_len,
+     const uint8_t *new_code, size_t new_len, bool force, struct spc_events *ev);
+diff --git a/iokit/Kernel/arm/SweetKeyStore.cpp b/iokit/Kernel/arm/SweetKeyStore.cpp
+--- a/iokit/Kernel/arm/SweetKeyStore.cpp
++++ b/iokit/Kernel/arm/SweetKeyStore.cpp
+@@ -98,11 +98,15 @@
+  *
+  *   0xd00c locked      -> AKSEvent 4
+  *   0xd00d unlocked    -> AKSEvent 1
+- *   0xd00f first unlock-> AKSEvent 0, and it reads the message argument
++ *   0xd00f first unlock-> AKSEvent 0
+  *   0xd010 changed     -> AKSEvent 3
+  *   0xd011 failed      -> AKSEvent 2
+  *   0xd012 backoff     -> AKSEvent 5
+  *
++ * 0xd013 is a seventh type the chain tests first (0x1e4ae4498). It becomes AKSEvent 6 and it is the only one that
++ * reads the message argument: `ldr w22,[x21]` and `ldrb w2,[x21,#4]` at 0x1e4ae44a0 and 0x1e4ae44cc, with no NULL
++ * check. We never send it, and must not without a real argument.
++ *
+  * MobileKeyBag.framework's own aksNotificationCB (0x1cb44e7bc), registered by MKBEventsRegister (0x1cb44ecec),
+  * understands only two types and drops the rest at 0x1cb44e870: 0xd00d as MKB event 1 and 0xd00f as MKB event 0.
+  *
+@@ -129,8 +133,9 @@
+  *   so the only route to selectors 8 and 32: 0 and 0 in ast253, against 11 and 2 on the stub, where sls read 0
+  *   (SPC_LS_UNLOCKED, so the byte was 1 from init) rather than 3.
+  *
+- * A set that commits therefore sends 0xd00d as well as 0xd010. 0xd00c is not sent at that moment: nothing is locked,
+- * and the cover sheet is driven in-process.
++ * A set that commits therefore sends 0xd00d as well as 0xd010, and so does a turn-off (2325b): the byte has to go
++ * back to 0 once the code is gone, and 0xd00d is the only message whose event re-reads it. 0xd00c is not sent at
++ * either moment: at a set nothing is locked, at a turn-off there is nothing left to lock.
+  */
+ #define SWEET_AKS_MSG_LOCKED            0xe3ffd00cu
+ #define SWEET_AKS_MSG_UNLOCKED          0xe3ffd00du
+@@ -337,10 +342,14 @@
+ 
+ /*
+  * 2325: order matters on this path, and only for one pair. SBFMobileKeyBag refreshes its cached has-passcode byte
+- * only from the interest event that runs -_queue_handleKeybagStatusChanged, which is 0xd00d's event, so a set that
+- * reports both "unlocked" and "passcode changed" must send unlocked first: the byte has to be true before anything
+- * downstream reads it. The map is walked in order, so SPC_EV_UNLOCKED is listed before SPC_EV_PASSCODE_CHANGED, and
+- * the host check asserts the order rather than leaving it to the table's layout.
++ * only from the interest event that runs -_queue_handleKeybagStatusChanged, which is 0xd00d's event, so a set or a
++ * turn-off that reports both "unlocked" and "passcode changed" must send unlocked first: the byte has to be right
++ * before anything downstream reads it. The map is walked in order, so SPC_EV_UNLOCKED is listed before
++ * SPC_EV_PASSCODE_CHANGED, and the host check asserts the order rather than leaving it to the table's layout.
++ *
++ * 2325b: the same message carries a turn-off. `unlocked` here means "the lock state has just changed", not "the
++ * session is open": SBFMobileKeyBag reads the state again and stores `lockState != 3`, which is 0 once the code is
++ * gone. Nothing is unlocked by one.
+  */
+ static void
+ pc_send_events(uint32_t bits)

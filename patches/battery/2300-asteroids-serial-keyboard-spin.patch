@@ -1,0 +1,40 @@
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -119,6 +119,18 @@
+ static void
+ register_serial_functions(struct pe_serial_functions *fns)
+ {
++	/*
++	 * 2300: registering a device twice would point its next at itself, and every walk of the list
++	 * (uart_getc, uart_putc_options, serial_init's re-init) would then loop forever. That happened on
++	 * asteroids: serial_init() registers sweet-fbcon, returns early with uart_initted still false because
++	 * the device tree has no serial-device, and PE_init_kprintf calls serial_init() again. The serial
++	 * keyboard thread then spun in uart_getc at MAXPRI_KERNEL, a full A520 (ast197, ast203).
++	 */
++	for (struct pe_serial_functions *p = gPESF; p != NULL; p = p->next) {
++		if (p == fns) {
++			return;
++		}
++	}
+ 	fns->next = gPESF;
+ 	gPESF = fns;
+ }
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -637,6 +637,16 @@
+ 	if (kern_feature_override(KF_SERIAL_OVRD)) {
+ 		serialmode = 0;
+ 	}
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * 2300: no serial device was enumerated (asteroids: only the output-only sweet-fbcon), so there is
++	 * nothing to read. Without this, serial=3 still starts serial_keyboard_poll at MAXPRI_KERNEL, waking
++	 * every 16 ms for good; output is already gated on serial_exists below.
++	 */
++	if (!serial_exists) {
++		serialmode &= ~SERIALMODE_INPUT;
++	}
++#endif
+ 
+ 	/* Start serial if requested and a serial device was enumerated in serial_init(). */
+ 	if ((serialmode & SERIALMODE_OUTPUT) && serial_exists) {

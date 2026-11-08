@@ -1,0 +1,31 @@
+--- a/bsd/dev/battery/AdspRuntime.inc
++++ b/bsd/dev/battery/AdspRuntime.inc
+@@ -134,6 +134,9 @@
+  __asm__ volatile("dsb sy":::"memory");
+  rc=m_pas(im->pas,5,1,0,0);if(!rc)im->started=true;return rc;
+ }
++/* io_map maps trunc_page(pa) for round_page(bytes+offset) and returns the offset
++ * address. pmap_remove panics on an unaligned range (ast188: qmpmem 0x400). */
++static void m_unmap(vm_offset_t va,vm_size_t bytes){vm_offset_t off=va&PAGE_MASK;ml_io_unmap(va-off,round_page(bytes+off));}
+ static bool adsp_cleanup(void){
+  battery_snapshot_clear();
+  if(m.images[1].started && m.sp.out){
+@@ -157,13 +160,13 @@
+  if(m.qmp_owed && m_qsend(false)){printf("SWEET BATTERY: B2 cleanup incomplete: QMP release\n");return false;}
+  for(unsigned i=0;i<2;i++){
+   struct adsp_image *im=&m.images[i];
+-  if(im->mapping)ml_io_unmap(im->mapping,im->bytes);
+-  if(im->metadata)ml_io_unmap(im->metadata,META_MAX);
++  if(im->mapping)m_unmap(im->mapping,im->bytes);
++  if(im->metadata)m_unmap(im->metadata,META_MAX);
+   if(im->mdt)kfree_data(im->mdt,im->mdt_bytes);
+  }
+- if(m.db)ml_io_unmap(m.db,0x20000);if(m.rsc)ml_io_unmap(m.rsc,0x4000);
+- if(m.qmpmem)ml_io_unmap(m.qmpmem,0x400);if(m.ipcc)ml_io_unmap(m.ipcc,0x1000);
+- if(m.mutex)ml_io_unmap(m.mutex,0x1000);if(m.smem)ml_io_unmap(m.smem,M_SM_SIZE);
++ if(m.db)m_unmap(m.db,0x20000);if(m.rsc)m_unmap(m.rsc,0x4000);
++ if(m.qmpmem)m_unmap(m.qmpmem,0x400);if(m.ipcc)m_unmap(m.ipcc,0x1000);
++ if(m.mutex)m_unmap(m.mutex,0x1000);if(m.smem)m_unmap(m.smem,M_SM_SIZE);
+  printf("SWEET BATTERY: B2 STOP verified; cleanup=ok; shared XO retained until reset=%u\n",m.xo_pinned);
+  sweet_log_sync();return true;
+ }

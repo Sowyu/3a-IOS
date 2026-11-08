@@ -1,0 +1,250 @@
+diff --git a/bsd/dev/sweet_wpss.c b/bsd/dev/sweet_wpss.c
+index 71b1b33d9..5373a7066 100644
+--- a/bsd/dev/sweet_wpss.c
++++ b/bsd/dev/sweet_wpss.c
+@@ -24,7 +24,11 @@ static void wpss_worker(void *arg,wait_result_t wait){
+   printf("SWEET WIFI: W1 survey complete; PAS6 untouched; no writes but the SPMI observer read command word\n");
+  } else if(arg==(void *)WpssPin){
+   int rc=wpss_gpio5_set();printf("SWEET WIFI: W1c done result=%d; PAS6 untouched\n",rc);
+- } else printf("SWEET WIFI: W2 worker final_error=%d\n",wpss_run());
++ } else if(arg==(void *)WpssGlink){
++  /* 2246: W3. Same start as W2b, plus the GLINK and QRTR edge, nothing sent on it. */
++  printf("SWEET WIFI: W3 worker begin; WPSS start plus the GLINK/QRTR edge\n");sweet_log_sync();
++  printf("SWEET WIFI: W2 worker final_error=%d\n",wpss_run(WpssGlink));
++ } else printf("SWEET WIFI: W2 worker final_error=%d\n",wpss_run(WpssStart));
+  sweet_log_sync();thread_terminate(current_thread());
+ }
+ /* Once per boot: the WPSS is never started a second time in one boot. */
+diff --git a/bsd/dev/wifi/WpssGate.h b/bsd/dev/wifi/WpssGate.h
+index a2bec9b21..a0cc9d54f 100644
+--- a/bsd/dev/wifi/WpssGate.h
++++ b/bsd/dev/wifi/WpssGate.h
+@@ -5,7 +5,10 @@
+ #define WPSS_GATE_H
+ #include "../modem/ModemGate.h"
+ /* 2243: sweetwpin=1 (W1c) sets the sleep-clock pin and verifies it, with no WPSS start; same safeguards as sweetwpss. */
+-enum {WpssOff=0,WpssSurvey=1,WpssStart=2,WpssPin=3,WpssRefused=-1};
++/* 2246: sweetwglink=1 is W3, the WPSS edge with GLINK and QRTR up and nothing sent on them. It is the first Wi-Fi gate that
++ * is ALLOWED to run beside the daily preset, because proving coexistence is its whole purpose; it refuses the other Wi-Fi
++ * probes and nothing else. Every gate that starts the DSP still needs the same three safeguards. */
++enum {WpssOff=0,WpssSurvey=1,WpssStart=2,WpssPin=3,WpssGlink=4,WpssRefused=-1};
+ /* Refused in any form: the presets, the battery's own gates, and every modem, IPA and battery-test gate ModemGate.h lists
+  * (modem_cell_gates, modem_cell_refused, modem_daily_refused), so the list cannot fall behind it. */
+ static const char *const wpss_refused[5]={"sweetdaily","sweetcell","sweetbatt","sweetbmeter","sweetbprobe"};
+@@ -18,8 +21,25 @@ static inline int wpss_conflict(const char *args){
+ }
+ static inline int wpss_gate(const char *args,int deadman){
+     unsigned probe=modem_arg_count(args,"sweetwprobe"),start=modem_arg_count(args,"sweetwpss"),pin=modem_arg_count(args,"sweetwpin");
+-    if(!probe && !start && !pin)return WpssOff;
+-    if((probe!=0)+(start!=0)+(pin!=0)>1)return WpssRefused;
++    unsigned glink=modem_arg_count(args,"sweetwglink");
++    if(!probe && !start && !pin && !glink)return WpssOff;
++    if((probe!=0)+(start!=0)+(pin!=0)+(glink!=0)>1)return WpssRefused;
++    /* 2246: W3 is the coexistence gate. It is the one Wi-Fi gate allowed beside a preset, because proving coexistence is its
++     * whole purpose, so sweetdaily=1 or sweetcell=1 may be present and the preset decides its own members. Every member and
++     * probe token named literally is refused instead: a preset plus one of its own members is an invalid preset
++     * (ModemGate.h's modem_daily/modem_cell return 0 for it), so it must not be read as a valid daily boot either. Two
++     * presets at once are refused too. */
++    if(glink){
++        if(!modem_arg_is(args,"sweetwglink","1"))return WpssRefused;
++        if(modem_arg_count(args,"sweetdaily") && modem_arg_count(args,"sweetcell"))return WpssRefused;
++        if(modem_arg_count(args,"sweetbatt") || modem_arg_count(args,"sweetbmeter") || modem_arg_count(args,"sweetbprobe"))return WpssRefused;
++        for(unsigned i=0;i<14;i++)if(modem_arg_count(args,modem_cell_gates[i]))return WpssRefused;
++        for(unsigned i=0;i<8;i++)if(modem_arg_count(args,modem_cell_refused[i]))return WpssRefused;
++        for(unsigned i=0;i<5;i++)if(modem_arg_count(args,modem_daily_refused[i]))return WpssRefused;
++        if(modem_arg_is(args,"sweetwprobe","1") || modem_arg_is(args,"sweetwpin","1") || modem_arg_is(args,"sweetwpss","1"))return WpssRefused;
++        if(!modem_gate(args,"sweetfbarm") || !modem_gate(args,"sweetselftest") || deadman!=600)return WpssRefused;
++        return WpssGlink;
++    }
+     if(wpss_conflict(args))return WpssRefused;
+     if(probe)return modem_arg_is(args,"sweetwprobe","1")?WpssSurvey:WpssRefused;
+     if(!modem_arg_is(args,pin?"sweetwpin":"sweetwpss","1") || !modem_gate(args,"sweetfbarm") || !modem_gate(args,"sweetselftest") || deadman!=600)
+diff --git a/bsd/dev/wifi/WpssRuntime.inc b/bsd/dev/wifi/WpssRuntime.inc
+index ff6766096..97d70bd25 100644
+--- a/bsd/dev/wifi/WpssRuntime.inc
++++ b/bsd/dev/wifi/WpssRuntime.inc
+@@ -35,9 +35,14 @@ extern int sweet_ufs_part_size(const char *,uint8_t *,uint64_t *);
+ #include "../modem/QcomQmp.h"
+ #include "../modem/QcomRpmh.h"
+ #include "../modem/QcomScm.h"
++/* 2246 (W3): the same GLINK and QRTR the battery and modem paths use, one instance on the WPSS edge. */
++#include "../modem/QcomGlink.h"
++#include "../modem/QcomQrtr.h"
+ #define ADSP_FW_LOG "SWEET WIFI"
+ #include "../battery/AdspFirmware.inc"
+ static int adsp_part_read(uint64_t off,void *dst,uint64_t bytes){return sweet_ufs_read_part("modem_a",off,dst,bytes);}
++/* 2246: defined with the rest of the W3 link code further down; w_cleanup runs before it in the file. */
++static void w_glink_close(void);
+ 
+ #define W_SM_PA 0x81d00000u
+ #define W_SM_SIZE 0x200000u
+@@ -76,6 +81,12 @@ static struct {
+  uint32_t state,rail_addr[2],rail_index[2],xo_addr;
+  bool fatal,voted,vote_uncertain,qmp_owed,owed,started;
+  bool smp_absent,smp_valid;
++ /* 2246 (W3): the WPSS edge's GLINK and QRTR, on the same partition and the same IPCC client as SMP2P, a different signal.
++  * link_asked is the gate: only sweetwglink=1 sets it, so every earlier boot behaves exactly as it did. */
++ QcomGlink gl;QcomQrtr qr;QcomGlinkChannel *glch;
++ bool link_asked,link_started,glink_up,qr_started,glink_broken;
++ uint32_t desc_off,our_fifo_off,their_fifo_off;
++ uint64_t link_began;
+  int master;
+  uint8_t *mdt;uint32_t mdt_bytes;
+  vm_offset_t mapping,metadata;uint64_t meta_pa;
+@@ -338,8 +349,11 @@ static void w_state_probe(void){
+  * kernel did not survive the next second. A cleanup whose evidence can be swallowed is a cleanup nobody can grade.
+  * The wait is also bounded by whether the DSP ever said it was up: a DSP that never reported ready cannot answer a
+  * stop request, so 3 s of waiting is 3 s of a wedged DSP still running with its watchdog armed. */
++/* 2246: the link goes down before the DSP is asked to stop, so the DSP sees IPCRTR close first, as its own teardown
++ * order expects. Closing our side sends only the link's own bookkeeping; no payload is ever sent in W3. */
+ static bool w_cleanup(void){
+  bool acked=false;
++ w_glink_close();
+  if(w.started && w.sp.out){
+   bool was_ready=!!(w.state&2);
+   qcom_smp2p_update(&w.sp,w.master,1,1);w_ring(W_IPCC,W_SIG_SMP2P);
+@@ -372,8 +386,124 @@ static bool w_cleanup(void){
+  sweet_log_sync();return true;
+ }
+ static int wpss_gpio5_set(void);
+-static int wpss_run(void){
+- memset(&w,0,sizeof(w));w.master=-1;struct wl_fat f;
++
++/* ---- 2246 (W3): the WPSS edge's GLINK and QRTR ----------------------------------------------------------------
++ * The device tree's glink-edge is IPCC client 0x18 signal 0 (SMP2P is signal 2), transport smem, one channel "IPCRTR"
++ * with intents 0x800 x5, 0x2000 x3, 0x4400 x2 on the WPSS's side. Items 478 (descriptor, 32 bytes) and 479 (our FIFO,
++ * 16 KiB) exist before we run; 480 is the WPSS's FIFO and appears only once the DSP has made it (W1: 480 absent).
++ * Nothing here sends a payload: the link's own VERSION/OPEN/INTENT exchange is all that goes out. */
++#define W_GLINK_DESC 478u
++#define W_GLINK_OUR_FIFO 479u
++#define W_GLINK_THEIR_FIFO 480u
++#define W_SIG_GLINK 0u
++/* The WPSS's intents, from qcom,wpss_qrtr: 0x800 five times, 0x2000 three times, 0x4400 twice. We advertise the largest,
++ * because a QRTR packet is small and one intent size keeps the bookkeeping simple. */
++#define W_GLINK_INTENT 0x800u
++#define W_GLINK_INTENT_COUNT 8u
++#define W_GLINK_TX 0x2000u
++static uint8_t w_glink_rx[W_GLINK_INTENT*W_GLINK_INTENT_COUNT];
++/* Our transmit ring lives in SMEM item 479, which is 16 KiB: half for each direction is the battery's split. */
++#define W_GLINK_FIFO 0x4000u
++
++static void w_glink_close(void);
++static void w_glink_kick(void *unused){(void)unused;w_ring(W_IPCC,W_SIG_GLINK);}
++static void w_qrtr_trace(const uint8_t *packet,uint32_t bytes);
++static int w_qrtr_send(void *unused,const uint8_t *packet,uint32_t length){
++ (void)unused;
++ if(!w.glink_up)return -1;
++ return qcom_glink_send(&w.gl,w.glch,packet,length)==QcomGlinkOk?0:-1;
++}
++static void w_glink_state(void *unused,QcomGlinkChannel *ch,int up){
++ (void)unused;(void)ch;w.glink_up=up!=0;
++ printf("SWEET WIFI: W3 glink IPCRTR up=%d after %llu ms\n",up,(unsigned long long)(w_now()-w.link_began));
++ sweet_log_sync();
++}
++static void w_glink_receive(void *unused,QcomGlinkChannel *ch,const uint8_t *data,uint32_t bytes){
++ (void)unused;(void)ch;
++ w_qrtr_trace(data,bytes);
++ if(!w.qr_started)return;
++ if(qcom_qrtr_receive(&w.qr,data,bytes))printf("SWEET WIFI: W3 qrtr bad packet bytes=%u\n",bytes);
++}
++/* One QRTR control packet, logged by kind and by service number only: nothing here is a name or an address. */
++static void w_qrtr_trace(const uint8_t *packet,uint32_t bytes){
++ if(bytes<QCOM_QRTR_HEADER+4)return;
++ uint32_t type=0;for(unsigned i=0;i<4;i++)type|=(uint32_t)packet[4+i]<<(8*i);
++ uint32_t a=0,b=0;if(bytes>=QCOM_QRTR_HEADER+12){for(unsigned i=0;i<4;i++)a|=(uint32_t)packet[36+i]<<(8*i);for(unsigned i=0;i<4;i++)b|=(uint32_t)packet[40+i]<<(8*i);}
++ if(type==QCOM_QRTR_NEW_SERVER)printf("SWEET WIFI: W3 qrtr NEW_SERVER service=%#x instance=%#x\n",a,b);
++ else if(type==QCOM_QRTR_DEL_SERVER)printf("SWEET WIFI: W3 qrtr DEL_SERVER service=%#x instance=%#x\n",a,b);
++ else if(type==QCOM_QRTR_HELLO)printf("SWEET WIFI: W3 qrtr HELLO\n");
++ else if(type==QCOM_QRTR_BYE)printf("SWEET WIFI: W3 qrtr BYE\n");
++ sweet_log_sync();
++}
++/* Brings the link up: reads what the bootloader left, waits for the WPSS's FIFO, then lets GLINK do its handshake. */
++static int w_glink_open(void){
++ uint32_t off=0,bytes=0;
++ if(w_item(W_GLINK_DESC,16,&off,&bytes)){
++  /* 478 is the one item W1 found already present on this edge. If it is missing, make it: GLINK owns it, not the DSP. */
++  if(w_alloc(W_GLINK_DESC,16,&off))return EIO;
++  w.desc_off=off;
++  printf("SWEET WIFI: W3 glink descriptor item=%u was absent; allocated\n",W_GLINK_DESC);
++ } else {
++  w.desc_off=off;
++  printf("SWEET WIFI: W3 glink descriptor item=%u head=%#x tail=%#x their_head=%#x their_tail=%#x (as left)\n",W_GLINK_DESC,
++   w_rd(w.smem,w.desc_off),w_rd(w.smem,w.desc_off+4),w_rd(w.smem,w.desc_off+8),w_rd(w.smem,w.desc_off+12));
++ }
++ if(w_alloc(W_GLINK_OUR_FIFO,W_GLINK_FIFO,&off))return EIO;
++ w.our_fifo_off=off;
++ volatile uint32_t *d=(volatile uint32_t *)(w.smem+w.desc_off);
++ QcomGlinkFifo tf={d+1,d,(volatile uint8_t *)(w.smem+w.our_fifo_off),W_GLINK_FIFO},rf={d+3,d+2,0,0};
++ qcom_glink_init(&w.gl,tf,rf,w_glink_kick,0);
++ static const QcomGlinkClient client={w_glink_state,w_glink_receive};
++ w.glch=qcom_glink_channel(&w.gl,"IPCRTR",W_GLINK_INTENT,W_GLINK_INTENT_COUNT,w_glink_rx,&client,0,1);
++ if(!w.glch)return ENOMEM;
++ qcom_qrtr_init(&w.qr,2,w_qrtr_send,0);
++ w.link_began=w_now();w.link_started=true;w.link_asked=true;
++ /* Qrtr's hello is sent by w_glink_poll once the channel is up, not here: qcom_qrtr_start would queue it before
++  * qcom_glink_send can accept it (the channel is not up yet), and QcomQrtr counts a refused send as tx_refused and does
++  * not retry it. The model showed exactly that: one refused hello and no HELLO ever reaching the DSP. */
++ printf("SWEET WIFI: W3 glink opened desc=%#x our_fifo=%#x tx=%u our_intents=%u channel=%s; waiting for the WPSS's FIFO\n",
++  w.desc_off,w.our_fifo_off,W_GLINK_FIFO,W_GLINK_INTENT_COUNT,"IPCRTR");
++ sweet_log_sync();
++ return 0;
++}
++/* Polls the link. Bounded: called from the same 2 ms loop as the SMP2P poll. */
++static void w_glink_poll(void){
++ if(!w.link_started)return;
++ if(!w.gl.rx.data){
++  uint32_t off=0,bytes=0;
++  if(w_item(W_GLINK_THEIR_FIFO,32,&off,&bytes) || bytes>0x100000 || (bytes&7))return;
++  w.their_fifo_off=off;
++  qcom_glink_set_rx(&w.gl,(volatile uint8_t *)(w.smem+off),bytes);
++  printf("SWEET WIFI: W3 glink their_fifo=%#x bytes=%u appeared\n",off,bytes);
++  sweet_log_sync();
++ }
++ int rc=qcom_glink_poll(&w.gl);
++ if(rc==QcomGlinkCorrupt){if(!w.glink_broken){w.glink_broken=true;printf("SWEET WIFI: W3 glink CORRUPT receive stream; link stopped\n");sweet_log_sync();}return;}
++ if(w.glink_up && !w.qr_started){
++  /* Only start QRTR when the channel can actually carry the hello. `qcom_qrtr_start` queues one packet through
++   * `w_qrtr_send`, and `QcomQrtr` counts a refused send and never retries it: starting early would lose the hello
++   * silently. The model showed it as `tx_refused=1` with no HELLO ever reaching the peer. `remote[].valid` is populated
++   * by the WPSS's INTENT messages, so an idle remote intent is the condition that the FIFO can accept a packet now. */
++  bool can_send=false;
++  for(unsigned k=0;k<QCOM_GLINK_MAX_REMOTE_INTENTS;k++)if(w.glch->remote[k].valid && !w.glch->remote[k].busy){can_send=true;break;}
++  if(can_send){qcom_qrtr_start(&w.qr);w.qr_started=true;
++   printf("SWEET WIFI: W3 qrtr hello sent; remote services=%u\n",w.qr.remote_count);sweet_log_sync();}
++ }
++ if(w.qr_started && qcom_qrtr_poll(&w.qr)){printf("SWEET WIFI: W3 qrtr resume failed\n");sweet_log_sync();}
++}
++/* Closes the link before the DSP is asked to stop: the DSP should see IPCRTR go down first. */
++static void w_glink_close(void){
++ if(!w.link_started)return;
++ printf("SWEET WIFI: W3 glink close: up=%u rx_messages=%u tx_messages=%u rx_data=%u dropped=%u unknown_opens=%u broken=%u\n",
++  w.glink_up,w.gl.rx_messages,w.gl.tx_messages,w.gl.rx_data,w.gl.dropped,w.gl.unknown_opens,w.glink_broken);
++ if(w.gl.unknown_names[0])printf("SWEET WIFI: W3 glink unserved channels: %s\n",w.gl.unknown_names);
++ printf("SWEET WIFI: W3 qrtr totals packets=%u data=%u bad=%u unrouted=%u refused=%u remote_services=%u\n",
++  w.qr.rx_packets,w.qr.rx_data,w.qr.rx_bad,w.qr.rx_unrouted,w.qr.tx_refused,w.qr.remote_count);
++ sweet_log_sync();
++ w.link_started=false;w.glink_up=false;
++}
++static int wpss_run(int gate){
++ memset(&w,0,sizeof(w));w.master=-1;w.link_asked=(gate==WpssGlink);struct wl_fat f;
+  int rc=w_open_image(&f);if(rc)goto out;
+  /* 2243: the sleep clock before any WPSS work (Fairphone's mainline enablement: without it the WPSS keeps crashing). */
+  if((rc=wpss_gpio5_set()))goto out;
+@@ -403,10 +533,15 @@ static int wpss_run(void){
+  if((rc=w_load_image(&f)))goto out;
+  uint64_t start=w_now(),ready=0,handover=0;
+  for(;;){
+-  w_smp_poll();uint64_t now=w_now();
++  w_smp_poll();w_glink_poll();uint64_t now=w_now();
+   if(w.fatal){rc=EIO;break;}
+   if(!ready && (w.state&2))ready=now;
+-  if(!handover && (w.state&4)){handover=now;printf("SWEET WIFI: W2 handover; shared cx/mx/xo votes kept\n");}
++  if(!handover && (w.state&4)){
++   handover=now;printf("SWEET WIFI: W2 handover; shared cx/mx/xo votes kept\n");
++   /* 2246: the edge is opened only once the DSP is up. Before handover the DSP has not made its FIFO and GLINK would just
++    * spin on a missing item. A failure here is the W3 answer and ends the run through the normal verified stop. */
++   if(w.link_asked && (rc=w_glink_open())){printf("SWEET WIFI: W3 glink open failed error=%d\n",rc);break;}
++  }
+   if(!ready && now-start>W_READY_MS){rc=ETIMEDOUT;break;}
+   if(ready && !handover && now-ready>W_HANDOVER_MS){rc=ETIMEDOUT;break;}
+   if(handover && now-handover>=W_DWELL_MS){rc=0;break;}

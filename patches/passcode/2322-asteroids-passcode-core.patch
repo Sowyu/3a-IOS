@@ -1,0 +1,1226 @@
+SWEET passcode core: the record, the verifier and the backoff (2322)
+
+The whole lock, with no I/O of its own: the record format, PBKDF2 over
+the kernel's corecrypto SHA-256, the constant-time compare, the backoff
+schedule, the load/verify/set state machine, the packed-buffer parser for libaks' verify
+selector and the DER the device-state calls return. File access goes through a vtable the
+kernel binds to vnodes and the host tests bind to a simulated filesystem, so the tested
+code and the shipped code are one implementation. No locks, no logging.
+
+Compiled into XNU from bsd/dev/ and, byte for byte, into the Mac host check
+(plans/passcode/tools/check-lock.py), which supplies CommonCrypto SHA-256
+through sweet_passcode_host.h. That is why the tested file and the shipped file
+are the same file.
+
+Needs 2321, which includes bsd/dev/SweetPasscode.h.
+
+Check: python3 -I plans/passcode/tools/check-lock.py XNU_DIR (36 checks, 25 negative controls)
+Apply: git apply -p1 in the kernel tree, after 2321.
+diff --git a/bsd/dev/SweetPasscode.c b/bsd/dev/SweetPasscode.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/SweetPasscode.c
+@@ -0,0 +1,952 @@
++/*
++ * SWEET passcode core (2322). Compiled into XNU on SWEET and, unchanged, into the Mac host check
++ * (plans/passcode/tools/test_lock.c), which supplies sweet_passcode_host.h for a SHA-256 that is not XNU's and a
++ * simulated filesystem for the I/O vtable.
++ *
++ * Nothing here logs, and nothing here keeps a copy of the code: spc_lock_verify() hashes it and lets it go.
++ * The whole state machine is here rather than in the kernel file so that the host test runs the shipped code.
++ */
++#if !defined(KERNEL) || defined(ARM64_BOARD_CONFIG_SWEET)
++#ifdef KERNEL
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <string.h>
++#include <libkern/crypto/sha2.h>
++#else
++#include <string.h>
++#include <errno.h>
++#include "sweet_passcode_host.h"        /* SHA256_Init/Update/Final from CommonCrypto */
++#endif
++#include "SweetPasscode.h"
++
++/* Record layout, little endian. */
++#define R_MAGIC         0x43505753u     /* 'SWPC' */
++#define R_VERSION       1u
++#define R_O_MAGIC       0
++#define R_O_VERSION     4
++#define R_O_SET         5
++#define R_O_SEQ         8
++#define R_O_ITER        16
++#define R_O_FAILED      20
++#define R_O_SALT        24
++#define R_O_VERIFIER    40
++#define R_O_CHECK       80              /* first 16 bytes of SHA-256 over bytes 0..79 */
++#define R_CHECK_LEN     16u
++#define R_O_PAD         72              /* the two reserved words between verifier and check */
++
++static void
++put32(uint8_t *p, uint32_t v)
++{
++	for (int i = 0; i < 4; i++) {
++		p[i] = (uint8_t)(v >> (8 * i));
++	}
++}
++
++static uint32_t
++get32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
++}
++
++static void
++put64(uint8_t *p, uint64_t v)
++{
++	put32(p, (uint32_t)v);
++	put32(p + 4, (uint32_t)(v >> 32));
++}
++
++static uint64_t
++get64(const uint8_t *p)
++{
++	return (uint64_t)get32(p) | (uint64_t)get32(p + 4) << 32;
++}
++
++void
++spc_wipe(void *p, size_t n)
++{
++	volatile uint8_t *v = (volatile uint8_t *)p;
++	while (n--) {
++		*v++ = 0;
++	}
++}
++
++/*
++ * Constant time in n alone. The loop bound is public (a hash is 32 bytes), the data is not, and there is no early
++ * exit: a compare that stopped at the first differing byte would leak how much of a guessed verifier was right.
++ */
++int
++spc_equal(const uint8_t *a, const uint8_t *b, size_t n)
++{
++	volatile uint8_t d = 0;
++	for (size_t i = 0; i < n; i++) {
++		d |= (uint8_t)(a[i] ^ b[i]);
++	}
++	return d == 0;
++}
++
++static void
++rec_check(const uint8_t *rec, uint8_t out[R_CHECK_LEN])
++{
++	SHA256_CTX c;
++	uint8_t h[SPC_HASH];
++	SHA256_Init(&c);
++	SHA256_Update(&c, rec, R_O_CHECK);
++	SHA256_Final(h, &c);
++	memcpy(out, h, R_CHECK_LEN);
++	spc_wipe(h, sizeof(h));
++	spc_wipe(&c, sizeof(c));
++}
++
++void
++spc_encode(const struct spc_state *s, uint8_t out[SPC_REC])
++{
++	memset(out, 0, SPC_REC);
++	put32(out + R_O_MAGIC, R_MAGIC);
++	out[R_O_VERSION] = R_VERSION;
++	out[R_O_SET] = s->set ? 1 : 0;
++	put64(out + R_O_SEQ, s->seq);
++	put32(out + R_O_ITER, s->iter);
++	put32(out + R_O_FAILED, s->failed);
++	if (s->set) {
++		memcpy(out + R_O_SALT, s->salt, SPC_SALT);
++		memcpy(out + R_O_VERIFIER, s->verifier, SPC_HASH);
++	}
++	rec_check(out, out + R_O_CHECK);
++}
++
++bool
++spc_decode(const uint8_t in[SPC_REC], struct spc_state *s)
++{
++	uint8_t want[R_CHECK_LEN];
++	bool ok = false;
++
++	if (get32(in + R_O_MAGIC) != R_MAGIC || in[R_O_VERSION] != R_VERSION || in[R_O_SET] > 1 ||
++	    in[6] != 0 || in[7] != 0) {
++		return false;
++	}
++	/* A file edited by hand must not be able to smuggle anything in the reserved words. */
++	for (unsigned i = R_O_PAD; i < R_O_CHECK; i++) {
++		if (in[i] != 0) {
++			return false;
++		}
++	}
++	rec_check(in, want);
++	if (!spc_equal(want, in + R_O_CHECK, R_CHECK_LEN)) {
++		return false;
++	}
++	uint32_t iter = get32(in + R_O_ITER);
++	if (in[R_O_SET] && (iter < SPC_ITER_MIN || iter > SPC_ITER_MAX)) {
++		/* A short count would make an offline guess cheap; a huge one would hang the verifier. */
++		return false;
++	}
++	memset(s, 0, sizeof(*s));
++	s->set = in[R_O_SET];
++	s->seq = get64(in + R_O_SEQ);
++	s->iter = iter;
++	s->failed = get32(in + R_O_FAILED);
++	if (s->set) {
++		memcpy(s->salt, in + R_O_SALT, SPC_SALT);
++		memcpy(s->verifier, in + R_O_VERIFIER, SPC_HASH);
++	}
++	ok = true;
++	spc_wipe(want, sizeof(want));
++	return ok;
++}
++
++void
++spc_pick(const uint8_t a[SPC_REC], const uint8_t b[SPC_REC], struct spc_state *s, int *next)
++{
++	struct spc_state sa, sb;
++	bool va = spc_decode(a, &sa), vb = spc_decode(b, &sb);
++
++	if (va && (!vb || sa.seq >= sb.seq)) {
++		*s = sa;
++		*next = 1;
++	} else if (vb) {
++		*s = sb;
++		*next = 0;
++	} else {
++		memset(s, 0, sizeof(*s));
++		*next = 0;
++	}
++	spc_wipe(&sa, sizeof(sa));
++	spc_wipe(&sb, sizeof(sb));
++}
++
++/* HMAC-SHA256 with the key's inner and outer states computed once, which is what makes 100k rounds affordable. */
++struct spc_hmac {
++	SHA256_CTX in, out;
++};
++
++static void
++hmac_key(struct spc_hmac *h, const uint8_t *key, size_t key_len)
++{
++	uint8_t k[64], pad[64];
++	memset(k, 0, sizeof(k));
++	if (key_len > sizeof(k)) {
++		SHA256_CTX c;
++		SHA256_Init(&c);
++		SHA256_Update(&c, key, key_len);
++		SHA256_Final(k, &c);
++		spc_wipe(&c, sizeof(c));
++	} else if (key_len > 0) {
++		memcpy(k, key, key_len);
++	}
++	for (int i = 0; i < 64; i++) {
++		pad[i] = (uint8_t)(k[i] ^ 0x36);
++	}
++	SHA256_Init(&h->in);
++	SHA256_Update(&h->in, pad, 64);
++	for (int i = 0; i < 64; i++) {
++		pad[i] = (uint8_t)(k[i] ^ 0x5c);
++	}
++	SHA256_Init(&h->out);
++	SHA256_Update(&h->out, pad, 64);
++	spc_wipe(k, sizeof(k));
++	spc_wipe(pad, sizeof(pad));
++}
++
++static void
++hmac_run(const struct spc_hmac *h, const uint8_t *d1, size_t l1, const uint8_t *d2, size_t l2, uint8_t out[SPC_HASH])
++{
++	SHA256_CTX c = h->in;
++	uint8_t inner[SPC_HASH];
++	SHA256_Update(&c, d1, l1);
++	if (l2) {
++		SHA256_Update(&c, d2, l2);
++	}
++	SHA256_Final(inner, &c);
++	c = h->out;
++	SHA256_Update(&c, inner, SPC_HASH);
++	SHA256_Final(out, &c);
++	spc_wipe(&c, sizeof(c));
++	spc_wipe(inner, sizeof(inner));
++}
++
++/* RFC 8018 PBKDF2 with dkLen == hLen == 32, so one block: T1 = U1 ^ ... ^ Uc, out = T1. */
++void
++spc_pbkdf2_sha256(const uint8_t *pw, size_t pw_len, const uint8_t *salt, size_t salt_len, uint32_t iter,
++    uint8_t out[SPC_HASH])
++{
++	struct spc_hmac h;
++	static const uint8_t one[4] = { 0, 0, 0, 1 };
++	uint8_t u[SPC_HASH];
++
++	if (iter == 0) {
++		memset(out, 0, SPC_HASH);
++		return;
++	}
++	hmac_key(&h, pw, pw_len);
++	hmac_run(&h, salt, salt_len, one, sizeof(one), u);
++	memcpy(out, u, SPC_HASH);
++	for (uint32_t i = 1; i < iter; i++) {
++		hmac_run(&h, u, SPC_HASH, NULL, 0, u);
++		for (unsigned j = 0; j < SPC_HASH; j++) {
++			out[j] ^= u[j];
++		}
++	}
++	spc_wipe(&h, sizeof(h));
++	spc_wipe(u, sizeof(u));
++}
++
++/* Five free tries, then 1, 5 and 15 minutes, then an hour each time, forever. No erase, no permanent lock. */
++uint32_t
++spc_backoff(uint32_t failed)
++{
++	if (failed < 5) {
++		return 0;
++	}
++	if (failed == 5) {
++		return 60;
++	}
++	if (failed == 6) {
++		return 300;
++	}
++	if (failed <= 8) {
++		return 900;
++	}
++	return 3600;
++}
++
++uint32_t
++spc_backoff_left(uint32_t failed, uint64_t since_ms)
++{
++	uint32_t owed = spc_backoff(failed);
++	uint32_t spent = since_ms >= (uint64_t)owed * 1000u ? owed : (uint32_t)(since_ms / 1000u);
++	return owed > spent ? owed - spent : 0;
++}
++
++/*
++ * Backoff record, little endian: magic, failed, pad, last_sec, then a SHA-256 prefix. A torn write leaves a bad
++ * checksum, which reads as no failures: a broken counter must never be able to lock the owner out either.
++ */
++#define F_O_MAGIC   0
++#define F_O_FAILED  4
++#define F_O_LAST    8
++#define F_O_CHECK   24
++#define F_CHECK_LEN 16u
++
++void
++spc_fail_encode(const struct spc_fail *f, uint8_t out[SPC_FAIL_REC])
++{
++	uint8_t h[SPC_HASH];
++	SHA256_CTX c;
++
++	memset(out, 0, SPC_FAIL_REC);
++	put32(out + F_O_MAGIC, SPC_FAIL_MAGIC);
++	put32(out + F_O_FAILED, f->failed);
++	put64(out + F_O_LAST, f->last_sec);
++	SHA256_Init(&c);
++	SHA256_Update(&c, out, F_O_CHECK);
++	SHA256_Final(h, &c);
++	memcpy(out + F_O_CHECK, h, F_CHECK_LEN);
++	spc_wipe(h, sizeof(h));
++	spc_wipe(&c, sizeof(c));
++}
++
++bool
++spc_fail_decode(const uint8_t in[SPC_FAIL_REC], struct spc_fail *f)
++{
++	uint8_t h[SPC_HASH];
++	SHA256_CTX c;
++
++	f->failed = 0;
++	f->last_sec = 0;
++	if (get32(in + F_O_MAGIC) != SPC_FAIL_MAGIC) {
++		return false;
++	}
++	SHA256_Init(&c);
++	SHA256_Update(&c, in, F_O_CHECK);
++	SHA256_Final(h, &c);
++	bool ok = spc_equal(h, in + F_O_CHECK, F_CHECK_LEN) != 0;
++	spc_wipe(h, sizeof(h));
++	spc_wipe(&c, sizeof(c));
++	if (!ok) {
++		return false;
++	}
++	f->failed = get32(in + F_O_FAILED);
++	f->last_sec = get64(in + F_O_LAST);
++	return true;
++}
++
++bool
++spc_packed_item(const uint8_t *buf, size_t buf_len, uint32_t want, const uint8_t **p, uint32_t *len)
++{
++	if (buf_len < 4) {
++		return false;
++	}
++	uint32_t count = get32(buf);
++	if (count == 0 || want >= count) {
++		return false;
++	}
++	size_t off = 4;
++	for (uint32_t i = 0; i <= want; i++) {
++		if (buf_len - off < 4) {
++			return false;
++		}
++		uint32_t n = get32(buf + off);
++		off += 4;
++		if (n > buf_len - off) {
++			return false;
++		}
++		if (i == want) {
++			*p = buf + off;
++			*len = n;
++			return true;
++		}
++		size_t padded = (size_t)n + ((4 - (n & 3)) & 3);
++		if (padded > buf_len - off) {
++			return false;
++		}
++		off += padded;
++	}
++	return false;
++}
++
++uint32_t
++spc_der_uint(uint8_t *p, uint32_t v)
++{
++	uint8_t b[5];
++	uint32_t n = 0;
++	do {
++		b[n++] = (uint8_t)v;
++		v >>= 8;
++	} while (v);
++	if (b[n - 1] & 0x80) {
++		b[n++] = 0;             /* keep the INTEGER positive */
++	}
++	p[0] = 0x02;
++	p[1] = (uint8_t)n;
++	for (uint32_t i = 0; i < n; i++) {
++		p[2 + i] = b[n - 1 - i];
++	}
++	return 2 + n;
++}
++
++uint32_t
++spc_der_pair(uint8_t *p, size_t room, const char *key, uint32_t value)
++{
++	size_t klen = strlen(key);
++	uint8_t val[8];
++	uint32_t n = 0;
++
++	if (klen > 0x7f || klen + 6u > room) {          /* 2 SEQUENCE + 2 UTF8String + 2 INTEGER */
++		return 0;
++	}
++	uint32_t vlen = spc_der_uint(val, value);
++	if (vlen == 0 || 4u + klen + vlen > room || 2u + klen + vlen > 0xffu) {
++		return 0;
++	}
++	p[n++] = 0x30;
++	p[n++] = (uint8_t)(2u + klen + vlen);
++	p[n++] = 0x0c;
++	p[n++] = (uint8_t)klen;
++	memcpy(p + n, key, klen);
++	n += klen;
++	memcpy(p + n, val, vlen);
++	n += vlen;
++	return n;
++}
++
++/* -------------------------------------------------------------------------------------------------------------
++ * The lock state machine. This is the code the kernel calls and the code the host test runs; there is no second
++ * copy. See the header for the contract.
++ * ---------------------------------------------------------------------------------------------------------- */
++
++void
++spc_lock_init(struct spc_lock *l, const struct spc_io *io, void *ctx)
++{
++	memset(l, 0, sizeof(*l));
++	l->io = *io;
++	l->ctx = ctx;
++	l->unlocked = false;            /* a reboot locks the phone */
++}
++
++static uint64_t
++lock_mono_ms(const struct spc_lock *l)
++{
++	uint64_t wall = 0, mono = 0;
++	if (l->io.clock != NULL) {
++		l->io.clock(l->ctx, &wall, &mono);
++	}
++	return mono;
++}
++
++static uint64_t
++lock_wall_sec(const struct spc_lock *l)
++{
++	uint64_t wall = 0, mono = 0;
++	if (l->io.clock != NULL) {
++		l->io.clock(l->ctx, &wall, &mono);
++	}
++	return wall;
++}
++
++/*
++ * Time served against the current wait, in ms, off the monotonic clock so a wall-clock change cannot shorten it.
++ * Works from a deadline rather than a start time: "what is left" is then exact even when the monotonic clock restarted
++ * since the failure, which is what a reboot does. UINT64_MAX means nothing is owed at all.
++ */
++static uint64_t
++lock_served_ms(const struct spc_lock *l)
++{
++	uint64_t now, owed_ms;
++
++	if (l->fail_deadline == 0) {
++		return UINT64_MAX;      /* never failed, or the wait already ran out */
++	}
++	now = lock_mono_ms(l);
++	owed_ms = (uint64_t)spc_backoff(l->fail) * 1000ull;
++	if (now >= l->fail_deadline) {
++		return owed_ms + 1;     /* served past the deadline: nothing left */
++	}
++	uint64_t left_ms = l->fail_deadline - now;
++	return left_ms >= owed_ms ? 0 : owed_ms - left_ms;
++}
++
++static int
++lock_read(const struct spc_lock *l, const char *path, void *buf, uint32_t len, uint32_t off)
++{
++	if (l->io.read == NULL) {
++		return ENOENT;
++	}
++	return l->io.read(l->ctx, path, buf, len, off);
++}
++
++static int
++lock_write(const struct spc_lock *l, const char *path, const void *buf, uint32_t len, uint32_t off)
++{
++	if (l->io.write == NULL) {
++		return EROFS;
++	}
++	return l->io.write(l->ctx, path, buf, len, off);
++}
++
++static void
++lock_step(const struct spc_lock *l, int step)
++{
++	if (l->io.step != NULL) {
++		l->io.step(l->ctx, step);
++	}
++}
++
++/*
++ * Read the two slots, each on its own. A slot that will not read, or that does not decode, is "not this one"; it
++ * never discards the other. That distinction is the fix for the defect the audit found: the first code ever set
++ * lands in slot 0, the file is then 96 bytes long, and reading slot 1 at offset 4096 is a short read. Treating one
++ * bad slot as "no passcode" threw away a perfectly good slot 0 and the lock vanished at the first reboot.
++ */
++void
++spc_lock_load(struct spc_lock *l)
++{
++	uint8_t a[SPC_REC], b[SPC_REC], fb[SPC_FAIL_REC];
++	struct spc_fail f;
++	int err_a, err_b, bad_a, bad_b;
++
++	if (l->loaded) {
++		return;
++	}
++
++	err_a = lock_read(l, SPC_FILE, a, SPC_REC, 0);
++	err_b = lock_read(l, SPC_FILE, b, SPC_REC, SPC_SLOT_STRIDE);
++
++	/*
++	 * A read that failed for a reason other than "there is no such file" or "the file is short" is not evidence of
++	 * anything: the volume may not be mounted yet, or be busy. Do not cache "no passcode" from it. The slot is still
++	 * treated as unusable for this call, so nothing is invented, but `loaded` stays false and the next caller tries
++	 * again (finding 6 of audit-delta-report.md). EIO is the short-read answer, ENOENT is a missing file, and both of
++	 * those are real answers.
++	 */
++	if ((err_a != 0 && err_a != ENOENT && err_a != EIO) ||
++	    (err_b != 0 && err_b != ENOENT && err_b != EIO)) {
++		spc_wipe(a, sizeof(a));
++		spc_wipe(b, sizeof(b));
++		return;                 /* nothing loaded; try again on the next selector */
++	}
++	/* `loaded` is set only once the count file has also been read without a transient error. */
++	bad_a = (err_a != 0);
++	bad_b = (err_b != 0);
++	if (bad_a) {
++		memset(a, 0, sizeof(a));
++	}
++	if (bad_b) {
++		memset(b, 0, sizeof(b));
++	}
++	spc_pick(a, b, &l->st, &l->next_slot);
++	spc_wipe(a, sizeof(a));
++	spc_wipe(b, sizeof(b));
++
++	/*
++	 * The count has its own file so a damaged verifier file cannot lose it, and it gets the same rule as the
++	 * verifier: ENOENT and a short read are answers, a decode failure is "no failures", and any other error means
++	 * the volume is not ready, so nothing is cached and the caller retries. Reading a transient error as "no
++	 * failures" would drop the backoff to zero for the rest of the boot (finding 2 of audit-delta-report-2.md).
++	 */
++	int err_f = lock_read(l, SPC_FAIL_FILE, fb, SPC_FAIL_REC, 0);
++	if (err_f != 0 && err_f != ENOENT && err_f != EIO) {
++		spc_wipe(fb, sizeof(fb));
++		l->loaded = false;      /* nothing cached: try again on the next selector */
++		spc_wipe(a, sizeof(a));
++		return;
++	}
++	if (err_f != 0 || !spc_fail_decode(fb, &f)) {
++		memset(&f, 0, sizeof(f));
++	}
++	spc_wipe(fb, sizeof(fb));
++	l->fail = f.failed;
++	l->have_code = l->st.set != 0;
++	if (f.failed != 0) {
++		/*
++		 * Rebuild the deadline from the stored wall clock, so the wait survives a reboot. `left` is what was still
++		 * owed when the phone went down; the deadline is "now + left" on this boot's monotonic clock. Because it is
++		 * a deadline rather than "when the failure happened", a reboot partway through a long wait resumes with
++		 * exactly the time that was left instead of restarting it (finding 2 of audit-delta-report.md).
++		 *
++		 * The monotonic clock restarts at zero every boot, so it carries no information across one. The wall clock
++		 * is the only thing that can say how much of the wait has already been served, and when it cannot be trusted
++		 * the wait is charged in full: erring long is the safe direction, and a reboot must never be a way out.
++		 */
++		uint64_t now = lock_wall_sec(l);
++		uint32_t owed = spc_backoff(f.failed);
++		uint64_t left = owed;
++
++		if (now > f.last_sec) {
++			uint64_t ago = now - f.last_sec;
++			left = (ago >= SPC_FAIL_STALE || ago >= owed) ? 0 : (uint64_t)owed - ago;
++		}
++		if (left != 0) {
++			l->fail_deadline = lock_mono_ms(l) + left * 1000ull;
++		}
++	}
++	/*
++	 * The record mirrors the count for information, but the fail file is what the backoff uses. Start them in
++	 * agreement so spc_lock_devstate() cannot disagree with the decision the next verify makes.
++	 */
++	l->st.failed = l->fail;
++	l->loaded = true;
++}
++
++/*
++ * The accessors load on first use. That is not an optimisation, it is a guard: the first version of the kernel file
++ * read these fields without loading, so a fresh boot answered "no passcode" until some other selector happened to
++ * load. A read-only accessor that cannot be called too early is worth one branch.
++ */
++bool
++spc_lock_have_code(const struct spc_lock *l)
++{
++	spc_lock_load((struct spc_lock *)l);
++	return l->have_code;
++}
++
++bool
++spc_lock_unlocked(const struct spc_lock *l)
++{
++	spc_lock_load((struct spc_lock *)l);
++	return l->unlocked;
++}
++
++uint32_t
++spc_lock_failed(const struct spc_lock *l)
++{
++	spc_lock_load((struct spc_lock *)l);
++	return l->fail;
++}
++
++uint32_t
++spc_lock_wait(const struct spc_lock *l)
++{
++	uint64_t served;
++	uint32_t owed;
++
++	spc_lock_load((struct spc_lock *)l);
++	owed = spc_backoff(l->fail);
++	if (owed == 0) {
++		return 0;
++	}
++	served = lock_served_ms(l);
++	if (served == UINT64_MAX || served >= (uint64_t)owed * 1000ull) {
++		return 0;               /* nothing owed, or the deadline has passed */
++	}
++	/*
++	 * Round up: a wait with 59.2 s left reports 60, not 59. Rounding down would make a caller that sleeps for the
++	 * reported number of seconds arrive a moment early and be refused, which is a puzzle rather than a lock.
++	 */
++	uint64_t left_ms = (uint64_t)owed * 1000ull - served;
++	return (uint32_t)((left_ms + 999ull) / 1000ull);
++}
++
++/* Put the count on the disk. Returns 0 or an errno; the caller decides what a failure means. */
++static int
++lock_persist_fail(struct spc_lock *l)
++{
++	uint8_t fb[SPC_FAIL_REC];
++	struct spc_fail f;
++	int err;
++
++	f.failed = l->fail;
++	f.last_sec = lock_wall_sec(l);
++	spc_fail_encode(&f, fb);
++	err = lock_write(l, SPC_FAIL_FILE, fb, SPC_FAIL_REC, 0);
++	spc_wipe(fb, sizeof(fb));
++	return err;
++}
++
++/*
++ * Write `s` into the slot that is not live, then flip. The caller commits it only when this returns 0.
++ *
++ * A clear writes both slots, so no earlier code can come back. Writing one slot and leaving an older record in the
++ * other means a power cut inside that write leaves the new slot invalid and the old one winning: the only way a
++ * "cleared" phone could lock itself again with a code the owner had already removed (finding 9 of
++ * audit-delta-report.md). Every other write touches one slot, which is what the alternation is for; its far slot may
++ * hold an older but still valid record, and a torn write then falls back to that older code, which is the intended
++ * behaviour for a change (the old code keeps working) and not a widening of the lock.
++ */
++static int
++lock_persist_state(struct spc_lock *l, struct spc_state *s)
++{
++	uint8_t rec[SPC_REC];
++	int slot = l->next_slot ? 1 : 0;
++	int err;
++
++	s->seq = l->st.seq + 1;
++	spc_encode(s, rec);
++	err = lock_write(l, SPC_FILE, rec, SPC_REC, (uint32_t)slot * SPC_SLOT_STRIDE);
++	if (err == 0 && s->set == 0) {
++		/*
++		 * A clear must be in both slots, or a torn write leaves an older code as the only valid record and the
++		 * phone locks itself with a code the owner just removed. The far slot is written with the same record, so
++		 * whichever one a later load reads first says "no passcode".
++		 */
++		err = lock_write(l, SPC_FILE, rec, SPC_REC, (uint32_t)(slot ? 0 : 1) * SPC_SLOT_STRIDE);
++	}
++	spc_wipe(rec, sizeof(rec));
++	if (err == 0) {
++		l->next_slot = slot ? 0 : 1;
++	}
++	return err;
++}
++
++/*
++ * Write both slots. Only the first set ever needs this: it makes the file SPC_FILE_LEN bytes at once, so every later
++ * load finds both slots where it expects them. A failure leaves at least one slot as it was, which is why the caller
++ * still commits only on success.
++ */
++static int
++lock_persist_state_both(struct spc_lock *l, struct spc_state *s)
++{
++	uint8_t rec[SPC_REC];
++	int err;
++
++	s->seq = l->st.seq + 1;
++	spc_encode(s, rec);
++	err = lock_write(l, SPC_FILE, rec, SPC_REC, 0);
++	if (err == 0) {
++		err = lock_write(l, SPC_FILE, rec, SPC_REC, SPC_SLOT_STRIDE);
++	}
++	spc_wipe(rec, sizeof(rec));
++	if (err == 0) {
++		/* Both slots hold this record, so the next write can go to either. Slot 0 keeps the live record. */
++		l->next_slot = 1;
++	}
++	return err;
++}
++
++/*
++ * The only way to run the verifier. The markers are inside this function, so the "the count is on the disk" step
++ * cannot be separated from the hash by a refactor: any code that hashes has already announced it, and the host check
++ * asserts that the announcement comes after the persist.
++ */
++static bool
++lock_hash(struct spc_lock *l, const uint8_t *code, size_t len)
++{
++	uint8_t h[SPC_HASH];
++	bool ok;
++
++	lock_step(l, SPC_STEP_HASH_BEGIN);
++	spc_pbkdf2_sha256(code, len, l->st.salt, SPC_SALT, l->st.iter, h);
++	ok = spc_equal(h, l->st.verifier, SPC_HASH) != 0;
++	spc_wipe(h, sizeof(h));
++	lock_step(l, SPC_STEP_HASH_DONE);
++	return ok;
++}
++
++/* Stamp the start of a new wait. The deadline is now + the whole backoff for the current count. */
++static void
++lock_note_fail_time(struct spc_lock *l)
++{
++	if (l->fail != 0) {
++		l->fail_deadline = lock_mono_ms(l) + (uint64_t)spc_backoff(l->fail) * 1000ull;
++	} else {
++		l->fail_deadline = 0;
++	}
++}
++
++enum spc_try
++spc_lock_verify(struct spc_lock *l, const uint8_t *code, size_t len, struct spc_events *ev)
++{
++	uint32_t owed;
++	bool ok;
++
++	spc_lock_load(l);
++	if (!l->have_code) {
++		return SPC_TRY_NOTHING_SET;
++	}
++	owed = spc_lock_wait(l);
++	if (owed != 0) {
++		/* Still backing off: the code is not even hashed, and the count does not move. */
++		ev->on[SPC_EV_BACKOFF_STARTED] = true;
++		return SPC_TRY_BACKOFF;
++	}
++	if (len > SPC_SECRET_MAX) {
++		/*
++		 * Nothing that long can be the code, so do not spend 100 ms hashing it. It is still a wrong try and it is
++		 * still counted: an uncounted guess is a free guess, whatever the length. The kernel refuses a code this
++		 * long before it gets here, so this is the belt to that brace.
++		 */
++		if (l->fail != UINT32_MAX) {
++			l->fail = l->fail + 1;
++		}
++		(void)lock_persist_fail(l);
++		lock_note_fail_time(l);
++		l->st.failed = l->fail;
++		ev->on[SPC_EV_ATTEMPTS_FAILED] = true;
++		if (spc_backoff(l->fail) != 0) {
++			ev->on[SPC_EV_BACKOFF_STARTED] = true;
++		}
++		return SPC_TRY_WRONG;
++	} else {
++		/*
++		 * The count reaches the disk before a byte of the code is hashed, so a power cut in between still counted
++		 * the guess. This ordering is the whole anti-brute-force property; the host check asserts it by watching
++		 * the step callbacks, not by reading this source.
++		 */
++		if (l->fail != UINT32_MAX) {
++			l->fail = l->fail + 1;
++		}
++		(void)lock_persist_fail(l);     /* a failed write must not refuse the attempt: see the header */
++		lock_note_fail_time(l);
++		lock_step(l, SPC_STEP_COUNT_SAVED);
++		ok = lock_hash(l, code, len);
++	}
++
++	if (ok) {
++		l->fail = 0;
++		l->st.failed = 0;
++		l->fail_deadline = 0;
++		(void)lock_persist_fail(l);
++		if (!l->unlocked) {
++			l->unlocked = true;
++			ev->on[SPC_EV_UNLOCKED] = true;
++			ev->on[SPC_EV_FIRST_UNLOCK] = true;
++		}
++		return SPC_TRY_OK;
++	}
++	l->st.failed = l->fail;
++	ev->on[SPC_EV_ATTEMPTS_FAILED] = true;
++	if (spc_backoff(l->fail) != 0) {
++		ev->on[SPC_EV_BACKOFF_STARTED] = true;
++	}
++	return SPC_TRY_WRONG;
++}
++
++enum spc_try
++spc_lock_set(struct spc_lock *l, const uint8_t *old, size_t old_len,
++    const uint8_t *new_code, size_t new_len, bool force, struct spc_events *ev)
++{
++	struct spc_state next;
++	int err;
++	bool first;
++
++	spc_lock_load(l);
++	if (new_len > SPC_SECRET_MAX) {
++		return SPC_TRY_BAD_ARGUMENT;
++	}
++	if (l->have_code && !force) {
++		if (old == NULL) {
++			return SPC_TRY_NEED_OLD;
++		}
++		enum spc_try v = spc_lock_verify(l, old, old_len, ev);
++		if (v != SPC_TRY_OK) {
++			return v;
++		}
++	}
++
++	/* Build the next record in a local copy: memory only changes once the disk has it. */
++	next = l->st;
++	memset(next.salt, 0, SPC_SALT);
++	memset(next.verifier, 0, SPC_HASH);
++	next.failed = 0;
++	if (new_len == 0) {
++		next.set = 0;
++		next.iter = 0;
++	} else {
++		if (l->io.random != NULL) {
++			l->io.random(l->ctx, next.salt, SPC_SALT);
++		} else {
++			memset(next.salt, 0, SPC_SALT);
++		}
++		next.iter = SPC_ITER;
++		spc_pbkdf2_sha256(new_code, new_len, next.salt, SPC_SALT, SPC_ITER, next.verifier);
++		next.set = 1;
++	}
++
++	first = !l->have_code && next.set;
++	err = first ? lock_persist_state_both(l, &next) : lock_persist_state(l, &next);
++	if (err != 0) {
++		spc_wipe(&next, sizeof(next));
++		return SPC_TRY_WRITE_FAILED;    /* nothing changed, in memory or on the disk */
++	}
++	l->st = next;
++	l->have_code = next.set != 0;
++	l->fail = 0;
++	l->fail_deadline = 0;
++	(void)lock_persist_fail(l);
++	spc_wipe(&next, sizeof(next));
++
++	/*
++	 * Whoever just set or changed the code is holding the phone and proved they may. Leaving the session locked
++	 * would make `sls` read 1 on a phone that is open in their hand, and the lock screen would appear from nowhere.
++	 */
++	if (l->have_code) {
++		l->unlocked = true;
++	}
++	ev->on[SPC_EV_PASSCODE_CHANGED] = true;
++	return SPC_TRY_OK;
++}
++
++void
++spc_lock_now_locked(struct spc_lock *l, struct spc_events *ev)
++{
++	spc_lock_load(l);
++	if (!l->have_code) {
++		return;                 /* nothing to unlock against: a device with no code is never "locked" */
++	}
++	if (l->unlocked) {
++		l->unlocked = false;
++		ev->on[SPC_EV_LOCKED] = true;
++	}
++}
++
++void
++spc_lock_devstate(const struct spc_lock *l, struct spc_devstate *d)
++{
++	uint32_t wait;
++
++	spc_lock_load((struct spc_lock *)l);
++	memset(d, 0, sizeof(*d));
++	if (!l->have_code) {
++		d->sls = SPC_LS_NO_PASSCODE;
++		/* A device with no passcode is "unlocked since boot" from the start, as the stub always said. */
++		d->ss = SPC_AKS_UNLOCKED_SINCE;
++		d->sfa = 0;
++		return;
++	}
++	wait = spc_lock_wait(l);
++	d->sls = l->unlocked ? SPC_LS_UNLOCKED : SPC_LS_LOCKED;
++	/* state_state keeps bit 2 once the device has been unlocked in this boot, which is what iOS reads. */
++	d->ss = l->unlocked ? (SPC_AKS_UNLOCKED_SINCE) : (SPC_AKS_LOCKED);
++	d->sfa = l->fail;
++	d->sb = wait;
++	d->sgpe = 0;                    /* no grace period: nothing to defer, nothing is encrypted */
++	d->srcd = 0;                    /* recovery countdown: we never wipe, so it is always 0 */
++}
++
++uint32_t
++spc_devstate_der(const struct spc_devstate *d, uint8_t *out, size_t room)
++{
++	static const char *const keys[] = { "ss", "sls", "sb", "sfa", "sgs", "sas", "sgpe", "srcd" };
++	uint32_t vals[8];
++	uint32_t n = 0, total = 2;
++
++	if (room < 3) {
++		return 0;
++	}
++	vals[0] = d->ss;
++	vals[1] = d->sls;
++	vals[2] = d->sb > 0xffffffffu ? 0xffffffffu : (uint32_t)d->sb;
++	vals[3] = d->sfa;
++	vals[4] = d->sgs;
++	vals[5] = d->sas;
++	vals[6] = d->sgpe;
++	vals[7] = d->srcd;
++
++	/* Two passes: size it, then fill it. The SET header is two bytes, so the body must fit in 0xff. */
++	for (unsigned i = 0; i < 8; i++) {
++		uint8_t tmp[3 + 2 + 4 + 7];     /* SEQ + UTF8String "srcd" + a 7-byte INTEGER */
++		uint32_t one = spc_der_pair(tmp, sizeof(tmp), keys[i], vals[i]);
++		if (one == 0) {
++			return 0;
++		}
++		total += one;
++	}
++	if (total > room || total - 2 > 0xff) {
++		return 0;
++	}
++	out[n++] = 0x31;
++	out[n++] = (uint8_t)(total - 2);
++	for (unsigned i = 0; i < 8; i++) {
++		n += spc_der_pair(out + n, room - n, keys[i], vals[i]);
++	}
++	return n;
++}
++#endif
+diff --git a/bsd/dev/SweetPasscode.h b/bsd/dev/SweetPasscode.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/SweetPasscode.h
+@@ -0,0 +1,235 @@
++/*
++ * SWEET passcode core (2322): the whole lock, with no I/O of its own and no locks.
++ *
++ * Everything that decides anything lives here: the record format, the verifier, the backoff, the load/verify/set/clear
++ * state machine and the device-state the lock answers with. The kernel file (SweetKeyStore.cpp, 2321) is a shim: it
++ * takes a mutex, copies a code out of user memory, and wires the four I/O calls to vnodes. The Mac host check
++ * (plans/passcode/tools/test_lock.c) runs the same state machine against a simulated filesystem, so the code under
++ * test is the code that ships. That split is deliberate: the first version of this had the state machine in the
++ * kernel file, the host test modelled it in its own loop, and two defects that broke the lock outright passed 30
++ * checks (plans/passcode/audit-report.md).
++ *
++ * Nothing here encrypts any data: there is no cprotect, no SEP and no keybag encryption. See plans/passcode/README.md.
++ */
++#ifndef SWEET_PASSCODE_H
++#define SWEET_PASSCODE_H
++
++#include <stdint.h>
++#include <stddef.h>
++#include <stdbool.h>
++
++/*
++ * C linkage. The core is C and SweetKeyStore.cpp is C++; without this every symbol is mangled on one side only and
++ * the kernel fails to link with "<symbol>, referenced from ... declaration possibly missing 'extern C'".
++ */
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define SPC_SECRET_MAX  128u            /* longest code accepted, in bytes; also the unlock_device buffer cap */
++#define SPC_SALT        16u
++#define SPC_HASH        32u
++#define SPC_ITER        100000u         /* PBKDF2 rounds for a new code; a record keeps its own count */
++#define SPC_ITER_MIN    1000u           /* a record asking for fewer is refused as damaged */
++#define SPC_ITER_MAX    10000000u
++#define SPC_REC         96u             /* one record */
++#define SPC_FAIL_REC    40u             /* the backoff record, its own file and checksum */
++#define SPC_SLOT_STRIDE 4096u           /* the two slots sit one filesystem block apart */
++#define SPC_FILE_LEN    (SPC_SLOT_STRIDE + SPC_REC)
++#define SPC_PACKED_MAX  2048u           /* the verify selector's packed buffer cap */
++#define SPC_FAIL_MAGIC  0x464c5053u     /* 'SPLF': the backoff counter lives in its own file */
++#define SPC_FAIL_STALE  86400u          /* a failure older than a day is not worth honouring */
++
++/* Where everything lives. /private/var is on the root volume, which is what survives a reboot. */
++#define SPC_FILE        "/private/var/db/sweet-passcode"
++#define SPC_FAIL_FILE   "/private/var/db/sweet-passcode-fail"
++
++/* Boot args (PE_parse_boot_argn): =2 clears the code on this RAM boot only; =0 is the stub of patch 0038/0238. */
++#define SPC_ARG         "sweetpasscode"
++
++/* Lock states as MobileKeyBag numbers them (MKBGetDeviceLockState). */
++#define SPC_LS_UNLOCKED         0
++#define SPC_LS_LOCKED           1
++#define SPC_LS_NO_PASSCODE      3
++
++/* aks_get_lock_state bits: 1 = device locked, 4 = unlocked since boot, 8 = "in gracetime after boot". */
++#define SPC_AKS_LOCKED          0x1u
++#define SPC_AKS_UNLOCKED_SINCE  0x4u
++#define SPC_AKS_GRACE           0x8u
++
++struct spc_state {
++	uint64_t seq;                   /* bumped on every write; the slot with the higher valid seq wins */
++	uint32_t iter;                  /* PBKDF2 rounds this verifier was made with */
++	uint32_t failed;                /* the count mirrored into the record; the fail file is authoritative */
++	uint8_t  set;                   /* 1: a passcode is set */
++	uint8_t  salt[SPC_SALT];
++	uint8_t  verifier[SPC_HASH];    /* PBKDF2-HMAC-SHA256(code, salt, iter), never the code */
++};
++
++/* Record <-> state. decode refuses a bad magic, version, checksum or iteration count, and any nonzero padding. */
++void spc_encode(const struct spc_state *s, uint8_t out[SPC_REC]);
++bool spc_decode(const uint8_t in[SPC_REC], struct spc_state *s);
++
++/*
++ * Pick the state from the two slots: the valid one with the higher seq. Neither valid means "no passcode", so a
++ * missing, corrupt or zeroed file can never lock the owner out. *next is the slot the next write must go to, which
++ * is never the slot the winning record came from.
++ */
++void spc_pick(const uint8_t a[SPC_REC], const uint8_t b[SPC_REC], struct spc_state *s, int *next);
++
++void spc_pbkdf2_sha256(const uint8_t *pw, size_t pw_len, const uint8_t *salt, size_t salt_len, uint32_t iter,
++    uint8_t out[SPC_HASH]);
++
++/* 1 when equal. Same instructions and the same number of them whatever the bytes are. */
++int spc_equal(const uint8_t *a, const uint8_t *b, size_t n);
++
++/* Seconds to wait before the next try after `failed` wrong ones. Five free tries, then 1, 5, 15, then an hour. */
++uint32_t spc_backoff(uint32_t failed);
++
++/* Seconds still to wait: backoff minus the time since the last failure (0 when nothing is owed). */
++uint32_t spc_backoff_left(uint32_t failed, uint64_t since_ms);
++
++/*
++ * The verify selector's buffer (libaks aks_pack_data): u32 count, then per item u32 length, the bytes, zero padding
++ * to 4. Returns item `want` in *p and *len, false on any overrun, a zero count or a missing item.
++ */
++bool spc_packed_item(const uint8_t *buf, size_t buf_len, uint32_t want, const uint8_t **p, uint32_t *len);
++
++/* DER INTEGER of a non-negative value, minimal length with a 0x00 when the top bit is set. Returns bytes (<= 7). */
++uint32_t spc_der_uint(uint8_t *p, uint32_t v);
++
++/* DER SEQUENCE { UTF8String key, INTEGER value }, short forms only. `room` must be >= 4 + strlen(key) + 3. */
++uint32_t spc_der_pair(uint8_t *p, size_t room, const char *key, uint32_t value);
++
++/* Wipe a buffer so the compiler cannot elide it. */
++void spc_wipe(void *p, size_t n);
++
++/*
++ * The backoff counter lives in its own small file, so a damaged verifier file cannot lose the count. Its record:
++ * magic, failed, the last failure's wall time (Unix seconds) and a checksum. A missing or damaged record reads as
++ * "no failures", so a broken counter cannot lock the owner out either.
++ */
++struct spc_fail {
++	uint32_t failed;
++	uint64_t last_sec;
++};
++
++void spc_fail_encode(const struct spc_fail *f, uint8_t out[SPC_FAIL_REC]);
++bool spc_fail_decode(const uint8_t in[SPC_FAIL_REC], struct spc_fail *f);
++
++/* -----------------------------------------------------------------------------------------------------------------
++ * The lock state machine.
++ *
++ * All file access goes through this vtable, so the kernel wires it to vnode_open/vn_rdwr and the host check wires it
++ * to a simulated filesystem. read/write return 0 or an errno; a short read must come back as an error (EIO), which is
++ * what the kernel's vnode path does and what a simulated one must imitate.
++ * -------------------------------------------------------------------------------------------------------------- */
++struct spc_io {
++	int  (*read)(void *ctx, const char *path, void *buf, uint32_t len, uint32_t off);
++	int  (*write)(void *ctx, const char *path, const void *buf, uint32_t len, uint32_t off);
++	/* Wall time in Unix seconds and the monotonic clock in ms. The backoff uses the monotonic one; the wall clock
++	 * is only stored, so that a wait survives a reboot. */
++	void (*clock)(void *ctx, uint64_t *wall_sec, uint64_t *mono_ms);
++	void (*random)(void *ctx, uint8_t *buf, size_t n);
++	/*
++	 * Optional, NULL in the kernel: called at each step of a verify so the host check can assert the ordering
++	 * (the count reaching the disk before a byte of the code is hashed) behaviourally instead of by reading the
++	 * source. It costs one NULL test per verify.
++	 */
++	void (*step)(void *ctx, int step);
++};
++
++#define SPC_STEP_COUNT_SAVED    1       /* the incremented count is on the disk */
++#define SPC_STEP_HASH_BEGIN     2       /* the verifier is about to run: the count must already be on the disk */
++#define SPC_STEP_HASH_DONE      3       /* the verifier has run */
++
++/* What a verify or a set came to. The kernel maps each to an IOReturn. */
++enum spc_try {
++	SPC_TRY_OK = 0,                 /* the code matched, or the change was written */
++	SPC_TRY_WRONG,                  /* a wrong code: counted, and the backoff may have started */
++	SPC_TRY_BACKOFF,                /* refused without hashing: a wait is still owed */
++	SPC_TRY_NOTHING_SET,            /* no code to check */
++	SPC_TRY_NEED_OLD,               /* a code is set and the caller did not supply the old one */
++	SPC_TRY_BAD_ARGUMENT,           /* the new code is longer than SPC_SECRET_MAX */
++	SPC_TRY_WRITE_FAILED,           /* the disk refused the record; nothing changed in memory */
++};
++
++/* Which notifications a call wants sent. Indexed by SPC_EV_*; the kernel maps them to 0xe3ffd0xx. */
++enum {
++	SPC_EV_LOCKED = 0,
++	SPC_EV_UNLOCKED,
++	SPC_EV_FIRST_UNLOCK,
++	SPC_EV_PASSCODE_CHANGED,
++	SPC_EV_ATTEMPTS_FAILED,
++	SPC_EV_BACKOFF_STARTED,
++	SPC_EV_BACKOFF_ENDED,
++	SPC_EV_COUNT,
++};
++
++struct spc_events {
++	bool on[SPC_EV_COUNT];
++};
++
++struct spc_lock {
++	struct spc_state st;            /* the committed record; never changed except by a successful write */
++	uint32_t fail;                  /* failed tries since the last right one; the backoff reads this */
++	uint64_t fail_deadline;         /* monotonic ms when the wait ends; 0 = nothing owed. A deadline, not a
++	                                 * start time, so a reboot mid-wait cannot overcharge (finding 2). */
++	int      next_slot;             /* the slot the next write goes to, never the live one */
++	bool     unlocked;              /* this boot's session; deliberately not persisted */
++	bool     loaded;
++	bool     have_code;
++	struct spc_io io;
++	void    *ctx;
++};
++
++void spc_lock_init(struct spc_lock *l, const struct spc_io *io, void *ctx);
++
++/* Read both slots and the count, once. Safe to call from anywhere; later calls do nothing. */
++void spc_lock_load(struct spc_lock *l);
++
++bool spc_lock_have_code(const struct spc_lock *l);
++bool spc_lock_unlocked(const struct spc_lock *l);
++uint32_t spc_lock_failed(const struct spc_lock *l);
++uint32_t spc_lock_wait(const struct spc_lock *l);      /* seconds still owed, 0 = go ahead */
++
++/*
++ * A verify. The incremented count reaches the disk *before* the verifier runs, so a power cut in between still
++ * counted the guess; on a match the count is cleared and the session unlocks. A write failure does not refuse the
++ * attempt (a full disk must not be a way to strand the owner); the in-memory count still limits the session.
++ */
++enum spc_try spc_lock_verify(struct spc_lock *l, const uint8_t *code, size_t len, struct spc_events *ev);
++
++/*
++ * Set (new_len > 0) or clear (new_len == 0) the code. With a code already set, the old one has to verify unless
++ * `force` is set, which the kernel passes only for uid 0. The new record is built in a local copy and swapped in only
++ * after the write succeeds, so memory and disk cannot disagree.
++ */
++enum spc_try spc_lock_set(struct spc_lock *l, const uint8_t *old, size_t old_len,
++    const uint8_t *new_code, size_t new_len, bool force, struct spc_events *ev);
++
++/* Lock the session. Does nothing when no code is set: there is nothing to unlock against. */
++void spc_lock_now_locked(struct spc_lock *l, struct spc_events *ev);
++
++/* The DER device-state fields, filled from the lock. */
++struct spc_devstate {
++	uint32_t ss;                    /* state_state: bit 2 once unlocked, bit 0 while locked */
++	uint32_t sls;                   /* state_lock_state: 0 unlocked, 1 locked, 3 no passcode */
++	uint64_t sb;                    /* state_backoff: seconds still owed */
++	uint32_t sfa;                   /* state_failed_attempts */
++	uint32_t sgs;                   /* state_generation_state */
++	uint32_t sas;                   /* state_assertion_set */
++	uint32_t sgpe;                  /* state_grace_period_enabled */
++	uint32_t srcd;                  /* state_recovery_countdown */
++};
++
++void spc_lock_devstate(const struct spc_lock *l, struct spc_devstate *d);
++
++/* Serialise those fields as the DER SET that aks_get_device_state/aks_get_extended_device_state return. */
++uint32_t spc_devstate_der(const struct spc_devstate *d, uint8_t *out, size_t room);
++
++#ifdef __cplusplus
++}   /* extern "C" */
++#endif
++
++#endif /* SWEET_PASSCODE_H */
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -110,6 +110,7 @@
+ bsd/dev/sweet_touch_asteroids.c		standard
+ bsd/dev/sweet_dsi_asteroids.c		standard
+ bsd/dev/sweet_rtc_asteroids.c		standard
++bsd/dev/SweetPasscode.c			standard
+ bsd/dev/sweet_thermal_asteroids.c	standard
+ bsd/dev/sweet_power_survey.c		standard
+ bsd/dev/sweet_a810.c			standard

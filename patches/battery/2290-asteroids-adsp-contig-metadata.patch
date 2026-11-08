@@ -1,0 +1,78 @@
+--- a/bsd/dev/battery/AdspRuntime.inc
++++ b/bsd/dev/battery/AdspRuntime.inc
+@@ -1,4 +1,4 @@
+-/* B2 draft. Not linked into the B1 image. Bounded ADSP PAS36/PAS1 lifecycle.
++/* ADSP PAS36/PAS1 lifecycle for the battery gauge: test gates sweetbadsp/sweetbglink/sweetbread.
+  * Hardware constants from volcano DT and rootstock's same-phone ADSP port.
+  */
+ #include <kern/clock.h>
+@@ -6,6 +6,8 @@
+ #include <kern/kalloc.h>
+ #include <machine/machine_routines.h>
+ #include <vm/pmap.h>
++#include <vm/vm_kern_xnu.h>
++#include "../sweet_board.h"
+ #include "QcomSmem.h"
+ #include "QcomSmp2p.h"
+ #include "QcomGlink.h"
+@@ -17,6 +19,7 @@
+ #include "BatterySnapshot.inc"
+ extern vm_offset_t ml_io_map_unmappable(vm_offset_t,vm_size_t,unsigned int);
+ extern void ml_io_unmap(vm_offset_t,vm_size_t);
++extern ppnum_t pmap_find_phys(pmap_t,addr64_t);
+ extern void sweet_apps_rsc_lock(void);
+ extern void sweet_apps_rsc_unlock(void);
+ extern void sweet_log_sync(void);
+@@ -93,8 +96,8 @@
+ static int adsp_open_images(struct wl_fat *f){
+  int rc=sweet_ufs_part_size("modem_a",NULL,&adsp_partition_bytes);if(rc)return rc;
+  if((rc=fat_mount(f,"modem_a")))return rc;
+- m.images[0]=(struct adsp_image){.stem="adsp_dtb",.pas=36,.base=0x99280000,.bytes=0x80000,.meta_pa=0xe1400000};
+- m.images[1]=(struct adsp_image){.stem="adsp",.pas=1,.base=0x99300000,.bytes=0x2800000,.meta_pa=0xe1410000};
++ m.images[0]=(struct adsp_image){.stem="adsp_dtb",.pas=36,.base=0x99280000,.bytes=0x80000};
++ m.images[1]=(struct adsp_image){.stem="adsp",.pas=1,.base=0x99300000,.bytes=0x2800000};
+  for(unsigned i=0;i<2;i++){
+   struct adsp_image *im=&m.images[i];char path[32];uint32_t cl;
+   snprintf(path,sizeof(path),"image/%s.mdt",im->stem);
+@@ -106,6 +109,16 @@
+  }
+  return 0;
+ }
++/* PAS metadata in contiguous kernel memory, as IPA does (PAS15 init passed in ast175/178/179).
++ * The modem owns the fixed 0xe1400000/0xe1410000 pages, so the two can run in one boot. */
++static int m_contig(vm_offset_t *va,uint64_t *pa,vm_size_t size){
++ if(kmem_alloc_contig(kernel_map,va,size,PAGE_MASK,0,0,KMA_DATA|KMA_ZERO,VM_KERN_MEMORY_IOKIT)!=KERN_SUCCESS){*va=0;return ENOMEM;}
++ *pa=ptoa_64(pmap_find_phys(kernel_pmap,(addr64_t)*va));
++ bool ok=*pa && *pa<(1ull<<36) && size<=(1ull<<36)-*pa;
++ for(vm_size_t off=0;ok && off<size;off+=PAGE_SIZE)ok=ptoa_64(pmap_find_phys(kernel_pmap,(addr64_t)(*va+off)))==*pa+off;
++ if(!ok){kmem_free(kernel_map,*va,size);*va=0;*pa=0;return EINVAL;}
++ return 0;
++}
+ static int adsp_load_image(struct wl_fat *f,struct adsp_image *im){
+  unsigned off=le32(im->mdt+28),count=le16(im->mdt+44);uint64_t low=UINT64_MAX,high=0;
+  for(unsigned i=0;i<count;i++){
+@@ -115,12 +128,11 @@
+  }
+  uint64_t span=((high+4095)&~4095ull)-low;
+  if(low==UINT64_MAX || !span || span>im->bytes)return EINVAL;
+- im->metadata=ml_io_map_unmappable(im->meta_pa,META_MAX,VM_WIMG_WCOMB);
+- if(!im->metadata)return ENOMEM;
+- memcpy((void *)im->metadata,im->mdt,im->mdt_bytes);__asm__ volatile("dsb sy":::"memory");
++ int rc=m_contig(&im->metadata,&im->meta_pa,META_MAX);if(rc)return rc;
++ memcpy((void *)im->metadata,im->mdt,im->mdt_bytes);sweet_dma_sync_va((void *)im->metadata,META_MAX);
+  /* Shutdown is owed even if secure firmware returns an uncertain init result. */
+  im->owed=true;
+- int rc=m_pas(im->pas,1,qcom_scm_args(2,0,2,0),im->meta_pa,0);if(rc)return rc;
++ if((rc=m_pas(im->pas,1,qcom_scm_args(2,0,2,0),im->meta_pa,0)))return rc;
+  if((rc=m_pas(im->pas,2,qcom_scm_args(3,0,0,0),im->base,span)))return rc;
+  im->mapping=ml_io_map_unmappable(im->base,im->bytes,VM_WIMG_WCOMB);if(!im->mapping)return ENOMEM;
+  for(unsigned i=0;i<count;i++){
+@@ -163,7 +175,7 @@
+  for(unsigned i=0;i<2;i++){
+   struct adsp_image *im=&m.images[i];
+   if(im->mapping)m_unmap(im->mapping,im->bytes);
+-  if(im->metadata)m_unmap(im->metadata,META_MAX);
++  if(im->metadata)kmem_free(kernel_map,im->metadata,META_MAX);
+   if(im->mdt)kfree_data(im->mdt,im->mdt_bytes);
+  }
+  if(m.db)m_unmap(m.db,0x20000);if(m.rsc)m_unmap(m.rsc,0x4000);

@@ -1,0 +1,1183 @@
+SWEET AKS: a real software passcode, with no SEP (2321)
+
+The stub of 0038/0238 answers "no passcode, always unlocked" to everything, so
+iOS thinks a passcode is set (`sls 0`) and the Passcode pane misbehaves. This
+gives AppleKeyStore a real verifier instead:
+
+- PBKDF2-HMAC-SHA256, 100000 rounds, 16-byte salt, in /private/var/db/sweet-passcode
+  as two checksummed 96-byte slots one 4 KiB block apart. A missing or corrupt
+  file means "no passcode", so a bad file can never lock the owner out.
+- The failed-try count is in its own file and is fsynced BEFORE the verifier
+  runs, so a reset mid-guess still counts it. Backoff is 5 free tries, then
+  60/300/900/900 s, then 3600 s forever. Never a wipe.
+- Real lock state in selectors 7, 8, 9, 12, 13, 17, 32 and 35, and the code
+  changes in 5 and 15 behind com.apple.keystore.device.
+- The lock-state IOKit interest messages 0xe3ffd00c..0xe3ffd013, which the stub
+  never sent and SpringBoard needs.
+- Selector 42 verifies. P0 on 2026-11-04 proved it arrives as FIVE SCALARS and
+  no structure input, so the packed buffer is a bare pointer in scalar 2 with
+  its length in scalar 3. Selector 31 answers an empty plist dictionary.
+- The code is never logged.
+- Out-of-line structure buffers (over 4096 bytes, e.g. selector 31's 32768-byte
+  output) arrive unwired, so both struct helpers prepare() the descriptor before
+  readBytes/writeBytes, complete() it after, and check the byte count. Without
+  that, selector 31 panicked "IOGMD: not wired for the IODMACommand" (ast204).
+
+This file is a shim: the record, the verifier, the backoff and the whole load/verify/set
+state machine are in bsd/dev/SweetPasscode.c (2322), which the Mac host tests compile and run.
+What is here is the mutex, the copyin, the vnode I/O binding and the selector mapping.
+AppleKeyStore::start() calls spc_lock_init(&sweet_pc, &sweet_pc_io, NULL) once, before any
+user client exists; without that call the vtable is NULL and the lock silently does nothing.
+
+- Selector 5 is the "turn it on" path and refuses an empty secret or a live code. Selector 15 always proves the old
+  code, root included. sweetpasscode=2 clears both slots and reports what actually happened.
+
+Escape hatches: sweetpasscode=0 (today's stub, byte for byte), =2 (clear the
+code for this boot), or delete the two files from OrangeFox.
+
+Nothing is encrypted. The HFS root has no cprotect and keychain wraps are still
+plaintext; this stops the next person who picks the phone up from using it.
+
+Needs 2322 for bsd/dev/SweetPasscode.h. Security code: plans/passcode/audit-brief.md
+is the audit brief, and no image should boot until that audit is a GO.
+
+Check: python3 -I plans/passcode/tools/check-lock.py XNU_DIR (56 checks, 30 negative controls)
+Apply: git apply -p1 in the kernel tree.
+--- a/iokit/Kernel/arm/SweetKeyStore.cpp
++++ b/iokit/Kernel/arm/SweetKeyStore.cpp
+@@ -1,18 +1,29 @@
+ /*
+- * Built-in AppleKeyStore for SWEET: a device without a passcode whose
+- * system keybag is always loaded and unlocked.
++ * Built-in AppleKeyStore for SWEET: the lock screen's passcode, with no SEP and no data protection.
+  *
+- * Apple's AppleKeyStore kext (closed, SEP-backed) owns the keybags behind
+- * data protection. libaks (AppleKeyStore.framework, statically in keybagd)
+- * opens IOServiceMatching("AppleKeyStore") with type 0, calls selector 0,
+- * then one selector per aks_* function (iOS 16.7 numbering below). keybagd
+- * --init asks for the system bag (14) and only loads systembag.kb when the
+- * answer is kIOReturnNotFound; answering with a handle is the path a
+- * userspace reboot takes, so no bag file is needed.
++ * Apple's AppleKeyStore kext (closed, SEP-backed) owns the keybags behind data protection. libaks
++ * (AppleKeyStore.framework, statically in keybagd) opens IOServiceMatching("AppleKeyStore") with type 0, calls
++ * selector 0, then one selector per aks_* function. keybagd --init asks for the system bag (14) and only loads
++ * systembag.kb when the answer is kIOReturnNotFound; answering with a handle is the path a userspace reboot takes,
++ * so no bag file is needed.
+  *
+- * Every call is logged (selector, caller, argument shapes, result) so the
+- * next selectors the system needs show up on the console; unknown ones fail
+- * with kIOReturnUnsupported.
++ * This file is a SHIM. The whole lock — the record, the verifier, the backoff, the load/verify/set state machine and
++ * the device state — lives in bsd/dev/SweetPasscode.c, which the Mac host check compiles and drives against a
++ * simulated filesystem. What is left here is what only a kernel can do: take a mutex, copy a code out of user memory,
++ * wire four I/O calls to vnodes, and map the outcomes to IOReturns and to the lock-state interest messages.
++ *
++ * That split is not tidiness. The first version kept the state machine here and had the host test model it in its own
++ * loop, so two defects that broke the lock outright passed 30 checks (plans/passcode/audit-report.md): the failed
++ * count was never incremented, and the first code ever set was thrown away at the next reboot.
++ *
++ * Nothing is encrypted. The HFS root has no cprotect, keychain wraps are still plaintext (selector 10), and anyone
++ * with a cable can RAM-boot an image with sweetpasscode=0 or read the verifier off the disk. It stops the next person
++ * who picks the phone up from using it, which is what the owner asked for.
++ *
++ * Escape hatches, most reliable last:
++ *   sweetpasscode=0   the patch 0038/0238 stub, exactly: no file is opened and every selector answers as it did
++ *   sweetpasscode=2   rewrite the verifier as "no passcode" for this RAM boot, then behave as 0
++ *   OrangeFox         delete /private/var/db/sweet-passcode and its -fail file by hand
+  */
+ #include <pexpert/arm64/board_config.h>
+ 
+@@ -22,72 +33,418 @@
+ #include <IOKit/IOKitKeys.h>
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOMemoryDescriptor.h>
++#include <IOKit/IOBSD.h>
+ #include <libkern/c++/OSString.h>
++#include <libkern/crypto/sha2.h>
++#include <libkern/crypto/rand.h>
+ #include <sys/proc.h>
++#include <sys/fcntl.h>
++#include <sys/stat.h>
++#include <sys/vnode.h>
++#include <sys/kauth.h>
++#include <sys/mount.h>
++#include <sys/uio.h>
++#include <sys/errno.h>
++#include <libkern/copyio.h>
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <pexpert/pexpert.h>
+ 
+-/* libaks selectors (AppleKeyStore.framework, iOS 16.7). */
++#include "../../../bsd/dev/SweetPasscode.h"
++
++/* libaks selectors (AppleKeyStore.framework; iOS 16.7 numbering, P0-checked against iOS 26 where noted). */
+ enum {
+ 	kAKSOpen             = 0,
+ 	kAKSCreateBag        = 2,
+ 	kAKSSaveBag          = 3,
+ 	kAKSUnloadBag        = 4,
+-	kAKSSetSystem        = 5,
++	kAKSSetSystem        = 5,       /* set_system_with_passcode: { handle, code ptr, len, ?, acm } */
+ 	kAKSLoadBag          = 6,
+ 	kAKSGetLockState     = 7,
+-	kAKSUnlockDevice     = 9,
++	kAKSLockDevice       = 8,
++	kAKSUnlockDevice     = 9,       /* { handle, code ptr, len, acm } */
+ 	kAKSWrapKey          = 10,
+ 	kAKSUnwrapKey        = 11,
+ 	kAKSUnlockBag        = 12,
+ 	kAKSLockBag          = 13,
+ 	kAKSGetSystem        = 14,
++	kAKSChangeSecret     = 15,      /* 12 scalars; the codes are {ptr, len} pairs */
+ 	kAKSGetDeviceState   = 17,
+-	kAKSGetExtDeviceState = 35,     /* aks_get_extended_device_state */
+ 	kAKSAssertHold       = 26,
+ 	kAKSAssertDrop       = 27,
++	kAKSSetConfiguration = 30,
++	kAKSGetConfiguration = 31,
++	kAKSLockDeviceAlt    = 32,
++	kAKSGetExtDeviceState = 35,
++	kAKSVerifyPassword   = 42,      /* PROVEN by P0: five scalars, no structure input */
+ 	kAKSUnloadSessionBags = 55,
++	kAKSIgnore83         = 83,
++	kAKSAssertConsume    = 101,
+ 	kAKSNotifyStateSet   = 102,
+ 	kAKSNotifyStateIsSet = 103,
+-	kAKSAssertConsume    = 101,     /* aks_assert_consume */
++	kAKSChangeEpilogue   = 105,
+ };
+ 
++/* aks lock state bits (aks_get_lock_state). */
++#define SWEET_AKS_LOCKED         0x1u
++#define SWEET_AKS_UNLOCKED_SINCE 0x4u
++
++/*
++ * Lock-state interest messages. aksNotificationCB (AppleKeyStore.framework) maps these to MobileKeyBag's lock-state
++ * notifications, which is how SpringBoard learns the phone locked. The stub never sent one.
++ */
++#define SWEET_AKS_MSG_LOCKED            0xe3ffd00cu
++#define SWEET_AKS_MSG_UNLOCKED          0xe3ffd00du
++#define SWEET_AKS_MSG_FIRST_UNLOCK      0xe3ffd00fu
++#define SWEET_AKS_MSG_PASSCODE_CHANGED  0xe3ffd010u
++#define SWEET_AKS_MSG_ATTEMPTS_FAILED   0xe3ffd011u
++#define SWEET_AKS_MSG_BACKOFF_STARTED   0xe3ffd012u
++#define SWEET_AKS_MSG_BACKOFF_ENDED     0xe3ffd013u
++
+ /* The system (device) bag handle. */
+ #define SWEET_AKS_SYSTEM_HANDLE 0
+ 
++/* The entitlement Settings changes the code with. Root is allowed too: it can rewrite the file anyway. */
++#define SWEET_AKS_CHANGE_ENTITLEMENT    "com.apple.keystore.device"
++
++LCK_GRP_DECLARE(sweet_pc_grp, "sweet_passcode");
++LCK_MTX_DECLARE(sweet_pc_mtx, &sweet_pc_grp);
++
++enum { SPC_MODE_ON = 0, SPC_MODE_STUB = 1, SPC_MODE_CLEAR = 2 };
++
+ /*
+- * aks lock state bits (aks_get_lock_state): bit 2 is "unlocked since boot"
+- * (MobileKeyBag MKBDeviceUnlockedSinceBoot); clear lock bits = unlocked.
++ * One lock, guarded by sweet_pc_mtx. Everything about it is in the core; this struct is only the core's handle plus
++ * the kernel's own I/O binding, so there is no second copy of any state for the two to disagree about.
+  */
+-#define SWEET_AKS_LOCK_STATE    0x4
++static struct spc_lock sweet_pc;
+ 
++/* Set once sweetpasscode=2 has actually cleared the code. A kernel boots once, so one flag is enough. */
++static bool sweet_pc_clear_done;
++
++#ifdef WIRING_TEST
++/* The host harness simulates several boots in one process, so it needs to clear the flag between them. */
++static void pc_clear_forget(void) { sweet_pc_clear_done = false; }
++#else
++#define pc_clear_forget()  do { } while (0)
++#endif
++
+ class AppleKeyStore : public IOService {
+ 	OSDeclareDefaultStructors(AppleKeyStore);
+ 
+ public:
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	void sendLockMsg(uint32_t msg);
+ };
+ 
+ OSDefineMetaClassAndStructors(AppleKeyStore, IOService);
+ 
++static AppleKeyStore *gSweetAKS;        /* one instance, from the KernelConfigTables personality */
++
++/* ---- the core's I/O, wired to the same vnode calls the SWEET RTC code uses ---- */
++
++static int
++pc_io_read(void *ctx, const char *path, void *buf, uint32_t len, uint32_t off)
++{
++	vfs_context_t vctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	int resid = 0, err;
++
++	(void)ctx;
++	err = vnode_open(path, FREAD | O_NOFOLLOW, 0, VNODE_LOOKUP_NOFOLLOW, &vp, vctx);
++	if (err != 0) {
++		return err;
++	}
++	err = vn_rdwr(UIO_READ, vp, (caddr_t)buf, len, off, UIO_SYSSPACE, IO_NOAUTH,
++	    vfs_context_ucred(vctx), &resid, vfs_context_proc(vctx));
++	(void)vnode_close(vp, FREAD, vctx);
++	if (err == 0 && resid != 0) {
++		err = EIO;                      /* a short read is not a record; the core judges each slot on its own */
++	}
++	return err;
++}
++
++static int
++pc_io_write(void *ctx, const char *path, const void *buf, uint32_t len, uint32_t off)
++{
++	vfs_context_t vctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	int resid = 0, err;
++
++	(void)ctx;
++	err = vnode_open(path, O_CREAT | FWRITE | O_NOFOLLOW, S_IRUSR | S_IWUSR, VNODE_LOOKUP_NOFOLLOW, &vp, vctx);
++	if (err != 0) {
++		return err;
++	}
++	err = vn_rdwr(UIO_WRITE, vp, (caddr_t)buf, len, off, UIO_SYSSPACE, IO_NOAUTH | IO_SYNC | IO_UNIT,
++	    vfs_context_ucred(vctx), &resid, vfs_context_proc(vctx));
++	if (err == 0 && resid != 0) {
++		err = EIO;
++	}
++	if (err == 0) {
++		err = VNOP_FSYNC(vp, MNT_WAIT, vctx);
++	}
++	int cerr = vnode_close(vp, FWRITE, vctx);
++	return err ? err : cerr;
++}
++
++static void
++pc_io_clock(void *ctx, uint64_t *wall_sec, uint64_t *mono_ms)
++{
++	clock_sec_t secs = 0;
++	clock_usec_t usec = 0;
++	uint64_t abs = 0, ns = 0;
++
++	(void)ctx;
++	clock_get_calendar_microtime(&secs, &usec);
++	clock_get_uptime(&abs);
++	absolutetime_to_nanoseconds(abs, &ns);
++	*wall_sec = (uint64_t)secs;
++	*mono_ms = ns / 1000000ull;
++}
++
++static void
++pc_io_random(void *ctx, uint8_t *buf, size_t n)
++{
++	(void)ctx;
++	if (random_buf(buf, n) != 0) {
++		memset(buf, 0, n);
++	}
++}
++
++static const struct spc_io sweet_pc_io = {
++	.read = pc_io_read,
++	.write = pc_io_write,
++	.clock = pc_io_clock,
++	.random = pc_io_random,
++	.step = NULL,                   /* the step markers exist only for the host check */
++};
++
++/*
++ * The boot-arg escape hatch. =0 is the old stub exactly: not one file is opened, and every selector answers what it
++ * answered before 2321. =2 clears the code for this boot. Checked once, on the first call.
++ */
++static int
++pc_mode(void)
++{
++	static int cached = -1;
++
++	if (cached < 0) {
++		int v = 1;
++		(void)PE_parse_boot_argn(SPC_ARG, &v, sizeof(v));
++		if (v == 0) {
++			cached = SPC_MODE_STUB;
++			printf("SWEET AKS: sweetpasscode=0, the 0038 stub: no file is opened\n");
++		} else if (v == 2) {
++			cached = SPC_MODE_CLEAR;
++			printf("SWEET AKS: sweetpasscode=2, clearing the passcode for this boot\n");
++		} else {
++			cached = SPC_MODE_ON;
++		}
++	}
++	return cached;
++}
++
++/* ---- notifications ---- */
++
++static void
++pc_send_events(uint32_t bits)
++{
++	static const struct {
++		int      ev;
++		uint32_t msg;
++	} map[] = {
++		{ SPC_EV_LOCKED, SWEET_AKS_MSG_LOCKED },
++		{ SPC_EV_UNLOCKED, SWEET_AKS_MSG_UNLOCKED },
++		{ SPC_EV_FIRST_UNLOCK, SWEET_AKS_MSG_FIRST_UNLOCK },
++		{ SPC_EV_PASSCODE_CHANGED, SWEET_AKS_MSG_PASSCODE_CHANGED },
++		{ SPC_EV_ATTEMPTS_FAILED, SWEET_AKS_MSG_ATTEMPTS_FAILED },
++		{ SPC_EV_BACKOFF_STARTED, SWEET_AKS_MSG_BACKOFF_STARTED },
++	};
++
++	if (gSweetAKS == NULL) {
++		return;
++	}
++	for (unsigned i = 0; i < sizeof(map) / sizeof(map[0]); i++) {
++		if (bits & (1u << map[i].ev)) {
++			gSweetAKS->sendLockMsg(map[i].msg);
++		}
++	}
++}
++
++static uint32_t
++pc_events_to_bits(const struct spc_events *ev)
++{
++	uint32_t bits = 0;
++	for (int i = 0; i < SPC_EV_COUNT; i++) {
++		if (ev->on[i]) {
++			bits |= (1u << i);
++		}
++	}
++	return bits;
++}
++
++static const char *
++pc_try_name(enum spc_try r)
++{
++	switch (r) {
++	case SPC_TRY_OK:           return "ok";
++	case SPC_TRY_WRONG:        return "wrong";
++	case SPC_TRY_BACKOFF:      return "backoff";
++	case SPC_TRY_NOTHING_SET:  return "nothing-set";
++	case SPC_TRY_NEED_OLD:     return "need-old";
++	case SPC_TRY_BAD_ARGUMENT: return "bad-arg";
++	case SPC_TRY_WRITE_FAILED: return "write-failed";
++	}
++	return "?";
++}
++
++/* Run one core operation under the mutex and send whatever it asked for, outside the mutex. */
++static enum spc_try
++pc_do(int op, const uint8_t *a, size_t alen, const uint8_t *b, size_t blen, bool force)
++{
++	struct spc_events ev;
++	enum spc_try r;
++
++	memset(&ev, 0, sizeof(ev));
++	lck_mtx_lock(&sweet_pc_mtx);
++	if (op == 1 && force) {
++		/*
++		 * A forced set is selector 5: "turn it on", which must not replace or clear a live code. Tested here, inside
++		 * the same lock as the write, so two privileged callers cannot both see "no code" and both write.
++		 */
++		(void)spc_lock_have_code(&sweet_pc);
++		if (!sweet_pc.loaded) {
++			lck_mtx_unlock(&sweet_pc_mtx);
++			return SPC_TRY_WRITE_FAILED;    /* state unknown: refuse rather than overwrite */
++		}
++		if (sweet_pc.have_code) {
++			lck_mtx_unlock(&sweet_pc_mtx);
++			return SPC_TRY_NEED_OLD;
++		}
++	}
++	switch (op) {
++	case 0:
++		r = spc_lock_verify(&sweet_pc, a, alen, &ev);
++		break;
++	case 1:
++		r = spc_lock_set(&sweet_pc, a, alen, b, blen, force, &ev);
++		break;
++	default:
++		spc_lock_now_locked(&sweet_pc, &ev);
++		r = SPC_TRY_OK;
++		break;
++	}
++	uint32_t sfa = spc_lock_failed(&sweet_pc);
++	uint32_t sb = spc_lock_wait(&sweet_pc);
++	lck_mtx_unlock(&sweet_pc_mtx);
++	pc_send_events(pc_events_to_bits(&ev));
++	/*
++	 * The test boot has to tell a wrong code from a refusal, and both map to kIOReturnNotPermitted. This line says
++	 * which, with the count and the wait, and never anything about the code itself.
++	 */
++	IOLog("SWEET AKS: %s -> %s, sfa %u, sb %u\n",
++	    op == 0 ? "verify" : op == 1 ? "set" : "lock", pc_try_name(r), sfa, sb);
++	return r;
++}
++
++/*
++ * sweetpasscode=2: rewrite the verifier as "no passcode" once, on the first selector. `done` is a plain static
++ * because a kernel boots once; the host harness, which simulates several boots in one process, resets it through
++ * pc_clear_forget() below, compiled only under WIRING_TEST.
++ */
++
++static void
++pc_clear_for_boot(void)
++{
++	struct spc_events ev;
++	uint8_t none = 0;
++
++	lck_mtx_lock(&sweet_pc_mtx);
++	if (sweet_pc_clear_done) {
++		lck_mtx_unlock(&sweet_pc_mtx);
++		return;
++	}
++	memset(&ev, 0, sizeof(ev));
++	enum spc_try r = SPC_TRY_OK;
++	/*
++	 * `spc_lock_have_code()` loads on demand and returns false for a read error that is not ENOENT or a short read,
++	 * so false does not mean "there is no code": it can mean "the volume is not ready yet". The first version
++	 * latched `done` on that and logged "passcode gone" for a phone that still had one (finding 1 of
++	 * audit-delta-report-2.md). Only latch once the load actually happened; otherwise leave it for the next
++	 * selector, which runs a moment later with the volume up.
++	 */
++	/* Load first: `loaded` says whether the disk answered, not whether a caller happened to have asked yet. */
++	(void)spc_lock_have_code(&sweet_pc);
++	if (!sweet_pc.loaded) {
++		lck_mtx_unlock(&sweet_pc_mtx);
++		printf("SWEET AKS: sweetpasscode=2 clear NOT DONE yet: the passcode files are not readable, retrying\n");
++		return;
++	}
++	bool had = spc_lock_have_code(&sweet_pc);
++	if (had) {
++		r = spc_lock_set(&sweet_pc, NULL, 0, &none, 0, true, &ev);
++	}
++	bool still = spc_lock_have_code(&sweet_pc);
++	/* The clear only counts as done when the code is really gone and the write said so. */
++	bool ok = !still && r == SPC_TRY_OK;
++	if (ok) {
++		sweet_pc_clear_done = true;
++	}
++	lck_mtx_unlock(&sweet_pc_mtx);
++	pc_send_events(pc_events_to_bits(&ev));
++	/*
++	 * After this the phone answers as the stub does: with no code set, 9 and 12 succeed, and the device state says
++	 * "no passcode". Say plainly what happened, because a half-cleared file is exactly the state a recovery boot
++	 * must not leave behind. Never claim success that was not achieved.
++	 */
++	if (ok) {
++		printf("SWEET AKS: sweetpasscode=2 clear ok (r=%d), passcode %s\n", (int)r, had ? "gone" : "was already unset");
++	} else {
++		printf("SWEET AKS: sweetpasscode=2 clear FAILED (r=%d), passcode %s; use =0 or OrangeFox\n",
++		    (int)r, still ? "STILL SET" : "state unknown");
++	}
++}
++
++/* ---- the user client ---- */
++
+ bool
+ AppleKeyStore::start(IOService *provider)
+ {
+ 	if (!IOService::start(provider)) {
+ 		return false;
+ 	}
++	/*
++	 * Bind the core to the disk and the clock, once, before any user client can exist. Without this the core's I/O
++	 * vtable stays NULL, every read answers ENOENT and every write EROFS, so the lock silently does nothing: no code
++	 * can be set, nothing is counted and sls reads 3 for the whole boot. That is how the first revision shipped, and
++	 * none of the host tests could see it, because they call spc_lock_init() themselves. check-lock.py now looks for
++	 * this call in the source and for the I/O symbols in the built object.
++	 */
++	spc_lock_init(&sweet_pc, &sweet_pc_io, NULL);
+ 	setProperty(kIOUserClientClassKey, "AppleKeyStoreUserClient");
+ 	registerService();
+-	IOLog("SWEET AKS: AppleKeyStore registered (no passcode, unlocked)\n");
++	gSweetAKS = this;
++	IOLog("SWEET AKS: AppleKeyStore registered (%s), io %s\n",
++	    pc_mode() == SPC_MODE_ON ? "software passcode" :
++	    pc_mode() == SPC_MODE_CLEAR ? "software passcode, sweetpasscode=2 clearing" : "stub, sweetpasscode=0",
++	    sweet_pc.io.read == pc_io_read && sweet_pc.io.write == pc_io_write ? "bound" : "UNBOUND");
+ 	return true;
+ }
+ 
++void
++AppleKeyStore::sendLockMsg(uint32_t msg)
++{
++	/* No argument: aksNotificationCB reads the message type, and the payload only for 0xd00f. */
++	messageClients(msg, NULL, 0);
++}
++
+ class AppleKeyStoreUserClient : public IOUserClient {
+ 	OSDeclareDefaultStructors(AppleKeyStoreUserClient);
+ 
+ public:
+ 	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
+ 	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+-	    IOExternalMethodDispatch *dispatch, OSObject *target,
+-	    void *reference) APPLE_KEXT_OVERRIDE;
++	    IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
+ };
+ 
+ OSDefineMetaClassAndStructors(AppleKeyStoreUserClient, IOUserClient);
+@@ -99,15 +456,28 @@
+ 	return kIOReturnSuccess;
+ }
+ 
+-/* Copy len bytes to the caller's output structure (inband or descriptor). */
++/*
++ * Copy len bytes to the caller's output structure (inband or descriptor). A descriptor is the caller's out-of-line
++ * buffer (anything over 4096 bytes, e.g. selector 31's 32768), and is_io_connect_method hands it over unwired:
++ * writeBytes() on it without prepare() panics "IOGMD: not wired" (ast204).
++ */
+ static IOReturn
+ sweet_aks_struct_out(IOExternalMethodArguments *args, const void *buf, uint32_t len)
+ {
+ 	if (args->structureOutputDescriptor != NULL) {
+-		if (len > args->structureOutputDescriptor->getLength()) {
++		IOMemoryDescriptor *md = args->structureOutputDescriptor;
++		if (len > md->getLength()) {
+ 			return kIOReturnNoSpace;
+ 		}
+-		args->structureOutputDescriptor->writeBytes(0, buf, len);
++		IOReturn pr = md->prepare();
++		if (pr != kIOReturnSuccess) {
++			return pr;
++		}
++		IOByteCount n = md->writeBytes(0, buf, len);
++		md->complete();
++		if (n != len) {
++			return kIOReturnVMError;
++		}
+ 		args->structureOutputDescriptorSize = len;
+ 		return kIOReturnSuccess;
+ 	}
+@@ -119,68 +489,30 @@
+ 	return kIOReturnSuccess;
+ }
+ 
+-/* Append SEQUENCE { UTF8String key, INTEGER value } (short forms only). */
+ static uint32_t
+-sweet_aks_der_pair(uint8_t *p, const char *key, uint8_t value)
+-{
+-	uint32_t klen = (uint32_t)strlen(key);
+-	uint32_t n = 0;
+-	p[n++] = 0x30;
+-	p[n++] = (uint8_t)(2 + klen + 3);
+-	p[n++] = 0x0c;
+-	p[n++] = (uint8_t)klen;
+-	memcpy(p + n, key, klen);
+-	n += klen;
+-	p[n++] = 0x02;
+-	p[n++] = 0x01;
+-	p[n++] = value;
+-	return n;
+-}
+-
+-/*
+- * Device state (selector 17): a DER SET of key/INTEGER pairs that libaks
+- * decode_extended_state reads: ss state, sls lock state (MKBGetDeviceLockState:
+- * 0 = unlocked), sb backoff, sfa failed attempts, sgs generation, sas
+- * assertions, sgpe grace period, srcd recovery countdown.
+- */
+-static IOReturn
+-sweet_aks_device_state(IOExternalMethodArguments *args)
+-{
+-	static const struct {
+-		const char *key;
+-		uint8_t value;
+-	} fields[] = {
+-		{ "ss", SWEET_AKS_LOCK_STATE }, { "sls", 0 }, { "sb", 0 }, { "sfa", 0 },
+-		{ "sgs", 0 }, { "sas", 0 }, { "sgpe", 0 }, { "srcd", 0 },
+-	};
+-	uint8_t buf[128];
+-	uint32_t n = 2;
+-	for (unsigned int i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
+-		n += sweet_aks_der_pair(buf + n, fields[i].key, fields[i].value);
+-	}
+-	buf[0] = 0x31;
+-	buf[1] = (uint8_t)(n - 2);
+-	return sweet_aks_struct_out(args, buf, n);
+-}
+-
+-static uint32_t
+ sweet_aks_struct_out_size(IOExternalMethodArguments *args)
+ {
+ 	return args->structureOutputDescriptor != NULL ?
+ 	       (uint32_t)args->structureOutputDescriptor->getLength() : args->structureOutputSize;
+ }
+ 
+-/* Copy the caller's input structure (inband or descriptor); returns its length or 0. */
++/* Copy the caller's input structure (inband or descriptor); returns its length or 0. A descriptor arrives unwired. */
+ static uint32_t
+ sweet_aks_struct_in(IOExternalMethodArguments *args, void *buf, uint32_t max)
+ {
+ 	uint32_t len;
+ 	if (args->structureInputDescriptor != NULL) {
+-		len = (uint32_t)args->structureInputDescriptor->getLength();
++		IOMemoryDescriptor *md = args->structureInputDescriptor;
++		len = (uint32_t)md->getLength();
+ 		if (len == 0 || len > max) {
+ 			return 0;
+ 		}
+-		return args->structureInputDescriptor->readBytes(0, buf, len) == len ? len : 0;
++		if (md->prepare() != kIOReturnSuccess) {
++			return 0;
++		}
++		IOByteCount n = md->readBytes(0, buf, len);
++		md->complete();
++		return n == len ? len : 0;
+ 	}
+ 	len = args->structureInputSize;
+ 	if (args->structureInput == NULL || len == 0 || len > max) {
+@@ -191,15 +523,61 @@
+ }
+ 
+ /*
+- * Key wrap / unwrap (aks_wrap_key / aks_unwrap_key): securityd wraps every keychain
+- * item's 32-byte key with a class key held by the SEP: inputs { handle, class }, the
+- * key in, the effective class out (scalar) and the wrapped key out (40 bytes, the size
+- * of an RFC 3394 wrap of 32 bytes). There is no SEP and no passcode here, so the
+- * "wrapped" key is the key behind an 8-byte header { 'SWAK', class }: keychain items
+- * round-trip, but their keys are readable from the disk (as on a device without
+- * data protection). Unwrap accepts only that header. Before this every SecItemAdd
+- * failed (bluetoothd: "LeSecurityManager hit a keychain problem").
++ * Copy a passcode out of the caller's address space. libaks passes it as a bare pointer in a scalar, so this is the
++ * one place user memory is read for a secret: the length is capped, copyin validates the range, and the caller wipes
++ * the buffer. A NULL pointer or a length over SPC_SECRET_MAX is refused rather than guessed at.
+  */
++static bool
++sweet_aks_copy_code(uint64_t ptr, uint64_t len, uint8_t *dst, size_t max, size_t *out_len)
++{
++	*out_len = 0;
++	if (ptr == 0 || len > max) {
++		return false;
++	}
++	if (len == 0) {
++		return true;                    /* an empty code: legal for "clear", and judged as wrong for verify */
++	}
++	if (copyin((user_addr_t)ptr, dst, (size_t)len) != 0) {
++		return false;
++	}
++	*out_len = (size_t)len;
++	return true;
++}
++
++static bool
++sweet_aks_may_change(void)
++{
++	if (kauth_getuid() == 0) {
++		return true;                    /* root can rewrite the verifier file anyway */
++	}
++	return IOTaskHasEntitlement(current_task(), SWEET_AKS_CHANGE_ENTITLEMENT) ? true : false;
++}
++
++static IOReturn
++sweet_aks_try_to_ret(enum spc_try r, bool *changed)
++{
++	if (changed != NULL) {
++		*changed = (r == SPC_TRY_OK);
++	}
++	switch (r) {
++	case SPC_TRY_OK:
++		return kIOReturnSuccess;
++	case SPC_TRY_WRONG:
++	case SPC_TRY_BACKOFF:
++	case SPC_TRY_NEED_OLD:
++		return kIOReturnNotPermitted;
++	case SPC_TRY_NOTHING_SET:
++		return kIOReturnNotFound;
++	case SPC_TRY_BAD_ARGUMENT:
++		return kIOReturnBadArgument;
++	case SPC_TRY_WRITE_FAILED:
++		return kIOReturnIOError;
++	}
++	return kIOReturnError;
++}
++
++/* ---- key wrap / unwrap (unchanged from patch 0238) ---- */
++
+ #define SWEET_AKS_WRAP_MAGIC    0x4b415753u     /* 'SWAK' little endian */
+ #define SWEET_AKS_WRAP_HDR      8u
+ #define SWEET_AKS_KEY_MAX       128u
+@@ -210,6 +588,7 @@
+ 	uint8_t buf[SWEET_AKS_WRAP_HDR + SWEET_AKS_KEY_MAX];
+ 	uint32_t cls = args->scalarInputCount > 1 ? (uint32_t)args->scalarInput[1] : 0;
+ 	uint32_t len = sweet_aks_struct_in(args, buf + SWEET_AKS_WRAP_HDR, SWEET_AKS_KEY_MAX);
++
+ 	if (len == 0) {
+ 		return kIOReturnBadArgument;
+ 	}
+@@ -217,11 +596,9 @@
+ 	memcpy(buf, &magic, 4);
+ 	memcpy(buf + 4, &cls, 4);
+ 	IOReturn ret = sweet_aks_struct_out(args, buf, SWEET_AKS_WRAP_HDR + len);
+-	if (ret == kIOReturnSuccess) {
+-		if (args->scalarOutputCount > 0) {
+-			args->scalarOutput[0] = cls;
+-			args->scalarOutputCount = 1;
+-		}
++	if (ret == kIOReturnSuccess && args->scalarOutputCount > 0) {
++		args->scalarOutput[0] = cls;
++		args->scalarOutputCount = 1;
+ 	}
+ 	return ret;
+ }
+@@ -230,8 +607,9 @@
+ sweet_aks_unwrap(IOExternalMethodArguments *args)
+ {
+ 	uint8_t buf[SWEET_AKS_WRAP_HDR + SWEET_AKS_KEY_MAX];
+-	uint32_t len = sweet_aks_struct_in(args, buf, sizeof(buf));
+ 	uint32_t magic;
++	uint32_t len = sweet_aks_struct_in(args, buf, sizeof(buf));
++
+ 	if (len <= SWEET_AKS_WRAP_HDR) {
+ 		return kIOReturnBadArgument;
+ 	}
+@@ -243,10 +621,245 @@
+ 	return sweet_aks_struct_out(args, buf + SWEET_AKS_WRAP_HDR, len - SWEET_AKS_WRAP_HDR);
+ }
+ 
++/* ---- device state ---- */
++
++static IOReturn
++sweet_aks_device_state(IOExternalMethodArguments *args)
++{
++	uint8_t der[256];
++	struct spc_devstate d;
++	uint32_t n;
++
++	lck_mtx_lock(&sweet_pc_mtx);
++	spc_lock_devstate(&sweet_pc, &d);
++	lck_mtx_unlock(&sweet_pc_mtx);
++
++	n = spc_devstate_der(&d, der, sizeof(der));
++	if (n == 0) {
++		return kIOReturnInternalError;
++	}
++	args->scalarOutputCount = 0;
++	return sweet_aks_struct_out(args, der, n);
++}
++
++/*
++ * Nothing set means "unlocked", as the stub always answered and as Apple's own AKS treats a bag with an empty secret.
++ * Checked before any copyin, so a caller that passes no code (or a bad pointer) still gets success on a phone with no
++ * passcode, which is what iOS 26 did before 2321 and what keybagd may rely on at boot.
++ */
++static bool
++sweet_aks_no_code(void)
++{
++	lck_mtx_lock(&sweet_pc_mtx);
++	bool none = !spc_lock_have_code(&sweet_pc);
++	lck_mtx_unlock(&sweet_pc_mtx);
++	return none;
++}
++
++/*
++ * True when the passcode files have not been read yet because the volume refused. Reading is "no passcode" so the
++ * owner is never locked out by a disk fault, but anything that would *change* the lock must refuse instead: with no
++ * state the core cannot tell a first set from a replacement, and a transient error must not become a way to overwrite
++ * a live code (finding 7 of audit-delta-report-3.md).
++ */
++static bool
++sweet_aks_state_unknown(void)
++{
++	lck_mtx_lock(&sweet_pc_mtx);
++	(void)spc_lock_have_code(&sweet_pc);     /* loads, or leaves `loaded` false */
++	bool unknown = !sweet_pc.loaded;
++	lck_mtx_unlock(&sweet_pc_mtx);
++	return unknown;
++}
++
++/* Selector 9 (unlock_device) and 12 (unlock_bag): { handle, code ptr, len, ... }. */
++static IOReturn
++sweet_aks_unlock(IOExternalMethodArguments *args)
++{
++	uint8_t code[SPC_SECRET_MAX];
++	size_t code_len = 0;
++	enum spc_try r;
++	bool changed = false;
++
++	if (sweet_aks_no_code()) {
++		return kIOReturnSuccess;        /* nothing to prove, and the stub answered success here */
++	}
++	if (args->scalarInputCount < 3) {
++		return kIOReturnBadArgument;
++	}
++	if (!sweet_aks_copy_code(args->scalarInput[1], args->scalarInput[2], code, sizeof(code), &code_len)) {
++		spc_wipe(code, sizeof(code));
++		return kIOReturnBadArgument;
++	}
++	r = pc_do(0, code, code_len, NULL, 0, false);
++	spc_wipe(code, sizeof(code));
++	return sweet_aks_try_to_ret(r, &changed);
++}
++
++/*
++ * Selector 42: aks_verify_password. P0 on 2026-11-04 settled the layout: iOS 26 sends FIVE scalars and NO structure
++ * input (`Preferences sel 42 arg0 0 in 5/0`), so the packed buffer is a bare pointer at scalar 2 with its length at
++ * scalar 3. Reading structureInput, as the first draft did, made every verify kIOReturnUnsupported and backed the
++ * Passcode pane out. aks_pack_data writes: u32 count, then per item a u32 length, the bytes, zero padding to 4.
++ */
++static IOReturn
++sweet_aks_verify_password(IOExternalMethodArguments *args)
++{
++	uint8_t *packed = NULL;
++	uint8_t code[SPC_SECRET_MAX];
++	const uint8_t *item = NULL;
++	uint32_t item_len = 0, packed_len;
++	enum spc_try r;
++	bool changed = false;
++
++	if (args->scalarOutputCount > 0) {
++		args->scalarOutput[0] = 0;
++	}
++	if (sweet_aks_no_code()) {
++		return kIOReturnUnsupported;    /* the stub's answer, and the honest one: there is nothing to verify */
++	}
++	if (args->scalarInputCount < 4) {
++		return kIOReturnBadArgument;
++	}
++	packed_len = (uint32_t)args->scalarInput[3];
++	if (packed_len < 8 || packed_len > SPC_PACKED_MAX) {
++		return kIOReturnBadArgument;
++	}
++	/* copyin outside the lock: it can fault, and it must not run under the mutex. */
++	packed = (uint8_t *)IOMalloc(packed_len);
++	if (packed == NULL) {
++		return kIOReturnNoMemory;
++	}
++	if (copyin((user_addr_t)args->scalarInput[2], packed, packed_len) != 0 ||
++	    !spc_packed_item(packed, packed_len, 0, &item, &item_len) || item_len > SPC_SECRET_MAX) {
++		spc_wipe(packed, packed_len);
++		IOFree(packed, packed_len);
++		return kIOReturnBadArgument;
++	}
++	memcpy(code, item, item_len);
++	spc_wipe(packed, packed_len);
++	IOFree(packed, packed_len);
++
++	r = pc_do(0, code, item_len, NULL, 0, false);
++	spc_wipe(code, sizeof(code));
++	return sweet_aks_try_to_ret(r, &changed);
++}
++
++/*
++ * Selector 15: change_secret_with_kek. libaks packs 12 scalars; the codes are {ptr, len} pairs at 3/4 (old) and 5/6
++ * (new), which is what _aks_change_secret_with_kek hands over. Anything else is refused rather than interpreted, so a
++ * mismatch can only make a change fail, never set a code from a stray pointer.
++ */
++static IOReturn
++sweet_aks_change_secret(IOExternalMethodArguments *args)
++{
++	uint8_t old_code[SPC_SECRET_MAX], new_code[SPC_SECRET_MAX];
++	size_t old_len = 0, new_len = 0;
++	enum spc_try r;
++	bool changed = false;
++
++	if (!sweet_aks_may_change()) {
++		printf("SWEET AKS: change refused, no %s\n", SWEET_AKS_CHANGE_ENTITLEMENT);
++		return kIOReturnNotPermitted;
++	}
++	if (args->scalarInputCount < 12) {
++		return kIOReturnBadArgument;
++	}
++	if (sweet_aks_state_unknown()) {
++		/* The files could not be read, so a change here could overwrite a live code it cannot see. */
++		printf("SWEET AKS: change refused, passcode state unknown\n");
++		return kIOReturnNotReady;
++	}
++	/*
++	 * The old code is required only when one is live. "Turn Passcode On" really is this selector: MobileKeyBag's
++	 * _MKBKeyBagCreateSystem ends in aks_change_secret_opts with x3 = NULL and w4 = 0 as the old secret and the new
++	 * one at x1/w2 (mkb.dis 0x1cb454560 to 0x1cb45459c). Refusing an empty old code unconditionally would make the
++	 * first set fail on the first real boot, so the requirement is tied to the live code, and the core enforces the
++	 * same fact through `force`.
++	 */
++	bool live = !sweet_aks_no_code();
++	if (live) {
++		if (args->scalarInput[3] == 0 || args->scalarInput[4] == 0) {
++			printf("SWEET AKS: change refused, no old passcode supplied\n");
++			return kIOReturnNotPermitted;
++		}
++		if (!sweet_aks_copy_code(args->scalarInput[3], args->scalarInput[4], old_code, sizeof(old_code),
++		    &old_len)) {
++			spc_wipe(old_code, sizeof(old_code));
++			return kIOReturnBadArgument;
++		}
++	}
++	/*
++	 * The new code may be absent, and that is how a change removes the code: a NULL pointer with length 0 is a clear,
++	 * not an error.
++	 */
++	if (args->scalarInput[6] != 0 &&
++	    !sweet_aks_copy_code(args->scalarInput[5], args->scalarInput[6], new_code, sizeof(new_code), &new_len)) {
++		spc_wipe(old_code, sizeof(old_code));
++		spc_wipe(new_code, sizeof(new_code));
++		return kIOReturnBadArgument;
++	}
++	/*
++	 * Never forced while a code is live: root included, a change always proves the old one. With no code live there is
++	 * nothing to prove, which is the first-set case above.
++	 */
++	r = pc_do(1, live ? old_code : NULL, live ? old_len : 0, new_code, new_len, !live);
++	spc_wipe(old_code, sizeof(old_code));
++	spc_wipe(new_code, sizeof(new_code));
++	return sweet_aks_try_to_ret(r, &changed);
++}
++
++/* Selector 5: set_system_with_passcode, the "turn a passcode on" path. Same gate as a change. */
++static IOReturn
++sweet_aks_set_system(IOExternalMethodArguments *args)
++{
++	uint8_t code[SPC_SECRET_MAX];
++	size_t code_len = 0;
++	enum spc_try r;
++	bool changed = false;
++
++	if (!sweet_aks_may_change()) {
++		printf("SWEET AKS: set refused, no %s\n", SWEET_AKS_CHANGE_ENTITLEMENT);
++		return kIOReturnNotPermitted;
++	}
++	if (args->scalarInputCount < 3) {
++		return kIOReturnBadArgument;
++	}
++	/*
++	 * MobileKeyBag's create-bag step: selector 5 with a NULL secret, no code live. It must succeed and leave no
++	 * passcode, because it is on the way through "Turn Passcode On" (mkb.dis 0x1cb4547a0 calls aks_set_system with
++	 * x1 = the new-code pointer and w2 = 0). Checked before the pointer is validated, because a NULL pointer with a
++	 * length of 0 is exactly what that call looks like.
++	 */
++	if (args->scalarInput[2] == 0) {
++		/*
++		 * An empty secret is a "create the bag, no passcode yet" request. With a code live it must not clear it:
++		 * that would be a disarming route with no proof of ownership.
++		 */
++		if (!sweet_aks_no_code()) {
++			printf("SWEET AKS: set refused, a passcode is already set\n");
++			return kIOReturnNotPermitted;
++		}
++		printf("SWEET AKS: set accepted, empty secret, no passcode\n");
++		return kIOReturnSuccess;
++	}
++	if (!sweet_aks_copy_code(args->scalarInput[1], args->scalarInput[2], code, sizeof(code), &code_len)) {
++		spc_wipe(code, sizeof(code));
++		return kIOReturnBadArgument;
++	}
++	if (sweet_aks_state_unknown()) {
++		spc_wipe(code, sizeof(code));
++		printf("SWEET AKS: set refused, passcode state unknown\n");
++		return kIOReturnNotReady;
++	}
++	r = pc_do(1, NULL, 0, code, code_len, true);
++	spc_wipe(code, sizeof(code));
++	return sweet_aks_try_to_ret(r, &changed);
++}
++
+ IOReturn
+ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+-    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
+-    __unused void *reference)
++    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target, __unused void *reference)
+ {
+ 	IOReturn ret = kIOReturnSuccess;
+ 	uint32_t in_scalars = args->scalarInputCount;
+@@ -255,21 +868,97 @@
+ 	uint32_t out_scalars = args->scalarOutputCount;
+ 	uint32_t out_struct = sweet_aks_struct_out_size(args);
+ 	uint64_t arg0 = in_scalars > 0 ? args->scalarInput[0] : 0;
++	int mode = pc_mode();
+ 
++	/*
++	 * sweetpasscode=0 is the 0038 stub, exactly: not one byte is read from the disk, and every selector answers
++	 * what it answered before 2321. That is the recovery path, so it must not depend on a file being readable.
++	 */
++	if (mode == SPC_MODE_STUB) {
++		switch (selector) {
++		case kAKSOpen:
++		case kAKSUnloadBag:
++		case kAKSSetSystem:
++		case kAKSUnlockDevice:
++		case kAKSUnlockBag:
++		case kAKSLockBag:
++		case kAKSAssertHold:
++		case kAKSAssertDrop:
++		case kAKSAssertConsume:
++		case kAKSUnloadSessionBags:
++		case kAKSNotifyStateSet:
++			args->scalarOutputCount = 0;
++			break;
++		case kAKSGetSystem:
++			if (out_scalars < 1) {
++				ret = kIOReturnBadArgument;
++				break;
++			}
++			args->scalarOutput[0] = SWEET_AKS_SYSTEM_HANDLE;
++			args->scalarOutputCount = 1;
++			break;
++		case kAKSGetLockState:
++			if (out_scalars < 1) {
++				ret = kIOReturnBadArgument;
++				break;
++			}
++			args->scalarOutput[0] = SWEET_AKS_UNLOCKED_SINCE;
++			args->scalarOutputCount = 1;
++			break;
++		case kAKSNotifyStateIsSet:
++			if (out_scalars < 1) {
++				ret = kIOReturnBadArgument;
++				break;
++			}
++			args->scalarOutput[0] = 0;
++			args->scalarOutputCount = 1;
++			break;
++		case kAKSGetDeviceState:
++		case kAKSGetExtDeviceState: {
++			/* Exactly the old answer: ss 4, sls 0, every other field 0. */
++			struct spc_devstate d;
++			uint8_t der[256];
++			uint32_t n;
++			memset(&d, 0, sizeof(d));
++			d.ss = SWEET_AKS_UNLOCKED_SINCE;
++			d.sls = SPC_LS_UNLOCKED;
++			n = spc_devstate_der(&d, der, sizeof(der));
++			args->scalarOutputCount = 0;
++			ret = n ? sweet_aks_struct_out(args, der, n) : kIOReturnInternalError;
++			break;
++		}
++		case kAKSWrapKey:
++			ret = sweet_aks_wrap(args);
++			break;
++		case kAKSUnwrapKey:
++			ret = sweet_aks_unwrap(args);
++			break;
++		default:
++			/* 8, 15, 30, 31, 42, 83, 105 and everything else: Unsupported, as before. */
++			ret = kIOReturnUnsupported;
++			break;
++		}
++		goto log;
++	}
++
++	if (mode == SPC_MODE_CLEAR) {
++		pc_clear_for_boot();
++	}
++
+ 	switch (selector) {
+ 	case kAKSOpen:
+ 	case kAKSUnloadBag:
+-	case kAKSSetSystem:
+-	case kAKSUnlockDevice:
+-	case kAKSUnlockBag:
+-	case kAKSLockBag:
+ 	case kAKSAssertHold:
+ 	case kAKSAssertDrop:
+ 	case kAKSAssertConsume:
+ 	case kAKSUnloadSessionBags:
+-	case kAKSNotifyStateSet:
++	case kAKSIgnore83:
+ 		args->scalarOutputCount = 0;
+ 		break;
++	case kAKSSetSystem:
++		args->scalarOutputCount = 0;
++		ret = sweet_aks_set_system(args);
++		break;
+ 	case kAKSGetSystem:
+ 		if (out_scalars < 1) {
+ 			ret = kIOReturnBadArgument;
+@@ -278,39 +967,87 @@
+ 		args->scalarOutput[0] = SWEET_AKS_SYSTEM_HANDLE;
+ 		args->scalarOutputCount = 1;
+ 		break;
+-	case kAKSGetLockState:
++	case kAKSGetLockState: {
++		uint64_t bits;
+ 		if (out_scalars < 1) {
+ 			ret = kIOReturnBadArgument;
+ 			break;
+ 		}
+-		args->scalarOutput[0] = SWEET_AKS_LOCK_STATE;
+-		args->scalarOutputCount = 1;
+-		break;
+-	case kAKSNotifyStateIsSet:
+-		/* Nothing was ever set: answer "not set". */
+-		if (out_scalars < 1) {
+-			ret = kIOReturnBadArgument;
+-			break;
++		lck_mtx_lock(&sweet_pc_mtx);
++		if (!spc_lock_have_code(&sweet_pc)) {
++			bits = SWEET_AKS_UNLOCKED_SINCE;
++		} else {
++			bits = spc_lock_unlocked(&sweet_pc) ? SWEET_AKS_UNLOCKED_SINCE : SWEET_AKS_LOCKED;
+ 		}
+-		args->scalarOutput[0] = 0;
++		lck_mtx_unlock(&sweet_pc_mtx);
++		args->scalarOutput[0] = bits;
+ 		args->scalarOutputCount = 1;
+ 		break;
++	}
++	case kAKSUnlockDevice:
++	case kAKSUnlockBag:
++		args->scalarOutputCount = 0;
++		ret = sweet_aks_unlock(args);
++		break;
++	case kAKSLockDevice:
++	case kAKSLockDeviceAlt:
++	case kAKSLockBag:
++		args->scalarOutputCount = 0;
++		(void)pc_do(2, NULL, 0, NULL, 0, false);
++		break;
++	case kAKSVerifyPassword:
++		ret = sweet_aks_verify_password(args);
++		break;
+ 	case kAKSGetDeviceState:
+ 	case kAKSGetExtDeviceState:
+-		args->scalarOutputCount = 0;
+ 		ret = sweet_aks_device_state(args);
+ 		break;
++	case kAKSChangeSecret:
++		args->scalarOutputCount = 0;
++		ret = sweet_aks_change_secret(args);
++		break;
++	case kAKSChangeEpilogue:
++		/* The epilogue only seals the new secret into the SEP's stash. There is none: accept and move on. */
++		args->scalarOutputCount = 0;
++		break;
++	case kAKSSetConfiguration:
++		/* The grace period and attempt limits mean nothing without a SEP. Accept so Settings need not error. */
++		args->scalarOutputCount = 0;
++		break;
++	case kAKSGetConfiguration: {
++		/* An empty plist dictionary: libaks parses it and finds no keys, which is the graceful "not set up"
++		 * answer. Guessing at Apple's configuration keys would be worse than answering with nothing. */
++		static const char empty[] = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
++		    "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
++		    "<plist version=\"1.0\"><dict/></plist>\n";
++		args->scalarOutputCount = 0;
++		ret = sweet_aks_struct_out(args, empty, (uint32_t)(sizeof(empty) - 1));
++		break;
++	}
+ 	case kAKSWrapKey:
+ 		ret = sweet_aks_wrap(args);
+ 		break;
+ 	case kAKSUnwrapKey:
+ 		ret = sweet_aks_unwrap(args);
+ 		break;
++	case kAKSNotifyStateSet:
++		args->scalarOutputCount = 0;
++		break;
++	case kAKSNotifyStateIsSet:
++		/* Nothing was ever stashed: answer "not set". */
++		if (out_scalars < 1) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		args->scalarOutput[0] = 0;
++		args->scalarOutputCount = 1;
++		break;
+ 	default:
+ 		ret = kIOReturnUnsupported;
+ 		break;
+ 	}
+ 
++log:
+ 	char name[32];
+ 	proc_selfname(name, sizeof(name));
+ 	IOLog("SWEET AKS: %s sel %u arg0 %llu in %u/%u out %u/%u -> 0x%x\n", name, selector,

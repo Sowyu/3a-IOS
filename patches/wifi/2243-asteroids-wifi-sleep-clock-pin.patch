@@ -1,0 +1,145 @@
+diff --git a/bsd/dev/sweet_wpss.c b/bsd/dev/sweet_wpss.c
+index 70aaa1d07..71b1b33d9 100644
+--- a/bsd/dev/sweet_wpss.c
++++ b/bsd/dev/sweet_wpss.c
+@@ -22,6 +22,8 @@ static void wpss_worker(void *arg,wait_result_t wait){
+   /* Last, so an SPMI surprise cannot hide the SMEM and firmware lines. */
+   wpss_gpio5_survey();
+   printf("SWEET WIFI: W1 survey complete; PAS6 untouched; no writes but the SPMI observer read command word\n");
++ } else if(arg==(void *)WpssPin){
++  int rc=wpss_gpio5_set();printf("SWEET WIFI: W1c done result=%d; PAS6 untouched\n",rc);
+  } else printf("SWEET WIFI: W2 worker final_error=%d\n",wpss_run());
+  sweet_log_sync();thread_terminate(current_thread());
+ }
+@@ -33,7 +35,7 @@ void sweet_wpss_start(void){
+  if(!PE_parse_boot_argn("sweetdeadman",&deadman,sizeof(deadman)))deadman=0;
+  int gate=wpss_gate(args,deadman);
+  if(gate==WpssOff)return;
+- if(gate==WpssRefused){printf("SWEET WIFI: refused: sweetwprobe=1 with no modem or battery gate, or sweetwpss=1 with sweetfbarm=1 sweetselftest=1 sweetdeadman=600 and no modem or battery gate\n");return;}
++ if(gate==WpssRefused){printf("SWEET WIFI: refused: sweetwprobe=1 with no modem or battery gate, or sweetwpin=1 or sweetwpss=1 with sweetfbarm=1 sweetselftest=1 sweetdeadman=600 and no modem or battery gate\n");return;}
+  thread_t thread=THREAD_NULL;kern_return_t rc=kernel_thread_start(wpss_worker,(void *)(uintptr_t)gate,&thread);
+  if(rc==KERN_SUCCESS)thread_deallocate(thread);else printf("SWEET WIFI: thread failure %d\n",rc);
+ }
+diff --git a/bsd/dev/wifi/WpssGate.h b/bsd/dev/wifi/WpssGate.h
+index 5dc4f7a2f..a2bec9b21 100644
+--- a/bsd/dev/wifi/WpssGate.h
++++ b/bsd/dev/wifi/WpssGate.h
+@@ -4,7 +4,8 @@
+ #ifndef WPSS_GATE_H
+ #define WPSS_GATE_H
+ #include "../modem/ModemGate.h"
+-enum {WpssOff=0,WpssSurvey=1,WpssStart=2,WpssRefused=-1};
++/* 2243: sweetwpin=1 (W1c) sets the sleep-clock pin and verifies it, with no WPSS start; same safeguards as sweetwpss. */
++enum {WpssOff=0,WpssSurvey=1,WpssStart=2,WpssPin=3,WpssRefused=-1};
+ /* Refused in any form: the presets, the battery's own gates, and every modem, IPA and battery-test gate ModemGate.h lists
+  * (modem_cell_gates, modem_cell_refused, modem_daily_refused), so the list cannot fall behind it. */
+ static const char *const wpss_refused[5]={"sweetdaily","sweetcell","sweetbatt","sweetbmeter","sweetbprobe"};
+@@ -16,13 +17,13 @@ static inline int wpss_conflict(const char *args){
+     return 0;
+ }
+ static inline int wpss_gate(const char *args,int deadman){
+-    unsigned probe=modem_arg_count(args,"sweetwprobe"),start=modem_arg_count(args,"sweetwpss");
+-    if(!probe && !start)return WpssOff;
+-    if(probe && start)return WpssRefused;
++    unsigned probe=modem_arg_count(args,"sweetwprobe"),start=modem_arg_count(args,"sweetwpss"),pin=modem_arg_count(args,"sweetwpin");
++    if(!probe && !start && !pin)return WpssOff;
++    if((probe!=0)+(start!=0)+(pin!=0)>1)return WpssRefused;
+     if(wpss_conflict(args))return WpssRefused;
+     if(probe)return modem_arg_is(args,"sweetwprobe","1")?WpssSurvey:WpssRefused;
+-    if(!modem_arg_is(args,"sweetwpss","1") || !modem_gate(args,"sweetfbarm") || !modem_gate(args,"sweetselftest") || deadman!=600)
++    if(!modem_arg_is(args,pin?"sweetwpin":"sweetwpss","1") || !modem_gate(args,"sweetfbarm") || !modem_gate(args,"sweetselftest") || deadman!=600)
+         return WpssRefused;
+-    return WpssStart;
++    return pin?WpssPin:WpssStart;
+ }
+ #endif
+diff --git a/bsd/dev/wifi/WpssRuntime.inc b/bsd/dev/wifi/WpssRuntime.inc
+index 3630806fe..f1269fd1a 100644
+--- a/bsd/dev/wifi/WpssRuntime.inc
++++ b/bsd/dev/wifi/WpssRuntime.inc
+@@ -264,9 +264,12 @@ static bool w_cleanup(void){
+  printf("SWEET WIFI: W2 STOP verified; cleanup=ok; cx/mx/xo votes retained until reset=%u\n",w.voted);
+  sweet_log_sync();return true;
+ }
++static int wpss_gpio5_set(void);
+ static int wpss_run(void){
+  memset(&w,0,sizeof(w));w.master=-1;struct wl_fat f;
+  int rc=w_open_image(&f);if(rc)goto out;
++ /* 2243: the sleep clock before any WPSS work (Fairphone's mainline enablement: without it the WPSS keeps crashing). */
++ if((rc=wpss_gpio5_set()))goto out;
+  w.smem=ml_io_map_unmappable(W_SM_PA,W_SM_SIZE,VM_WIMG_IO);
+  w.mutex=ml_io_map_unmappable(0x1f43000,0x1000,VM_WIMG_IO);
+  w.ipcc=ml_io_map_unmappable(0x405000,0x1000,VM_WIMG_IO);
+@@ -376,3 +379,72 @@ out:
+  if(core)w_unmap(core,0x3000);
+  sweet_log_sync();
+ }
++/* 2243: put PMK8550 GPIO5 into its sleep-clock state, the one the live DT's alt_sleep_clk_default gives it and stock Android
++ * applies at boot (pmk8550_gpios pinctrl-0, no other DT user of the pin): func1, output, input off, no pull, VIN 0.
++ * Values from the vendor pinctrl-spmi-gpio.c (NothingOSS msm-6.1 sm7635/b/mr), LV/MV subtypes: func1 is function index 2,
++ * written to DIG_OUT_SOURCE_CTL 0x44 bits 3:0 with the invert bit 7 clear; output alone is MODE_CTL 0x40 = 1; no pull is
++ * DIG_PULL_CTL 0x42 = 5. The vendor writes source, then pull, then mode (set_mux before config_set); so do we. W1 (ast200)
++ * read 0x41 VIN 0, 0x43 0, 0x45 0x01 and 0x46 0x80, which are what the vendor would write back, so they are left alone.
++ * Writes go through our EE 0 channel only (0x0c500000 + 0x1000 * apid: WDATA0 +0x10, CMD +0x00 = EXT_WRITEL (opcode 0) |
++ * reg << 4 | 0 for one byte, STATUS +0x08), as sweet_reboot.c writes SDAM on this phone. Only from W1's exact state, or
++ * none when the pin already has the target; each write is read back through the observer and any mismatch or failed
++ * command stops all further writes. The pin is left set, as stock Android leaves it. */
++#define W_SPMI_CHNLS 0x0c500000u
++static int w_spmi_wait(vm_offset_t ch,uint32_t *st){
++ for(unsigned t=0;t<1000;t++){*st=w_rd(ch,8);if(*st&1u)return *st&0x0eu?EIO:0;delay(10);}
++ return ETIMEDOUT;
++}
++static int w_spmi_read(vm_offset_t obs,uint8_t reg,uint8_t *v){
++ uint32_t st;w_wr(obs,0,(1u<<27)|((uint32_t)reg<<4));int rc=w_spmi_wait(obs,&st);
++ if(!rc)*v=(uint8_t)(w_rd(obs,0x18)&0xffu);return rc;
++}
++static int w_spmi_write(vm_offset_t ch,uint8_t reg,uint8_t v){
++ uint32_t st;w_wr(ch,0x10,v);w_wr(ch,0,((uint32_t)reg<<4));int rc=w_spmi_wait(ch,&st);
++ printf("SWEET WIFI: W1c pmk8550 gpio5 write reg=%#x value=%#x rc=%d status=%#x\n",0xbc00u|reg,v,rc,st);return rc;
++}
++static int wpss_gpio5_set(void){
++ static const uint8_t regs[]={0x04,0x05,0x08,0x40,0x41,0x42,0x43,0x44,0x45,0x46};
++ static const uint8_t wreg[3]={0x44,0x42,0x40},from[3]={0x00,0x04,0x00},to[3]={0x02,0x05,0x01};
++ vm_offset_t core=ml_io_map_unmappable(W_SPMI_CORE,0x3000,VM_WIMG_IO),cnfg=ml_io_map_unmappable(W_SPMI_CNFG,0x4000,VM_WIMG_IO),obs=0,ch=0;
++ int apid=-1,rc=EINVAL;uint8_t v[sizeof(regs)];
++ if(!core || !cnfg){rc=ENOMEM;printf("SWEET WIFI: W1c SPMI mapping failed\n");goto out;}
++ uint32_t ver=w_rd(core,0),count=w_rd(core,4)&0x7ffu;
++ if(ver<0x70000000u || ver>=0x80000000u || !count || count>0x380u){printf("SWEET WIFI: W1c SPMI arbiter %#x with %u APIDs is not v7\n",ver,count);goto out;}
++ /* Exactly one APID for the pin, owned by our EE 0: anything else is not the arbiter we read in W1. */
++ unsigned matches=0;
++ for(uint32_t n=0;n<count;n++){
++  uint32_t map=w_rd(core,0x2000+4*n);if(!map || ((map>>8)&0xfffu)!=W_GPIO5_PPID)continue;
++  matches++;unsigned o=w_rd(cnfg,4*n)&7u;printf("SWEET WIFI: W1c SPMI PPID 0x0bc APID %u owner EE %u\n",n,o);
++  if(o==0)apid=(int)n;
++ }
++ if(matches!=1 || apid<0){printf("SWEET WIFI: W1c refused: PPID 0x0bc needs exactly one APID, owned by EE 0\n");goto out;}
++ obs=ml_io_map_unmappable(W_SPMI_OBS+0x20u*(uint32_t)apid,0x20,VM_WIMG_IO);
++ ch=ml_io_map_unmappable(W_SPMI_CHNLS+0x1000u*(uint32_t)apid,0x20,VM_WIMG_IO);
++ if(!obs || !ch){rc=ENOMEM;printf("SWEET WIFI: W1c SPMI channel mapping failed\n");goto out;}
++ for(unsigned i=0;i<sizeof(regs);i++){
++  if((rc=w_spmi_read(obs,regs[i],&v[i]))){printf("SWEET WIFI: W1c read reg=%#x rc=%d; no write\n",0xbc00u|regs[i],rc);goto out;}
++  printf("SWEET WIFI: W1c before reg=%#x value=%#x\n",0xbc00u|regs[i],v[i]);
++ }
++ /* GPIO of an LV/MV subtype (the register meaning above), VIN 0, no dtest, enabled: else refuse. v[] index: 0 type,
++  * 1 subtype, 3 mode, 4 vin, 5 pull, 6 dig_in, 7 source, 9 en. */
++ rc=EINVAL;
++ if(v[0]!=0x10 || v[1]<0x10 || v[1]>0x15 || v[4]!=0 || v[6]!=0 || v[9]!=0x80){printf("SWEET WIFI: W1c refused: unexpected pin identity or config; no write\n");goto out;}
++ bool target=v[7]==to[0] && v[5]==to[1] && v[3]==to[2],stock=v[7]==from[0] && v[5]==from[1] && v[3]==from[2];
++ if(target){rc=0;printf("SWEET WIFI: W1c pin already in its sleep-clock state; no write\n");goto out;}
++ if(!stock){printf("SWEET WIFI: W1c refused: mode/pull/source %#x/%#x/%#x are neither W1's state nor the target; no write\n",v[3],v[5],v[7]);goto out;}
++ for(unsigned i=0;i<3;i++){
++  uint8_t back=0;
++  if((rc=w_spmi_write(ch,wreg[i],to[i])))break;
++  if((rc=w_spmi_read(obs,wreg[i],&back)) || back!=to[i]){
++   printf("SWEET WIFI: W1c readback reg=%#x value=%#x rc=%d: mismatch, no further write\n",0xbc00u|wreg[i],back,rc);if(!rc)rc=EIO;break;}
++ }
++ if(rc)goto out;
++ for(unsigned i=0;i<sizeof(regs);i++){uint8_t a=0;int r=w_spmi_read(obs,regs[i],&a);printf("SWEET WIFI: W1c after reg=%#x rc=%d value=%#x\n",0xbc00u|regs[i],r,a);if(r)break;}
++out:
++ printf("SWEET WIFI: W1c sleep clock pin result=%d\n",rc);
++ if(ch)w_unmap(ch,0x20);
++ if(obs)w_unmap(obs,0x20);
++ if(cnfg)w_unmap(cnfg,0x4000);
++ if(core)w_unmap(core,0x3000);
++ sweet_log_sync();return rc;
++}

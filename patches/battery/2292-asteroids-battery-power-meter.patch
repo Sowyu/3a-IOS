@@ -1,0 +1,166 @@
+--- a/bsd/dev/battery/BatteryRead.h
++++ b/bsd/dev/battery/BatteryRead.h
+@@ -5,11 +5,14 @@
+  * After timeout, close the transport before using a fresh client: this wire
+  * protocol has no transaction ID to distinguish a delayed old response.
+  */
+-enum {BatteryFields=7};
++/* 2292: with fields=BatteryAllFields a cycle also reads the meter fields (charge counter, USB voltage and current).
++ * They are logged only: validity and the snapshot use the first BatteryFields. fields=0 means BatteryFields. */
++enum {BatteryFields=7,BatteryAllFields=10};
+ typedef struct {
+-    int32_t value[BatteryFields];
+-    unsigned cursor, waiting, failed;
++    int32_t value[BatteryAllFields];
++    unsigned cursor, waiting, failed, fields;
+ } BatteryRead;
++int battery_read_complete(const BatteryRead *);
+ uint32_t battery_read_request(const BatteryRead *,uint8_t out[24]);
+ int battery_read_allowed(const uint8_t *,uint32_t);
+ int battery_read_sent(BatteryRead *);
+--- a/bsd/dev/battery/BatteryRead.c
++++ b/bsd/dev/battery/BatteryRead.c
+@@ -1,35 +1,39 @@
+ #include "BatteryRead.h"
+ /* Nothing qti_battery_charger: status, present, capacity in 0.01%, voltage uV,
+  * signed current uA, temperature in 0.01 C, USB online. See rootstock T38.
++ * 2292 meter fields: battery charge counter (uAh, 14), USB voltage (uV, 0x32 1) and current (uA, 0x32 3),
++ * numbered as Linux qcom_battmgr. All are GETs.
+  * No notification registration or SET packet can be constructed here.
+  */
+-static const uint8_t properties[BatteryFields]={0,2,4,7,9,12,0};
++static const uint8_t properties[BatteryAllFields]={0,2,4,7,9,12,0,14,1,3};
++static unsigned nfields(const BatteryRead *b){return b->fields==BatteryAllFields?BatteryAllFields:BatteryFields;}
+ static uint32_t get32(const uint8_t *p){return (uint32_t)p[0]|(uint32_t)p[1]<<8|(uint32_t)p[2]<<16|(uint32_t)p[3]<<24;}
+ static void put32(uint8_t *p,uint32_t v){for(unsigned i=0;i<4;i++)p[i]=(uint8_t)(v>>(8*i));}
+-static unsigned opcode(unsigned field){return field==6?0x32:0x30;}
++static unsigned opcode(unsigned field){return field==6 || field==8 || field==9?0x32:0x30;}
+ int battery_read_allowed(const uint8_t *p,uint32_t n){
+  if(!p || n!=24 || get32(p)!=32778 || get32(p+4)!=1 || get32(p+12)!=0 || get32(p+20)!=0)return 0;
+- for(unsigned i=0;i<BatteryFields;i++)if(get32(p+8)==opcode(i) && get32(p+16)==properties[i])return 1;
++ for(unsigned i=0;i<BatteryAllFields;i++)if(get32(p+8)==opcode(i) && get32(p+16)==properties[i])return 1;
+  return 0;
+ }
+ uint32_t battery_read_request(const BatteryRead *b,uint8_t p[24]){
+- if(!b || !p || b->failed || b->waiting || b->cursor>=BatteryFields)return 0;
++ if(!b || !p || b->failed || b->waiting || b->cursor>=nfields(b))return 0;
+  put32(p,32778);put32(p+4,1);put32(p+8,opcode(b->cursor));put32(p+12,0);put32(p+16,properties[b->cursor]);put32(p+20,0);
+  return battery_read_allowed(p,24)?24:0;
+ }
+ int battery_read_sent(BatteryRead *b){
+- if(!b || b->failed || b->waiting || b->cursor>=BatteryFields)return -1;
++ if(!b || b->failed || b->waiting || b->cursor>=nfields(b))return -1;
+  b->waiting=1;return 0;
+ }
+ int battery_read_receive(BatteryRead *b,const uint8_t *p,uint32_t n){
+- if(!b || !p || b->failed || !b->waiting || b->cursor>=BatteryFields || n!=24)return 0;
++ if(!b || !p || b->failed || !b->waiting || b->cursor>=nfields(b) || n!=24)return 0;
+  if(get32(p)!=32778 || get32(p+4)!=1 || get32(p+8)!=opcode(b->cursor) || get32(p+12)!=properties[b->cursor])return 0;
+  if(get32(p+20)){b->failed=1;return -1;}
+  b->value[b->cursor++]=(int32_t)get32(p+16);b->waiting=0;return 1;
+ }
++int battery_read_complete(const BatteryRead *b){return b && b->cursor==nfields(b);}
+ void battery_read_timeout(BatteryRead *b){if(b && b->waiting)b->failed=1;}
+ int battery_read_valid(const BatteryRead *b){
+- if(!b || b->failed || b->waiting || b->cursor!=BatteryFields)return 0;
++ if(!b || b->failed || b->waiting || b->cursor!=nfields(b))return 0;
+  return b->value[0]>=1 && b->value[0]<=4 && b->value[1]==1 &&
+  b->value[2]>=0 && b->value[2]<=10000 && b->value[3]>=2500000 && b->value[3]<=5000000 &&
+  b->value[4]>=-20000000 && b->value[4]<=20000000 && b->value[5]>=-4000 && b->value[5]<=10000 &&
+--- a/bsd/dev/battery/AdspRuntime.inc
++++ b/bsd/dev/battery/AdspRuntime.inc
+@@ -47,7 +47,7 @@
+  uint32_t qhead,qcount,rxoff,state,rail_addr[2],rail_index[2],xo_addr;
+  bool failed,fatal,qr_started,battery_up,votes_owed,vote_uncertain,xo_pinned,qmp_owed,glink,proxy_released;
+  int master;
+- BatteryRead read;bool reads,daily;uint64_t cycle_started,request_sent,cycle_due,read_quiet_until;unsigned read_failures,cycles;int32_t last_status,last_online;
++ BatteryRead read;bool reads,daily,meter;uint64_t cycle_started,request_sent,cycle_due,read_quiet_until;unsigned read_failures,cycles;int32_t last_status,last_online;
+  struct adsp_image images[2];
+ } m;
+ static uint64_t m_now(void);
+@@ -56,14 +56,18 @@
+  * client starts. Five failed cycles in a row stop reading until reboot. */
+ #define B_CYCLE_TEST_MS 15000u
+ #define B_CYCLE_DAILY_MS 20000u
++/* 2292 sweetbmeter=1 (daily only): a 5 s cycle that also reads the meter fields and logs every cycle. */
++#define B_CYCLE_METER_MS 5000u
+ #define B_QUIET_MS 30000u
+ #define B_READ_FAILURES 5u
+ /* Set by sweet_adsp_shutdown() at power off or restart; outside m, which adsp_run clears. */
+ static volatile bool adsp_stop_requested;
++/* A fresh client; the meter fields ride along in meter mode. */
++static void adsp_read_reset(void){m.read=(BatteryRead){.fields=m.meter?BatteryAllFields:0};}
+ static void adsp_read_fail(void){
+  battery_snapshot_clear();
+  if(!m.daily){m.failed=true;return;}
+- m.read=(BatteryRead){0};m.cycle_started=0;m.read_quiet_until=m_now()+B_QUIET_MS;
++ adsp_read_reset();m.cycle_started=0;m.read_quiet_until=m_now()+B_QUIET_MS;
+  if(++m.read_failures>=B_READ_FAILURES){m.reads=false;printf("SWEET BATTERY: B5 reads stopped after %u failed cycles; fallback until reboot\n",m.read_failures);}
+  else printf("SWEET BATTERY: B5 read failure %u; fresh client in %u s\n",m.read_failures,B_QUIET_MS/1000);
+  sweet_log_sync();
+@@ -78,7 +82,7 @@
+  if(!m.reads || m_now()<m.read_quiet_until)return;
+  int rc=battery_read_receive(&m.read,data,bytes);
+  if(rc<0){printf("SWEET BATTERY: B3 reply error field=%u\n",m.read.cursor);adsp_read_fail();return;}
+- if(rc==1 && m.read.cursor==BatteryFields){
++ if(rc==1 && battery_read_complete(&m.read)){
+   /* Log raw values before validation, so a wrong property id is visible. */
+   int valid=battery_read_valid(&m.read);
+   /* Test images log every cycle. Daily mode logs the first, every 15th (5 min), status or
+@@ -91,7 +95,12 @@
+   m.cycles++;m.last_status=m.read.value[0];m.last_online=m.read.value[6];
+   if(!valid){adsp_read_fail();return;}
+   battery_snapshot_publish(&m.read,m_now());m.read_failures=0;
+-  m.cycle_due=m_now()+(m.daily?B_CYCLE_DAILY_MS:B_CYCLE_TEST_MS);
++  if(m.meter){
++   uint64_t ms=m_now();
++   printf("SWEET BATTERY: B6 meter ms=%llu vbat_uV=%d ibat_uA=%d charge_uAh=%d vusb_uV=%d iusb_uA=%d status=%d online=%d\n",
++    (unsigned long long)ms,m.read.value[3],m.read.value[4],m.read.value[7],m.read.value[8],m.read.value[9],m.read.value[0],m.read.value[6]);
++  }
++  m.cycle_due=m_now()+(m.meter?B_CYCLE_METER_MS:m.daily?B_CYCLE_DAILY_MS:B_CYCLE_TEST_MS);
+  }
+ }
+ #include "AdspHelpers.inc"
+@@ -99,9 +108,9 @@
+  if(!m.reads || !m.battery_up || (m.state&6)!=6 || m.fatal || m.failed)return;
+  uint64_t now=m_now();
+  if(now<m.read_quiet_until)return;
+- if(m.read.cursor==BatteryFields){
++ if(battery_read_complete(&m.read)){
+   if(now<m.cycle_due)return;
+-  m.read=(BatteryRead){0};m.cycle_started=now;
++  adsp_read_reset();m.cycle_started=now;
+  }
+  if(!m.cycle_started)m.cycle_started=now;
+  if((m.read.waiting && now-m.request_sent>=2000) || now-m.cycle_started>=20000){
+@@ -118,7 +127,7 @@
+  m.request_sent=now;
+ }
+ /* Inside a read cycle, waiting for its next request or reply. */
+-static bool adsp_read_busy(void){return m.reads && (m.read.waiting || (m.cycle_started && m.read.cursor<BatteryFields));}
++static bool adsp_read_busy(void){return m.reads && (m.read.waiting || (m.cycle_started && !battery_read_complete(&m.read)));}
+ static int adsp_open_images(struct wl_fat *f){
+  int rc=sweet_ufs_part_size("modem_a",NULL,&adsp_partition_bytes);if(rc)return rc;
+  if((rc=fat_mount(f,"modem_a")))return rc;
+@@ -210,8 +219,8 @@
+  printf("SWEET BATTERY: B2 STOP verified; cleanup=ok; shared XO retained until reset=%u\n",m.xo_pinned);
+  sweet_log_sync();return true;
+ }
+-static int adsp_run(bool glink,bool reads,bool daily){
+- memset(&m,0,sizeof(m));m.master=-1;m.glink=glink;m.reads=reads;m.daily=daily;struct wl_fat f;
++static int adsp_run(bool glink,bool reads,bool daily,bool meter){
++ memset(&m,0,sizeof(m));m.master=-1;m.glink=glink;m.reads=reads;m.daily=daily;m.meter=daily && meter;adsp_read_reset();struct wl_fat f;
+  int rc=adsp_open_images(&f);if(rc)goto out;
+  m.smem=ml_io_map_unmappable(0x81d00000,M_SM_SIZE,VM_WIMG_IO);
+  m.mutex=ml_io_map_unmappable(0x1f43000,0x1000,VM_WIMG_IO);
+--- a/bsd/dev/sweet_adsp.c
++++ b/bsd/dev/sweet_adsp.c
+@@ -18,7 +18,7 @@
+  int rc=EINTR;
+  if(!__atomic_load_n(&adsp_stop_requested,__ATOMIC_SEQ_CST)){
+   const char *args=PE_boot_args();
+-  rc=adsp_run(daily || modem_gate(args,"sweetbglink"),daily || modem_gate(args,"sweetbread"),daily);
++  rc=adsp_run(daily || modem_gate(args,"sweetbglink"),daily || modem_gate(args,"sweetbread"),daily,modem_gate(args,"sweetbmeter"));
+  }
+  printf("SWEET BATTERY: B2 worker final_error=%d\n",rc);sweet_log_sync();
+  __atomic_store_n(&adsp_worker_active,false,__ATOMIC_SEQ_CST);thread_terminate(current_thread());

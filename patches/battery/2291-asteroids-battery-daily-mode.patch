@@ -1,0 +1,236 @@
+--- a/bsd/dev/battery/AdspRuntime.inc
++++ b/bsd/dev/battery/AdspRuntime.inc
+@@ -47,10 +47,27 @@
+  uint32_t qhead,qcount,rxoff,state,rail_addr[2],rail_index[2],xo_addr;
+  bool failed,fatal,qr_started,battery_up,votes_owed,vote_uncertain,xo_pinned,qmp_owed,glink,proxy_released;
+  int master;
+- BatteryRead read;bool reads;uint64_t cycle_started,request_sent,cycle_due;
++ BatteryRead read;bool reads,daily;uint64_t cycle_started,request_sent,cycle_due,read_quiet_until;unsigned read_failures,cycles;int32_t last_status,last_online;
+  struct adsp_image images[2];
+ } m;
+ static uint64_t m_now(void);
++/* sweetbatt=1 daily mode (2291): no run limit, a read every 20 s, 250 ms idle polls.
++ * A failed read cycle keeps the ADSP up: late replies are dropped for 30 s, then a fresh
++ * client starts. Five failed cycles in a row stop reading until reboot. */
++#define B_CYCLE_TEST_MS 15000u
++#define B_CYCLE_DAILY_MS 20000u
++#define B_QUIET_MS 30000u
++#define B_READ_FAILURES 5u
++/* Set by sweet_adsp_shutdown() at power off or restart; outside m, which adsp_run clears. */
++static volatile bool adsp_stop_requested;
++static void adsp_read_fail(void){
++ battery_snapshot_clear();
++ if(!m.daily){m.failed=true;return;}
++ m.read=(BatteryRead){0};m.cycle_started=0;m.read_quiet_until=m_now()+B_QUIET_MS;
++ if(++m.read_failures>=B_READ_FAILURES){m.reads=false;printf("SWEET BATTERY: B5 reads stopped after %u failed cycles; fallback until reboot\n",m.read_failures);}
++ else printf("SWEET BATTERY: B5 read failure %u; fresh client in %u s\n",m.read_failures,B_QUIET_MS/1000);
++ sweet_log_sync();
++}
+ static void m_bstate(void *ctx,QcomGlinkChannel *ch,int up){
+  (void)ctx;(void)ch;m.battery_up=up!=0;
+  printf("SWEET BATTERY: B2 PMIC_RTR_ADSP_APPS up=%d\n",up);
+@@ -58,31 +75,38 @@
+ }
+ static void m_breceive(void *ctx,QcomGlinkChannel *ch,const uint8_t *data,uint32_t bytes){
+  (void)ctx;(void)ch;
+- if(!m.reads)return;
++ if(!m.reads || m_now()<m.read_quiet_until)return;
+  int rc=battery_read_receive(&m.read,data,bytes);
+- if(rc<0){printf("SWEET BATTERY: B3 reply error field=%u\n",m.read.cursor);m.failed=true;battery_snapshot_clear();return;}
++ if(rc<0){printf("SWEET BATTERY: B3 reply error field=%u\n",m.read.cursor);adsp_read_fail();return;}
+  if(rc==1 && m.read.cursor==BatteryFields){
+   /* Log raw values before validation, so a wrong property id is visible. */
+   int valid=battery_read_valid(&m.read);
+-  printf("SWEET BATTERY: B3 raw status=%d present=%d capacity=%d voltage_uV=%d current_uA=%d temp_centiC=%d online=%d valid=%d\n",
+-   m.read.value[0],m.read.value[1],m.read.value[2],m.read.value[3],m.read.value[4],m.read.value[5],m.read.value[6],valid);
+-  sweet_log_sync();
+-  if(!valid){m.failed=true;battery_snapshot_clear();return;}
+-  battery_snapshot_publish(&m.read,m_now());m.cycle_due=m_now()+15000;
++  /* Test images log every cycle. Daily mode logs the first, every 15th (5 min), status or
++   * online changes and every invalid cycle, so hours of reads do not flood the kernel log. */
++  if(!m.daily || !valid || !m.cycles || m.cycles%15==0 || m.read.value[0]!=m.last_status || m.read.value[6]!=m.last_online){
++   printf("SWEET BATTERY: B3 raw status=%d present=%d capacity=%d voltage_uV=%d current_uA=%d temp_centiC=%d online=%d valid=%d cycle=%u\n",
++    m.read.value[0],m.read.value[1],m.read.value[2],m.read.value[3],m.read.value[4],m.read.value[5],m.read.value[6],valid,m.cycles);
++   sweet_log_sync();
++  }
++  m.cycles++;m.last_status=m.read.value[0];m.last_online=m.read.value[6];
++  if(!valid){adsp_read_fail();return;}
++  battery_snapshot_publish(&m.read,m_now());m.read_failures=0;
++  m.cycle_due=m_now()+(m.daily?B_CYCLE_DAILY_MS:B_CYCLE_TEST_MS);
+  }
+ }
+ #include "AdspHelpers.inc"
+ static void adsp_read_poll(void){
+  if(!m.reads || !m.battery_up || (m.state&6)!=6 || m.fatal || m.failed)return;
+  uint64_t now=m_now();
++ if(now<m.read_quiet_until)return;
+  if(m.read.cursor==BatteryFields){
+   if(now<m.cycle_due)return;
+   m.read=(BatteryRead){0};m.cycle_started=now;
+  }
+  if(!m.cycle_started)m.cycle_started=now;
+  if((m.read.waiting && now-m.request_sent>=2000) || now-m.cycle_started>=20000){
+-  battery_read_timeout(&m.read);m.failed=true;battery_snapshot_clear();
+-  printf("SWEET BATTERY: B3 read timeout field=%u; terminating client\n",m.read.cursor);return;
++  battery_read_timeout(&m.read);
++  printf("SWEET BATTERY: B3 read timeout field=%u\n",m.read.cursor);adsp_read_fail();return;
+  }
+  uint8_t request[24];uint32_t bytes=battery_read_request(&m.read,request);
+  if(!bytes)return;
+@@ -93,6 +117,8 @@
+  if(rc || battery_read_sent(&m.read)){m.failed=true;battery_snapshot_clear();return;}
+  m.request_sent=now;
+ }
++/* Inside a read cycle, waiting for its next request or reply. */
++static bool adsp_read_busy(void){return m.reads && (m.read.waiting || (m.cycle_started && m.read.cursor<BatteryFields));}
+ static int adsp_open_images(struct wl_fat *f){
+  int rc=sweet_ufs_part_size("modem_a",NULL,&adsp_partition_bytes);if(rc)return rc;
+  if((rc=fat_mount(f,"modem_a")))return rc;
+@@ -184,8 +210,8 @@
+  printf("SWEET BATTERY: B2 STOP verified; cleanup=ok; shared XO retained until reset=%u\n",m.xo_pinned);
+  sweet_log_sync();return true;
+ }
+-static int adsp_run(bool glink,bool reads){
+- memset(&m,0,sizeof(m));m.master=-1;m.glink=glink;m.reads=reads;struct wl_fat f;
++static int adsp_run(bool glink,bool reads,bool daily){
++ memset(&m,0,sizeof(m));m.master=-1;m.glink=glink;m.reads=reads;m.daily=daily;struct wl_fat f;
+  int rc=adsp_open_images(&f);if(rc)goto out;
+  m.smem=ml_io_map_unmappable(0x81d00000,M_SM_SIZE,VM_WIMG_IO);
+  m.mutex=ml_io_map_unmappable(0x1f43000,0x1000,VM_WIMG_IO);
+@@ -213,13 +239,15 @@
+  if((rc=m_vote(true)))goto out;
+  if((rc=adsp_load_image(&f,&m.images[0])))goto out;
+  if((rc=adsp_load_image(&f,&m.images[1])))goto out;
+- uint64_t ready=m_now()+10000,end=m_now()+120000;
+- while(m_now()<end){
++ uint64_t ready=m_now()+10000,end=daily?UINT64_MAX:m_now()+120000;
++ while(m_now()<end && !adsp_stop_requested){
+   m_smp_poll();if(glink)m_ipc_poll();adsp_read_poll();
+   if(m.fatal || m.failed){rc=EIO;break;}
+   if(!(m.state&2) && m_now()>ready){rc=ETIMEDOUT;break;}
+-  m_sleep(2);
+- }
++  /* Daily: 250 ms between polls once up and idle, 2 ms while starting, sending or inside a cycle. */
++  m_sleep(daily && (m.state&6)==6 && m.battery_up && !m.qcount && !adsp_read_busy()?250:2);
++ }
++ if(adsp_stop_requested)printf("SWEET BATTERY: B5 stop requested by shutdown\n");
+  if(!rc && ((m.state&6)!=6 || (glink && !m.battery_up)))rc=ETIMEDOUT;
+ out:
+  printf("SWEET BATTERY: B2 run end error=%d ready=%u handover=%u pmic=%u\n",rc,!!(m.state&2),!!(m.state&4),m.battery_up);
+--- a/bsd/dev/sweet_adsp.c
++++ b/bsd/dev/sweet_adsp.c
+@@ -9,22 +9,49 @@
+ #include "battery/AdspRuntime.inc"
+ extern kern_return_t thread_terminate(thread_t);
+ void sweet_adsp_start(void);
++void sweet_adsp_shutdown(void);
++static bool adsp_worker_active;
+ static void adsp_worker(void *arg,wait_result_t wait){
+- (void)arg;(void)wait;m_sleep(30000);
+- int rc=adsp_run(modem_gate(PE_boot_args(),"sweetbglink")!=0,modem_gate(PE_boot_args(),"sweetbread")!=0);
+- printf("SWEET BATTERY: B2 worker final_error=%d\n",rc);sweet_log_sync();thread_terminate(current_thread());
++ (void)wait;bool daily=arg!=NULL;m_sleep(30000);
++ /* Dekker order with sweet_adsp_shutdown(): mark active, then check for a stop. */
++ __atomic_store_n(&adsp_worker_active,true,__ATOMIC_SEQ_CST);
++ int rc=EINTR;
++ if(!__atomic_load_n(&adsp_stop_requested,__ATOMIC_SEQ_CST)){
++  const char *args=PE_boot_args();
++  rc=adsp_run(daily || modem_gate(args,"sweetbglink"),daily || modem_gate(args,"sweetbread"),daily);
++ }
++ printf("SWEET BATTERY: B2 worker final_error=%d\n",rc);sweet_log_sync();
++ __atomic_store_n(&adsp_worker_active,false,__ATOMIC_SEQ_CST);thread_terminate(current_thread());
++}
++/* SweetBattery calls this at power off and restart, in thread context. The ADSP stop needs at most
++ * 3 s for stop_ack plus 5 s of PAS retries; wait 15 s, inside IOKit's 30 s halt timeout. */
++void sweet_adsp_shutdown(void){
++ __atomic_store_n(&adsp_stop_requested,true,__ATOMIC_SEQ_CST);
++ unsigned waited=0;
++ while(__atomic_load_n(&adsp_worker_active,__ATOMIC_SEQ_CST) && waited<15000){m_sleep(10);waited+=10;}
++ if(waited)printf("SWEET BATTERY: B5 shutdown waited %u ms, worker %s\n",waited,__atomic_load_n(&adsp_worker_active,__ATOMIC_SEQ_CST)?"still running":"done");
++ sweet_log_sync();
+ }
+ void sweet_adsp_start(void){
+  const char *args=PE_boot_args();
+- if(!modem_gate(args,"sweetbadsp"))return;
++ /* sweetbatt=1 is the daily preset: ADSP, GLINK, reads and publication, no run limit and no
++  * selftest or deadman. It refuses the test gates by name and still needs sweetfbarm. */
++ bool daily=modem_gate(args,"sweetbatt");
++ if(daily){
++  if(!modem_gate(args,"sweetfbarm") || modem_gate(args,"sweetbadsp") || modem_gate(args,"sweetbglink") ||
++     modem_gate(args,"sweetbread") || modem_gate(args,"sweetbpub") || modem_gate(args,"sweetbprobe") ||
++     modem_gate(args,"sweetmpss")){
++   printf("SWEET BATTERY: B5 sweetbatt refused: needs sweetfbarm, no test gates, no modem in this kernel\n");return;
++  }
++ } else if(!modem_gate(args,"sweetbadsp"))return;
+  int deadman=0;
+- if(!modem_gate(args,"sweetfbarm") || !modem_gate(args,"sweetselftest") ||
++ if(!daily && (!modem_gate(args,"sweetfbarm") || !modem_gate(args,"sweetselftest") ||
+     !PE_parse_boot_argn("sweetdeadman",&deadman,sizeof(deadman)) || deadman!=600 ||
+     modem_gate(args,"sweetbprobe") || modem_gate(args,"sweetmpss") ||
+-    (modem_gate(args,"sweetbread") && !modem_gate(args,"sweetbglink"))){
++    (modem_gate(args,"sweetbread") && !modem_gate(args,"sweetbglink")))){
+   printf("SWEET BATTERY: B2 refused missing safeguards or conflicting probe\n");return;
+  }
+- thread_t thread=THREAD_NULL;kern_return_t rc=kernel_thread_start(adsp_worker,NULL,&thread);
++ thread_t thread=THREAD_NULL;kern_return_t rc=kernel_thread_start(adsp_worker,daily?(void *)1:NULL,&thread);
+  if(rc==KERN_SUCCESS)thread_deallocate(thread);else printf("SWEET BATTERY: B2 thread failure %d\n",rc);
+ }
+ #endif
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -10,11 +10,14 @@
+ #include <IOKit/IOWorkLoop.h>
+ #include <IOKit/IOTimerEventSource.h>
+ #include <IOKit/pwr_mgt/IOPMPowerSource.h>
++#include <IOKit/pwr_mgt/RootDomain.h>
+ #include <libkern/c++/OSCollectionIterator.h>
+ #include <pexpert/pexpert.h>
+ #include "../../../bsd/dev/sweet_board.h"
+ #include "../../../bsd/dev/battery/BatterySnapshot.h"
+ #include "../../../bsd/dev/battery/ModemGate.h"
++/* bsd/dev/sweet_adsp.c: stop the ADSP cleanly before power off or restart (2291). */
++extern "C" void sweet_adsp_shutdown(void);
+ /* bsd/dev/sweet_spmi.c */
+ extern "C" int sweet_spmi_init(void);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+@@ -55,6 +58,8 @@
+ 	void poll(void);
+ 	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
+ 	static IOReturn stopPolling(OSObject *owner, void *, void *, void *, void *);
++	static IOReturn haltHandler(void *target, void *refCon, UInt32 messageType, IOService *provider,
++	    void *messageArgument, vm_size_t argSize);
+ 	static bool readWord(unsigned address, uint16_t *value, unsigned sid = 0);
+ 	void pollBeryllium(void);
+ 	static unsigned estimatePercent(unsigned mv);
+@@ -427,7 +432,14 @@
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
+ 	/* sweet_spmi.c is the SM7150/SDM845 arbiter (v5): not the Nothing Phone (3a)'s (v7) */
+ 	fReal = real == 1 && !sweet_board_asteroids() && sweet_spmi_init() == 0;
+-	fADSP = sweet_board_asteroids() && modem_gate(PE_boot_args(), "sweetbpub");
++	const char *args = PE_boot_args();
++	fADSP = sweet_board_asteroids() && (modem_gate(args, "sweetbpub") || modem_gate(args, "sweetbatt"));
++	if (sweet_board_asteroids() && (modem_gate(args, "sweetbadsp") || modem_gate(args, "sweetbatt")) && getPMRootDomain()) {
++		/* Priority clients run synchronously, in thread context, before the platform reset. */
++		if (!registerPrioritySleepWakeInterest(&SweetBattery::haltHandler, this, NULL)) {
++			IOLog("SWEET BATTERY: shutdown hook unavailable; the reset stops the ADSP\n");
++		}
++	}
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+ 	poll();
+ 	if (fReal || fADSP) {
+@@ -460,6 +472,15 @@
+ }
+ 
+ IOReturn
++SweetBattery::haltHandler(void *, void *, UInt32 messageType, IOService *, void *, vm_size_t)
++{
++	if (messageType == kIOMessageSystemWillPowerOff || messageType == kIOMessageSystemWillRestart) {
++		sweet_adsp_shutdown();
++	}
++	return kIOReturnSuccess;
++}
++
++IOReturn
+ SweetBattery::stopPolling(OSObject *owner, void *, void *, void *, void *)
+ {
+ 	SweetBattery *self = OSDynamicCast(SweetBattery, owner);

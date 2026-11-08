@@ -7,13 +7,20 @@ export TMPDIR=/tmp
 for name in AdspRuntime.inc AdspHelpers.inc AdspFirmware.inc QcomGlink.c QcomGlink.h QcomQrtr.c QcomQrtr.h QcomQmp.c QcomQmp.h QcomScm.h; do
  python3 "$root/extract.py" "$root/../../patches/battery" "$out/battery/$name" "bsd/dev/battery/$name"
 done
+# Negative control: the series before 2197 (2190 to 2196) unmaps offset addresses (ast188 panic).
+mkdir -p "$out/patches-old" "$out/battery-old"
+for p in "$root/../../patches/battery"/219[0-6]-*.patch; do cp "$p" "$out/patches-old/"; done
+python3 "$root/extract.py" "$out/patches-old" "$out/battery-old/AdspRuntime.inc" bsd/dev/battery/AdspRuntime.inc
 python3 - "$root" "$out" <<'PY'
 from pathlib import Path
 import sys
 root,out=map(Path,sys.argv[1:]);s=(out/'battery/AdspRuntime.inc').read_text()
-a=s.index('static bool adsp_cleanup');b=s.index('static int adsp_run',a)
+cut='static void m_unmap' if 'static void m_unmap' in s else 'static bool adsp_cleanup'
+a=s.index(cut);b=s.index('static int adsp_run',a)
 (out/'adsp-cleanup.c').write_text((root/'tests/adsp-cleanup-prefix.c').read_text()+s[a:b]+(root/'tests/adsp-cleanup-tail.c').read_text())
-a=s.index('static int adsp_load_image');b=s.index('static bool adsp_cleanup',a)
+old=(out/'battery-old/AdspRuntime.inc').read_text();a=old.index('static bool adsp_cleanup');b=old.index('static int adsp_run',a)
+(out/'adsp-cleanup-old.c').write_text((root/'tests/adsp-cleanup-prefix.c').read_text()+old[a:b]+(root/'tests/adsp-cleanup-tail.c').read_text())
+a=s.index('static int adsp_load_image');b=s.index(cut,a)
 load=s[a:b].replace('__asm__ volatile("dsb sy":::"memory");','/* Host barrier omitted. */')
 (out/'adsp-load.c').write_text((root/'tests/adsp-load-prefix.c').read_text()+load+(root/'tests/adsp-load-tail.c').read_text())
 h=(out/'battery/AdspHelpers.inc').read_text();a=h.index('static int m_vote');b=h.index('static int m_qwait',a)
@@ -21,6 +28,10 @@ vote=h[a:b];a=h.index('static void m_smp_poll');b=h.index('static int m_qsend_pa
 (out/'adsp-vote.c').write_text((root/'tests/adsp-vote-prefix.c').read_text()+vote+h[a:b]+(root/'tests/adsp-vote-tail.c').read_text())
 PY
 cc -save-temps=obj -std=gnu11 -Wall -Wextra -Werror -fsanitize=address,undefined "$out/adsp-cleanup.c" -o "$out/adsp-cleanup"
+cc -std=gnu11 -Wall -Wextra -Werror -Wno-unused-function -fsanitize=address,undefined "$out/adsp-cleanup-old.c" -o "$out/adsp-cleanup-old"
+if neg=$("$out/adsp-cleanup-old" 2>&1); then echo "FAIL: pre-2197 cleanup passed the alignment model"; exit 1; fi
+printf '%s\n' "$neg" | grep -q 'UNALIGNED unmap .* bytes=0x400$' || { printf '%s\n' "$neg"; echo "FAIL: pre-2197 cleanup failed for another reason"; exit 1; }
+echo "PASS: negative control, pre-2197 cleanup fails on the qmpmem 0x400 unmap, as in ast188"
 "$out/adsp-cleanup"
 cc -save-temps=obj -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined "$out/adsp-load.c" -o "$out/adsp-load"
 "$out/adsp-load"

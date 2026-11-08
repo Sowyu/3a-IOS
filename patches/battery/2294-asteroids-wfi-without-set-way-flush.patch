@@ -1,0 +1,30 @@
+--- a/osfmk/arm64/cpu.c
++++ b/osfmk/arm64/cpu.c
+@@ -115,6 +115,17 @@
+ //  1 : normal
+ //  2 : overhead simulation (delay & flags)
+ TUNABLE(unsigned int, wfi, "wfi", 1);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * 2294 sweetwfi=1: idle with a plain WFI, without platform_cache_idle_enter(). That call cleans and invalidates
++ * the data cache by set/way up to LoUIS on every idle entry, and its inclusive loop bound always walks at least all
++ * of L1D even when LoUIS is 0 (caches_asm.s DCACHE_SET_WAY). Here WFI only clock-gates the core: nothing powers a
++ * core down from this path, caches stay coherent (__ARM_COHERENT_CACHE__), and cpu_sleep() does its own
++ * CleanPoC_Dcache() before CPU_OFF. Set/way operations are not a coherency tool on a multi-core part and a
++ * hypervisor may trap them. Default 0 keeps the stock behaviour; a future CPU_SUSPEND idle must flush itself.
++ */
++TUNABLE(unsigned int, sweet_wfi_noflush, "sweetwfi", 0);
++#endif
+ #if DEVELOPMENT || DEBUG
+ 
+ // wfi_flags
+@@ -587,6 +598,9 @@
+ 
+ 	if (wfi) {
+ #if !defined(APPLE_ARM64_ARCH_FAMILY)
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		if (!sweet_wfi_noflush)
++#endif
+ 		platform_cache_idle_enter();
+ #endif
+ 

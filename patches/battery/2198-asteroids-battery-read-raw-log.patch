@@ -1,0 +1,32 @@
+--- a/bsd/dev/battery/AdspRuntime.inc
++++ b/bsd/dev/battery/AdspRuntime.inc
+@@ -57,13 +57,15 @@
+  (void)ctx;(void)ch;
+  if(!m.reads)return;
+  int rc=battery_read_receive(&m.read,data,bytes);
+- if(rc<0){m.failed=true;battery_snapshot_clear();return;}
++ if(rc<0){printf("SWEET BATTERY: B3 reply error field=%u\n",m.read.cursor);m.failed=true;battery_snapshot_clear();return;}
+  if(rc==1 && m.read.cursor==BatteryFields){
+-  if(!battery_read_valid(&m.read)){m.failed=true;battery_snapshot_clear();return;}
++  /* Log raw values before validation, so a wrong property id is visible. */
++  int valid=battery_read_valid(&m.read);
++  printf("SWEET BATTERY: B3 raw status=%d present=%d capacity=%d voltage_uV=%d current_uA=%d temp_centiC=%d online=%d valid=%d\n",
++   m.read.value[0],m.read.value[1],m.read.value[2],m.read.value[3],m.read.value[4],m.read.value[5],m.read.value[6],valid);
++  sweet_log_sync();
++  if(!valid){m.failed=true;battery_snapshot_clear();return;}
+   battery_snapshot_publish(&m.read,m_now());m.cycle_due=m_now()+15000;
+-  printf("SWEET BATTERY: B3 sample capacity=%d voltage_uV=%d current_uA=%d temp_centiC=%d status=%d online=%d\n",
+-   m.read.value[2],m.read.value[3],m.read.value[4],m.read.value[5],m.read.value[0],m.read.value[6]);
+-  sweet_log_sync();
+  }
+ }
+ #include "AdspHelpers.inc"
+@@ -77,7 +79,7 @@
+  if(!m.cycle_started)m.cycle_started=now;
+  if((m.read.waiting && now-m.request_sent>=2000) || now-m.cycle_started>=20000){
+   battery_read_timeout(&m.read);m.failed=true;battery_snapshot_clear();
+-  printf("SWEET BATTERY: B3 read timeout; terminating client\n");return;
++  printf("SWEET BATTERY: B3 read timeout field=%u; terminating client\n",m.read.cursor);return;
+  }
+  uint8_t request[24];uint32_t bytes=battery_read_request(&m.read,request);
+  if(!bytes)return;

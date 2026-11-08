@@ -1,0 +1,137 @@
+--- a/osfmk/kern/processor.c
++++ b/osfmk/kern/processor.c
+@@ -892,6 +892,84 @@
+  * the power work; off unless the boot-arg is set. One scan holds tasks_threads_lock for a few ms.
+  */
+ #define SCT_MAX 3072u
++/*
++ * 2298: where a thread that held a CPU for a whole window is running. The sampler cross-calls the CPU it last
++ * ran on; the IRQ handler there reads the interrupted state (cpu_int_state, set at IRQ entry in locore.s) and,
++ * if that CPU is still running the thread in the kernel, walks at most SCT_FRAMES frame records that lie inside
++ * the thread's own kernel stack. No answer within 20 ms means the thread is spinning with interrupts off.
++ */
++#include <machine/machine_routines.h>
++#include <arm/cpu_data_internal.h>
++#include <arm64/proc_reg.h>
++#include <kern/clock.h>
++#define SCT_FRAMES 6u
++struct sct_pc { thread_t th; volatile int done; int hit, el0; unsigned n; uint64_t pc, lr, frames[SCT_FRAMES]; };
++/* Frame-pointer walk bounded to [lo, hi): 16-byte aligned records, strictly increasing, at most max. */
++static unsigned
++sct_walk(uint64_t fp, uint64_t lo, uint64_t hi, uint64_t *out, unsigned max)
++{
++	unsigned n = 0;
++	while (n < max && fp >= lo && hi >= 16 && fp <= hi - 16 && !(fp & 7)) {
++		const uint64_t *rec = (const uint64_t *)fp;
++		out[n++] = rec[1];
++		uint64_t next = rec[0];
++		if (next <= fp) {
++			break;
++		}
++		fp = next;
++	}
++	return n;
++}
++static void
++sct_pc_xcall(void *arg)
++{
++	struct sct_pc *r = arg;
++	thread_t self = current_thread();
++	arm_saved_state_t *ss = (arm_saved_state_t *)getCpuDatap()->cpu_int_state;
++	r->hit = self == r->th;
++	if (ss != NULL) {
++		r->pc = get_saved_state_pc(ss);
++		r->lr = get_saved_state_lr(ss);
++		r->el0 = (get_saved_state_cpsr(ss) & PSR64_MODE_EL_MASK) == PSR64_MODE_EL0;
++		if (r->hit && !r->el0 && self->kernel_stack) {
++			r->n = sct_walk(get_saved_state_fp(ss), self->kernel_stack, self->kernel_stack + kernel_stack_size, r->frames, SCT_FRAMES);
++		}
++	}
++	__atomic_store_n(&r->done, 1, __ATOMIC_RELEASE);
++}
++static void
++sct_pc_log(thread_t th, uint64_t tid)
++{
++	struct sct_pc r = { .th = th };
++	processor_t last = th->last_processor;
++	int cpu = last ? last->cpu_id : -1;
++	if (cpu < 0 || cpu == cpu_number()) {
++		printf("SWEET CPUTOP: pc tid=%llu skipped cpu=%d\n", (unsigned long long)tid, cpu);
++		return;
++	}
++	if (cpu_xcall(cpu, sct_pc_xcall, &r) != KERN_SUCCESS) {
++		printf("SWEET CPUTOP: pc tid=%llu cpu=%d xcall refused\n", (unsigned long long)tid, cpu);
++		return;
++	}
++	for (unsigned us = 0; us < 20000 && !__atomic_load_n(&r.done, __ATOMIC_ACQUIRE); us += 10) {
++		delay(10);
++	}
++	if (!__atomic_load_n(&r.done, __ATOMIC_ACQUIRE)) {
++		/* r stays on this stack; a late handler could write it, so never return before it answers. */
++		while (!__atomic_load_n(&r.done, __ATOMIC_ACQUIRE)) {
++			delay(1000);
++		}
++		printf("SWEET CPUTOP: pc tid=%llu cpu=%d no answer in 20 ms: interrupts off\n", (unsigned long long)tid, cpu);
++		return;
++	}
++	char line[256];
++	int n = snprintf(line, sizeof(line), "SWEET CPUTOP: pc tid=%llu cpu=%d hit=%d el0=%d pc=%#llx lr=%#llx frames", (unsigned long long)tid, cpu,
++	    r.hit, r.el0, (unsigned long long)r.pc, (unsigned long long)r.lr);
++	for (unsigned i = 0; i < r.n && n < (int)sizeof(line) - 20; i++) {
++		n += snprintf(line + n, sizeof(line) - n, " %#llx", (unsigned long long)r.frames[i]);
++	}
++	printf("%s\n", line);
++}
+ static struct { uint64_t tid, t; } sct_prev[SCT_MAX], sct_cur[SCT_MAX];
+ static unsigned sct_nprev;
+ static uint64_t sct_idle[MAX_CPUS], sct_wall;
+@@ -899,7 +977,7 @@
+ void
+ sweet_cputop_log(void)
+ {
+-	struct { uint64_t tid, d; int pri, cpu; uintptr_t cont; char task[24], name[24]; } top[6];
++	struct { uint64_t tid, d; int pri, cpu; uintptr_t cont; char task[24], name[24]; thread_t th; } top[6];
+ 	unsigned ntop = 0, ncur = 0, total = 0;
+ 	uint64_t now = mach_absolute_time(), wall = sct_wall ? now - sct_wall : 0;
+ 	char line[512];
+@@ -934,7 +1012,8 @@
+ 			sct_cur[ncur].tid = tid;
+ 			sct_cur[ncur++].t = t;
+ 		}
+-		if (!wall || !d) {
++		/* 2298: idle threads are idle time, not work. */
++		if (!wall || !d || (thread->state & TH_IDLE)) {
+ 			continue;
+ 		}
+ 		/* Insertion into the six largest, kept sorted. */
+@@ -947,6 +1026,7 @@
+ 				top[k] = top[k - 1];
+ 			}
+ 			top[at].tid = tid;
++			top[at].th = thread;
+ 			top[at].d = d;
+ 			top[at].pri = thread->base_pri;
+ 			top[at].cpu = thread->last_processor ? thread->last_processor->cpu_id : -1;
+@@ -961,6 +1041,11 @@
+ 			}
+ 		}
+ 	}
++	/* 2298: keep the busiest thread alive past the unlock if it held 90% of the window. */
++	thread_t hog = ntop && top[0].d * 10 >= wall * 9 ? top[0].th : THREAD_NULL;
++	if (hog != THREAD_NULL) {
++		thread_reference(hog);
++	}
+ 	lck_mtx_unlock(&tasks_threads_lock);
+ 	memcpy(sct_prev, sct_cur, ncur * sizeof(sct_cur[0]));
+ 	sct_nprev = ncur;
+@@ -971,6 +1056,10 @@
+ 		printf("SWEET CPUTOP: %u %s/%s tid=%llu pri=%d cpu=%d cont=%#lx ms=%llu\n", i + 1, top[i].task,
+ 		    top[i].name[0] ? top[i].name : "-", (unsigned long long)top[i].tid, top[i].pri, top[i].cpu,
+ 		    (unsigned long)top[i].cont, (unsigned long long)(ns / NSEC_PER_MSEC));
++	}
++	if (hog != THREAD_NULL) {
++		sct_pc_log(hog, top[0].tid);
++		thread_deallocate(hog);
+ 	}
+ }
+ 

@@ -1,0 +1,132 @@
+Patch 2350 (video V1b, plans/video/v1b/README.md): the realtime admission limit accepts 50 ms of a 24 MHz clock.
+iOS 26 userspace builds thread time constraints in 24 MHz ticks. CoreAudio's AMCP::Utility::configure_thread_for_realtime
+(iOS 26.6.2 cache 0x1e210fd7c) passes period = constraint = the IO cycle and computation = clamp(cycle, 1200, 1200000).
+On this kernel's 19.2 MHz timebase the stock 50 ms limit is 960000 ticks, so thread_policy_set refused every HAL IO thread
+with a cycle of 960000 ticks or more. The 4096-frame media buffer is 2229115 ticks, so its IO stopped after 0 frames,
+the AudioQueue start timed out (-66681) and Safari's MSE timebase stayed at 0 (ast226). max_rt_quantum becomes
+max(50 ms, 1200000 ticks), 62.5 ms here and unchanged on 24 MHz hardware. sweetrtq=0 keeps the stock limit.
+Kernel log lines: "SWEET RT: max rt computation" once at boot, then one per refused time constraint request (first 32)
+and one per request only the allowance admits (first 8). Applies on top of 2330 (research/xnu-video-v0).
+
+diff --git a/osfmk/kern/sched.h b/osfmk/kern/sched.h
+index ac4b4d3..e31c51e 100644
+--- a/osfmk/kern/sched.h
++++ b/osfmk/kern/sched.h
+@@ -349,6 +349,7 @@ extern uint32_t default_timeshare_computation;
+ extern uint32_t default_timeshare_constraint;
+ 
+ extern uint32_t max_rt_quantum, min_rt_quantum;
++extern uint32_t sweet_rt_stock_max_quantum;     /* patch 2350: max_rt_quantum before its 24 MHz allowance */
+ 
+ extern int default_preemption_rate;
+ 
+diff --git a/osfmk/kern/sched_rt.c b/osfmk/kern/sched_rt.c
+index 531dbfe..aefcf21 100644
+--- a/osfmk/kern/sched_rt.c
++++ b/osfmk/kern/sched_rt.c
+@@ -37,6 +37,8 @@
+ #include <kern/sched_rt.h>
+ #include <kern/thread.h>
+ #include <kern/queue.h>
++#include <kern/misc_protos.h>
++#include <kern/startup.h>
+ 
+ #include <sys/kdebug_kernel.h>
+ 
+@@ -54,6 +56,10 @@ uint32_t rt_constraint_threshold;
+ int rt_deadline_epsilon_us = 100;
+ uint32_t max_rt_quantum;
+ uint32_t min_rt_quantum;
++/* Patch 2350: 50 ms of the 24 MHz clock iOS userspace assumes, and the limit before 2350 raised it */
++#define SWEET_RT_QUANTUM_24MHZ 1200000u
++static TUNABLE(uint32_t, sweet_rtq, "sweetrtq", 1);
++uint32_t sweet_rt_stock_max_quantum;
+ int sched_allow_rt_smt = 1;
+ int sched_rt_runq_strict_priority = false;
+ 
+@@ -91,6 +97,20 @@ sched_realtime_timebase_init(void)
+ 		50, 1000 * NSEC_PER_USEC, &abstime);
+ 	assert((abstime >> 32) == 0 && (uint32_t)abstime != 0);
+ 	max_rt_quantum = (uint32_t)abstime;
++	/*
++	 * Patch 2350: iOS 26 userspace builds RT time constraints on a fixed 24 MHz clock. CoreAudio's
++	 * AMCP::Utility::configure_thread_for_realtime clamps the computation to 1200000 ticks, 50 ms at 24 MHz, but
++	 * this kernel's 19.2 MHz timebase makes the 50 ms limit 960000 ticks. Every HAL IO thread with a cycle of
++	 * 960000 ticks or more (4096 frames, the media playback buffer) was refused and its IO stopped after 0 frames,
++	 * so Safari's MSE timebase never started. Admit 50 ms of a 24 MHz clock as well, 62.5 ms here. No change on
++	 * 24 MHz hardware. sweetrtq=0 keeps the stock limit.
++	 */
++	sweet_rt_stock_max_quantum = max_rt_quantum;
++	if (sweet_rtq && max_rt_quantum < SWEET_RT_QUANTUM_24MHZ) {
++		max_rt_quantum = SWEET_RT_QUANTUM_24MHZ;
++	}
++	printf("SWEET RT: max rt computation %u ticks, stock %u (2350 sweetrtq=%u)\n", max_rt_quantum,
++	    sweet_rt_stock_max_quantum, sweet_rtq);
+ 
+ 	/* constraint threshold for sending backup IPIs (4 ms) */
+ 	clock_interval_to_absolutetime_interval(4, NSEC_PER_MSEC, &abstime);
+diff --git a/osfmk/kern/thread_policy.c b/osfmk/kern/thread_policy.c
+index bb1f51b..b8110cc 100644
+--- a/osfmk/kern/thread_policy.c
++++ b/osfmk/kern/thread_policy.c
+@@ -34,6 +34,8 @@
+ #include <kern/processor.h>
+ #include <kern/thread.h>
+ #include <kern/affinity.h>
++#include <kern/misc_protos.h>
++#include <kern/task.h>
+ #include <kern/work_interval.h>
+ #include <mach/task_policy.h>
+ #include <kern/sfi.h>
+@@ -261,8 +263,8 @@ thread_qos_scaled_relative_priority(int qos, int qos_relprio)
+  */
+ static TUNABLE(bool, allow_qos_policy_set, "-qos-policy-allow", false);
+ 
+-kern_return_t
+-thread_policy_set(
++static kern_return_t
++thread_policy_set_checked(
+ 	thread_t                                thread,
+ 	thread_policy_flavor_t  flavor,
+ 	thread_policy_t                 policy_info,
+@@ -332,6 +334,40 @@ thread_policy_set(
+ 	return kr;
+ }
+ 
++/*
++ * Patch 2350: a kernel log line for each time constraint request this kernel refuses (the first 32 of a boot) and
++ * for each one only 2350's 24 MHz allowance admits (the first 8), so a run names the RT threads the 19.2 MHz
++ * timebase affects. thread_policy_set_checked is the stock thread_policy_set.
++ */
++kern_return_t
++thread_policy_set(
++	thread_t                                thread,
++	thread_policy_flavor_t  flavor,
++	thread_policy_t                 policy_info,
++	mach_msg_type_number_t  count)
++{
++	static uint32_t sweet_rt_refused, sweet_rt_widened;
++	thread_time_constraint_policy_data_t want = {};
++	bool rt = thread != THREAD_NULL && count >= THREAD_TIME_CONSTRAINT_POLICY_COUNT &&
++	    (flavor == THREAD_TIME_CONSTRAINT_POLICY || flavor == THREAD_TIME_CONSTRAINT_WITH_PRIORITY_POLICY);
++
++	if (rt) {
++		want = *(thread_time_constraint_policy_t)(void *)policy_info;
++	}
++	kern_return_t kr = thread_policy_set_checked(thread, flavor, policy_info, count);
++	if (rt && kr != KERN_SUCCESS && os_atomic_inc_orig(&sweet_rt_refused, relaxed) < 32) {
++		printf("SWEET RT: pid %d tid %llu time constraint refused, kr %d: period %u computation %u constraint %u, "
++		    "admits %u..%u (2350)\n", task_pid(get_threadtask(thread)), thread_tid(thread), kr, want.period,
++		    want.computation, want.constraint, min_rt_quantum, max_rt_quantum);
++	} else if (rt && kr == KERN_SUCCESS && want.computation > sweet_rt_stock_max_quantum &&
++	    os_atomic_inc_orig(&sweet_rt_widened, relaxed) < 8) {
++		printf("SWEET RT: pid %d tid %llu time constraint admitted by 2350: period %u computation %u constraint %u, "
++		    "stock limit %u\n", task_pid(get_threadtask(thread)), thread_tid(thread), want.period, want.computation,
++		    want.constraint, sweet_rt_stock_max_quantum);
++	}
++	return kr;
++}
++
+ static_assert(offsetof(thread_time_constraint_with_priority_policy_data_t, period) == offsetof(thread_time_constraint_policy_data_t, period));
+ static_assert(offsetof(thread_time_constraint_with_priority_policy_data_t, computation) == offsetof(thread_time_constraint_policy_data_t, computation));
+ static_assert(offsetof(thread_time_constraint_with_priority_policy_data_t, constraint) == offsetof(thread_time_constraint_policy_data_t, constraint));
